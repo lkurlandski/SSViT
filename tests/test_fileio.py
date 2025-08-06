@@ -9,12 +9,12 @@ import pytest
 import tempfile
 from typing import Callable, Optional
 
-from src.utils import read_file
-from src.utils import read_file_asynch
-from src.utils import read_files
-from src.utils import read_files_asynch
-from src.utils import read_files_lazy
-from src.utils import read_files_asynch_lazy
+from src.fileio import read_file
+from src.fileio import read_file_asynch
+from src.fileio import read_files
+from src.fileio import read_files_asynch
+from src.fileio import read_files_lazy
+from src.fileio import read_files_asynch_lazy
 
 
 class TestReadFile:
