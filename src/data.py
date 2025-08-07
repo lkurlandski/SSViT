@@ -7,11 +7,9 @@ from abc import ABC
 from abc import abstractmethod
 from collections.abc import Iterator
 from collections.abc import Sequence
-from datetime import datetime
 import math
 import os
-from pathlib import Path
-import sys
+import random
 from typing import Optional
 
 import torch
@@ -20,6 +18,7 @@ from torch import LongTensor
 from torch.utils.data import Dataset
 from torch.utils.data import IterableDataset
 from torch.utils.data import get_worker_info
+from torch.utils.data import Sampler
 
 from src.fileio import read_files_asynch_lazy, read_file
 
@@ -213,3 +212,35 @@ class IterableBinaryDatasetBatchedLoader(IterableDataset, BinaryDataset):
         self.my_labels = self.labels[start:end]
         self.my_x = [None for _ in range(self.my_length)]
         self.my_idx = 0
+
+
+class ContiguousSampler(Sampler[int]):
+
+    def __init__(self, num_samples: int, chunk_size: int, shuffle: bool = False) -> None:
+        self.num_samples = num_samples
+        self.chunk_size = chunk_size
+        self.shuffle = shuffle
+        self.leads = list(range(0, num_samples, self.chunk_size))
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __iter__(self) -> Iterator[int]:
+        if self.shuffle:
+            random.shuffle(self.leads)
+        return self
+
+    def __next__(self) -> int:
+        for l in self.leads:
+            for i in range(l, min(l + self.chunk_size, self.num_samples)):
+                return i
+        raise StopIteration()
+
+
+class CollateFn:
+
+    def __call__(self, batch: list[Sample]) -> tuple[LongTensor, LongTensor]:
+        names, xs, ys = zip(*batch)
+        x = torch.nn.utils.rnn.pad_sequence([x + 1 for x in xs], batch_first=True, padding_value=0)
+        y = torch.stack(ys, dim=0)
+        return x, y
