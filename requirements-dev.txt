@@ -1,6 +1,8 @@
 mypy
 pandas
+psutil
 pylint
 pytest
 ruff
+types-tqdm
 scipy
