@@ -34,7 +34,6 @@ for v in lief.PE.OptionalHeader.SUBSYSTEM.__dict__.values():
 SUBSYSTEMS = tuple(SUBSYSTEMS)
 
 
-
 def is_dotnet(raw: str | Path | bytes) -> bool:
     pe: lief.PE.Binary = lief.parse(raw)
     if not isinstance(pe, lief.PE.Binary):
@@ -76,10 +75,8 @@ def patch_binary(
             machine = machine.value
         struct.pack_into("<H", data, filehdr_off + 0, machine)
 
-    # Find Subsystem offset in Optional Header.
-    magic = struct.unpack_from("<H", data, opthdr_off)[0]
-    # Subsystem offset depends on PE32 vs PE32+
-    subsys_rel = 68 if magic == 0x10B else 72  # 0x10B=PE32, 0x20B=PE32+
+    # Patch Subsystem (IMAGE_OPTIONAL_HEADER.Subsystem).
+    subsys_rel = 68
     if subsystem is not None:
         if hasattr(subsystem, "value"):
             subsystem = subsystem.value
