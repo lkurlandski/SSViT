@@ -136,6 +136,7 @@ class TestSemanticGuider:
         assert x.ndim == 2
         assert x.shape[0] == os.path.getsize(file)
         assert x.shape[1] == len(ParserGuider.PARSEERRORS)
+        # assert torch.all(torch.isin(x, torch.tensor([0, 1, -1])))
 
     @pytest.mark.parametrize("file", FILES)
     @pytest.mark.parametrize("input_type", [str, Path, bytes])
@@ -155,11 +156,11 @@ class TestSemanticGuider:
     def test_create_characteristics_guide(self, file: Path, input_type: type[str | Path | bytes]):
         data = self.path_to_input_type(file, input_type)
         x = SemanticGuider.create_characteristics_guide(data)
-        assert isinstance(x, IntTensor)
+        assert isinstance(x, BoolTensor)
         assert x.ndim == 2
         assert x.shape[0] == os.path.getsize(file)
         assert x.shape[1] == len(SemanticGuider.CHARACTERISTICS)
-        assert torch.all(torch.isin(x, torch.tensor([0, 1, -1])))
+        # assert torch.all(torch.isin(x, torch.tensor([0, 1, -1])))
 
     @pytest.mark.parametrize("do_parse", [False, True])
     @pytest.mark.parametrize("do_entropy", [False, True])

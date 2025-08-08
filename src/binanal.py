@@ -149,9 +149,9 @@ def rearm_disarmed_binary(src: str | Path | bytes, sha: str, check: bool = True,
 
 @dataclass(frozen=True, slots=True)
 class SemanticGuides:
-    parse: Optional[IntTensor] = None
+    parse: Optional[BoolTensor] = None
     entropy: Optional[DoubleTensor] = None
-    characteristics: Optional[IntTensor] = None
+    characteristics: Optional[BoolTensor] = None
 
     def __post_init__(self) -> None:
         lengths = [len(x) for x in (self.parse, self.entropy, self.characteristics) if x is not None]
@@ -226,9 +226,9 @@ class SemanticGuider:
         return x
 
     @staticmethod
-    def create_characteristics_guide(data: LiefParse) -> IntTensor:
+    def create_characteristics_guide(data: LiefParse) -> BoolTensor:
         size = os.path.getsize(data) if isinstance(data, (str, os.PathLike)) else len(data)
-        x = torch.full((size, len(SemanticGuider.CHARACTERISTICS)), -1, dtype=torch.int32)
+        x = torch.full((size, len(SemanticGuider.CHARACTERISTICS)), False, dtype=torch.bool)
         pe = lief.parse(data)
         if pe is None:
             raise RuntimeError(f"lief.parse({type(data)}) return None")
@@ -236,7 +236,7 @@ class SemanticGuider:
             offset = section.offset
             size = section.size
             for i, c in enumerate(SemanticGuider.CHARACTERISTICS):
-                x[offset:offset + size, i] = 1 if section.has_characteristic(c) else 0
+                x[offset:offset + size, i] = True if section.has_characteristic(c) else False
         return x
 
 
