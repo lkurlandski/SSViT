@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 from torch import Tensor
+from torch import BoolTensor
 from torch import IntTensor
 from torch import LongTensor
 from torch import FloatTensor
@@ -19,6 +20,7 @@ from torch import DoubleTensor
 from src.binanal import patch_binary
 from src.binanal import SemanticGuider
 from src.binanal import SemanticGuides
+from src.binanal import ParserGuider
 
 
 FILES = sorted(Path("./tests/data").iterdir())
@@ -125,17 +127,15 @@ class TestSemanticGuider:
         else:
             return file.read_bytes()
 
-    @pytest.mark.skip("NotImplemented")
     @pytest.mark.parametrize("file", FILES)
     @pytest.mark.parametrize("input_type", [str, Path, bytes])
     def test_create_parse_guide(self, file: Path, input_type: type[str | Path | bytes]):
         data = self.path_to_input_type(file, input_type)
-        x = SemanticGuider.create_parse_guide(data)
-        assert isinstance(x, IntTensor)
+        x = SemanticGuider.create_parse_guide(data, True)
+        assert isinstance(x, BoolTensor)
         assert x.ndim == 2
         assert x.shape[0] == os.path.getsize(file)
-        assert x.shape[1] == len(SemanticGuider.PARSEERRORS)
-        assert torch.all(torch.isin(x, torch.tensor([0, 1, -1])))
+        assert x.shape[1] == len(ParserGuider.PARSEERRORS)
 
     @pytest.mark.parametrize("file", FILES)
     @pytest.mark.parametrize("input_type", [str, Path, bytes])
@@ -189,3 +189,31 @@ class TestSemanticGuider:
             assert isinstance(characteristics, Tensor)
         else:
             assert characteristics is None
+
+
+class TestParserGuider:
+
+    def test_parser_not_called(self):
+        guider = ParserGuider(FILES[0])
+        with pytest.raises(RuntimeError):
+            guider.build_simple_guide()
+        with pytest.raises(RuntimeError):
+            guider.build_complex_guide()
+
+    @pytest.mark.parametrize("file", FILES)
+    def test_build_simple_guide(self, file: Path):
+        parser = ParserGuider(file)
+        g = parser(True)
+        assert isinstance(g, BoolTensor)
+        assert g.ndim == 2
+        assert g.shape[0] == os.path.getsize(file)
+        assert g.shape[1] == len(ParserGuider.PARSEERRORS)
+
+    @pytest.mark.parametrize("file", FILES)
+    def test_build_complex_guide(self, file: Path):
+        parser = ParserGuider(file)
+        g = parser(False)
+        assert isinstance(g, BoolTensor)
+        assert g.ndim == 2
+        assert g.shape[0] == os.path.getsize(file)
+        assert g.shape[1] == len(ParserGuider.PARSEERRORS)
