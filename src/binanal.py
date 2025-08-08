@@ -3,16 +3,26 @@ Binary analysis.
 """
 
 from dataclasses import dataclass
+import enum
 import hashlib
+import os
 from pathlib import Path
 import struct
 from typing import Optional
 
 import lief
 import numpy as np
-import numpy.typing as npt
 from numpy.lib.stride_tricks import sliding_window_view
 from scipy.stats import entropy
+import torch
+from torch import IntTensor
+from torch import LongTensor
+from torch import FloatTensor
+from torch import DoubleTensor
+
+
+StrPath = str | os.PathLike[str]
+LiefParse = StrPath | bytes
 
 
 # Machine types, from most to least common for PE files.
@@ -36,7 +46,6 @@ for v in lief.PE.OptionalHeader.SUBSYSTEM.__dict__.values():
     if type(v).__name__ == "SUBSYSTEM" and v not in SUBSYSTEMS:
         SUBSYSTEMS.append(v)
 SUBSYSTEMS = tuple(SUBSYSTEMS)
-
 
 
 def is_section_executable(section: lief.PE.Section) -> bool:
@@ -137,15 +146,14 @@ def rearm_disarmed_binary(src: str | Path | bytes, sha: str, check: bool = True,
     raise RuntimeError(f"Could not find matching machine and subsystem for SHA-256: {sha}")
 
 
-@dataclass(frozen=True)
-class SemanticSample:
-    buffer: bytes
-    parse: Optional[npt.NDArray[np.int32]] = None
-    entropy: Optional[npt.NDArray[np.float64]] = None
-    characteristics: Optional[npt.NDArray[np.int32]] = None
+@dataclass(frozen=True, slots=True)
+class SemanticGuides:
+    parse: Optional[IntTensor] = None
+    entropy: Optional[DoubleTensor] = None
+    characteristics: Optional[IntTensor] = None
 
     def __post_init__(self) -> None:
-        lengths = [len(x) for x in (self.buffer, self.parse, self.entropy, self.characteristics) if x is not None]
+        lengths = [len(x) for x in (self.parse, self.entropy, self.characteristics) if x is not None]
         if len(set(lengths)) > 1:
             raise ValueError(f"SemanticSample buffers have different lengths: {lengths}")
 
@@ -155,34 +163,28 @@ class SemanticGuider:
     Semantic guides to acompany a byte stream.
     """
 
+    PARSEERRORS = [
+        lief.lief_errors.asn1_bad_tag,
+        lief.lief_errors.build_error,
+        lief.lief_errors.conversion_error,
+        lief.lief_errors.corrupted,
+        lief.lief_errors.data_too_large,
+        lief.lief_errors.file_error,
+        lief.lief_errors.file_format_error,
+        lief.lief_errors.not_found,
+        lief.lief_errors.not_implemented,
+        lief.lief_errors.not_supported,
+        lief.lief_errors.parsing_error,
+        lief.lief_errors.read_error,
+        lief.lief_errors.read_out_of_bound,
+        lief.lief_errors.require_extended_version
+    ]
+
     CHARACTERISTICS = [
-        # lief.PE.Section.CHARACTERISTICS.TYPE_NO_PAD,
         lief.PE.Section.CHARACTERISTICS.CNT_CODE,
         lief.PE.Section.CHARACTERISTICS.CNT_INITIALIZED_DATA,
         lief.PE.Section.CHARACTERISTICS.CNT_UNINITIALIZED_DATA,
-        # lief.PE.Section.CHARACTERISTICS.LNK_OTHER,
-        # lief.PE.Section.CHARACTERISTICS.LNK_INFO,
-        # lief.PE.Section.CHARACTERISTICS.LNK_REMOVE,
-        # lief.PE.Section.CHARACTERISTICS.LNK_COMDAT,
         lief.PE.Section.CHARACTERISTICS.GPREL,
-        # lief.PE.Section.CHARACTERISTICS.MEM_PURGEABLE,  # Reserved for future use
-        # lief.PE.Section.CHARACTERISTICS.MEM_16BIT,      # Reserved for future use
-        # lief.PE.Section.CHARACTERISTICS.MEM_LOCKED,     # Reserved for future use
-        # lief.PE.Section.CHARACTERISTICS.MEM_PRELOAD,    # Reserved for future use
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_1BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_2BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_4BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_8BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_16BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_32BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_64BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_128BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_256BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_512BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_1024BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_2048BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_4096BYTES,
-        # lief.PE.Section.CHARACTERISTICS.ALIGN_8192BYTES,
         lief.PE.Section.CHARACTERISTICS.LNK_NRELOC_OVFL,
         lief.PE.Section.CHARACTERISTICS.MEM_DISCARDABLE,
         lief.PE.Section.CHARACTERISTICS.MEM_NOT_CACHED,
@@ -199,70 +201,101 @@ class SemanticGuider:
         self.do_characteristics = do_characteristics
         self.window = window
 
-    def __call__(self, b: bytes) -> SemanticSample:
+    def __call__(self, data: LiefParse) -> SemanticGuides:
         parse = None
         if self.do_parse:
             try:
-                parse = self.create_parse_guide(b)
+                parse = self.create_parse_guide(data)
             except Exception as err:
                 print(f"Error creating parse guide: {err}")
 
         entropy = None
         if self.do_entropy:
             try:
-                entropy = self.create_entropy_guide(b, self.window)
+                entropy = self.create_entropy_guide(data, self.window)
             except Exception as err:
                 print(f"Error creating entropy guide: {err}")
 
         characteristics = None
         if self.do_characteristics:
             try:
-                characteristics = self.create_characteristics_guide(b)
+                characteristics = self.create_characteristics_guide(data)
             except Exception as err:
                 print(f"Error creating permission guide: {err}")
 
-        return SemanticSample(b, parse, entropy, characteristics)
+        return SemanticGuides(parse, entropy, characteristics)
 
     @staticmethod
-    def create_parse_guide(b: bytes) -> npt.NDArray[np.int32]:
-        import warnings
-        warnings.warn("SemanticGuider.create_parse_guide is not implemented yet. Returning dummy data.")
-        return np.random.randint(0, 255, size=len(b), dtype=np.int32)
+    def create_parse_guide(data: LiefParse) -> IntTensor:
+        try:
+            pe = lief.parse(data)
+        except lief.lief_errors.asn1_bad_tag:
+            ...
 
     @staticmethod
-    def create_entropy_guide(b: bytes, w: int, e: float = 1e-8) -> npt.NDArray[np.float64]:
-        """
-        Args:
-            b: The byte stream to analyze.
-            w: The window size on each side for entropy calculation.
-            e: A small value to avoid division by zero in entropy calculation.
-        Returns:
-            A numpy array of entropy values for each byte in the stream. The beginning and end of the array
-            will be NaN-padded to account for the window size unless `w` is 0.
-        """
+    def create_entropy_guide(data: LiefParse, w: int, e: float = 1e-8) -> FloatTensor:
+        b = Path(data).read_bytes() if isinstance(data, (str, Path)) else data
         x = np.frombuffer(b, dtype=np.uint8).astype(np.float64)
         x = entropy(sliding_window_view(x, w * 2 + 1) + e, axis=1, nan_policy="raise")
         if np.any(np.isnan(x)):
             raise RuntimeError("Entropy calculation resulted in NaN values.")
-        x: npt.NDArray[np.float64] = np.concatenate((np.full(w, np.nan), x, np.full(w, np.nan)))
+        x = np.concatenate((np.full(w, np.nan), x, np.full(w, np.nan)))
+        x = torch.from_numpy(x)
         return x
 
     @staticmethod
-    def create_characteristics_guide(b: bytes) -> npt.NDArray[np.int32]:
-        """
-        Args:
-            b: The byte stream to analyze.
-        Returns:
-            A numpy array indicating the presence (1) or absense (0) of each characteristic in the
-            sections of the binary. Bytes outside of section boundaries will be set to -1.
-        """
-        x = np.full((len(b), len(SemanticGuider.CHARACTERISTICS)), -1, dtype=np.int32)
-        pe = lief.parse(b)
+    def create_characteristics_guide(data: LiefParse) -> IntTensor:
+        size = os.path.getsize(data) if isinstance(data, (str, os.PathLike)) else len(data)
+        x = torch.full((size, len(SemanticGuider.CHARACTERISTICS)), -1, dtype=torch.int32)
+        pe = lief.parse(data)
         if pe is None:
-            raise RuntimeError("Failed to parse binary with lief.")
+            raise RuntimeError(f"Failed to parse binary with lief.")
         for section in pe.sections:
             offset = section.offset
             size = section.size
             for i, c in enumerate(SemanticGuider.CHARACTERISTICS):
                 x[offset:offset + size, i] = 1 if section.has_characteristic(c) else 0
         return x
+
+
+class HierarchicalLevel(enum.Enum):
+    NONE = "none"
+    COARSE = "coarse"
+    MIDDLE = "middle"
+    FINE = "fine"
+
+
+@dataclass(frozen=True, slots=True)
+class StructureMap:
+    index: IntTensor
+    lexicon: dict[int, str]
+
+    def __post_init__(self) -> None:
+        if set(torch.unique(self.index)) != set(self.lexicon.keys()):
+            raise ValueError("StructureMap index does not match lexicon keys.")
+
+
+class StructurePartitioner:
+    """
+    Partitions a binary into hierarchical structures.
+    """
+
+    def __init__(self, level: HierarchicalLevel = HierarchicalLevel.NONE) -> None:
+        self.level = level
+
+    def __call__(self, data: LiefParse) -> StructureMap:
+        size = os.path.getsize(data) if isinstance(data, (str, os.PathLike)) else len(data)
+
+        if self.level == HierarchicalLevel.NONE:
+            index = torch.zeros(size, dtype=torch.int32)
+            lexicon = {0: "none"}
+        elif self.level == HierarchicalLevel.COARSE:
+            raise NotImplementedError("Coarse level partitioning is not implemented yet.")
+        elif self.level == HierarchicalLevel.MIDDLE:
+            raise NotImplementedError("Middle level partitioning is not implemented yet.")
+        elif self.level == HierarchicalLevel.FINE:
+            raise NotImplementedError("Fine level partitioning is not implemented yet.")
+        else:
+            raise ValueError(f"Unknown hierarchical level: {self.level}")
+
+        return StructureMap(index, lexicon)
