@@ -21,9 +21,21 @@ from src.binanal import patch_binary
 from src.binanal import SemanticGuider
 from src.binanal import SemanticGuides
 from src.binanal import ParserGuider
+from src.binanal import StructurePartitioner
+from src.binanal import HierarchicalLevel
+from src.binanal import StructureMap
 
 
 FILES = sorted(Path("./tests/data").iterdir())
+
+
+def path_to_input_type(file: Path, input_type: type[str | Path | bytes]) -> str | Path | bytes:
+    if input_type == str:
+        return str(file)
+    elif input_type == Path:
+        return file
+    else:
+        return file.read_bytes()
 
 
 class TestPatchPEFile:
@@ -119,18 +131,10 @@ class TestPatchPEFile:
 
 class TestSemanticGuider:
 
-    def path_to_input_type(self, file: Path, input_type: type[str | Path | bytes]) -> str | Path | bytes:
-        if input_type == str:
-            return str(file)
-        elif input_type == Path:
-            return file
-        else:
-            return file.read_bytes()
-
     @pytest.mark.parametrize("file", FILES)
     @pytest.mark.parametrize("input_type", [str, Path, bytes])
     def test_create_parse_guide(self, file: Path, input_type: type[str | Path | bytes]):
-        data = self.path_to_input_type(file, input_type)
+        data = path_to_input_type(file, input_type)
         x = SemanticGuider.create_parse_guide(data, True)
         assert isinstance(x, BoolTensor)
         assert x.ndim == 2
@@ -142,7 +146,7 @@ class TestSemanticGuider:
     @pytest.mark.parametrize("input_type", [str, Path, bytes])
     @pytest.mark.parametrize("w", [0, 16, 32])
     def test_create_entropy(self, file: Path, input_type: type[str | Path | bytes], w: int):
-        data = self.path_to_input_type(file, input_type)
+        data = path_to_input_type(file, input_type)
         x = SemanticGuider.create_entropy_guide(data, w)
         assert isinstance(x, DoubleTensor)
         assert x.ndim == 1
@@ -154,7 +158,7 @@ class TestSemanticGuider:
     @pytest.mark.parametrize("file", FILES)
     @pytest.mark.parametrize("input_type", [str, Path, bytes])
     def test_create_characteristics_guide(self, file: Path, input_type: type[str | Path | bytes]):
-        data = self.path_to_input_type(file, input_type)
+        data = path_to_input_type(file, input_type)
         x = SemanticGuider.create_characteristics_guide(data)
         assert isinstance(x, BoolTensor)
         assert x.ndim == 2
