@@ -2,17 +2,24 @@
 Binary analysis.
 """
 
+from __future__ import annotations
+from collections.abc import Mapping
+from collections.abc import Sequence
 from dataclasses import dataclass
 import enum
 import hashlib
 import os
 from pathlib import Path
 import struct
+from typing import Callable
 from typing import Optional
+from typing import Iterable
+from typing import Self
 import warnings
 
 import lief
 import numpy as np
+import numpy.typing as npt
 from numpy.lib.stride_tricks import sliding_window_view
 from scipy.stats import entropy
 import torch
@@ -24,6 +31,7 @@ from torch import DoubleTensor
 
 StrPath = str | os.PathLike[str]
 LiefParse = StrPath | bytes
+Range = tuple[int, int]
 
 
 # Machine types, from most to least common for PE files.
@@ -47,6 +55,20 @@ for v in lief.PE.OptionalHeader.SUBSYSTEM.__dict__.values():
     if type(v).__name__ == "SUBSYSTEM" and v not in SUBSYSTEMS:
         SUBSYSTEMS.append(v)
 SUBSYSTEMS = tuple(SUBSYSTEMS)
+
+
+def get_ranges_numpy(x: npt.NDArray[np.bool_]) -> tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+    """
+    Detects the ranges of consecutive True values in a boolean numpy array.
+    """
+    if x.dtype != np.bool_ or x.ndim != 1:  # type: ignore[comparison-overlap]
+        raise TypeError(f"Expected a 1D boolean numpy array, got {type(x)} with shape {x.shape}.")
+
+    padded = np.pad(x, (1, 1), mode='constant', constant_values=False)
+    diff = np.diff(padded.astype(int))
+    lo = np.where(diff == 1)[0]
+    hi = np.where(diff == -1)[0]
+    return lo, hi
 
 
 def is_section_executable(section: lief.PE.Section) -> bool:
@@ -145,6 +167,88 @@ def rearm_disarmed_binary(src: str | Path | bytes, sha: str, check: bool = True,
                 return patched
 
     raise RuntimeError(f"Could not find matching machine and subsystem for SHA-256: {sha}")
+
+
+class BinaryCreator:
+
+    def __init__(
+        self,
+        type_: lief.PE.PE_TYPE = lief.PE.PE_TYPE.PE32,
+        machine: lief.PE.Header.MACHINE_TYPES = lief.PE.Header.MACHINE_TYPES.I386,
+        subsystem: lief.PE.OptionalHeader.SUBSYSTEM = lief.PE.OptionalHeader.SUBSYSTEM.WINDOWS_CUI,
+    ) -> None:
+        self.pe = lief.PE.Binary(type_)
+        self.pe.header.machine = machine
+        self.pe.header.sizeof_optional_header = 0xE0 if type_ == lief.PE.PE_TYPE.PE32 else 0xF0
+        self.pe.optional_header.subsystem = subsystem
+        self.pe.optional_header.major_operating_system_version = 4
+        self.pe.optional_header.minor_operating_system_version = 0
+        self.pe.optional_header.major_subsystem_version = 4
+        self.pe.optional_header.minor_subsystem_version = 0
+        self.pe.optional_header.file_alignment = 0x200
+        self.pe.optional_header.section_alignment = 0x1000
+        self.pe.optional_header.addressof_entrypoint = 0x1000
+        self.pe.optional_header.numberof_rva_and_size = 16
+
+        self.overlay = b""
+
+    def __call__(self) -> tuple[lief.PE.Binary, bytes]:
+        builder = lief.PE.Builder(self.pe)
+        builder.build()
+        pe_bytes = bytes(builder.get_build())
+        pe_bytes += self.overlay
+        pe: lief.PE.Binary = lief.parse(pe_bytes)
+        if pe is None:
+            raise RuntimeError(f"lief.parse({type(pe_bytes)}) returned None")
+        if pe.overlay_offset == 0:
+            warnings.warn("PE overlay offset is 0, which may indicate that the overlay was not added correctly.")
+        elif bytes(pe.overlay) != self.overlay:
+            raise RuntimeError("Overlay mismatch after building the PE binary.")
+        return pe, pe_bytes
+
+    def add_overlay(self, overlay: bytes) -> Self:
+        self.overlay += overlay
+        return self
+
+    def add_section(self, section: lief.PE.Section, type_: lief.PE.SECTION_TYPES = lief.PE.SECTION_TYPES.UNKNOWN) -> Self:
+        self.pe.add_section(section, type_)
+        return self
+
+    def add_section_text(self, name: str = ".text", content: Optional[Sequence[int]] = None, characteristics: Optional[int] = None) -> Self:
+        section = lief.PE.Section(name)
+        if content is None:
+            content = bytearray(0x200)
+            content[0] = 0xC3  # RET
+            content = list(content)
+        section.content = content
+        if characteristics is None:
+            characteristics = (
+                int(lief.PE.Section.CHARACTERISTICS.CNT_CODE) |
+                int(lief.PE.Section.CHARACTERISTICS.MEM_READ) |
+                int(lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE)
+            )
+        section.characteristics = characteristics
+        self.add_section(section, lief.PE.SECTION_TYPES.TEXT)
+        return self
+
+    def add_section_data(self, name: str = ".data", content: Optional[Sequence[int]] = None, characteristics: Optional[int] = None) -> Self:
+        if characteristics is not None:
+            warnings.warn("Characteristics may be ignored when using the lief.PE.SECTION_TYPES.DATA type.")
+        section = lief.PE.Section(name)
+        if content is None:
+            content = bytearray(0x200)
+            content[0] = 0x00
+            content = list(content)
+        section.content = content
+        if characteristics is None:
+            characteristics = (
+                int(lief.PE.Section.CHARACTERISTICS.CNT_INITIALIZED_DATA) |
+                int(lief.PE.Section.CHARACTERISTICS.MEM_READ) |
+                int(lief.PE.Section.CHARACTERISTICS.MEM_WRITE)
+            )
+        section.characteristics = characteristics
+        self.add_section(section, lief.PE.SECTION_TYPES.DATA)
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,10 +552,354 @@ class HierarchicalLevel(enum.Enum):
     FINE = "fine"
 
 
+class HierarchicalStructure(enum.Enum):
+    ...
+
+
+class HierarchicalStructureNone(HierarchicalStructure):
+    ANY = "any"
+
+
+class HierarchicalStructureCoarse(HierarchicalStructure):
+    HEADERS = "headers"  # Headers      (ANY)
+    SECTION = "sections" # Sections     (ANY)
+    OVERLAY = "overlay"  # Overlay data (ANY)
+    OTHER   = "other"    # All other bytes  (ANY)
+
+
+class HierarchicalStructureMiddle(HierarchicalStructure):
+    HEADERS = "headers"     # Headers               (ANY)
+    OVERLAY = "overlay"     # Overlay data          (ANY)
+    OTHER = "other"         # All other bytes       (ANY)
+    CODE = "code"           # Code sections         (SECTION)
+    DATA = "data"           # Data sections         (SECTION)
+    DIRECTORY = "directory" # Resouce directories   (SECTION)
+    OTHERSEC = "othersec"   # No clean split        (SECTION)
+
+
+class HierarchicalStructureFine(HierarchicalStructure):
+    # TODO: Should we consider using the lief.PE.SECTION_TYPES?
+    OVERLAY = "overlay"          # Overlay data     (ANY)
+    OTHER = "other"              # All other bytes  (ANY)
+    DOS_HEADER  = "dos_header"   # DOS header       (HEADER)
+    COFF_HEADER = "coff_header"  # COFF header      (HEADER)
+    OPTN_HEADER = "optn_header"  # Optional header  (HEADER)
+    SECTN_TABLE = "sectn_table"  # Section table    (HEADER)
+    OTHERSEC = "othersec"        # No clean split   (SECTION)
+    RDATA = "rdata"              # Read-only data   (DATA)
+    WDATA = "wdata"              # Writeable data   (DATA)
+    RCODE = "rcode"              # Read-only code   (CODE)
+    WCODE = "wcode"              # Writeable code   (CODE)
+    IDATA = "idata"              # Import data      (DIRECTORY)
+    EDATA = "edata"              # Export data      (DIRECTORY)
+    RELOC = "reloc"              # Relocation data  (DIRECTORY)
+    CLR   = "clr"                # CLR/.NET data    (DIRECTORY)
+    OTHERDIR = "otherdir"        # Other directory  (DIRECTORY)
+
+
+class StructureParser:
+
+    _SCN_MEM_EXECUTE = 0x20000000
+    _SCN_MEM_READ    = 0x40000000
+    _SCN_MEM_WRITE   = 0x80000000
+
+    # _SCN_CNT_CODE    = 0x00000020
+    # _SCN_CNT_IN_DATA = 0x00000040
+    # _SCN_CNT_UN_DATA = 0x00000080
+
+    def __init__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> None:
+        self.pe: lief.PE.Binary = data if isinstance(data, lief.PE.Binary) else lief.parse(data)
+        self.size: int = size if size is not None else (len(data) if isinstance(data, bytes) else os.path.getsize(data))
+        if self.pe is None:
+            raise RuntimeError(f"lief.parse({type(data)}) return None")
+        if self.size is None:
+            raise ValueError("Size must be provided if data is a lief.PE.Binary object.")
+
+        self.functions = {
+            HierarchicalStructureNone.ANY: self.get_any,
+            HierarchicalStructureCoarse.HEADERS: self.get_headers,
+            HierarchicalStructureCoarse.SECTION: self.get_sections,
+            HierarchicalStructureCoarse.OVERLAY: self.get_overlay,
+            HierarchicalStructureCoarse.OTHER: self.get_other,
+            HierarchicalStructureMiddle.CODE: self.get_code,
+            HierarchicalStructureMiddle.DATA: self.get_data,
+            HierarchicalStructureMiddle.DIRECTORY: self.get_directory,
+            HierarchicalStructureMiddle.OTHERSEC: self.get_othersec,
+            HierarchicalStructureFine.DOS_HEADER: self.get_dos_header,
+            HierarchicalStructureFine.COFF_HEADER: self.get_coff_header,
+            HierarchicalStructureFine.OPTN_HEADER: self.get_optional_header,
+            HierarchicalStructureFine.SECTN_TABLE: self.get_section_table,
+            HierarchicalStructureFine.RDATA: self.get_rdata,
+            HierarchicalStructureFine.WDATA: self.get_wdata,
+            HierarchicalStructureFine.RCODE: self.get_rcode,
+            HierarchicalStructureFine.WCODE: self.get_wcode,
+            HierarchicalStructureFine.IDATA: self.get_idata,
+            HierarchicalStructureFine.EDATA: self.get_edata,
+            HierarchicalStructureFine.RELOC: self.get_reloc,
+            HierarchicalStructureFine.CLR: self.get_clr,
+            HierarchicalStructureFine.OTHERDIR: self.get_otherdir,
+        }
+
+    def __call__(self, structure: HierarchicalStructure) -> list[Range]:
+        if self.pe is None:
+            return []
+        return self._norm(self.functions[structure]())
+
+    # ---------- Range Helpers ----------
+    def _norm(self, ranges: Iterable[Range]) -> list[Range]:
+        ranges = [r for r in ranges if r is not None]
+        ranges = [self._clip(*r) for r in ranges]
+        ranges = [r for r in ranges if r is not None]
+        return ranges
+
+    def _clip(self, start: int, end: int) -> Optional[Range]:
+        """Clip range to be within the file size. Return None if invalid.
+        """
+        if start is None or end is None:  # TODO: remove?
+            return None
+        start = max(0, start)  # TODO: add warnings for stuff out of bounds.
+        end   = min(self.size, end)
+        if end <= start:
+            return None
+        return (start, end)
+
+    # ---------- PE Helpers ----------
+    def _sec_raw_range(self, s: lief.PE.Section) -> Optional[Range]:
+        """Get the raw data range of a section if it has raw data.
+        """
+        if s.sizeof_raw_data == 0:
+            return None
+        return (int(s.pointerto_raw_data), int(s.pointerto_raw_data + s.sizeof_raw_data))
+
+    def _select_sections(self, function: Callable[[lief.PE.Section], bool]) -> list[Range]:
+        out = []
+        for s in self.pe.sections:
+            if function(s):
+                r = self._sec_raw_range(s)
+                if r:
+                    out.append(r)
+        return out
+
+    def _dirs(self) -> list[lief.PE.DataDirectory]:
+        try:
+            return list(self.pe.data_directories)
+        except Exception:
+            print("An error occurred while accessing data directories.")
+            return []
+
+    def _dir_range(self, d: lief.PE.DataDirectory) -> Optional[Range]:
+        try:
+            # SECURITY (certificate table) is special: VirtualAddress is a FILE OFFSET (not an RVA)
+            if d.type == lief.PE.DataDirectory.TYPES.CERTIFICATE_TABLE:
+                off = int(d.rva)
+                return (off, off + int(d.size))
+            if d.size == 0:
+                return None
+            if d.rva == 0:  # TODO: is this really an invalid RVA?
+                return None
+            off = self.pe.rva_to_offset(int(d.rva))
+            if off is None or off <= 0:
+                return None
+            return (int(off), int(off + d.size))
+        except Exception:
+            print(f"An error occurred while computing range for data directory {d.type}.")
+            return None
+
+    def _dir_type_range(self, types: set[lief.PE.DataDirectory.TYPES]) -> list[Range]:
+        out = []
+        for d in self._dirs():
+            if d.type in types:
+                r = self._dir_range(d)
+                if r:
+                    out.append(r)
+        return out
+
+    # ---------- PE Logic ----------
+    @staticmethod
+    def _is_code(s: lief.PE.Section) -> bool:
+        c = int(s.characteristics)
+        is_executable = bool(c & StructureParser._SCN_MEM_EXECUTE)
+        is_code_section = False # bool(c & StructureParser._SCN_CNT_CODE)
+        return is_executable or is_code_section
+
+    @staticmethod
+    def _is_rcode(s: lief.PE.Section) -> bool:
+        c = int(s.characteristics)
+        is_writeable = bool(c & StructureParser._SCN_MEM_WRITE)
+        return StructureParser._is_code(s) and not is_writeable
+
+    @staticmethod
+    def _is_wcode(s: lief.PE.Section) -> bool:
+        c = int(s.characteristics)
+        is_writeable = bool(c & StructureParser._SCN_MEM_WRITE)
+        return StructureParser._is_code(s) and is_writeable
+
+    @staticmethod
+    def _is_data(s: lief.PE.Section) -> bool:
+        c = int(s.characteristics)
+        is_readable = bool(c & StructureParser._SCN_MEM_READ)
+        is_executable = bool(c & StructureParser._SCN_MEM_EXECUTE)
+        is_initialized = False # bool(c & StructureParser._SCN_CNT_IN_DATA)
+        is_uninitialized = False # bool(c & StructureParser._SCN_CNT_UN_DATA)
+        return is_readable and (not is_executable or is_initialized or is_uninitialized)
+
+    @staticmethod
+    def _is_rdata(s: lief.PE.Section) -> bool:
+        c = int(s.characteristics)
+        is_writeable = bool(c & StructureParser._SCN_MEM_WRITE)
+        print(f"StructureParser::_is_rdata {StructureParser._is_data(s) = } {is_writeable = }")
+        return StructureParser._is_data(s) and not is_writeable
+
+    @staticmethod
+    def _is_wdata(s: lief.PE.Section) -> bool:
+        c = int(s.characteristics)
+        is_writeable = bool(c & StructureParser._SCN_MEM_WRITE)
+        return StructureParser._is_data(s) and is_writeable
+
+    # ---------- ANY ----------
+    def get_any(self) -> list[Range]:
+        return self._norm([(0, self.size)])
+
+    # ---------- COARSE ----------
+    def get_headers(self) -> list[Range]:
+        return self._norm([(0, self.pe.sizeof_headers)])
+
+    def get_sections(self) -> list[Range]:
+        out = []
+        for s in self.pe.sections:
+            r = self._sec_raw_range(s)
+            if r:
+                out.append(r)
+        return self._norm(out)
+
+    def get_overlay(self) -> list[Range]:
+        sec_end = 0
+        for s in self.pe.sections:
+            if s.sizeof_raw_data and s.pointerto_raw_data:
+                sec_end = max(sec_end, int(s.pointerto_raw_data + s.sizeof_raw_data))
+        if self.size > sec_end:
+            return self._norm([(sec_end, self.size)])
+        return []
+
+    def get_other(self) -> list[Range]:
+        covered = np.array([False] * self.size, dtype=bool)
+        for lo, hi in self.get_headers() + self.get_sections() + self.get_overlay():
+            covered[lo:hi] = True
+        lo, hi = get_ranges_numpy(covered == False)
+        return self._norm([(int(l), int(o)) for l, o in zip(lo, hi, strict=True)])
+
+    # ---------- MIDDLE ----------
+    def get_code(self) -> list[Range]:
+        return self._norm(self._select_sections(self._is_code))
+
+    def get_data(self) -> list[Range]:
+        return self._norm(self._select_sections(self._is_data))
+
+    def get_directory(self) -> list[Range]:
+        warnings.warn("StructureParser::get_directory() has not been tested thoroughly.")
+        out = []
+        for d in self._dirs():
+            r = self._dir_range(d)
+            if r:
+                out.append(r)
+        return self._norm(out)
+
+    def get_othersec(self) -> list[Range]:
+        allsec = self.get_sections()
+        for b in self.get_code() + self.get_data() + self.get_directory():
+            if b in allsec:
+                allsec.remove(b)
+        return self._norm(allsec)
+
+    # ---------- FINE ----------
+    def get_dos_header(self) -> list[Range]:
+        try:
+            e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
+            dos_start = 0
+            dos_end   = e_lfanew + 64  # DOS header is 64 bytes long
+            return self._norm([(dos_start, dos_end)])
+        except Exception:  # TODO: why catch?
+            warnings.warn("An error occurred while computing DOS header range.")
+            return []
+
+    def get_coff_header(self) -> list[Range]:
+        try:
+            e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
+            coff_start = e_lfanew + 4  # skip "PE\0\0"
+            coff_end   = coff_start + 20
+            return self._norm([(coff_start, coff_end)])
+        except Exception:  # TODO: why catch?
+            warnings.warn("An error occurred while computing COFF header range.")
+            return []
+
+    def get_optional_header(self) -> list[Range]:
+        try:
+            e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
+            coff_start = e_lfanew + 4
+            coff_end   = coff_start + 20
+            opt_start  = coff_end
+            opt_end    = opt_start + int(self.pe.header.sizeof_optional_header)
+            return self._norm([(opt_start, opt_end)])
+        except Exception:  # TODO: why catch?
+            warnings.warn("An error occurred while computing optional header range.")
+            return []
+
+    def get_section_table(self) -> list[Range]:
+        try:
+            e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
+            coff_start = e_lfanew + 4
+            coff_end   = coff_start + 20
+            opt_start  = coff_end
+            opt_end    = opt_start + int(self.pe.header.sizeof_optional_header)
+            nsects     = int(self.pe.header.numberof_sections)
+            sectab_start = opt_end
+            sectab_end   = sectab_start + 40 * nsects
+            return self._norm([(sectab_start, sectab_end)])
+        except Exception:  # TODO: why catch?
+            warnings.warn("An error occurred while computing section table range.")
+            return []
+
+    def get_rdata(self) -> list[Range]:
+        return self._norm(self._select_sections(self._is_rdata))
+
+    def get_wdata(self) -> list[Range]:
+        return self._norm(self._select_sections(self._is_wdata))
+
+    def get_rcode(self) -> list[Range]:
+        return self._norm(self._select_sections(self._is_rcode))
+
+    def get_wcode(self) -> list[Range]:
+        return self._norm(self._select_sections(self._is_wcode))
+
+    def get_idata(self) -> list[Range]:
+        warnings.warn("StructureParser::get_idata() has not been tested thoroughly.")
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.IMPORT_TABLE}))
+
+    def get_edata(self) -> list[Range]:
+        warnings.warn("StructureParser::get_edata() has not been tested thoroughly.")
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.EXPORT_TABLE}))
+
+    def get_reloc(self) -> list[Range]:
+        warnings.warn("StructureParser::get_reloc() has not been tested thoroughly.")
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.BASE_RELOCATION_TABLE}))
+
+    def get_clr(self) -> list[Range]:
+        warnings.warn("StructureParser::get_clr() has not been tested thoroughly.")
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.CLR_RUNTIME_HEADER}))
+
+    def get_otherdir(self) -> list[Range]:
+        warnings.warn("StructureParser::get_otherdir() has not been tested thoroughly.")
+        alldir = self.get_directory()
+        for b in self.get_idata() + self.get_edata() + self.get_reloc() + self.get_clr():
+            if b in alldir:
+                alldir.remove(b)
+        return self._norm(alldir)
+
+
 @dataclass(frozen=True, slots=True)
 class StructureMap:
     index: IntTensor
-    lexicon: dict[int, str]
+    lexicon: Mapping[int, HierarchicalStructure]
 
     def __post_init__(self) -> None:
         if set(torch.unique(self.index)) != set(self.lexicon.keys()):
@@ -467,18 +915,24 @@ class StructurePartitioner:
         self.level = level
 
     def __call__(self, data: LiefParse) -> StructureMap:
-        size = os.path.getsize(data) if isinstance(data, (str, os.PathLike)) else len(data)
+        parser = StructureParser(data)
 
         if self.level == HierarchicalLevel.NONE:
-            index = torch.zeros(size, dtype=torch.int32)
-            lexicon = {0: "none"}
-        elif self.level == HierarchicalLevel.COARSE:
-            raise NotImplementedError("Coarse level partitioning is not implemented yet.")
+            structures = list(HierarchicalStructureNone)
+        if self.level == HierarchicalLevel.COARSE:
+            structures = list(HierarchicalStructureCoarse)
         elif self.level == HierarchicalLevel.MIDDLE:
-            raise NotImplementedError("Middle level partitioning is not implemented yet.")
+            structures = list(HierarchicalStructureMiddle)
         elif self.level == HierarchicalLevel.FINE:
-            raise NotImplementedError("Fine level partitioning is not implemented yet.")
+            structures = list(HierarchicalStructureFine)
         else:
-            raise ValueError(f"Unknown hierarchical level: {self.level}")
+            raise TypeError(f"Unknown HierarchicalLevel: {self.level}. Expected one of {list(HierarchicalLevel)}.")
 
+        index = torch.zeros(parser.size, dtype=torch.int32)
+        lexicon = {}
+        for i, s in enumerate(structures):
+            bounds = parser(s)
+            for l, u in bounds:
+                index[l:u] = i
+            lexicon[i] = s
         return StructureMap(index, lexicon)
