@@ -3,6 +3,7 @@ Benchmark.
 """
 
 from argparse import ArgumentParser
+from collections.abc import Iterable
 import json
 from pathlib import Path
 import random
@@ -13,6 +14,7 @@ import warnings
 
 import lief
 import psutil
+import torch
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
 from tqdm import tqdm
@@ -20,6 +22,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.binanal import HierarchicalLevel
+from src.data import BatchedSamples
 from src.data import BinaryDataset
 from src.data import CollateFn
 from src.data import Preprocessor
@@ -31,6 +34,7 @@ def main() -> None:
     lief.logging.disable()
 
     parser = ArgumentParser()
+    parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--no_parser", action="store_false", dest="do_parser")
     parser.add_argument("--no_entropy", action="store_false", dest="do_entropy")
     parser.add_argument("--no_characteristics", action="store_false", dest="do_characteristics")
@@ -41,11 +45,14 @@ def main() -> None:
     parser.add_argument("--outfile", type=Path, required=False)
     args = parser.parse_args()
 
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
     d: dict[str, dict[str, float]] = {}
 
     print("Arguments:")
     print(f" Batch size:  {args.batch_size}")
     print(f" Num workers: {args.num_workers}")
+    print(f" Device:      {device}")
 
     files: list[Path] = sorted(f for f in args.input.rglob("*") if f.is_file())
     random.shuffle(files)
@@ -62,17 +69,24 @@ def main() -> None:
     d["config"]["batch_size"] = args.batch_size
     d["config"]["num_workers"] = args.num_workers
     d["config"]["num_samples"] = num_samples
+    d["config"]["device"] = str(device)
 
     preprocessor = Preprocessor(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics, level=HierarchicalLevel.FINE)
     dataset = BinaryDataset(files, labels, preprocessor=preprocessor)
     collate_fn = CollateFn(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics)
     dataloader = DataLoader(dataset, args.batch_size, True, num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True)
-    iterable = tqdm(enumerate(dataloader), leave=False, total=len(dataset) // args.batch_size)
+    iterable: Iterable[BatchedSamples] = tqdm(enumerate(dataloader), leave=False, total=len(dataset) // args.batch_size)
 
     start = time.time()
 
     mems = []
-    for _ in iterable:
+    for i, batch in iterable:
+        files = batch.file
+        names = batch.name
+        labels = batch.label.to(device)
+        inputs = batch.inputs.to(device)
+        guides = batch.guides.to(device)
+        structure = batch.structure.to(device)
         mems.append(psutil.virtual_memory().used)
 
     end = time.time()
