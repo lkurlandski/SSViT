@@ -159,10 +159,12 @@ class StructureMap:
             raise ValueError("StructureMap index does not match lexicon keys.")
 
     def clone(self) -> StructureMap:
-        return StructureMap(self.index.clone(), deepcopy(self.lexicon))
+        cls = type(self)
+        return cls(self.index.clone(), self.lexicon)
 
     def to(self, device: torch.device) -> StructureMap:
-        return StructureMap(self.index.to(device), self.lexicon)
+        cls = type(self)
+        return cls(self.index.to(device), self.lexicon)
 
 
 @dataclass(frozen=True, slots=True)
