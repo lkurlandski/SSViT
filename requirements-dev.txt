@@ -3,6 +3,7 @@ pandas
 psutil
 pylint
 pytest
+pyinstrument
 ruff
 types-tqdm
 scipy
