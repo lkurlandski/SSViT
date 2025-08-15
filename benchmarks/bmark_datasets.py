@@ -13,6 +13,7 @@ import time
 import warnings
 
 import lief
+import numpy as np
 import psutil
 import torch
 from torch.utils.data import DataLoader
@@ -22,6 +23,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.binanal import HierarchicalLevel
+from src.binanal import EntropyGuider
 from src.data import BatchedSamples
 from src.data import BinaryDataset
 from src.data import CollateFn
@@ -71,6 +73,7 @@ def main() -> None:
     d["config"]["num_samples"] = num_samples
     d["config"]["device"] = str(device)
 
+    _ = EntropyGuider(np.zeros(1, np.uint8))()  # Compile the numba code
     preprocessor = Preprocessor(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics, level=HierarchicalLevel.FINE)
     dataset = BinaryDataset(files, labels, preprocessor=preprocessor)
     collate_fn = CollateFn(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics)
