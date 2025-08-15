@@ -263,6 +263,12 @@ class SemanticGuides:
             raise ValueError(f"SemanticSample buffers have different lengths: {lengths}")
 
 
+class BatchedSemanticGuides(SemanticGuides):
+
+    def __post_init__(self) -> None:
+        ...
+
+
 class SemanticGuider:
     """
     Semantic guides to acompany a byte stream.
@@ -617,14 +623,20 @@ class StructureParser:
 
         self.functions = {
             HierarchicalStructureNone.ANY: self.get_any,
+
             HierarchicalStructureCoarse.HEADERS: self.get_headers,
             HierarchicalStructureCoarse.SECTION: self.get_sections,
             HierarchicalStructureCoarse.OVERLAY: self.get_overlay,
             HierarchicalStructureCoarse.OTHER: self.get_other,
+
+            HierarchicalStructureMiddle.HEADERS: self.get_headers,
             HierarchicalStructureMiddle.CODE: self.get_code,
             HierarchicalStructureMiddle.DATA: self.get_data,
             HierarchicalStructureMiddle.DIRECTORY: self.get_directory,
             HierarchicalStructureMiddle.OTHERSEC: self.get_othersec,
+            HierarchicalStructureMiddle.OVERLAY: self.get_overlay,
+            HierarchicalStructureMiddle.OTHER: self.get_other,
+
             HierarchicalStructureFine.DOS_HEADER: self.get_dos_header,
             HierarchicalStructureFine.COFF_HEADER: self.get_coff_header,
             HierarchicalStructureFine.OPTN_HEADER: self.get_optional_header,
@@ -633,11 +645,14 @@ class StructureParser:
             HierarchicalStructureFine.WDATA: self.get_wdata,
             HierarchicalStructureFine.RCODE: self.get_rcode,
             HierarchicalStructureFine.WCODE: self.get_wcode,
+            HierarchicalStructureFine.OTHERSEC: self.get_othersec,
             HierarchicalStructureFine.IDATA: self.get_idata,
             HierarchicalStructureFine.EDATA: self.get_edata,
             HierarchicalStructureFine.RELOC: self.get_reloc,
             HierarchicalStructureFine.CLR: self.get_clr,
             HierarchicalStructureFine.OTHERDIR: self.get_otherdir,
+            HierarchicalStructureFine.OVERLAY: self.get_overlay,
+            HierarchicalStructureFine.OTHER: self.get_other,
         }
 
     def __call__(self, structure: HierarchicalStructure) -> list[Range]:
@@ -747,7 +762,6 @@ class StructureParser:
     def _is_rdata(s: lief.PE.Section) -> bool:
         c = int(s.characteristics)
         is_writeable = bool(c & StructureParser._SCN_MEM_WRITE)
-        print(f"StructureParser::_is_rdata {StructureParser._is_data(s) = } {is_writeable = }")
         return StructureParser._is_data(s) and not is_writeable
 
     @staticmethod
@@ -898,11 +912,11 @@ class StructureParser:
 
 @dataclass(frozen=True, slots=True)
 class StructureMap:
-    index: IntTensor
+    index: BoolTensor
     lexicon: Mapping[int, HierarchicalStructure]
 
     def __post_init__(self) -> None:
-        if set(torch.unique(self.index)) != set(self.lexicon.keys()):
+        if self.index.shape[0] != len(list(self.lexicon.keys())):
             raise ValueError("StructureMap index does not match lexicon keys.")
 
 
@@ -928,11 +942,11 @@ class StructurePartitioner:
         else:
             raise TypeError(f"Unknown HierarchicalLevel: {self.level}. Expected one of {list(HierarchicalLevel)}.")
 
-        index = torch.zeros(parser.size, dtype=torch.int32)
+        index = torch.full((len(structures), parser.size), dtype=bool, fill_value=False)
         lexicon = {}
         for i, s in enumerate(structures):
             bounds = parser(s)
             for l, u in bounds:
-                index[l:u] = i
+                index[i, l:u] = True
             lexicon[i] = s
         return StructureMap(index, lexicon)
