@@ -277,7 +277,7 @@ class PrepareSorel:
                 continue
 
             try:
-                b = rearm_disarmed_binary(b, s, check=True)
+                b = rearm_disarmed_binary(b, s)
             except RuntimeError as err:
                 if not self.quiet:
                     print(f"Skipping {s} ({err.__class__.__name__}: {err})")

@@ -34,29 +34,6 @@ LiefParse = StrPath | bytes
 Range = tuple[int, int]
 
 
-# Machine types, from most to least common for PE files.
-MACHINES = [
-    lief.PE.Header.MACHINE_TYPES.I386,
-    lief.PE.Header.MACHINE_TYPES.AMD64,
-    lief.PE.Header.MACHINE_TYPES.ARM64,
-]
-for v in lief.PE.Header.MACHINE_TYPES.__dict__.values():
-    if type(v).__name__ == "MACHINE_TYPES" and v not in MACHINES:
-        MACHINES.append(v)
-MACHINES = tuple(MACHINES)
-
-# Subsystem types, from most to least common for PE files.
-SUBSYSTEMS = [
-    lief.PE.OptionalHeader.SUBSYSTEM.WINDOWS_GUI,
-    lief.PE.OptionalHeader.SUBSYSTEM.WINDOWS_CUI,
-    lief.PE.OptionalHeader.SUBSYSTEM.NATIVE,
-]
-for v in lief.PE.OptionalHeader.SUBSYSTEM.__dict__.values():
-    if type(v).__name__ == "SUBSYSTEM" and v not in SUBSYSTEMS:
-        SUBSYSTEMS.append(v)
-SUBSYSTEMS = tuple(SUBSYSTEMS)
-
-
 def get_ranges_numpy(x: npt.NDArray[np.bool_]) -> tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
     """
     Detects the ranges of consecutive True values in a boolean numpy array.
@@ -131,7 +108,7 @@ def patch_binary(
     return bytes(data)
 
 
-def rearm_disarmed_binary(src: str | Path | bytes, sha: str, check: bool = True, verbose: bool = False) -> bytes:
+def rearm_disarmed_binary(src: str | Path | bytes, sha: str) -> bytes:
     """
     Rearm a Sorel binary by patching its machine and subsystem until the target SHA-256 matches.
     """
@@ -144,26 +121,31 @@ def rearm_disarmed_binary(src: str | Path | bytes, sha: str, check: bool = True,
     else:
         raise TypeError(f"Unsupported type for src: {type(src)}. Expected str, Path, or bytes.")
 
-    if verbose:
-        machine, subsystem = get_machine_and_subsystem(data)
-        print(f"Target SHA-256: {sha}")
-        print(f"Current Machine: {machine}")
-        print(f"Current Subsystem: {subsystem}")
+    # Machine types, from most to least common for PE files.
+    machines = [
+        lief.PE.Header.MACHINE_TYPES.I386,
+        lief.PE.Header.MACHINE_TYPES.AMD64,
+        lief.PE.Header.MACHINE_TYPES.ARM64,
+    ]
+    for v in lief.PE.Header.MACHINE_TYPES.__dict__.values():
+        if type(v).__name__ == "MACHINE_TYPES" and v not in machines:
+            machines.append(v)
 
-    for machine in MACHINES:
-        for subsystem in SUBSYSTEMS:
+    # Subsystem types, from most to least common for PE files.
+    subsystems = [
+        lief.PE.OptionalHeader.SUBSYSTEM.WINDOWS_GUI,
+        lief.PE.OptionalHeader.SUBSYSTEM.WINDOWS_CUI,
+        lief.PE.OptionalHeader.SUBSYSTEM.NATIVE,
+    ]
+    for v in lief.PE.OptionalHeader.SUBSYSTEM.__dict__.values():
+        if type(v).__name__ == "SUBSYSTEM" and v not in subsystems:
+            subsystems.append(v)
+
+    for machine in machines:
+        for subsystem in subsystems:
             patched = patch_binary(data, machine=machine, subsystem=subsystem)
             s = hashlib.sha256(patched).hexdigest()
-            if verbose:
-                print(f"Ran Machine: {machine}, Subsystem: {subsystem} -> SHA-256: {s}")
             if s == sha:
-                if check:
-                    machine_, subsystem_ = get_machine_and_subsystem(patched)
-                    if machine_ != machine or subsystem_ != subsystem:
-                        raise ValueError(f"Patched binary does not match expected machine and subsystem: {machine_}, {subsystem_}")
-                    equal = np.equal(np.frombuffer(data, dtype=np.uint8), np.frombuffer(patched, dtype=np.uint8))  # type: ignore[no-untyped-call]
-                    if len(equal) - np.sum(equal) > 3:
-                        raise ValueError(f"Patched binary differs from original by more than 3 bytes: {len(equal) - np.sum(equal)} differences.")
                 return patched
 
     raise RuntimeError(f"Could not find matching machine and subsystem for SHA-256: {sha}")
