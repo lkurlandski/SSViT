@@ -86,8 +86,8 @@ class BatchedSemanticGuides(SemanticGuides):
 
     def __post_init__(self) -> None:
         lengths = [x.shape[1] for x in (self.parse, self.entropy, self.characteristics) if x is not None]
-        if len(lengths) != len(set(lengths)):
-            raise ValueError("All non-None guides must have the same length.")
+        if len(set(lengths)) > 1:
+            raise ValueError(f"All non-None guides must have the same length. Got lengths: {lengths}")
 
     @classmethod
     def from_singles(cls, guides: Sequence[SemanticGuides]) -> BatchedSemanticGuides:
@@ -111,25 +111,28 @@ class SemanticGuider:
     Semantic guides to acompany a byte stream.
     """
 
-    def __init__(self, do_parse: bool = False, do_entropy: bool = False, do_characteristics: bool = False, window: int = 256, simple: bool = False) -> None:
+    def __init__(self, do_parse: bool = False, do_entropy: bool = False, do_characteristics: bool = False, radius: int = 256, simple: bool = False) -> None:
         self.do_parse = do_parse
         self.do_entropy = do_entropy
         self.do_characteristics = do_characteristics
-        self.window = window
+        self.radius = radius
         self.simple = simple
 
     def __call__(self, data: LiefParse) -> SemanticGuides:
         parse = None
         if self.do_parse:
             parse = ParserGuider(data)(simple=self.simple)
+            parse = torch.from_numpy(parse)
 
         entropy = None
         if self.do_entropy:
-            entropy = EntropyGuider(data)()
+            entropy = EntropyGuider(data)(radius=self.radius)
+            entropy = torch.from_numpy(entropy)
 
         characteristics = None
         if self.do_characteristics:
             characteristics = CharacteristicGuider(data)()
+            characteristics = torch.from_numpy(characteristics)
 
         return SemanticGuides(parse, entropy, characteristics)
 
@@ -235,9 +238,9 @@ class BatchedSamples:
     label: IntTensor
     inputs: IntTensor
     guides: BatchedSemanticGuides
-    structure: list[StructureMap]
+    structure: BatchedStructureMap
 
-    def __iter__(self) -> Iterable[tuple[list[StrPath], list[Name], IntTensor, IntTensor, BatchedSemanticGuides, list[StructureMap]]]:
+    def __iter__(self) -> Iterable[tuple[list[StrPath], list[Name], IntTensor, IntTensor, BatchedSemanticGuides, BatchedStructureMap]]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
 
 
@@ -322,10 +325,6 @@ class CollateFn:
             name=[s.name for s in batch],
             label=torch.stack([s.label for s in batch]),
             inputs=pad_sequence([s.inputs for s in batch], batch_first=True, padding_value=0),
-            guides=BatchedSemanticGuides(
-                parse=pad_sequence([s.guides.parse for s in batch], batch_first=True, padding_value=False) if self.do_parser else None,
-                entropy=pad_sequence([s.guides.entropy for s in batch], batch_first=True, padding_value=0.0) if self.do_entropy else None,
-                characteristics=pad_sequence([s.guides.characteristics for s in batch], batch_first=True, padding_value=False) if self.do_characteristics else None,
-            ),
-            structure=[s.structure for s in batch],
+            guides=BatchedSemanticGuides.from_singles([s.guides for s in batch]),
+            structure=BatchedStructureMap.from_singles([s.structure for s in batch]),
         )
