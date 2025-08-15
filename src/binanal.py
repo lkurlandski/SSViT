@@ -25,7 +25,7 @@ from scipy.stats import entropy
 
 
 StrPath = str | os.PathLike[str]
-LiefParse = str | io.IOBase | os.PathLike | bytes
+LiefParse = str | io.IOBase | os.PathLike | bytes | memoryview
 Range = tuple[int, int]
 
 
@@ -245,6 +245,7 @@ class BinaryCreator:
 
 
 def _parse_pe_and_get_size(data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> tuple[lief.PE.Binary, int]:
+    # Its usually much faster to parse the binary from a file than any buffer.
 
     pe: Optional[lief.PE.Binary]
     sz: Optional[int]
@@ -255,6 +256,9 @@ def _parse_pe_and_get_size(data: LiefParse | lief.PE.Binary, size: Optional[int]
     elif isinstance(data, (str, os.PathLike)):
         pe = lief.PE.parse(data)
         sz = os.path.getsize(data)
+    elif isinstance(data, memoryview):
+        pe = lief.PE.parse(data)
+        sz = len(data)
     elif isinstance(data, bytes):
         pe = lief.PE.parse(io.BytesIO(data))
         sz = len(data)
