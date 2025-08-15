@@ -17,6 +17,7 @@ from typing import Self
 import warnings
 
 import lief
+import numba as nb
 import numpy as np
 import numpy.typing as npt
 from numpy.lib.stride_tricks import sliding_window_view
@@ -304,7 +305,7 @@ class EntropyGuider:
         if hist and not fast:
             return self.compute_histogram_entropy(self.data, radius)
         if hist and fast:
-            return self.compute_histogram_entropy_rolling(self.data, radius)
+            return self.compute_histogram_entropy_rolling(self.data, radius)  # type: ignore[no-any-return]
         raise RuntimeError("unreachable")
 
     # -----------------------------
@@ -313,13 +314,14 @@ class EntropyGuider:
     # -----------------------------
     @staticmethod
     def compute_entropy_scipy(x: npt.NDArray[np.uint8], radius: int, epsilon: float = 1e-8) -> npt.NDArray[np.float64]:
+        if radius <= 0 or len(x) <= 0:
+            raise ValueError(f"The `radius` must be > 0 and `x` must not be empty. Got radius {radius} and length of x {len(x)}.")
+
         n = int(x.size)
         W = 2 * radius + 1
         out = np.full(n, np.nan, dtype=np.float64)
-        if n < W or W <= 0:
-            return out
-        win = sliding_window_view(x.astype(np.float64), W) + epsilon  # shape: (n-W+1, W)
-        H = entropy(win, axis=1)  # shape: (n-W+1,)
+        win = sliding_window_view(x.astype(np.float64), W) + epsilon
+        H = entropy(win, axis=1)
         out[radius:n - radius] = H
         return out
 
@@ -329,11 +331,12 @@ class EntropyGuider:
     # -----------------------------
     @staticmethod
     def compute_entropy(x: npt.NDArray[np.uint8], radius: int, epsilon: float = 1e-8) -> npt.NDArray[np.float64]:
+        if radius <= 0 or len(x) <= 0:
+            raise ValueError(f"The `radius` must be > 0 and `x` must not be empty. Got radius {radius} and length of x {len(x)}.")
+
         n = int(x.size)
         W = 2 * radius + 1
         out = np.full(n, np.nan, dtype=np.float64)
-        if n < W or W <= 0:
-            return out
         win = sliding_window_view(x.astype(np.float64), W) + epsilon  # shape: (n-W+1, W)
         S = win.sum(axis=1)
         T = (win * np.log(win)).sum(axis=1)
@@ -347,34 +350,33 @@ class EntropyGuider:
     # -----------------------------
     @staticmethod
     def compute_entropy_rolling(x: npt.NDArray[np.uint8], radius: int, epsilon: float = 1e-8) -> npt.NDArray[np.float64]:
+        if radius <= 0 or len(x) <= 0:
+            raise ValueError(f"The `radius` must be > 0 and `x` must not be empty. Got radius {radius} and length of x {len(x)}.")
+
         n = int(x.size)
         W = 2 * radius + 1
         out = np.full(n, np.nan, dtype=np.float64)
-        if n < W or W <= 0:
-            return out
 
-        # Precompute z and z*log(z) for all 256 byte values with same epsilon
+        # LUTs for z and z*log z at byte values with the same epsilon
         z_vals = np.arange(256, dtype=np.float64) + float(epsilon)
-        z_logz = z_vals * np.log(z_vals)
+        z_logz_lut = z_vals * np.log(z_vals)
 
-        # Initialize window [0:W)
-        w0 = x[:W]
-        S = float(w0.sum()) + W * float(epsilon)                # sum(z)
-        T = float(z_logz[w0].sum())                             # sum(z*log z)
+        # Build arrays to scan once
+        x_float = x.astype(np.float64)
+        t_vals  = z_logz_lut[x]                       # length N
 
-        out[radius] = np.log(S) - (T / S)
+        # Prefix sums with a leading 0 for easy slicing
+        S_ps = np.empty(n + 1, dtype=np.float64); S_ps[0] = 0.0
+        T_ps = np.empty(n + 1, dtype=np.float64); T_ps[0] = 0.0
+        np.cumsum(x_float, out=S_ps[1:])              # sum of raw bytes
+        np.cumsum(t_vals,  out=T_ps[1:])              # sum of z*log z
 
-        # Slide
-        for i in range(W, n):
-            out_b = x[i - W]
-            in_b  = x[i]
-            if out_b != in_b:
-                # epsilon cancels in S update
-                S += float(in_b) - float(out_b)
-                T += float(z_logz[in_b]) - float(z_logz[out_b])
-            # center at i - radius
-            out[i - radius] = np.log(S) - (T / S)
+        # Window sums via prefix differences (valid positions: starts 0..n-W)
+        S_win = (S_ps[W:] - S_ps[:-W]) + W * float(epsilon)
+        T_win =  T_ps[W:] - T_ps[:-W]
 
+        H = np.log(S_win) - (T_win / S_win)
+        out[radius:n - radius] = H
         return out
 
     # -----------------------------
@@ -383,11 +385,12 @@ class EntropyGuider:
     # -----------------------------
     @staticmethod
     def compute_histogram_entropy(x: npt.NDArray[np.uint8], radius: int) -> npt.NDArray[np.float64]:
+        if radius <= 0 or len(x) <= 0:
+            raise ValueError(f"The `radius` must be > 0 and `x` must not be empty. Got radius {radius} and length of x {len(x)}.")
+
         n = int(x.size)
         W = 2 * radius + 1
         out = np.full(n, np.nan, dtype=np.float64)
-        if n < W or W <= 0:
-            return out
 
         logW = np.log(W)
         for c in range(radius, n - radius):
@@ -404,12 +407,14 @@ class EntropyGuider:
     # Only two bins change per step.
     # -----------------------------
     @staticmethod
+    @nb.njit(cache=True, nogil=True, fastmath=True)  # type: ignore[misc]
     def compute_histogram_entropy_rolling(x: npt.NDArray[np.uint8], radius: int) -> npt.NDArray[np.float64]:
+        if radius <= 0 or len(x) <= 0:
+            raise ValueError(f"The `radius` must be > 0 and `x` must not be empty. Got radius {radius} and length of x {len(x)}.")
+
         n = int(x.size)
         W = 2 * radius + 1
         out = np.full(n, np.nan, dtype=np.float64)
-        if n < W or W <= 0:
-            return out
 
         # log table for k=0..W with log(0)=0 to realize 0*log 0 := 0
         log_tbl = np.empty(W + 1, dtype=np.float64)
@@ -453,7 +458,7 @@ class EntropyGuider:
     # Raises ValueError if the input is not a 1D array of integers.
     # -----------------------------
     @staticmethod
-    def _get_array(data: LiefParse | np.ndarray) -> npt.NDArray[np.uint8]:
+    def _get_array(data: LiefParse | npt.NDArray[np.int_] | npt.NDArray[np.uint]) -> npt.NDArray[np.uint8]:
         x: npt.NDArray[np.uint8]
         if isinstance(data, (str, os.PathLike)):
             x = np.memmap(data, mode="r", dtype=np.uint8)
