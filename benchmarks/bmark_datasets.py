@@ -3,14 +3,12 @@ Benchmark.
 """
 
 from argparse import ArgumentParser
-from collections.abc import Callable
-from collections.abc import Sequence
 import json
 from pathlib import Path
+import random
 from statistics import mean
 import sys
 import time
-from typing import Optional
 import warnings
 
 import lief
@@ -49,7 +47,9 @@ def main() -> None:
     print(f" Batch size:  {args.batch_size}")
     print(f" Num workers: {args.num_workers}")
 
-    files: list[Path] = sorted(f for f in args.input.rglob("*") if f.is_file())[0:args.num_samples]
+    files: list[Path] = sorted(f for f in args.input.rglob("*") if f.is_file())
+    random.shuffle(files)
+    files = files[0:args.num_samples]
     num_samples = len(files)
     labels = [-1] * len(files)
     mem = sum(f.stat().st_size for f in files)
