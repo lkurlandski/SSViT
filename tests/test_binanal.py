@@ -10,46 +10,21 @@ import tempfile
 import lief
 import numpy as np
 import pytest
-import torch
-from torch import Tensor
-from torch import BoolTensor
-from torch import IntTensor
-from torch import LongTensor
-from torch import FloatTensor
-from torch import DoubleTensor
 
 from src.binanal import patch_binary
-from src.binanal import SemanticGuider
-from src.binanal import SemanticGuides
 from src.binanal import ParserGuider
-from src.binanal import StructurePartitioner
-from src.binanal import HierarchicalLevel
-from src.binanal import StructureMap
+from src.binanal import EntropyGuider
+from src.binanal import CharacteristicGuider
 from src.binanal import StructureParser
 from src.binanal import BinaryCreator
 
-
-FILES = sorted(Path("./tests/data").iterdir())
-from itertools import chain
-FILES = sorted(
-    (f for f in chain(Path("./data/ass").rglob("*"), Path("./data/sor").rglob("*")) if f.is_file()),
-    key=lambda f: f.name
-)[0:4096]
-
-
-def path_to_input_type(file: Path, input_type: type[str | Path | bytes]) -> str | Path | bytes:
-    if input_type == str:
-        return str(file)
-    elif input_type == Path:
-        return file
-    else:
-        return file.read_bytes()
+from tests import FILES
 
 
 class TestPatchPEFile:
 
     @pytest.mark.parametrize("file", FILES)
-    def test_patch_none_1(self, file: Path):
+    def test_patch_none_1(self, file: Path) -> None:
         org = file.read_bytes()
         pe = lief.parse(org)
         org_machine, org_subsystem = pe.header.machine, pe.optional_header.subsystem
@@ -61,7 +36,7 @@ class TestPatchPEFile:
         assert new == org
 
     @pytest.mark.parametrize("file", FILES)
-    def test_patch_same(self, file: Path):
+    def test_patch_same(self, file: Path) -> None:
         org = file.read_bytes()
         pe = lief.parse(org)
         org_machine, org_subsystem = pe.header.machine, pe.optional_header.subsystem
@@ -73,7 +48,7 @@ class TestPatchPEFile:
         assert new == org
 
     @pytest.mark.parametrize("file", FILES)
-    def test_patch_machine(self, file: Path):
+    def test_patch_machine(self, file: Path) -> None:
         org = file.read_bytes()
         pe = lief.parse(org)
         org_machine, org_subsystem = pe.header.machine, pe.optional_header.subsystem
@@ -93,7 +68,7 @@ class TestPatchPEFile:
         assert np.sum(equal) >= len(equal) - 2, f"{np.sum(equal)} {len(equal)}"
 
     @pytest.mark.parametrize("file", FILES)
-    def test_patch_subsystem(self, file: Path):
+    def test_patch_subsystem(self, file: Path) -> None:
         org = file.read_bytes()
         pe = lief.parse(org)
         org_machine, org_subsystem = pe.header.machine, pe.optional_header.subsystem
@@ -113,7 +88,7 @@ class TestPatchPEFile:
         assert np.sum(equal) >= len(equal) - 1, f"{np.sum(equal)} {len(equal)}"
 
     @pytest.mark.parametrize("file", FILES)
-    def test_patch_machine_subsystem(self, file: Path):
+    def test_patch_machine_subsystem(self, file: Path) -> None:
         org = file.read_bytes()
         pe = lief.parse(org)
         org_machine, org_subsystem = pe.header.machine, pe.optional_header.subsystem
@@ -137,99 +112,110 @@ class TestPatchPEFile:
         assert np.sum(equal) >= len(equal) - 3, f"{np.sum(equal)} {len(equal)}"
 
 
-class TestSemanticGuider:
-
-    @pytest.mark.parametrize("file", FILES)
-    @pytest.mark.parametrize("input_type", [str, Path, bytes])
-    def test_create_parse_guide(self, file: Path, input_type: type[str | Path | bytes]):
-        data = path_to_input_type(file, input_type)
-        x = SemanticGuider.create_parse_guide(data, True)
-        assert isinstance(x, BoolTensor)
-        assert x.ndim == 2
-        assert x.shape[0] == os.path.getsize(file)
-        assert x.shape[1] == len(ParserGuider.PARSEERRORS)
-        # assert torch.all(torch.isin(x, torch.tensor([0, 1, -1])))
-
-    @pytest.mark.parametrize("file", FILES)
-    @pytest.mark.parametrize("input_type", [str, Path, bytes])
-    @pytest.mark.parametrize("w", [0, 16, 32])
-    def test_create_entropy(self, file: Path, input_type: type[str | Path | bytes], w: int):
-        data = path_to_input_type(file, input_type)
-        x = SemanticGuider.create_entropy_guide(data, w)
-        assert isinstance(x, DoubleTensor)
-        assert x.ndim == 1
-        assert x.shape[0] == len(file.read_bytes())
-        assert torch.all(torch.isnan(x[:w])) or w == 0
-        assert torch.all(torch.isnan(x[-w + 1:])) or w == 0
-        assert torch.all(torch.isfinite(x[w:-w]))
-
-    @pytest.mark.parametrize("file", FILES)
-    @pytest.mark.parametrize("input_type", [str, Path, bytes])
-    def test_create_characteristics_guide(self, file: Path, input_type: type[str | Path | bytes]):
-        data = path_to_input_type(file, input_type)
-        x = SemanticGuider.create_characteristics_guide(data)
-        assert isinstance(x, BoolTensor)
-        assert x.ndim == 2
-        assert x.shape[0] == os.path.getsize(file)
-        assert x.shape[1] == len(SemanticGuider.CHARACTERISTICS)
-        # assert torch.all(torch.isin(x, torch.tensor([0, 1, -1])))
-
-    @pytest.mark.parametrize("do_parse", [False, True])
-    @pytest.mark.parametrize("do_entropy", [False, True])
-    @pytest.mark.parametrize("do_characteristics", [False, True])
-    def test_main(self, do_parse: bool, do_entropy: bool, do_characteristics: bool):
-        file = FILES[0]
-        b = file.read_bytes()
-
-        guider = SemanticGuider(do_parse=do_parse, do_entropy=do_entropy, do_characteristics=do_characteristics)
-        sample = guider(b)
-        assert isinstance(sample, SemanticGuides)
-
-        parse = sample.parse
-        if do_parse:
-            assert isinstance(parse, Tensor)
-        else:
-            assert parse is None
-
-        entropy = sample.entropy
-        if do_entropy:
-            assert isinstance(entropy, Tensor)
-        else:
-            assert entropy is None
-
-        characteristics = sample.characteristics
-        if do_characteristics:
-            assert isinstance(characteristics, Tensor)
-        else:
-            assert characteristics is None
+def _path_to_input_type(file: Path, input_type: type[str | Path | bytes]) -> str | Path | bytes:
+    if input_type == str:
+        return str(file)
+    elif input_type == Path:
+        return file
+    else:
+        return file.read_bytes()
 
 
 class TestParserGuider:
 
-    def test_parser_not_called(self):
-        guider = ParserGuider(FILES[0])
-        with pytest.raises(RuntimeError):
-            guider.build_simple_guide()
-        with pytest.raises(RuntimeError):
-            guider.build_complex_guide()
-
     @pytest.mark.parametrize("file", FILES)
-    def test_build_simple_guide(self, file: Path):
+    def test_build_simple_guide(self, file: Path) -> None:
         parser = ParserGuider(file)
         g = parser(True)
-        assert isinstance(g, BoolTensor)
         assert g.ndim == 2
         assert g.shape[0] == os.path.getsize(file)
         assert g.shape[1] == len(ParserGuider.PARSEERRORS)
 
     @pytest.mark.parametrize("file", FILES)
-    def test_build_complex_guide(self, file: Path):
+    def test_build_complex_guide(self, file: Path) -> None:
         parser = ParserGuider(file)
         g = parser(False)
-        assert isinstance(g, BoolTensor)
         assert g.ndim == 2
         assert g.shape[0] == os.path.getsize(file)
         assert g.shape[1] == len(ParserGuider.PARSEERRORS)
+
+
+class TestEntropyGuider:
+
+    def _check_entropy(self, h: np.ndarray, b: np.ndarray, radius: int) -> None:
+        assert h.ndim == 1
+        assert h.shape[0] == len(b)
+        assert np.all(np.isnan(h[:radius])) or radius == 0
+        assert np.all(np.isnan(h[-radius:])) or radius == 0
+        assert np.all(np.isfinite(h[radius:-radius]))
+
+    @pytest.mark.parametrize("radius", [0, 1, 2, 16, 32, 64])
+    @pytest.mark.parametrize("size", [1024, 4096, 16384])
+    def test_compute_entropy_scipy(self, radius: int, size: int) -> None:
+        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
+        h = EntropyGuider.compute_entropy_scipy(b, radius)
+        self._check_entropy(h, b, radius)
+
+    @pytest.mark.parametrize("radius", [0, 1, 2, 16, 32, 64])
+    @pytest.mark.parametrize("size", [1024, 4096, 16384])
+    def test_compute_entropy(self, radius: int, size: int) -> None:
+        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
+        h = EntropyGuider.compute_entropy(b, radius)
+        self._check_entropy(h, b, radius)
+
+    @pytest.mark.parametrize("radius", [0, 1, 2, 16, 32, 64])
+    @pytest.mark.parametrize("size", [1024, 4096, 16384])
+    def test_compute_entropy_rolling(self, radius: int, size: int) -> None:
+        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
+        h = EntropyGuider.compute_entropy_rolling(b, radius)
+        self._check_entropy(h, b, radius)
+
+    @pytest.mark.parametrize("radius", [0, 1, 2, 16, 32, 64])
+    @pytest.mark.parametrize("size", [1024, 4096, 16384])
+    def test_compute_histogram_entropy(self, radius: int, size: int) -> None:
+        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
+        h = EntropyGuider.compute_histogram_entropy(b, radius)
+        self._check_entropy(h, b, radius)
+
+    @pytest.mark.parametrize("radius", [0, 1, 2, 16, 32, 64])
+    @pytest.mark.parametrize("size", [1024, 4096, 16384])
+    def test_compute_histogram_entropy_rolling(self, radius: int, size: int) -> None:
+        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
+        h = EntropyGuider.compute_histogram_entropy_rolling(b, radius)
+        self._check_entropy(h, b, radius)
+
+    @pytest.mark.parametrize("radius", [0, 1, 2, 16])
+    @pytest.mark.parametrize("size", [1024, 4096])
+    def test_equivalence(self, radius: int, size: int) -> None:
+        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
+        h_1 = EntropyGuider.compute_entropy(b, radius)
+        h_2 = EntropyGuider.compute_entropy_rolling(b, radius)
+        h_3 = EntropyGuider.compute_entropy_scipy(b, radius)
+        assert h_1.shape == h_2.shape == h_3.shape
+        assert np.allclose(h_1, h_2, atol=1e-3 if radius == 0 else 1e-8, equal_nan=True)
+        assert np.allclose(h_1, h_3, atol=1e-3 if radius == 0 else 1e-8, equal_nan=True)
+
+    @pytest.mark.parametrize("radius", [0, 1, 2, 16])
+    @pytest.mark.parametrize("size", [1024, 4096])
+    def test_histogram_equivalence(self, radius: int, size: int) -> None:
+        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
+        h_1 = EntropyGuider.compute_histogram_entropy(b, radius)
+        h_2 = EntropyGuider.compute_histogram_entropy_rolling(b, radius)
+        assert h_1.shape == h_2.shape
+        assert np.allclose(h_1, h_2, equal_nan=True)
+
+
+class TestCharacteristicGuider:
+
+    @pytest.mark.parametrize("file", FILES)
+    @pytest.mark.parametrize("input_type", [str, Path, bytes])
+    def test(self, file: Path, input_type: type[str | Path | bytes]) -> None:
+        data = _path_to_input_type(file, input_type)
+        x = CharacteristicGuider(data)()
+        assert x.ndim == 2
+        assert x.shape[0] == os.path.getsize(file)
+        assert x.shape[1] == len(CharacteristicGuider.CHARACTERISTICS)
+        # assert torch.all(torch.isin(x, torch.tensor([0, 1, -1])))
 
 
 class TestStructureParser:

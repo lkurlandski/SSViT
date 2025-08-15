@@ -3,11 +3,10 @@ Binary analysis.
 """
 
 from __future__ import annotations
-from collections.abc import Mapping
 from collections.abc import Sequence
-from dataclasses import dataclass
 import enum
 import hashlib
+import io
 import os
 from pathlib import Path
 import struct
@@ -22,15 +21,10 @@ import numpy as np
 import numpy.typing as npt
 from numpy.lib.stride_tricks import sliding_window_view
 from scipy.stats import entropy
-import torch
-from torch import BoolTensor
-from torch import IntTensor
-from torch import FloatTensor
-from torch import DoubleTensor
 
 
 StrPath = str | os.PathLike[str]
-LiefParse = StrPath | bytes
+LiefParse = str | io.IOBase | os.PathLike | bytes
 Range = tuple[int, int]
 
 
@@ -57,8 +51,9 @@ def is_section_executable(section: lief.PE.Section) -> bool:
     return False
 
 
-def is_dotnet(raw: str | Path | bytes) -> bool:
-    pe: lief.PE.Binary = lief.parse(raw)
+def is_dotnet(data: LiefParse) -> bool:
+    data = io.BytesIO(data) if isinstance(data, bytes) else data
+    pe = lief.PE.parse(data)
     if not isinstance(pe, lief.PE.Binary):
         raise RuntimeError(f"Expected lief.PE.Binary, got {type(pe)}")
     dd: lief.PE.DataDirectory = pe.data_directory(lief.PE.DataDirectory.TYPES.CLR_RUNTIME_HEADER)
@@ -67,24 +62,27 @@ def is_dotnet(raw: str | Path | bytes) -> bool:
     return bool(dd.rva != 0) and bool(dd.size != 0)
 
 
-def get_machine_and_subsystem(data: str | Path | bytes) -> tuple[lief.PE.Header.MACHINE_TYPES, lief.PE.OptionalHeader.SUBSYSTEM]:
-    pe = lief.parse(data)
+def get_machine_and_subsystem(data: LiefParse) -> tuple[lief.PE.Header.MACHINE_TYPES, lief.PE.OptionalHeader.SUBSYSTEM]:
+    data = io.BytesIO(data) if isinstance(data, bytes) else data
+    pe = lief.PE.parse(data)
     if not isinstance(pe, lief.PE.Binary):
         raise RuntimeError(f"Expected lief.PE.Binary, got {type(pe)}")
     return pe.header.machine, pe.optional_header.subsystem
 
 
 def patch_binary(
-    src: str | Path | bytes,
+    data: LiefParse,
     machine: Optional[lief.PE.Header.MACHINE_TYPES] = None,
     subsystem: Optional[lief.PE.OptionalHeader.SUBSYSTEM] = None,
 ) -> bytes:
-    if isinstance(src, (str, Path)):
-        data = bytearray(Path(src).read_bytes())
-    elif isinstance(src, bytes):
-        data = bytearray(src)
+    if isinstance(data, (str, os.PathLike)):
+        data = bytearray(Path(data).read_bytes())
+    elif isinstance(data, bytes):
+        data = bytearray(data)
+    elif isinstance(data, io.IOBase):
+        data = bytearray(data.read())
     else:
-        raise TypeError(f"Unsupported type for src: {type(src)}. Expected str, Path, or bytes.")
+        raise TypeError(f"Unsupported input type {type(data)}")
 
     # Locate headers.
     e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
@@ -233,28 +231,35 @@ class BinaryCreator:
         return self
 
 
-@dataclass(frozen=True, slots=True)
-class SemanticGuides:
-    parse: Optional[BoolTensor] = None
-    entropy: Optional[DoubleTensor] = None
-    characteristics: Optional[BoolTensor] = None
+def _parse_pe_and_get_size(data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> tuple[lief.PE.Binary, int]:
 
-    def __post_init__(self) -> None:
-        lengths = [len(x) for x in (self.parse, self.entropy, self.characteristics) if x is not None]
-        if len(set(lengths)) > 1:
-            raise ValueError(f"SemanticSample buffers have different lengths: {lengths}")
+    pe: Optional[lief.PE.Binary]
+    sz: Optional[int]
+
+    if isinstance(data, lief.PE.Binary):
+        pe = data
+        sz = size
+    elif isinstance(data, (str, os.PathLike)):
+        pe = lief.PE.parse(data)
+        sz = os.path.getsize(data)
+    elif isinstance(data, bytes):
+        pe = lief.PE.parse(io.BytesIO(data))
+        sz = len(data)
+    elif isinstance(data, io.IOBase):
+        pe = lief.PE.parse(data)
+        sz = size
+    else:
+        raise TypeError(f"Unsupported input type {type(data)}.")
+
+    if pe is None:
+        raise RuntimeError(f"lief.PE.parse({type(data)}) returned None")
+    if sz is None:
+        raise RuntimeError(f"Size must be provided when data is {type(data)}.")
+
+    return pe, sz
 
 
-class BatchedSemanticGuides(SemanticGuides):
-
-    def __post_init__(self) -> None:
-        ...
-
-
-class SemanticGuider:
-    """
-    Semantic guides to acompany a byte stream.
-    """
+class CharacteristicGuider:
 
     CHARACTERISTICS = [
         lief.PE.Section.CHARACTERISTICS.CNT_CODE,
@@ -271,64 +276,197 @@ class SemanticGuider:
         lief.PE.Section.CHARACTERISTICS.MEM_WRITE,
     ]
 
-    def __init__(self, do_parse: bool = False, do_entropy: bool = False, do_characteristics: bool = False, window: int = 256, simple: bool = False) -> None:
-        self.do_parse = do_parse
-        self.do_entropy = do_entropy
-        self.do_characteristics = do_characteristics
-        self.window = window
-        self.simple = simple
+    def __init__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> None:
+        self.pe, self.size = _parse_pe_and_get_size(data, size)
 
-    def __call__(self, data: LiefParse) -> SemanticGuides:
-        parse = None
-        if self.do_parse:
-            try:
-                parse = self.create_parse_guide(data, self.simple)
-            except Exception as err:
-                print(f"Error creating parse guide: {err}")
-
-        entropy = None
-        if self.do_entropy:
-            try:
-                entropy = self.create_entropy_guide(data, self.window)
-            except Exception as err:
-                print(f"Error creating entropy guide: {err}")
-
-        characteristics = None
-        if self.do_characteristics:
-            try:
-                characteristics = self.create_characteristics_guide(data)
-            except Exception as err:
-                print(f"Error creating permission guide: {err}")
-
-        return SemanticGuides(parse, entropy, characteristics)
-
-    @staticmethod
-    def create_parse_guide(data: LiefParse, simple: bool) -> BoolTensor:
-        return ParserGuider(data)(simple=simple)
-
-    @staticmethod
-    def create_entropy_guide(data: LiefParse, w: int, e: float = 1e-8) -> FloatTensor:
-        b = Path(data).read_bytes() if isinstance(data, (str, Path)) else data
-        x = np.frombuffer(b, dtype=np.uint8).astype(np.float64)
-        x = entropy(sliding_window_view(x, w * 2 + 1) + e, axis=1, nan_policy="raise")
-        if np.any(np.isnan(x)):
-            raise RuntimeError("Entropy calculation resulted in NaN values.")
-        x = np.concatenate((np.full(w, np.nan), x, np.full(w, np.nan)))
-        x = torch.from_numpy(x)
-        return x
-
-    @staticmethod
-    def create_characteristics_guide(data: LiefParse) -> BoolTensor:
-        size = os.path.getsize(data) if isinstance(data, (str, os.PathLike)) else len(data)
-        x = torch.full((size, len(SemanticGuider.CHARACTERISTICS)), False, dtype=torch.bool)
-        pe = lief.parse(data)
-        if pe is None:
-            raise RuntimeError(f"lief.parse({type(data)}) return None")
-        for section in pe.sections:
+    def __call__(self) -> npt.NDArray[np.bool_]:
+        x = np.full((self.size, len(self.CHARACTERISTICS)), False, dtype=bool)
+        for section in self.pe.sections:
             offset = section.offset
             size = section.size
-            for i, c in enumerate(SemanticGuider.CHARACTERISTICS):
+            for i, c in enumerate(self.CHARACTERISTICS):
                 x[offset:offset + size, i] = True if section.has_characteristic(c) else False
+        return x
+
+
+class EntropyGuider:
+
+    def __init__(self, data: LiefParse | npt.NDArray[np.uint8]) -> None:
+        self.data = self._get_array(data)
+
+    def __call__(self, fast: bool = True, hist: bool = True, radius: int = 256) -> npt.NDArray[np.float64]:
+        if radius < 0:
+            raise ValueError("radius must be >= 0")
+        if not hist and not fast:
+            return self.compute_entropy(self.data, radius)
+        if not hist and fast:
+            return self.compute_entropy_rolling(self.data, radius)
+        if hist and not fast:
+            return self.compute_histogram_entropy(self.data, radius)
+        if hist and fast:
+            return self.compute_histogram_entropy_rolling(self.data, radius)
+        raise RuntimeError("unreachable")
+
+    # -----------------------------
+    # 0) SciPy-equivalent entropy (slow, reference implementation)
+    # H = log(S) - (1/S) * sum(z * log z), where z = x + eps
+    # -----------------------------
+    @staticmethod
+    def compute_entropy_scipy(x: npt.NDArray[np.uint8], radius: int, epsilon: float = 1e-8) -> npt.NDArray[np.float64]:
+        n = int(x.size)
+        W = 2 * radius + 1
+        out = np.full(n, np.nan, dtype=np.float64)
+        if n < W or W <= 0:
+            return out
+        win = sliding_window_view(x.astype(np.float64), W) + epsilon  # shape: (n-W+1, W)
+        H = entropy(win, axis=1)  # shape: (n-W+1,)
+        out[radius:n - radius] = H
+        return out
+
+    # -----------------------------
+    # 1) Value-weighted (slow, SciPy-equivalent semantics)
+    # H = log(S) - (1/S) * sum(z * log z), where z = x + eps
+    # -----------------------------
+    @staticmethod
+    def compute_entropy(x: npt.NDArray[np.uint8], radius: int, epsilon: float = 1e-8) -> npt.NDArray[np.float64]:
+        n = int(x.size)
+        W = 2 * radius + 1
+        out = np.full(n, np.nan, dtype=np.float64)
+        if n < W or W <= 0:
+            return out
+        win = sliding_window_view(x.astype(np.float64), W) + epsilon  # shape: (n-W+1, W)
+        S = win.sum(axis=1)
+        T = (win * np.log(win)).sum(axis=1)
+        H = np.log(S) - (T / S)
+        out[radius:n - radius] = H
+        return out
+
+    # -----------------------------
+    # 2) Value-weighted (fast rolling, O(N), identical semantics)
+    # Precompute tables for z=byte+eps to avoid per-step logs.
+    # -----------------------------
+    @staticmethod
+    def compute_entropy_rolling(x: npt.NDArray[np.uint8], radius: int, epsilon: float = 1e-8) -> npt.NDArray[np.float64]:
+        n = int(x.size)
+        W = 2 * radius + 1
+        out = np.full(n, np.nan, dtype=np.float64)
+        if n < W or W <= 0:
+            return out
+
+        # Precompute z and z*log(z) for all 256 byte values with same epsilon
+        z_vals = np.arange(256, dtype=np.float64) + float(epsilon)
+        z_logz = z_vals * np.log(z_vals)
+
+        # Initialize window [0:W)
+        w0 = x[:W]
+        S = float(w0.sum()) + W * float(epsilon)                # sum(z)
+        T = float(z_logz[w0].sum())                             # sum(z*log z)
+
+        out[radius] = np.log(S) - (T / S)
+
+        # Slide
+        for i in range(W, n):
+            out_b = x[i - W]
+            in_b  = x[i]
+            if out_b != in_b:
+                # epsilon cancels in S update
+                S += float(in_b) - float(out_b)
+                T += float(z_logz[in_b]) - float(z_logz[out_b])
+            # center at i - radius
+            out[i - radius] = np.log(S) - (T / S)
+
+        return out
+
+    # -----------------------------
+    # 3) Byte-frequency (slow reference, per-window bincount)
+    # H = log(W) - (1/W) * sum_c c*log(c), with 0*log 0 := 0
+    # -----------------------------
+    @staticmethod
+    def compute_histogram_entropy(x: npt.NDArray[np.uint8], radius: int) -> npt.NDArray[np.float64]:
+        n = int(x.size)
+        W = 2 * radius + 1
+        out = np.full(n, np.nan, dtype=np.float64)
+        if n < W or W <= 0:
+            return out
+
+        logW = np.log(W)
+        for c in range(radius, n - radius):
+            counts = np.bincount(x[c - radius:c + radius + 1], minlength=256)
+            # sum c*log(c) with 0*log 0 := 0 (mask zeros)
+            nz = counts[counts > 0].astype(np.float64)
+            s_clogc = float((nz * np.log(nz)).sum())
+            out[c] = logW - (s_clogc / W)
+        return out
+
+    # -----------------------------
+    # 4) Byte-frequency (fast rolling, O(N))
+    # Maintain counts[256] and s_clogc = sum c*log(c).
+    # Only two bins change per step.
+    # -----------------------------
+    @staticmethod
+    def compute_histogram_entropy_rolling(x: npt.NDArray[np.uint8], radius: int) -> npt.NDArray[np.float64]:
+        n = int(x.size)
+        W = 2 * radius + 1
+        out = np.full(n, np.nan, dtype=np.float64)
+        if n < W or W <= 0:
+            return out
+
+        # log table for k=0..W with log(0)=0 to realize 0*log 0 := 0
+        log_tbl = np.empty(W + 1, dtype=np.float64)
+        log_tbl[0] = 0.0
+        log_tbl[1:] = np.log(np.arange(1, W + 1, dtype=np.float64))
+        logW = np.log(W)
+
+        counts = np.zeros(256, dtype=np.int32)
+        # initial histogram over [0:W)
+        for v in x[:W]:
+            counts[int(v)] += 1
+        # initial s_clogc
+        s_clogc = float((counts.astype(np.float64) * log_tbl[counts]).sum())
+        out[radius] = logW - (s_clogc / W)
+
+        # slide window
+        for i in range(W, n):
+            v_out = int(x[i - W])
+            v_in  = int(x[i])
+            if v_out != v_in:
+                co = counts[v_out]
+                ci = counts[v_in]
+                # remove old contributions
+                s_clogc -= co * log_tbl[co]
+                s_clogc -= ci * log_tbl[ci]
+                # update counts
+                co -= 1; ci += 1
+                counts[v_out] = co
+                counts[v_in]  = ci
+                # add new contributions
+                s_clogc += co * log_tbl[co]
+                s_clogc += ci * log_tbl[ci]
+            out[i - radius] = logW - (s_clogc / W)
+
+        return out
+
+    # -----------------------------
+    # Helper to convert input data to a numpy array of uint8.
+    # Supports str, Path, bytes, bytearray, memoryview, io.BytesIO, and np.ndarray.
+    # Raises TypeError for unsupported types.
+    # Raises ValueError if the input is not a 1D array of integers.
+    # -----------------------------
+    @staticmethod
+    def _get_array(data: LiefParse | np.ndarray) -> npt.NDArray[np.uint8]:
+        x: npt.NDArray[np.uint8]
+        if isinstance(data, (str, os.PathLike)):
+            x = np.memmap(data, mode="r", dtype=np.uint8)
+        elif isinstance(data, (bytes, bytearray, memoryview)):
+            x = np.frombuffer(data, dtype=np.uint8)
+        elif isinstance(data, io.BytesIO):
+            x = np.frombuffer(data.getbuffer(), dtype=np.uint8)
+        elif isinstance(data, np.ndarray):
+            if not np.issubdtype(data.dtype, np.integer) or data.ndim != 1:
+                raise ValueError(f"Expected a 1D array of integers, got {data.dtype} with shape {data.shape}.")
+            x = data.astype(np.uint8)
+        else:
+            raise TypeError(f"Unsupported input type {type(data)}.")
         return x
 
 
@@ -352,43 +490,30 @@ class ParserGuider:
     ]
     PARSEERRORS = [Exception]  # FIXME: remove.
 
-    def __init__(self, data: LiefParse) -> None:
+    def __init__(self, data: LiefParse | lief.PE.Binary) -> None:
         warnings.warn("ParserGuider not yet fully operational. All errors marked in same channel.")
-        self.data = data
-        self.pe: Optional[lief.PE.Binary] = None
-        self.guide = torch.zeros((len(self), len(ParserGuider.PARSEERRORS)), dtype=torch.bool)
+        self.pe, self.size = _parse_pe_and_get_size(data)
+        self.guide = np.zeros((self.size, len(ParserGuider.PARSEERRORS)), dtype=bool)
 
-    def __call__(self, simple: bool) -> BoolTensor:
-        try:
-            self.pe = lief.parse(self.data)
-        except Exception as e:
-            self._mark_guide(0, len(self), e)
-            return self.guide
-
-        if self.pe is None:
-            raise RuntimeError(f"lief.parse({type(self.data)}) return None")
-
+    def __call__(self, simple: bool) -> npt.NDArray[np.bool_]:
         if simple:
             self.build_simple_guide()
         else:
             self.build_complex_guide()
         return self.guide
 
-    def __len__(self) -> int:
-        return os.path.getsize(self.data) if isinstance(self.data, (str, os.PathLike)) else len(self.data)
-
     def build_simple_guide(self) -> None:
         if self.pe is None:
             raise RuntimeError("ParserGuider has not been called yet.")
 
         probes: list[tuple[str, tuple[int, int]]] = [
-            ("header", (0, min(0x40, len(self)))),
-            ("optional_header", (0, min(0x100, len(self)))),
-            ("sections", (0x200, len(self))),
-            ("data_directories", (0, min(0x200, len(self)))),
-            ("imports", (0, len(self))),
-            ("exports", (0, len(self))),
-            ("resources", (0, len(self))),
+            ("header", (0, min(0x40, self.size))),
+            ("optional_header", (0, min(0x100, self.size))),
+            ("sections", (0x200, self.size)),
+            ("data_directories", (0, min(0x200, self.size))),
+            ("imports", (0, self.size)),
+            ("exports", (0, self.size)),
+            ("resources", (0, self.size)),
         ]
         for attr, (lo, hi) in probes:
             try:
@@ -414,21 +539,21 @@ class ParserGuider:
             raise RuntimeError("ParserGuider has not been called yet.")
 
         # Check the header
-        lo, hi = self._compute_coff_header_region_boundaries(self.pe, len(self))
+        lo, hi = self._compute_coff_header_region_boundaries(self.pe, self.size)
         try:
             getattr(self.pe, "header")
         except Exception as e:
             self._mark_guide(lo, hi, e)
 
         # Check the optional header
-        lo, hi = self._compute_optional_header_boundaries(self.pe, len(self))
+        lo, hi = self._compute_optional_header_boundaries(self.pe, self.size)
         try:
             getattr(self.pe, "optional_header")
         except Exception as e:
             self._mark_guide(lo, hi, e)
 
         # Check the section table
-        lo, hi = self._compute_section_table_boundaries(self.pe, len(self))
+        lo, hi = self._compute_section_table_boundaries(self.pe, self.size)
         try:
             getattr(self.pe, "sections")
         except Exception as e:
@@ -438,7 +563,7 @@ class ParserGuider:
             if self.pe.sections is not None:
                 for s in self.pe.sections:
                     lo = s.pointerto_raw_data
-                    hi = min(lo + s.size, len(self))
+                    hi = min(lo + s.size, self.size)
                     try:
                         # Touch properties that often trigger lazy reads/validations
                         _ = (s.name, s.size, s.virtual_address, s.content)
@@ -446,7 +571,7 @@ class ParserGuider:
                         self._mark_guide(lo, hi, e)
 
         # Check the data directories
-        lo, hi = self._compute_optional_header_boundaries(self.pe, len(self))
+        lo, hi = self._compute_optional_header_boundaries(self.pe, self.size)
         try:
             getattr(self.pe, "data_directories")
         except Exception as e:
@@ -474,13 +599,13 @@ class ParserGuider:
                             _ = self.pe.has_resources
                     except Exception as e_obj:
                         if not bool(rva) or not bool(size) or not bool(self.pe.rva_to_offset(rva)):
-                            lo, hi = self._compute_optional_header_boundaries(self.pe, len(self))
+                            lo, hi = self._compute_optional_header_boundaries(self.pe, self.size)
                         else:
                             off = self.pe.rva_to_offset(rva)
                             if off is None or off < 0:
                                 return None
                             lo = self.pe.rva_to_offset(rva)
-                            hi = min(lo + size, len(self))
+                            hi = min(lo + size, self.size)
                         self._mark_guide(lo, hi, e_obj)
 
     @staticmethod
@@ -596,12 +721,7 @@ class StructureParser:
     # _SCN_CNT_UN_DATA = 0x00000080
 
     def __init__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> None:
-        self.pe: lief.PE.Binary = data if isinstance(data, lief.PE.Binary) else lief.parse(data)
-        self.size: int = size if size is not None else (len(data) if isinstance(data, bytes) else os.path.getsize(data))
-        if self.pe is None:
-            raise RuntimeError(f"lief.parse({type(data)}) return None")
-        if self.size is None:
-            raise ValueError("Size must be provided if data is a lief.PE.Binary object.")
+        self.pe, self.size = _parse_pe_and_get_size(data, size)
 
         self.functions = {
             HierarchicalStructureNone.ANY: self.get_any,
@@ -890,45 +1010,3 @@ class StructureParser:
             if b in alldir:
                 alldir.remove(b)
         return self._norm(alldir)
-
-
-@dataclass(frozen=True, slots=True)
-class StructureMap:
-    index: BoolTensor
-    lexicon: Mapping[int, HierarchicalStructure]
-
-    def __post_init__(self) -> None:
-        if self.index.shape[0] != len(list(self.lexicon.keys())):
-            raise ValueError("StructureMap index does not match lexicon keys.")
-
-
-class StructurePartitioner:
-    """
-    Partitions a binary into hierarchical structures.
-    """
-
-    def __init__(self, level: HierarchicalLevel = HierarchicalLevel.NONE) -> None:
-        self.level = level
-
-    def __call__(self, data: LiefParse) -> StructureMap:
-        parser = StructureParser(data)
-
-        if self.level == HierarchicalLevel.NONE:
-            structures = list(HierarchicalStructureNone)
-        if self.level == HierarchicalLevel.COARSE:
-            structures = list(HierarchicalStructureCoarse)
-        elif self.level == HierarchicalLevel.MIDDLE:
-            structures = list(HierarchicalStructureMiddle)
-        elif self.level == HierarchicalLevel.FINE:
-            structures = list(HierarchicalStructureFine)
-        else:
-            raise TypeError(f"Unknown HierarchicalLevel: {self.level}. Expected one of {list(HierarchicalLevel)}.")
-
-        index = torch.full((len(structures), parser.size), dtype=bool, fill_value=False)
-        lexicon = {}
-        for i, s in enumerate(structures):
-            bounds = parser(s)
-            for l, u in bounds:
-                index[i, l:u] = True
-            lexicon[i] = s
-        return StructureMap(index, lexicon)
