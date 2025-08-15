@@ -36,10 +36,22 @@ def get_ranges_numpy(x: npt.NDArray[np.bool_]) -> tuple[npt.NDArray[np.int32], n
     if x.dtype != np.bool_ or x.ndim != 1:  # type: ignore[comparison-overlap]
         raise TypeError(f"Expected a 1D boolean numpy array, got {type(x)} with shape {x.shape}.")
 
-    padded = np.pad(x, (1, 1), mode='constant', constant_values=False)
-    diff = np.diff(padded.astype(int))
-    lo = np.where(diff == 1)[0]
-    hi = np.where(diff == -1)[0]
+    n = x.size
+    if n == 0:
+        z = np.empty(0, dtype=np.int32)
+        return z, z
+
+    # Boolean-only edge detection:
+    prev = np.empty_like(x)
+    prev[0] = False
+    prev[1:] = x[:-1]
+
+    nxt = np.empty_like(x)
+    nxt[:-1] = x[1:]
+    nxt[-1] = False
+
+    lo = np.flatnonzero(x & ~prev).astype(np.int32, copy=False)
+    hi = (np.flatnonzero(x & ~nxt) + 1).astype(np.int32, copy=False)
     return lo, hi
 
 
@@ -903,7 +915,7 @@ class StructureParser:
         return []
 
     def get_other(self) -> list[Range]:
-        covered = np.array([False] * self.size, dtype=bool)
+        covered = np.full(self.size, False, dtype=bool)
         for lo, hi in self.get_headers() + self.get_sections() + self.get_overlay():
             covered[lo:hi] = True
         lo, hi = get_ranges_numpy(covered == False)
