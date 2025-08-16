@@ -60,7 +60,7 @@ if __name__ == "__main__":
 from src.binanal import EntropyGuider
 
 
-def run_benchmark(func: Callable, b: npt.NDArray[np.uint8], radius: int, runs: int, interval: float = 0.01) -> tuple[float, float]:
+def run_benchmark(func: Callable, b: npt.NDArray[np.uint8], radius: int, dtype: npt.DTypeLike, runs: int, interval: float = 0.01) -> tuple[float, float]:
     proc = psutil.Process(os.getpid())
     stop = threading.Event()
 
@@ -75,7 +75,7 @@ def run_benchmark(func: Callable, b: npt.NDArray[np.uint8], radius: int, runs: i
             time.sleep(interval)
 
     threading.Thread(target=poll, daemon=True).start()
-    func(b, radius)
+    func(b, radius, dtype=dtype)
     t0 = time.perf_counter()
     for _ in range(runs):
         func(b, radius)
@@ -87,8 +87,8 @@ def run_benchmark(func: Callable, b: npt.NDArray[np.uint8], radius: int, runs: i
 
 
 def main() -> None:
-    sizes = [2 ** 18, 2 ** 20, 2 ** 22, 2 ** 24]
-    radii = [64, 128, 256, 512, 1024]
+    sizes = [2 ** 16, 2 ** 18, 2 ** 20, 2 ** 22, 2 ** 24]
+    radii = [256]
     RUNS = 5
 
     for size in sizes:
@@ -98,13 +98,14 @@ def main() -> None:
                 # EntropyGuider.compute_entropy_scipy,
                 # EntropyGuider.compute_entropy,
                 # EntropyGuider.compute_entropy_rolling,
-                EntropyGuider.compute_entropy_rolling,
+                # EntropyGuider.compute_entropy_rolling,
                 # EntropyGuider.compute_histogram_entropy,
                 EntropyGuider.compute_histogram_entropy_rolling,
             ]:
-                print(f"func {func.__name__}{' ' * (len('compute_histogram_entropy_rolling') - len(func.__name__))} size {size} radius {radius} ...", end=" ", flush=True)
-                t, m = run_benchmark(func, b, radius, RUNS)
-                print(f"time {t:.3f}s memory {m / (1024 ** 2):.3f}MB", flush=True)
+                for dtype in [np.float32, np.float64]:
+                    print(f"func {func.__name__}{' ' * (len('compute_histogram_entropy_rolling') - len(func.__name__))} size {size} radius {radius} dtype {dtype} ...", end=" ", flush=True)
+                    t, m = run_benchmark(func, b, radius, dtype, RUNS)
+                    print(f"time {t:.4f}s memory {m / (1024 ** 2):.3f}MB", flush=True)
 
 
 if __name__ == "__main__":
