@@ -298,6 +298,7 @@ class CharacteristicGuider:
 
     def __call__(self) -> npt.NDArray[np.bool_]:
         x = np.full((self.size, len(self.CHARACTERISTICS)), False, dtype=bool)
+        # TODO: account for sections with invalid offsets/sizes (use the StructureParser).
         for section in self.pe.sections:
             offset = section.offset
             size = section.size
