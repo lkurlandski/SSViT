@@ -131,8 +131,8 @@ class SemanticGuider:
 
         entropy = None
         if self.do_entropy:
-            entropy = EntropyGuider(data)(radius=self.radius)
-            entropy = torch.from_numpy(entropy).to(torch.float16)
+            entropy = EntropyGuider(data)(radius=self.radius)      # 64-bit is fastest for computation.
+            entropy = torch.from_numpy(entropy).to(torch.float16)  # 16-bit is fastest for GPU transfer.
 
         characteristics = None
         if self.do_characteristics:
