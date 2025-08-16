@@ -15,9 +15,14 @@ from typing import Optional
 
 import torch
 from torch import BoolTensor
-from torch import DoubleTensor
+from torch import HalfTensor
 from torch import FloatTensor
+from torch import DoubleTensor
+from torch import CharTensor
+from torch import ByteTensor
+from torch import ShortTensor
 from torch import IntTensor
+from torch import LongTensor
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
@@ -58,7 +63,7 @@ class SemanticGuides:
         characteristics (Optional[BoolTensor]): A boolean tensor of shape (T, *).
     """
     parse: Optional[BoolTensor] = None
-    entropy: Optional[DoubleTensor] = None
+    entropy: Optional[HalfTensor | FloatTensor | DoubleTensor] = None
     characteristics: Optional[BoolTensor] = None
 
     def __post_init__(self) -> None:
@@ -127,7 +132,7 @@ class SemanticGuider:
         entropy = None
         if self.do_entropy:
             entropy = EntropyGuider(data)(radius=self.radius)
-            entropy = torch.from_numpy(entropy)
+            entropy = torch.from_numpy(entropy).to(torch.float16)
 
         characteristics = None
         if self.do_characteristics:
@@ -225,7 +230,7 @@ class Sample:
     file: StrPath
     name: Name
     label: IntTensor
-    inputs: IntTensor
+    inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
     guides: SemanticGuides
     structure: StructureMap
 
@@ -238,7 +243,7 @@ class BatchedSamples:
     file: list[StrPath]
     name: list[Name]
     label: IntTensor
-    inputs: IntTensor
+    inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
     guides: BatchedSemanticGuides
     structure: BatchedStructureMap
 
@@ -326,7 +331,7 @@ class CollateFn:
             file=[s.file for s in batch],
             name=[s.name for s in batch],
             label=torch.stack([s.label for s in batch]),
-            inputs=pad_sequence([s.inputs for s in batch], batch_first=True, padding_value=0),
+            inputs=pad_sequence([s.inputs.to(torch.int16) + 1 for s in batch], batch_first=True, padding_value=0),
             guides=BatchedSemanticGuides.from_singles([s.guides for s in batch]),
             structure=BatchedStructureMap.from_singles([s.structure for s in batch]),
         )
