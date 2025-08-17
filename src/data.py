@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
+import lief
 import torch
 from torch import BoolTensor
 from torch import HalfTensor
@@ -26,6 +27,8 @@ from torch import LongTensor
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
+from src.binanal import _parse_pe_and_get_size
+from src.binanal import _get_size_of_liefparse
 from src.binanal import LiefParse
 from src.binanal import ParserGuider
 from src.binanal import CharacteristicGuider
@@ -123,20 +126,28 @@ class SemanticGuider:
         self.radius = radius
         self.simple = simple
 
-    def __call__(self, data: LiefParse) -> SemanticGuides:
+    def __call__(self, data: Optional[LiefParse | lief.PE.Binary], size: Optional[int] = None, inputs: Optional[torch.CharTensor] = None) -> SemanticGuides:
+        if not any((self.do_parse, self.do_entropy, self.do_characteristics)):
+            return SemanticGuides()
+
+        if data is None:
+            raise ValueError("Data must be provided for semantic guides.")
+
         parse = None
         if self.do_parse:
-            parse = ParserGuider(data)(simple=self.simple)
+            parse = ParserGuider(data, size)(simple=self.simple)
             parse = torch.from_numpy(parse)
 
         entropy = None
         if self.do_entropy:
-            entropy = EntropyGuider(data)(radius=self.radius)      # 64-bit is fastest for computation.
+            # TODO: clean this up.
+            inputs = inputs.clone().numpy() if inputs is not None else data
+            entropy = EntropyGuider(inputs)(radius=self.radius)      # 64-bit is fastest for computation.
             entropy = torch.from_numpy(entropy).to(torch.float16)  # 16-bit is fastest for GPU transfer.
 
         characteristics = None
         if self.do_characteristics:
-            characteristics = CharacteristicGuider(data)()
+            characteristics = CharacteristicGuider(data, size)()
             characteristics = torch.from_numpy(characteristics)
 
         return SemanticGuides(parse, entropy, characteristics)
@@ -201,8 +212,17 @@ class StructurePartitioner:
     def __init__(self, level: HierarchicalLevel = HierarchicalLevel.NONE) -> None:
         self.level = level
 
-    def __call__(self, data: LiefParse) -> StructureMap:
-        parser = StructureParser(data)
+    def __call__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> StructureMap:
+        if self.level == HierarchicalLevel.NONE:
+            size = _get_size_of_liefparse(data) if size is None else size
+            index = torch.full((size, 1), dtype=bool, fill_value=True)
+            lexicon = {0: HierarchicalStructureNone.ANY}
+            return StructureMap(index, lexicon)
+
+        if data is None:
+            raise ValueError("Data must be provided for structure partitioning.")
+
+        parser = StructureParser(data, size)
 
         if self.level == HierarchicalLevel.NONE:
             structures = list(HierarchicalStructureNone)
@@ -304,13 +324,24 @@ class Preprocessor:
         do_characteristics: bool = True,
         level: HierarchicalLevel | str = HierarchicalLevel.NONE,
     ) -> None:
+        self.do_parser = do_parser
+        self.do_entropy = do_entropy
+        self.do_characteristics = do_characteristics
+        self.level = HierarchicalLevel(level)
         self.guider = SemanticGuider(do_parser, do_entropy, do_characteristics)
         self.partitioner = StructurePartitioner(HierarchicalLevel(level))
 
     def __call__(self, mv: memoryview, file: StrPath) -> tuple[IntTensor, SemanticGuides, StructureMap]:
         inputs = torch.frombuffer(mv, dtype=torch.uint8)
-        guides = self.guider(file)
-        structure = self.partitioner(file)
+
+        if self.do_parser or self.do_entropy or self.do_characteristics or self.level != HierarchicalLevel.NONE:
+            pe, size = _parse_pe_and_get_size(file)
+        else:
+            pe, size = None, os.path.getsize(file)
+
+        guides = self.guider(pe, size, inputs)
+        structure = self.partitioner(pe, size)
+
         return inputs, guides, structure
 
 
