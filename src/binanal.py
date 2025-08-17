@@ -363,8 +363,8 @@ class EntropyGuider:
     # -----------------------------
     @staticmethod
     def compute_entropy_scipy(x: npt.NDArray[np.uint8], radius: int, dtype: npt.DTypeLike = np.float64, epsilon: float = 1e-7) -> npt.NDArray[NPFloat]:
-        if radius <= 0 or len(x) <= 0:
-            raise ValueError(f"The `radius` must be > 0 and `x` must not be empty. Got radius {radius} and length of x {len(x)}.")
+        if radius <= 0 or len(x) <= radius:
+            raise ValueError(f"The `radius` must be > 0 and `x` must be larger than the radius. Got radius {radius} and length of x {len(x)}.")
 
         n = int(x.size)
         W = 2 * radius + 1
@@ -380,8 +380,8 @@ class EntropyGuider:
     # -----------------------------
     @staticmethod
     def compute_entropy(x: npt.NDArray[np.uint8], radius: int, dtype: npt.DTypeLike = np.float64, epsilon: float = 1e-7) -> npt.NDArray[NPFloat]:
-        if radius <= 0 or len(x) <= 0:
-            raise ValueError(f"The `radius` must be > 0 and `x` must not be empty. Got radius {radius} and length of x {len(x)}.")
+        if radius <= 0 or len(x) <= radius:
+            raise ValueError(f"The `radius` must be > 0 and `x` must be larger than the radius. Got radius {radius} and length of x {len(x)}.")
 
         n = int(x.size)
         W = 2 * radius + 1
@@ -399,8 +399,8 @@ class EntropyGuider:
     # -----------------------------
     @staticmethod
     def compute_entropy_rolling(x: npt.NDArray[np.uint8], radius: int, dtype: npt.DTypeLike = np.float64, epsilon: float = 1e-7) -> npt.NDArray[NPFloat]:
-        if radius <= 0 or len(x) <= 0:
-            raise ValueError(f"The `radius` must be > 0 and `x` must not be empty. Got radius {radius} and length of x {len(x)}.")
+        if radius <= 0 or len(x) <= radius:
+            raise ValueError(f"The `radius` must be > 0 and `x` must be larger than the radius. Got radius {radius} and length of x {len(x)}.")
         if dtype == np.float16:
             warnings.warn(f"compute_entropy_rolling with dtype=float16 often overflows.")
 
@@ -438,8 +438,8 @@ class EntropyGuider:
     # -----------------------------
     @staticmethod
     def compute_histogram_entropy(x: npt.NDArray[np.uint8], radius: int, dtype: npt.DTypeLike = np.float64) -> npt.NDArray[NPFloat]:
-        if radius <= 0 or len(x) <= 0:
-            raise ValueError(f"The `radius` must be > 0 and `x` must not be empty. Got radius {radius} and length of x {len(x)}.")
+        if radius <= 0 or len(x) <= radius:
+            raise ValueError(f"The `radius` must be > 0 and `x` must be larger than the radius. Got radius {radius} and length of x {len(x)}.")
 
         n = int(x.size)
         W = 2 * radius + 1
@@ -462,8 +462,8 @@ class EntropyGuider:
     @staticmethod
     @nb.njit(cache=True, nogil=True, fastmath=True)  # type: ignore[misc]
     def compute_histogram_entropy_rolling(x: npt.NDArray[np.uint8], radius: int, dtype: npt.DTypeLike = np.float64) -> npt.NDArray[NPFloat]:
-        if radius <= 0 or len(x) <= 0:
-            raise ValueError(f"The `radius` must be > 0 and `x` must not be empty. Got radius {radius} and length of x {len(x)}.")
+        if radius <= 0 or len(x) <= radius:
+            raise ValueError(f"The `radius` must be > 0 and `x` must be larger than the radius. Got radius {radius} and length of x {len(x)}.")
 
         n = int(x.size)
         W = 2 * radius + 1

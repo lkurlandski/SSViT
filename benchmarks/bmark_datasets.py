@@ -81,8 +81,8 @@ def main() -> None:
     d["config"]["device"] = str(device)
 
     # Compile the numba
-    EntropyGuider(np.zeros(1, np.uint8))(dtype=np.float64)
-    EntropyGuider(np.zeros(1, np.uint8))(dtype=np.float32)
+    EntropyGuider(np.zeros(1024, np.uint8))(dtype=np.float64)
+    EntropyGuider(np.zeros(1024, np.uint8))(dtype=np.float32)
     # EntropyGuider(np.zeros(1, np.uint8))(dtype=np.float16)
 
     preprocessor = Preprocessor(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics, level=args.level)
