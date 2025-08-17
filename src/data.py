@@ -8,10 +8,12 @@ from collections.abc import Mapping
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+from dataclasses import replace
 import mmap
 import os
 from pathlib import Path
 from typing import Optional
+from typing import Self
 
 import lief
 import torch
@@ -74,18 +76,28 @@ class SemanticGuides:
         if len(set(lengths)) > 1:
             raise ValueError(f"All non-None guides must have the same length. Got lengths: {lengths}")
 
-    def clone(self) -> SemanticGuides:
-        return SemanticGuides(
-            self.parse.clone() if self.parse is not None else None,
-            self.entropy.clone() if self.entropy is not None else None,
-            self.characteristics.clone() if self.characteristics is not None else None,
+    def clone(self) -> Self:
+        return replace(
+            self,
+            parse=self.parse.clone() if self.parse is not None else None,
+            entropy=self.entropy.clone() if self.entropy is not None else None,
+            characteristics=self.characteristics.clone() if self.characteristics is not None else None,
         )
 
-    def to(self, device: torch.device) -> SemanticGuides:
-        return SemanticGuides(
-            self.parse.to(device) if self.parse is not None else None,
-            self.entropy.to(device) if self.entropy is not None else None,
-            self.characteristics.to(device) if self.characteristics is not None else None,
+    def to(self, device: torch.device, non_blocking: bool = False) -> Self:
+        return replace(
+            self,
+            parse=self.parse.to(device, non_blocking=non_blocking) if self.parse is not None else None,
+            entropy=self.entropy.to(device, non_blocking=non_blocking) if self.entropy is not None else None,
+            characteristics=self.characteristics.to(device, non_blocking=non_blocking) if self.characteristics is not None else None,
+        )
+
+    def pin_memory(self) -> Self:
+        return replace(
+            self,
+            parse=self.parse.pin_memory() if self.parse is not None else None,
+            entropy=self.entropy.pin_memory() if self.entropy is not None else None,
+            characteristics=self.characteristics.pin_memory() if self.characteristics is not None else None,
         )
 
 
@@ -174,13 +186,26 @@ class StructureMap:
         if self.index.shape[1] != len(list(self.lexicon.keys())):
             raise ValueError("StructureMap index does not match lexicon keys.")
 
-    def clone(self) -> StructureMap:
-        cls = type(self)
-        return cls(self.index.clone(), self.lexicon)
+    def clone(self) -> Self:
+        return replace(
+            self,
+            index=self.index.clone(),
+            lexicon=deepcopy(self.lexicon),
+        )
 
-    def to(self, device: torch.device) -> StructureMap:
-        cls = type(self)
-        return cls(self.index.to(device), self.lexicon)
+    def to(self, device: torch.device, non_blocking: bool = False) -> Self:
+       return replace(
+            self,
+            index=self.index.to(device, non_blocking=non_blocking),
+            lexicon=deepcopy(self.lexicon),
+        )
+
+    def pin_memory(self) -> Self:
+        return replace(
+            self,
+            index=self.index.pin_memory(),
+            lexicon=deepcopy(self.lexicon),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,7 +282,41 @@ class Sample:
     def __iter__(self) -> Iterable[tuple[StrPath, Name, IntTensor, IntTensor, SemanticGuides, StructureMap]]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
 
+    def clone(self) -> Self:
+        return replace(
+            self,
+            file=deepcopy(self.file),
+            name=deepcopy(self.name),
+            label=self.label.clone(),
+            inputs=self.inputs.clone(),
+            guides=self.guides.clone(),
+            structure=self.structure.clone(),
+        )
 
+    def to(self, device: torch.device, non_blocking: bool = False) -> Self:
+        return replace(
+            self,
+            file=self.file,
+            name=self.name,
+            label=self.label.to(device, non_blocking=non_blocking),
+            inputs=self.inputs.to(device, non_blocking=non_blocking),
+            guides=self.guides.to(device, non_blocking=non_blocking),
+            structure=self.structure.to(device, non_blocking=non_blocking),
+        )
+
+    def pin_memory(self) -> Self:
+        return replace(
+            self,
+            file=self.file,
+            name=self.name,
+            label=self.label.pin_memory(),
+            inputs=self.inputs.pin_memory(),
+            guides=self.guides.pin_memory(),
+            structure=self.structure.pin_memory(),
+        )
+
+
+# TODO: make this inherit from Sample
 @dataclass(frozen=True, slots=True)
 class BatchedSamples:
     file: list[StrPath]
@@ -269,6 +328,39 @@ class BatchedSamples:
 
     def __iter__(self) -> Iterable[tuple[list[StrPath], list[Name], IntTensor, IntTensor, BatchedSemanticGuides, BatchedStructureMap]]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
+
+    def clone(self) -> Self:
+        return replace(
+            self,
+            file=deepcopy(self.file),
+            name=deepcopy(self.name),
+            label=self.label.clone(),
+            inputs=self.inputs.clone(),
+            guides=self.guides.clone(),
+            structure=self.structure.clone(),
+        )
+
+    def to(self, device: torch.device, non_blocking: bool = False) -> Self:
+        return replace(
+            self,
+            file=self.file,
+            name=self.name,
+            label=self.label.to(device, non_blocking=non_blocking),
+            inputs=self.inputs.to(device, non_blocking=non_blocking),
+            guides=self.guides.to(device, non_blocking=non_blocking),
+            structure=self.structure.to(device, non_blocking=non_blocking),
+        )
+
+    def pin_memory(self) -> Self:
+        return replace(
+            self,
+            file=self.file,
+            name=self.name,
+            label=self.label.pin_memory(),
+            inputs=self.inputs.pin_memory(),
+            guides=self.guides.pin_memory(),
+            structure=self.structure.pin_memory(),
+        )
 
 
 class BinaryDataset(Dataset):
@@ -287,7 +379,7 @@ class BinaryDataset(Dataset):
         file = self.files[i]
         name = Name(file)
         label = torch.tensor(self.labels[i])
-        # inputs, guides, structure = self.preprocessor(Path(file).read_bytes(), file)
+        # inputs, guides, structure = self.preprocessor(file)
 
         with open(file, "rb") as fp:
             with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -332,6 +424,7 @@ class Preprocessor:
         self.partitioner = StructurePartitioner(HierarchicalLevel(level))
 
     def __call__(self, mv: memoryview, file: StrPath) -> tuple[IntTensor, SemanticGuides, StructureMap]:
+        # inputs = torch.from_file(str(file), shared=False, size=os.path.getsize(file), dtype=torch.uint8)
         inputs = torch.frombuffer(mv, dtype=torch.uint8)
 
         if self.do_parser or self.do_entropy or self.do_characteristics or self.level != HierarchicalLevel.NONE:
