@@ -38,6 +38,7 @@ def main() -> None:
     parser = ArgumentParser()
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--shuffle", action="store_true")
+    parser.add_argument("--level", type=HierarchicalLevel, default=HierarchicalLevel.FINE)
     parser.add_argument("--no_parser", action="store_false", dest="do_parser")
     parser.add_argument("--no_entropy", action="store_false", dest="do_entropy")
     parser.add_argument("--no_characteristics", action="store_false", dest="do_characteristics")
@@ -53,9 +54,13 @@ def main() -> None:
     d: dict[str, dict[str, float]] = {}
 
     print("Arguments:")
-    print(f" Batch size:  {args.batch_size}")
-    print(f" Num workers: {args.num_workers}")
-    print(f" Device:      {device}")
+    print(f" Batch size:      {args.batch_size}")
+    print(f" Num workers:     {args.num_workers}")
+    print(f" Device:          {device}")
+    print(f" Level:           {args.level}")
+    print(f" Parser:          {args.do_parser}")
+    print(f" Entropy:         {args.do_entropy}")
+    print(f" Characteristics: {args.do_characteristics}")
 
     files: list[Path] = sorted(f for f in args.input.rglob("*") if f.is_file())
     if args.shuffle:
@@ -80,7 +85,7 @@ def main() -> None:
     EntropyGuider(np.zeros(1, np.uint8))(dtype=np.float32)
     # EntropyGuider(np.zeros(1, np.uint8))(dtype=np.float16)
 
-    preprocessor = Preprocessor(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics, level=HierarchicalLevel.FINE)
+    preprocessor = Preprocessor(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics, level=args.level)
     dataset = BinaryDataset(files, labels, preprocessor=preprocessor)
     collate_fn = CollateFn(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics)
     dataloader = DataLoader(dataset, args.batch_size, True, num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True)
