@@ -281,6 +281,28 @@ def _parse_pe_and_get_size(data: LiefParse | lief.PE.Binary, size: Optional[int]
     return pe, sz
 
 
+def _get_size_of_liefparse(data: LiefParse) -> int:
+
+    sz: Optional[int] = None
+
+    if isinstance(data, (str, os.PathLike)):
+        sz = os.path.getsize(data)
+    elif isinstance(data, (memoryview, bytes, bytearray, list)):
+        sz = len(data)
+    elif isinstance(data, io.IOBase):
+        warnings.warn("Using io.IOBase, size will be determined by seeking to the end. This has not been tested.")
+        data.seek(0, io.SEEK_END)
+        sz = data.tell()
+        data.seek(0, io.SEEK_SET)
+    else:
+        raise TypeError(f"Unsupported input type {type(data)}.")
+
+    if sz is None:
+        raise RuntimeError(f"Size must be provided when data is {type(data)}.")
+
+    return sz
+
+
 class CharacteristicGuider:
 
     CHARACTERISTICS = [
@@ -526,9 +548,9 @@ class ParserGuider:
     ]
     PARSEERRORS = [Exception]  # FIXME: remove.
 
-    def __init__(self, data: LiefParse | lief.PE.Binary) -> None:
+    def __init__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> None:
         warnings.warn("ParserGuider not yet fully operational. All errors marked in same channel.")
-        self.pe, self.size = _parse_pe_and_get_size(data)
+        self.pe, self.size = _parse_pe_and_get_size(data, size)
         self.guide = np.zeros((self.size, len(ParserGuider.PARSEERRORS)), dtype=bool)
 
     def __call__(self, simple: bool) -> npt.NDArray[np.bool_]:
