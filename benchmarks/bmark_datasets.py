@@ -37,6 +37,7 @@ def main() -> None:
 
     parser = ArgumentParser()
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--no_parser", action="store_false", dest="do_parser")
     parser.add_argument("--no_entropy", action="store_false", dest="do_entropy")
     parser.add_argument("--no_characteristics", action="store_false", dest="do_characteristics")
@@ -57,7 +58,8 @@ def main() -> None:
     print(f" Device:      {device}")
 
     files: list[Path] = sorted(f for f in args.input.rglob("*") if f.is_file())
-    random.shuffle(files)
+    if args.shuffle:
+        random.shuffle(files)
     files = files[0:args.num_samples]
     num_samples = len(files)
     labels = [-1] * len(files)
@@ -73,7 +75,11 @@ def main() -> None:
     d["config"]["num_samples"] = num_samples
     d["config"]["device"] = str(device)
 
-    _ = EntropyGuider(np.zeros(1, np.uint8))()  # Compile the numba code
+    # Compile the numba
+    EntropyGuider(np.zeros(1, np.uint8))(dtype=np.float64)
+    EntropyGuider(np.zeros(1, np.uint8))(dtype=np.float32)
+    # EntropyGuider(np.zeros(1, np.uint8))(dtype=np.float16)
+
     preprocessor = Preprocessor(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics, level=HierarchicalLevel.FINE)
     dataset = BinaryDataset(files, labels, preprocessor=preprocessor)
     collate_fn = CollateFn(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics)
