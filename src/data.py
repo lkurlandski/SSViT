@@ -64,23 +64,10 @@ class Name(str):
 
 
 @dataclass(frozen=True, slots=True)
-class SemanticGuides:
-    """
-    Semantic guides to acompany a byte stream.
-
-    Attrs:
-        parse (Optional[BoolTensor]): A boolean tensor of shape (T, *).
-        entropy (Optional[DoubleTensor]): A float tensor of shape (T,).
-        characteristics (Optional[BoolTensor]): A boolean tensor of shape (T, *).
-    """
+class _SemanticGuideOrSemanticGuides(ABC):
     parse: Optional[BoolTensor] = None
     entropy: Optional[HalfTensor | FloatTensor | DoubleTensor] = None
     characteristics: Optional[BoolTensor] = None
-
-    def __post_init__(self) -> None:
-        lengths = [x.shape[0] for x in (self.parse, self.entropy, self.characteristics) if x is not None]
-        if len(set(lengths)) > 1:
-            raise ValueError(f"All non-None guides must have the same length. Got lengths: {lengths}")
 
     def clone(self) -> Self:
         return replace(
@@ -107,8 +94,15 @@ class SemanticGuides:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class BatchedSemanticGuides(SemanticGuides):
+class SemanticGuide(_SemanticGuideOrSemanticGuides):
+
+    def __post_init__(self) -> None:
+        lengths = [x.shape[0] for x in (self.parse, self.entropy, self.characteristics) if x is not None]
+        if len(set(lengths)) > 1:
+            raise ValueError(f"All non-None guides must have the same length. Got lengths: {lengths}")
+
+
+class SemanticGuides(_SemanticGuideOrSemanticGuides):
 
     def __post_init__(self) -> None:
         lengths = [x.shape[1] for x in (self.parse, self.entropy, self.characteristics) if x is not None]
@@ -116,9 +110,9 @@ class BatchedSemanticGuides(SemanticGuides):
             raise ValueError(f"All non-None guides must have the same length. Got lengths: {lengths}")
 
     @classmethod
-    def from_singles(cls, guides: Sequence[SemanticGuides], pin_memory: bool = False) -> BatchedSemanticGuides:
+    def from_singles(cls, guides: Sequence[SemanticGuide], pin_memory: bool = False) -> SemanticGuides:
         if len(guides) == 0:
-            raise ValueError("Cannot create BatchedSemanticMap from empty list.")
+            raise ValueError("Cannot create Guides from empty list.")
 
         parse = None
         if guides[0].parse is not None:
@@ -144,9 +138,9 @@ class SemanticGuider:
         self.radius = radius
         self.simple = simple
 
-    def __call__(self, data: Optional[LiefParse | lief.PE.Binary], size: Optional[int] = None, inputs: Optional[torch.CharTensor] = None) -> SemanticGuides:
+    def __call__(self, data: Optional[LiefParse | lief.PE.Binary], size: Optional[int] = None, inputs: Optional[torch.CharTensor] = None) -> SemanticGuide:
         if not any((self.do_parse, self.do_entropy, self.do_characteristics)):
-            return SemanticGuides()
+            return SemanticGuide()
 
         if data is None:
             raise ValueError("Data must be provided for semantic guides.")
@@ -168,29 +162,13 @@ class SemanticGuider:
             characteristics = CharacteristicGuider(data, size)()
             characteristics = torch.from_numpy(characteristics)
 
-        return SemanticGuides(parse, entropy, characteristics)
+        return SemanticGuide(parse, entropy, characteristics)
 
 
 @dataclass(frozen=True, slots=True)
-class StructureMap:
-    """
-    Maps hierarchical structures to byte positions in a binary.
-
-    Attrs:
-        index (BoolTensor): A binary matrix of shape (T,*)
-            indicating which bytes belong to which structures.
-        lexicon (Mapping[int, HierarchicalStructure]): A mapping indicating which column
-            in the index corresponds to which structure.
-    """
-
+class _StructureMapOrStructureMaps(ABC):
     index: BoolTensor
     lexicon: Mapping[int, HierarchicalStructure]
-
-    def __post_init__(self) -> None:
-        if self.index.dim() != 2:
-            raise ValueError("StructureMap index must be a 2D tensor.")
-        if self.index.shape[1] != len(list(self.lexicon.keys())):
-            raise ValueError("StructureMap index does not match lexicon keys.")
 
     def clone(self) -> Self:
         return replace(
@@ -214,8 +192,16 @@ class StructureMap:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class BatchedStructureMap(StructureMap):
+class StructureMap(_StructureMapOrStructureMaps):
+
+    def __post_init__(self) -> None:
+        if self.index.dim() != 2:
+            raise ValueError("StructureMap index must be a 2D tensor.")
+        if self.index.shape[1] != len(list(self.lexicon.keys())):
+            raise ValueError("StructureMap index does not match lexicon keys.")
+
+
+class StructureMaps(_StructureMapOrStructureMaps):
 
     def __post_init__(self) -> None:
         if self.index.dim() != 3:
@@ -224,7 +210,7 @@ class BatchedStructureMap(StructureMap):
             raise ValueError("BatchedStructureMap index does not match lexicon keys.")
 
     @classmethod
-    def from_singles(cls, maps: Sequence[StructureMap], pin_memory: bool = False) -> BatchedStructureMap:
+    def from_singles(cls, maps: Sequence[StructureMap], pin_memory: bool = False) -> _StructureMapOrStructureMaps:
         if len(maps) == 0:
             raise ValueError("Cannot create BatchedStructureMap from empty list.")
         lexicon = maps[0].lexicon
@@ -282,8 +268,8 @@ class _SampleOrSamples(ABC):
     name: Name | list[Name]
     label: IntTensor
     inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
-    guides: SemanticGuides | BatchedSemanticGuides
-    structure: StructureMap | BatchedStructureMap
+    guides: _SemanticGuideOrSemanticGuides
+    structure: _StructureMapOrStructureMaps
 
     def __iter__(self) -> Iterable[tuple[StrPath, Name, IntTensor, IntTensor, SemanticGuides, StructureMap]]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
@@ -327,7 +313,7 @@ class Sample(_SampleOrSamples):
     name: Name
     label: IntTensor
     inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
-    guides: SemanticGuides
+    guides: SemanticGuide
     structure: StructureMap
 
     def __post__init__(self) -> None:
@@ -340,8 +326,8 @@ class Samples(_SampleOrSamples):
     name: list[Name]
     label: IntTensor
     inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
-    guides: BatchedSemanticGuides
-    structure: BatchedStructureMap
+    guides: SemanticGuides
+    structure: StructureMaps
 
     def __post__init__(self) -> None:
         check_tensor(self.label, (None,), torch.int)
@@ -451,8 +437,8 @@ class CollateFn:
             name=[s.name for s in batch],
             label=torch.stack([s.label for s in batch]),
             inputs=pad_sequence([s.inputs.to(torch.int16) + 1 for s in batch], True, 0, "right", self.pin_memory),
-            guides=BatchedSemanticGuides.from_singles([s.guides for s in batch], pin_memory=self.pin_memory),
-            structure=BatchedStructureMap.from_singles([s.structure for s in batch], pin_memory=self.pin_memory),
+            guides=SemanticGuides.from_singles([s.guides for s in batch], pin_memory=self.pin_memory),
+            structure=StructureMaps.from_singles([s.structure for s in batch], pin_memory=self.pin_memory),
         )
 
 
