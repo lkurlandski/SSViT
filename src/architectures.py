@@ -15,7 +15,7 @@ Notations:
 
 import math
 import sys
-from typing import Optional, Protocol
+from typing import Protocol
 
 import torch
 from torch import nn
@@ -24,27 +24,7 @@ from torch import IntTensor
 from torch import FloatTensor
 from torch.nn.utils.rnn import pad_sequence
 
-
-class TensorError(ValueError):
-    """
-    Exception raised when the shape of a tensor does not match the expected shape.
-    """
-
-    def __init__(self, x: Tensor, s: Optional[tuple[Optional[int], ...]], t: Optional[torch.dtype]) -> None:
-        super().__init__(
-            f"Expected tensor with dtype {t} and shape {s}. Got tensor with dtype {x.dtype} and shape {tuple(x.shape)}."
-        )
-
-    @staticmethod
-    def check(x: Tensor, s: Optional[tuple[Optional[int], ...]], t: Optional[torch.dtype]) -> None:
-        if t is not None and x.dtype != t:
-            raise TensorError(x, s, t)
-        if s is not None and len(x.shape) != len(s):
-            raise TensorError(x, s, t)
-        if s is not None:
-            for i, j in zip(x.shape, s, strict=True):
-                if j is not None and i != j:
-                    raise TensorError(x, s, t)
+from src.utils import TensorError
 
 
 class ClassifificationHead(nn.Module):

@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.binanal import HierarchicalLevel
 from src.binanal import EntropyGuider
-from src.data import BatchedSamples
+from src.data import Samples
 from src.data import BinaryDataset
 from src.data import CollateFn
 from src.data import Preprocessor
@@ -89,7 +89,7 @@ def main() -> None:
     dataset = BinaryDataset(files, labels, preprocessor=preprocessor)
     collate_fn = CollateFn(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics)
     dataloader = DataLoader(dataset, args.batch_size, True, num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True)
-    iterable: Iterable[BatchedSamples] = tqdm(enumerate(dataloader), leave=False, total=len(dataset) // args.batch_size)
+    iterable: Iterable[Samples] = tqdm(enumerate(dataloader), leave=False, total=len(dataset) // args.batch_size)
 
     start = time.time()
 

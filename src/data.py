@@ -3,6 +3,7 @@ Manage data and datasets.
 """
 
 from __future__ import annotations
+from abc import ABC
 from collections.abc import Iterable
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -12,6 +13,7 @@ from dataclasses import replace
 import mmap
 import os
 from pathlib import Path
+import sys
 from typing import Optional
 from typing import Self
 
@@ -29,6 +31,7 @@ from torch import LongTensor
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
+from src.utils import check_tensor
 from src.binanal import _parse_pe_and_get_size
 from src.binanal import _get_size_of_liefparse
 from src.binanal import LiefParse
@@ -271,13 +274,13 @@ class StructurePartitioner:
 
 
 @dataclass(frozen=True, slots=True)
-class Sample:
-    file: StrPath
-    name: Name
+class _SampleOrSamples(ABC):
+    file: StrPath | list[StrPath]
+    name: Name | list[Name]
     label: IntTensor
     inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
-    guides: SemanticGuides
-    structure: StructureMap
+    guides: SemanticGuides | BatchedSemanticGuides
+    structure: StructureMap | BatchedStructureMap
 
     def __iter__(self) -> Iterable[tuple[StrPath, Name, IntTensor, IntTensor, SemanticGuides, StructureMap]]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
@@ -316,9 +319,20 @@ class Sample:
         )
 
 
-# TODO: make this inherit from Sample
-@dataclass(frozen=True, slots=True)
-class BatchedSamples:
+class Sample(_SampleOrSamples):
+    file: StrPath
+    name: Name
+    label: IntTensor
+    inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
+    guides: SemanticGuides
+    structure: StructureMap
+
+    def __post__init__(self) -> None:
+        check_tensor(self.label, (), torch.int)
+        check_tensor(self.inputs, (None,), torch.int)
+
+
+class Samples(_SampleOrSamples):
     file: list[StrPath]
     name: list[Name]
     label: IntTensor
@@ -326,41 +340,9 @@ class BatchedSamples:
     guides: BatchedSemanticGuides
     structure: BatchedStructureMap
 
-    def __iter__(self) -> Iterable[tuple[list[StrPath], list[Name], IntTensor, IntTensor, BatchedSemanticGuides, BatchedStructureMap]]:
-        return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
-
-    def clone(self) -> Self:
-        return replace(
-            self,
-            file=deepcopy(self.file),
-            name=deepcopy(self.name),
-            label=self.label.clone(),
-            inputs=self.inputs.clone(),
-            guides=self.guides.clone(),
-            structure=self.structure.clone(),
-        )
-
-    def to(self, device: torch.device, non_blocking: bool = False) -> Self:
-        return replace(
-            self,
-            file=self.file,
-            name=self.name,
-            label=self.label.to(device, non_blocking=non_blocking),
-            inputs=self.inputs.to(device, non_blocking=non_blocking),
-            guides=self.guides.to(device, non_blocking=non_blocking),
-            structure=self.structure.to(device, non_blocking=non_blocking),
-        )
-
-    def pin_memory(self) -> Self:
-        return replace(
-            self,
-            file=self.file,
-            name=self.name,
-            label=self.label.pin_memory(),
-            inputs=self.inputs.pin_memory(),
-            guides=self.guides.pin_memory(),
-            structure=self.structure.pin_memory(),
-        )
+    def __post__init__(self) -> None:
+        check_tensor(self.label, (None,), torch.int)
+        check_tensor(self.inputs, (self.label.shape[0], None), torch.int)
 
 
 class BinaryDataset(Dataset):
@@ -450,8 +432,8 @@ class CollateFn:
         self.do_entropy = do_entropy
         self.do_characteristics = do_characteristics
 
-    def __call__(self, batch: Sequence[Sample]) -> BatchedSamples:
-        return BatchedSamples(
+    def __call__(self, batch: Sequence[Sample]) -> Samples:
+        return Samples(
             file=[s.file for s in batch],
             name=[s.name for s in batch],
             label=torch.stack([s.label for s in batch]),
