@@ -25,6 +25,7 @@ from torch import FloatTensor
 from torch.nn.utils.rnn import pad_sequence
 
 from src.utils import TensorError
+from src.utils import check_tensor
 
 
 class ClassifificationHead(nn.Module):  # type: ignore[misc]
@@ -74,7 +75,7 @@ class ClassifificationHead(nn.Module):  # type: ignore[misc]
         Returns:
             Output tensor of shape (B, M).
         """
-        TensorError.check(x, (None, self.input_size), torch.float)
+        check_tensor(x, (None, self.input_size), torch.float)
 
         z = self.layers.forward(x)
 
@@ -125,7 +126,7 @@ class MeanLatentPooler(nn.Module):  # type: ignore[misc]
         Returns:
             Output tensor of shape (B, E).
         """
-        TensorError.check(z, (None, None, None), torch.float)
+        check_tensor(z, (None, None, None), torch.float)
         return z.mean(dim=1)
 
 
@@ -158,7 +159,7 @@ class MultiChannelDiscreteEmbedding(nn.Module):  # type: ignore[misc]
             Output tensor of shape (B, T, E).
         """
         for x_ in x:
-            TensorError.check(x_, tuple(x[0].shape), torch.int64)
+            check_tensor(x_, tuple(x[0].shape), torch.int64)
 
         z = torch.cat([self.embedding[i].forward(x[i]) for i in range(len(x))], dim=-1)
 
@@ -202,7 +203,7 @@ class SequenceEmbeddingEncoder(nn.Module):  # type: ignore[misc]
         Returns:
             Output tensor of shape (B, N, C).
         """
-        TensorError.check(z, (None, None, None), torch.float)
+        check_tensor(z, (None, None, None), torch.float)
 
         B = z.shape[0]
         T = z.shape[1]
@@ -233,7 +234,7 @@ class SequenceEmbeddingEncoder(nn.Module):  # type: ignore[misc]
         Returns:
             Output tensor of shape (B, N, P, E).
         """
-        TensorError.check(z, (None, None, None), torch.float)
+        check_tensor(z, (None, None, None), torch.float)
 
         if z.shape[1] <= patch_size:
             return z.unsqueeze(1)
@@ -251,7 +252,7 @@ class SequenceEmbeddingEncoder(nn.Module):  # type: ignore[misc]
         Returns:
             Output tensor of shape (B, N, P, E).
         """
-        TensorError.check(z, (None, None, self.in_channels), torch.float)
+        check_tensor(z, (None, None, self.in_channels), torch.float)
         return self._split_patches(z, self.patch_size)
 
 
@@ -305,7 +306,7 @@ class MultiChannelDiscreteSequenceVisionTransformer(nn.Module):  # type: ignore[
             Output tensor of shape (B, M).
         """
         for x_ in x:
-            TensorError.check(x_, tuple(x[0].shape), torch.int64)
+            check_tensor(x_, tuple(x[0].shape), torch.int64)
 
         print(x[0].shape)
         z = self.embedding.forward(*x)  # (B, T, E)
@@ -363,7 +364,7 @@ class MultiChannelMalConv(nn.Module):  # type: ignore[misc]
             Output tensor of shape (B, M).
         """
         for x_ in x:
-            TensorError.check(x_, tuple(x[0].shape), torch.int64)
+            check_tensor(x_, tuple(x[0].shape), torch.int64)
 
         B = x[0].shape[0]
         T = x[0].shape[1]
