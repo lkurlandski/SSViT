@@ -361,28 +361,7 @@ class BinaryDataset(Dataset):
         file = self.files[i]
         name = Name(file)
         label = torch.tensor(self.labels[i])
-        # inputs, guides, structure = self.preprocessor(file)
-
-        with open(file, "rb") as fp:
-            with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                mv = memoryview(mm)
-                try:
-                    inputs, guides, structure = self.preprocessor(mv, file)
-                    # Detach references to the memoryview object. This is necessary to prevent Segmentation Faults.
-                    inputs = inputs.clone()
-                    # guides = SemanticGuides(
-                    #     guides.parse.clone() if guides.parse is not None else None,
-                    #     guides.entropy.clone() if guides.entropy is not None else None,
-                    #     guides.characteristics.clone() if guides.characteristics is not None else None,
-                    # )
-                    # structure = StructureMap(
-                    #     structure.index.clone(),
-                    #     deepcopy(structure.lexicon),
-                    # )
-                    # TODO: Can we move straight to GPU memory?
-                finally:
-                    mv.release()
-
+        inputs, guides, structure = self.preprocessor(file)
         return Sample(file, name, label, inputs, guides, structure)
 
     def __len__(self) -> int:
@@ -405,9 +384,17 @@ class Preprocessor:
         self.guider = SemanticGuider(do_parser, do_entropy, do_characteristics)
         self.partitioner = StructurePartitioner(HierarchicalLevel(level))
 
-    def __call__(self, mv: memoryview, file: StrPath) -> tuple[IntTensor, SemanticGuides, StructureMap]:
+    def __call__(self, file: StrPath) -> tuple[IntTensor, SemanticGuides, StructureMap]:
         # inputs = torch.from_file(str(file), shared=False, size=os.path.getsize(file), dtype=torch.uint8)
-        inputs = torch.frombuffer(mv, dtype=torch.uint8)
+
+        with open(file, "rb") as fp:
+            with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                mv = memoryview(mm)
+                try:
+                    inputs = torch.frombuffer(mv, dtype=torch.uint8)
+                    inputs = inputs.clone()  # Detach reference to the memoryview.
+                finally:
+                    mv.release()
 
         if self.do_parser or self.do_entropy or self.do_characteristics or self.level != HierarchicalLevel.NONE:
             pe, size = _parse_pe_and_get_size(file)
