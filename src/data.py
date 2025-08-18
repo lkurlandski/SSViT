@@ -14,11 +14,13 @@ import mmap
 import os
 from pathlib import Path
 import sys
+from typing import Literal
 from typing import Optional
 from typing import Self
 
 import lief
 import torch
+from torch import Tensor
 from torch import BoolTensor
 from torch import HalfTensor
 from torch import FloatTensor
@@ -29,7 +31,7 @@ from torch import ShortTensor
 from torch import IntTensor
 from torch import LongTensor
 from torch.utils.data import Dataset
-from torch.nn.utils.rnn import pad_sequence
+from torch.nn.utils.rnn import pad_sequence as _pad_sequence
 
 from src.utils import check_tensor
 from src.binanal import _parse_pe_and_get_size
@@ -113,19 +115,19 @@ class BatchedSemanticGuides(SemanticGuides):
             raise ValueError(f"All non-None guides must have the same length. Got lengths: {lengths}")
 
     @classmethod
-    def from_singles(cls, guides: Sequence[SemanticGuides]) -> BatchedSemanticGuides:
+    def from_singles(cls, guides: Sequence[SemanticGuides], pin_memory: bool = False) -> BatchedSemanticGuides:
         if len(guides) == 0:
             raise ValueError("Cannot create BatchedSemanticMap from empty list.")
 
         parse = None
         if guides[0].parse is not None:
-            parse = pad_sequence([g.parse for g in guides], batch_first=True, padding_value=False)
+            parse = pad_sequence([g.parse for g in guides], True, False, "right", pin_memory)
         entropy = None
         if guides[0].entropy is not None:
-            entropy = pad_sequence([g.entropy for g in guides], batch_first=True, padding_value=0.0)
+            entropy = pad_sequence([g.entropy for g in guides], True, 0.0, "right", pin_memory)
         characteristics = None
         if guides[0].characteristics is not None:
-            characteristics = pad_sequence([g.characteristics for g in guides], batch_first=True, padding_value=False)
+            characteristics = pad_sequence([g.characteristics for g in guides], True, False, "right", pin_memory)
         return cls(parse, entropy, characteristics)
 
 
@@ -221,14 +223,14 @@ class BatchedStructureMap(StructureMap):
             raise ValueError("BatchedStructureMap index does not match lexicon keys.")
 
     @classmethod
-    def from_singles(cls, maps: Sequence[StructureMap]) -> BatchedStructureMap:
+    def from_singles(cls, maps: Sequence[StructureMap], pin_memory: bool = False) -> BatchedStructureMap:
         if len(maps) == 0:
             raise ValueError("Cannot create BatchedStructureMap from empty list.")
         lexicon = maps[0].lexicon
         for m in maps[1:]:
             if m.lexicon != lexicon:
                 raise ValueError("All StructureMaps must have the same lexicon to be batched.")
-        index = pad_sequence([m.index for m in maps], batch_first=True, padding_value=False)
+        index = pad_sequence([m.index for m in maps], True, False, "right", pin_memory)
         return cls(index, lexicon)
 
 
@@ -407,24 +409,52 @@ class Preprocessor:
         return inputs, guides, structure
 
 
+def pad_sequence(
+    sequences: list[Tensor],
+    batch_first: bool = False,
+    padding_value: float | int | bool = 0.0,
+    padding_side: Literal["right", "left"] = "right",
+    pin_memory: bool = False,
+) -> Tensor:
+    if not pin_memory:
+        return _pad_sequence(sequences, batch_first, padding_value, padding_side)
+
+    if padding_side != "right":
+        raise NotImplementedError("pad_sequence with pin_memory=True requires padding_side='right'.")
+    if not batch_first:
+        raise NotImplementedError("pad_sequence with pin_memory=True requires batch_first=True.")
+
+    if len(sequences) == 0:
+        raise ValueError("Cannot pad an empty list of sequences.")
+    for s in sequences:
+        if s.device.type != "cpu":
+            raise ValueError("All sequences must be on CPU when pin_memory=True.")
+        if s.shape[1:] != sequences[0].shape[1:]:
+            raise ValueError("All sequences must have the same shape except for the first dimension.")
+        if s.dtype != sequences[0].dtype:
+            raise ValueError("All sequences must have the same dtype.")
+
+    size = tuple([len(sequences), max(s.shape[0] for s in sequences)] + list(sequences[0].shape[1:]))
+    dtype = sequences[0].dtype
+
+    padded = torch.full(size, fill_value=padding_value, dtype=dtype, pin_memory=True)
+    for i, s in enumerate(sequences):
+        s = s.contiguous() if not s.is_contiguous() else s
+        padded[i, :s.shape[0]].copy_(s)
+    return padded
+
+
 class CollateFn:
 
-    def __init__(
-        self,
-        do_parser: bool = True,
-        do_entropy: bool = True,
-        do_characteristics: bool = True,
-    ) -> None:
-        self.do_parser = do_parser
-        self.do_entropy = do_entropy
-        self.do_characteristics = do_characteristics
+    def __init__(self, pin_memory: bool) -> None:
+        self.pin_memory = pin_memory
 
     def __call__(self, batch: Sequence[Sample]) -> Samples:
         return Samples(
             file=[s.file for s in batch],
             name=[s.name for s in batch],
             label=torch.stack([s.label for s in batch]),
-            inputs=pad_sequence([s.inputs.to(torch.int16) + 1 for s in batch], batch_first=True, padding_value=0),
-            guides=BatchedSemanticGuides.from_singles([s.guides for s in batch]),
-            structure=BatchedStructureMap.from_singles([s.structure for s in batch]),
+            inputs=pad_sequence([s.inputs.to(torch.int16) + 1 for s in batch], True, 0, "right", self.pin_memory),
+            guides=BatchedSemanticGuides.from_singles([s.guides for s in batch], pin_memory=self.pin_memory),
+            structure=BatchedStructureMap.from_singles([s.structure for s in batch], pin_memory=self.pin_memory),
         )
