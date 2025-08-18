@@ -350,22 +350,13 @@ class Samples(_SampleOrSamples):
 
 class BinaryDataset(Dataset):
 
-    def __init__(
-        self,
-        files: Sequence[StrPath],
-        labels: Sequence[int],
-        preprocessor: Preprocessor,
-    ) -> None:
+    def __init__(self, files: Sequence[StrPath], labels: Sequence[int], preprocessor: Preprocessor) -> None:
         self.files = files
         self.labels = labels
         self.preprocessor = preprocessor
 
     def __getitem__(self, i: int) -> Sample:
-        file = self.files[i]
-        name = Name(file)
-        label = torch.tensor(self.labels[i])
-        inputs, guides, structure = self.preprocessor(file)
-        return Sample(file, name, label, inputs, guides, structure)
+        return self.preprocessor(self.files[i], self.labels[i])
 
     def __len__(self) -> int:
         return len(self.files)
@@ -387,7 +378,11 @@ class Preprocessor:
         self.guider = SemanticGuider(do_parser, do_entropy, do_characteristics)
         self.partitioner = StructurePartitioner(HierarchicalLevel(level))
 
-    def __call__(self, file: StrPath) -> tuple[IntTensor, SemanticGuides, StructureMap]:
+    def __call__(self, file: StrPath, label: int) -> Sample:
+        name = Name(file)
+        label = torch.tensor(label)
+
+        # TODO: experiment with using torch.from_file instead of mmap.
         # inputs = torch.from_file(str(file), shared=False, size=os.path.getsize(file), dtype=torch.uint8)
 
         with open(file, "rb") as fp:
@@ -407,7 +402,7 @@ class Preprocessor:
         guides = self.guider(pe, size, inputs)
         structure = self.partitioner(pe, size)
 
-        return inputs, guides, structure
+        return Sample(file, name, label, inputs, guides, structure)
 
 
 def pad_sequence(
