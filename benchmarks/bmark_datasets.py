@@ -87,9 +87,9 @@ def main() -> None:
 
     preprocessor = Preprocessor(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics, level=args.level)
     dataset = BinaryDataset(files, labels, preprocessor=preprocessor)
-    collate_fn = CollateFn(do_parser=args.do_parser, do_entropy=args.do_entropy, do_characteristics=args.do_characteristics)
-    dataloader = DataLoader(dataset, args.batch_size, True, num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True)
-    iterable: Iterable[Samples] = tqdm(enumerate(dataloader), leave=False, total=len(dataset) // args.batch_size)
+    collate_fn = CollateFn(pin_memory=True)
+    dataloader = DataLoader(dataset, args.batch_size, True, num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=False)
+    iterable: Iterable[tuple[int, Samples]] = tqdm(enumerate(dataloader), leave=False, total=len(dataset) // args.batch_size)
 
     start = time.time()
 
@@ -97,11 +97,14 @@ def main() -> None:
     for i, batch in iterable:
         files = batch.file
         names = batch.name
-        labels = batch.label.to(device)
-        inputs = batch.inputs.to(device)
-        guides = batch.guides.to(device)
-        structure = batch.structure.to(device)
+        labels = batch.label.to(device, non_blocking=True)
+        inputs = batch.inputs.to(device, non_blocking=True)
+        guides = batch.guides.to(device, non_blocking=True)
+        structure = batch.structure.to(device, non_blocking=True)
         mems.append(psutil.virtual_memory().used)
+        # del files, names, labels, inputs, guides, structure
+        # if (i * args.batch_size) % 256 == 0:
+        #     torch.cuda.empty_cache()
 
     end = time.time()
 
