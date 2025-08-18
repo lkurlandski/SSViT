@@ -466,6 +466,9 @@ class CUDAPrefetcher:
         self._preload()
         return batch
 
+    def __len__(self) -> int:
+        return len(self.loader)
+
     def _preload(self) -> None:
         try:
             batch = next(self.it)
