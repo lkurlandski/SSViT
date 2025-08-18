@@ -5,6 +5,7 @@ Manage data and datasets.
 from __future__ import annotations
 from abc import ABC
 from collections.abc import Iterable
+from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
 from copy import deepcopy
@@ -458,3 +459,35 @@ class CollateFn:
             guides=BatchedSemanticGuides.from_singles([s.guides for s in batch], pin_memory=self.pin_memory),
             structure=BatchedStructureMap.from_singles([s.structure for s in batch], pin_memory=self.pin_memory),
         )
+
+
+class CUDAPrefetcher:
+
+    def __init__(self, loader: Iterable[Samples], device: torch.device) -> None:
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream()
+        self.next_batch: Optional[Samples] = None
+
+    def __iter__(self) -> Iterator[Samples]:
+        self.it = iter(self.loader)
+        self.next_batch = None
+        self._preload()
+        return self
+
+    def __next__(self) -> Samples:
+        if self.next_batch is None:
+            raise StopIteration
+        torch.cuda.current_stream().wait_stream(self.stream)
+        batch = self.next_batch
+        self._preload()
+        return batch
+
+    def _preload(self) -> None:
+        try:
+            batch = next(self.it)
+        except StopIteration:
+            self.next_batch = None
+            return
+        with torch.cuda.stream(self.stream):
+            self.next_batch = batch.to(self.device, non_blocking=True)
