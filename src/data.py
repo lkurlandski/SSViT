@@ -286,6 +286,7 @@ class _SampleOrSamples(ABC):
         )
 
     def to(self, device: torch.device, non_blocking: bool = False) -> Self:
+        # No reason to move the structure map.
         return replace(
             self,
             file=self.file,
@@ -293,10 +294,11 @@ class _SampleOrSamples(ABC):
             label=self.label.to(device, non_blocking=non_blocking),
             inputs=self.inputs.to(device, non_blocking=non_blocking),
             guides=self.guides.to(device, non_blocking=non_blocking),
-            structure=self.structure.to(device, non_blocking=non_blocking),
+            structure=self.structure,
         )
 
     def pin_memory(self) -> Self:
+        # No reason to move the structure map.
         return replace(
             self,
             file=self.file,
@@ -304,7 +306,7 @@ class _SampleOrSamples(ABC):
             label=self.label.pin_memory(),
             inputs=self.inputs.pin_memory(),
             guides=self.guides.pin_memory(),
-            structure=self.structure.pin_memory(),
+            structure=self.structure,
         )
 
 
