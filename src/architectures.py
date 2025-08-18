@@ -27,7 +27,7 @@ from torch.nn.utils.rnn import pad_sequence
 from src.utils import TensorError
 
 
-class ClassifificationHead(nn.Module):
+class ClassifificationHead(nn.Module):  # type: ignore[misc]
     """
     Classification head for a neural network.
     """
@@ -113,7 +113,7 @@ class LatentPooler(Protocol):
         ...
 
 
-class MeanLatentPooler(nn.Module):
+class MeanLatentPooler(nn.Module):  # type: ignore[misc]
     """
     Mean pooling layer for latent representations.
     """
@@ -129,7 +129,7 @@ class MeanLatentPooler(nn.Module):
         return z.mean(dim=1)
 
 
-class MultiChannelDiscreteEmbedding(nn.Module):
+class MultiChannelDiscreteEmbedding(nn.Module):  # type: ignore[misc]
     """
     Multi-channel embedding layer for discrete sequence inputs.
     """
@@ -165,7 +165,7 @@ class MultiChannelDiscreteEmbedding(nn.Module):
         return z
 
 
-class SequenceEmbeddingEncoder(nn.Module):
+class SequenceEmbeddingEncoder(nn.Module):  # type: ignore[misc]
     """
     Patch embedding layer for discrete sequence inputs.
     """
@@ -255,7 +255,7 @@ class SequenceEmbeddingEncoder(nn.Module):
         return self._split_patches(z, self.patch_size)
 
 
-class MultiChannelDiscreteSequenceVisionTransformer(nn.Module):
+class MultiChannelDiscreteSequenceVisionTransformer(nn.Module):  # type: ignore[misc]
     """
     Vision Transformer for discrete sequential inputs.
     """
@@ -317,7 +317,7 @@ class MultiChannelDiscreteSequenceVisionTransformer(nn.Module):
         return z
 
 
-class MultiChannelMalConv(nn.Module):
+class MultiChannelMalConv(nn.Module):  # type: ignore[misc]
     """
     MalConv model for discrete sequential inputs.
     """

@@ -336,7 +336,7 @@ class Samples(_SampleOrSamples):
         check_tensor(self.inputs, (self.label.shape[0], None), torch.int)
 
 
-class BinaryDataset(Dataset):
+class BinaryDataset(Dataset):  # type: ignore[misc]
 
     def __init__(self, files: Sequence[StrPath], labels: Sequence[int], preprocessor: Preprocessor) -> None:
         self.files = files
