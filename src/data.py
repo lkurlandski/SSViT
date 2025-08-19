@@ -41,7 +41,6 @@ from src.binanal import _get_size_of_liefparse
 from src.binanal import LiefParse
 from src.binanal import ParserGuider
 from src.binanal import CharacteristicGuider
-from src.binanal import EntropyGuider
 from src.binanal import StructureParser
 from src.binanal import HierarchicalLevel
 from src.binanal import HierarchicalStructure
@@ -49,6 +48,7 @@ from src.binanal import HierarchicalStructureCoarse
 from src.binanal import HierarchicalStructureFine
 from src.binanal import HierarchicalStructureMiddle
 from src.binanal import HierarchicalStructureNone
+from src.binentropy import compute_entropy_rolling_numpy
 
 
 StrPath = str | os.PathLike[str]
@@ -171,10 +171,13 @@ class SemanticGuider:
 
         entropy = None
         if self.do_entropy:
-            # TODO: clean this up.
-            inputs = inputs.clone().numpy() if inputs is not None else data
-            entropy = EntropyGuider(inputs)(radius=self.radius)      # 64-bit is fastest for computation.
-            entropy = torch.from_numpy(entropy).to(torch.float16)  # 16-bit is fastest for GPU transfer.
+            if inputs is None:
+                raise RuntimeError("Inputs must be provided for entropy computation.")
+            # NOTE: computing entropy with JIT-based numba is faster than torch.
+            # TODO: there may be a better way to prevent additional data copying.
+            inputs = inputs.numpy(force=True)
+            entropy = compute_entropy_rolling_numpy(inputs, self.radius)
+            entropy = torch.from_numpy(entropy).to(torch.float16)
 
         characteristics = None
         if self.do_characteristics:

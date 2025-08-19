@@ -14,11 +14,9 @@ import pytest
 
 from src.binanal import patch_binary
 from src.binanal import ParserGuider
-from src.binanal import EntropyGuider
 from src.binanal import CharacteristicGuider
 from src.binanal import StructureParser
 from src.binanal import BinaryCreator
-from src.binanal import NPFloat
 
 from tests import FILES
 
@@ -140,89 +138,6 @@ class TestParserGuider:
         assert g.ndim == 2
         assert g.shape[0] == os.path.getsize(file)
         assert g.shape[1] == len(ParserGuider.PARSEERRORS)
-
-
-class TestEntropyGuider:
-
-    def _check_entropy(self, h: npt.NDArray[NPFloat], b: npt.NDArray[np.uint8], radius: int, dtype: npt.DTypeLike) -> None:
-        assert h.ndim == 1
-        assert h.shape[0] == len(b)
-        assert np.all(np.isnan(h[:radius])) or radius == 0
-        assert np.all(np.isnan(h[-radius:])) or radius == 0
-        assert np.all(np.isfinite(h[radius:-radius]))
-        assert h.dtype == dtype
-
-    @pytest.mark.parametrize("radius", [1, 2, 16, 32, 64])
-    @pytest.mark.parametrize("size", [1024, 4096, 16384])
-    @pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
-    def test_compute_entropy_scipy(self, radius: int, size: int, dtype: npt.DTypeLike) -> None:
-        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
-        h = EntropyGuider.compute_entropy_scipy(b, radius, dtype)
-        self._check_entropy(h, b, radius, dtype)
-
-    @pytest.mark.parametrize("radius", [1, 2, 16, 32, 64])
-    @pytest.mark.parametrize("size", [1024, 4096, 16384])
-    @pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
-    def test_compute_entropy(self, radius: int, size: int, dtype: npt.DTypeLike) -> None:
-        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
-        h = EntropyGuider.compute_entropy(b, radius, dtype)
-        self._check_entropy(h, b, radius, dtype)
-
-    @pytest.mark.parametrize("radius", [1, 2, 16, 32, 64])
-    @pytest.mark.parametrize("size", [1024, 4096, 16384, 2 ** 24])
-    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-    def test_compute_entropy_rolling(self, radius: int, size: int, dtype: npt.DTypeLike) -> None:
-        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
-        h = EntropyGuider.compute_entropy_rolling(b, radius, dtype)
-        self._check_entropy(h, b, radius, dtype)
-
-    @pytest.mark.parametrize("radius", [1, 2, 16, 32, 64])
-    @pytest.mark.parametrize("size", [1024, 4096, 16384])
-    @pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
-    def test_compute_histogram_entropy(self, radius: int, size: int, dtype: npt.DTypeLike) -> None:
-        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
-        h = EntropyGuider.compute_histogram_entropy(b, radius, dtype)
-        self._check_entropy(h, b, radius, dtype)
-
-    @pytest.mark.parametrize("radius", [1, 2, 16, 32, 64])
-    @pytest.mark.parametrize("size", [1024, 4096, 16384, 2 ** 24])
-    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-    def test_compute_histogram_entropy_rolling(self, radius: int, size: int, dtype: npt.DTypeLike) -> None:
-        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
-        h = EntropyGuider.compute_histogram_entropy_rolling(b, radius, dtype)
-        self._check_entropy(h, b, radius, dtype)
-
-    @pytest.mark.parametrize("radius", [1, 2, 16])
-    @pytest.mark.parametrize("size", [1024, 4096])
-    @pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
-    def test_equivalence_compute_entropy(self, radius: int, size: int, dtype: npt.DTypeLike) -> None:
-        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
-        h_0 = EntropyGuider.compute_entropy_scipy(b, radius, dtype)
-        h_1 = EntropyGuider.compute_entropy(b, radius, dtype)
-        atol = 1e-8 if dtype == np.float64 else 1e-2
-        assert h_0.shape == h_1.shape
-        assert np.allclose(h_0, h_1, atol=atol, equal_nan=True)
-
-    @pytest.mark.parametrize("radius", [1, 2, 16])
-    @pytest.mark.parametrize("size", [1024, 4096])
-    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-    def test_equivalence_compute_entropy_rolling(self, radius: int, size: int, dtype: npt.DTypeLike) -> None:
-        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
-        h_0 = EntropyGuider.compute_entropy_scipy(b, radius, dtype)
-        h_1 = EntropyGuider.compute_entropy_rolling(b, radius, dtype)
-        atol = 1e-8 if dtype == np.float64 else 1e-2
-        assert h_0.shape == h_1.shape
-        assert np.allclose(h_0, h_1, atol=atol, equal_nan=True)
-
-    @pytest.mark.parametrize("radius", [1, 2, 16])
-    @pytest.mark.parametrize("size", [1024, 4096])
-    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-    def test_histogram_equivalence(self, radius: int, size: int, dtype: npt.DTypeLike) -> None:
-        b = np.random.randint(0, 256, size=size, dtype=np.uint8)
-        h_1 = EntropyGuider.compute_histogram_entropy(b, radius, dtype)
-        h_2 = EntropyGuider.compute_histogram_entropy_rolling(b, radius, dtype)
-        assert h_1.shape == h_2.shape
-        assert np.allclose(h_1, h_2, equal_nan=True)
 
 
 class TestCharacteristicGuider:
