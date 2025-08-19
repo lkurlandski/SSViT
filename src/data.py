@@ -32,6 +32,7 @@ from torch import ShortTensor
 from torch import IntTensor
 from torch import LongTensor
 from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence as _pad_sequence
 
 from src.utils import check_tensor
@@ -91,6 +92,24 @@ class _SemanticGuideOrSemanticGuides(ABC):
             parse=self.parse.pin_memory() if self.parse is not None else None,
             entropy=self.entropy.pin_memory() if self.entropy is not None else None,
             characteristics=self.characteristics.pin_memory() if self.characteristics is not None else None,
+        )
+
+    def compress(self) -> Self:
+        # TODO: implement BitTensor for parse and characteristics.
+        return replace(
+            self,
+            parse=self.parse,
+            entropy=self.entropy.to(torch.float16) if self.entropy is not None else None,
+            characteristics=self.characteristics,
+        )
+
+    def decompress(self) -> Self:
+        # TODO: implement BitTensor for parse and characteristics.
+        return replace(
+            self,
+            parse=self.parse,
+            entropy=self.entropy.to(torch.float32) if self.entropy is not None else None,
+            characteristics=self.characteristics,
         )
 
 
@@ -189,6 +208,22 @@ class _StructureMapOrStructureMaps(ABC):
             self,
             index=self.index.pin_memory(),
             lexicon=deepcopy(self.lexicon),
+        )
+
+    def compress(self) -> Self:
+        # TODO: implement BitTensor for index.
+        return replace(
+            self,
+            index=self.index,
+            lexicon=self.lexicon,
+        )
+
+    def decompress(self) -> Self:
+        # TODO: implement BitTensor for index.
+        return replace(
+            self,
+            index=self.index,
+            lexicon=self.lexicon,
         )
 
 
@@ -307,6 +342,28 @@ class _SampleOrSamples(ABC):
             inputs=self.inputs.pin_memory(),
             guides=self.guides.pin_memory(),
             structure=self.structure,
+        )
+
+    def compress(self) -> Self:
+        return replace(
+            self,
+            file=self.file,
+            name=self.name,
+            label=self.label.to(torch.int16),
+            inputs=self.inputs.to(torch.int16),
+            guides=self.guides.compress(),
+            structure=self.structure.compress(),
+        )
+
+    def decompress(self) -> Self:
+        return replace(
+            self,
+            file=self.file,
+            name=self.name,
+            label=self.label.to(torch.int32),
+            inputs=self.inputs.to(torch.int32),
+            guides=self.guides.decompress(),
+            structure=self.structure.decompress(),
         )
 
 
@@ -446,7 +503,7 @@ class CollateFn:
 
 class CUDAPrefetcher:
 
-    def __init__(self, loader: Iterable[Samples], device: torch.device) -> None:
+    def __init__(self, loader: DataLoader, device: torch.device) -> None:
         self.loader = loader
         self.device = device
         self.stream = torch.cuda.Stream()
