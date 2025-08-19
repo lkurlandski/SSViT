@@ -15,10 +15,24 @@ from torch import ByteTensor
 from torch import HalfTensor
 from torch import FloatTensor
 from torch import DoubleTensor
+from torch import LongTensor
 
 
 AnyFloatTensor = HalfTensor | FloatTensor | DoubleTensor
 AnyFloatArray  = npt.NDArray[np.float16] | npt.NDArray[np.float32] | npt.NDArray[np.float64]
+
+
+TORCH_JIT_KWDS = {
+    "fullgraph": False,
+    "dynamic": False,
+}
+
+NUMBA_JIT_KWDS = {
+    "nopython": True,
+    "cache": True,
+    "nogil": True,
+    "parallel": True,
+}
 
 
 class Backend(Enum):
@@ -140,26 +154,30 @@ def compute_entropy(
     return h
 
 
-def _compute_discrete_entropy_from_counts_numpy(n: int, c: npt.NDArray[np.uint8]) -> float:
+@nb.jit(**NUMBA_JIT_KWDS)
+def _compute_discrete_entropy_from_counts_numpy(n: int, c: npt.NDArray[np.int64]) -> float:
     c = c[c > 0]
     c = c.astype(np.float64)
     h = np.log2(n) - (c * np.log2(c)).sum() / n
     return float(h)
 
 
-def _compute_discrete_entropy_from_counts_torch(n: int, c: ByteTensor) -> float:
+@torch.compile(**TORCH_JIT_KWDS)
+def _compute_discrete_entropy_from_counts_torch(n: int, c: LongTensor) -> float:
     c = c[c > 0]
     c = c.to(torch.float64)
     h = torch.log2(torch.tensor(n, dtype=torch.float64)) - (c * torch.log2(c)).sum() / n
     return float(h)
 
 
+@nb.jit(**NUMBA_JIT_KWDS)
 def _compute_discrete_entropy_numpy(x: npt.NDArray[np.uint8]) -> float:
     n = len(x)
     c = np.bincount(x, minlength=256)
     return _compute_discrete_entropy_from_counts_numpy(n, c)
 
 
+@torch.compile(**TORCH_JIT_KWDS)
 def _compute_discrete_entropy_torch(x: npt.NDArray[np.uint8]) -> float:
     n = len(x)
     c = torch.bincount(x, minlength=256)
@@ -177,8 +195,8 @@ def _check_inputs(length: int, radius: int, stride: int) -> None:
         raise ValueError(f"Stride {stride} is too large for the specified radius {radius}.")
 
 
-def compute_entropy_naive_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) -> npt.NDArray[np.float64]:
-    _check_inputs(len(x), r, s)
+@nb.jit(**NUMBA_JIT_KWDS)
+def _compute_entropy_naive_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) -> npt.NDArray[np.float64]:
     w = 2 * r + 1
     o = np.full((len(x),), float("nan"), dtype=np.float64)
     # i is the index of the middle byte in the current window.
@@ -191,7 +209,12 @@ def compute_entropy_naive_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) ->
         o[i:i + s] = h
     return o
 
+def compute_entropy_naive_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) -> npt.NDArray[np.float64]:
+    _check_inputs(len(x), r, s)
+    return _compute_entropy_naive_numpy(x, r, s)
 
+
+@torch.compile(**TORCH_JIT_KWDS)
 def compute_entropy_naive_torch(x: ByteTensor, r: int, s: int = 1) -> DoubleTensor:
     _check_inputs(len(x), r, s)
     w = 2 * r + 1
@@ -207,8 +230,8 @@ def compute_entropy_naive_torch(x: ByteTensor, r: int, s: int = 1) -> DoubleTens
     return o
 
 
-def compute_entropy_rolling_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) -> npt.NDArray[np.float64]:
-    _check_inputs(len(x), r, s)
+@nb.jit(**NUMBA_JIT_KWDS)
+def _compute_entropy_rolling_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) -> npt.NDArray[np.float64]:
     w = 2 * r + 1
     o = np.full((len(x),), float("nan"), dtype=np.float64)
     c = np.bincount(x[0:w-s], minlength=256)
@@ -228,7 +251,12 @@ def compute_entropy_rolling_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) 
         o[l:u] = h
     return o
 
+def compute_entropy_rolling_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) -> npt.NDArray[np.float64]:
+    _check_inputs(len(x), r, s)
+    return _compute_entropy_rolling_numpy(x, r, s)
 
+
+@torch.compile(**TORCH_JIT_KWDS)
 def compute_entropy_rolling_torch(x: ByteTensor, r: int, s: int = 1) -> DoubleTensor:
     _check_inputs(len(x), r, s)
     w = 2 * r + 1
