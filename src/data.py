@@ -112,6 +112,14 @@ class _SemanticGuideOrSemanticGuides(ABC):
             characteristics=self.characteristics,
         )
 
+    def trim(self, length: Optional[int]) -> Self:
+        return replace(
+            self,
+            parse=self.parse[:length, :] if self.parse is not None else None,
+            entropy=self.entropy[:length] if self.entropy is not None else None,
+            characteristics=self.characteristics[:length, :] if self.characteristics is not None else None,
+        )
+
 
 class SemanticGuide(_SemanticGuideOrSemanticGuides):
 
@@ -226,6 +234,13 @@ class _StructureMapOrStructureMaps(ABC):
         return replace(
             self,
             index=self.index,
+            lexicon=self.lexicon,
+        )
+
+    def trim(self, length: Optional[int]) -> Self:
+        return replace(
+            self,
+            index=self.index[:length, :],
             lexicon=self.lexicon,
         )
 
@@ -363,7 +378,7 @@ class _SampleOrSamples(ABC):
             self,
             file=self.file,
             name=self.name,
-            label=self.label.to(torch.int32),
+            label=self.label.to(torch.int64),
             inputs=self.inputs.to(torch.int32),
             guides=self.guides.decompress(),
             structure=self.structure.decompress(),
@@ -418,11 +433,13 @@ class Preprocessor:
         do_entropy: bool = True,
         do_characteristics: bool = True,
         level: HierarchicalLevel | str = HierarchicalLevel.NONE,
+        max_length: Optional[int] = None,
     ) -> None:
         self.do_parser = do_parser
         self.do_entropy = do_entropy
         self.do_characteristics = do_characteristics
         self.level = HierarchicalLevel(level)
+        self.max_length = max_length
         self.guider = SemanticGuider(do_parser, do_entropy, do_characteristics)
         self.partitioner = StructurePartitioner(HierarchicalLevel(level))
 
@@ -449,6 +466,12 @@ class Preprocessor:
 
         guides = self.guider(pe, size, inputs)
         structure = self.partitioner(pe, size)
+
+        # NOTE: this is not meant to be efficient, since its only for debugging.
+        if self.max_length is not None:
+            inputs = inputs[:self.max_length]
+            guides = guides.trim(self.max_length)
+            structure = structure.trim(self.max_length)
 
         return Sample(file, name, label, inputs, guides, structure)
 
