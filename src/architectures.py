@@ -30,14 +30,6 @@ from src.utils import TensorError
 from src.utils import check_tensor
 
 
-@dataclass(frozen=True, slots=True)
-class ModelOutput:
-    logits: FloatTensor
-
-    def __iter__(self) -> Iterable[tuple[Tensor]]:
-        return iter((self.logits,))
-
-
 class ClassifificationHead(nn.Module):  # type: ignore[misc]
     """
     Classification head for a neural network.
@@ -169,7 +161,7 @@ class MultiChannelDiscreteEmbedding(nn.Module):  # type: ignore[misc]
             Output tensor of shape (B, T, E).
         """
         for x_ in x:
-            check_tensor(x_, tuple(x[0].shape), torch.int64)
+            check_tensor(x_, tuple(x[0].shape), (torch.int64, torch.int32))
 
         z = torch.cat([self.embedding[i].forward(x[i]) for i in range(len(x))], dim=-1)
 
