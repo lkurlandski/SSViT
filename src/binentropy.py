@@ -31,7 +31,8 @@ NUMBA_JIT_KWDS = {
     "nopython": True,
     "cache": True,
     "nogil": True,
-    "parallel": True,
+    "parallel": False,
+    "fastmath": True,
 }
 
 
@@ -112,49 +113,7 @@ def _get_torch_array_from_input(input: str | os.PathLike[str] | bytes | memoryvi
     return x
 
 
-def compute_entropy(
-    input: str | os.PathLike[str] | bytes | memoryview | np.ndarray | torch.Tensor,  # type: ignore[type-arg]
-    backend: str | Backend,
-    *,
-    radius: int = 1,
-    stride: int = 1,
-) -> DoubleTensor | npt.NDArray[np.float64]:
-    """
-    Compute the sliding window entropy of the input data.
-
-    Args:
-        input: Input data representing raw bytes.
-        measure: Type of entropy measure to compute.
-        algorithm: Algorithm to use for entropy calculation.
-        backend: Backend to use for computation.
-        check: Whether to check the result for non-finite values.
-        radius: Radius of the sliding window, i.e., the number of bytes in either
-            direction that will contribute to a local entropy calculation.
-        stride: Stride of the sliding window, i.e., the number of bytes to skip
-            between consecutive entropy calculations.
-        padding: Value to use for padding on either side of the input data.
-
-    Returns:
-        Entropy values as a tensor or array within a sliding window of each byte in the input data.
-    """
-    backend = Backend(backend) if isinstance(backend, str) else backend
-
-    if backend == Backend.NUMPY:
-        x = _get_numpy_array_from_input(input)
-        h = compute_entropy_numpy(x, radius=radius, stride=stride)
-    elif backend == Backend.NUMBA:
-        x = _get_numpy_array_from_input(input)
-        h = compute_entropy_numba(x, radius=radius, stride=stride)
-    elif backend == Backend.TORCH:
-        x = _get_torch_array_from_input(input)
-        h = compute_entropy_torch(x, radius=radius, stride=stride)
-    else:
-        raise ValueError(f"Unsupported backend: {backend}.")
-
-    return h
-
-
-@nb.jit(**NUMBA_JIT_KWDS)
+@nb.jit(**NUMBA_JIT_KWDS)  # type: ignore[misc]
 def _compute_discrete_entropy_from_counts_numpy(n: int, c: npt.NDArray[np.int64]) -> float:
     c = c[c > 0]
     c = c.astype(np.float64)
@@ -162,7 +121,7 @@ def _compute_discrete_entropy_from_counts_numpy(n: int, c: npt.NDArray[np.int64]
     return float(h)
 
 
-@torch.compile(**TORCH_JIT_KWDS)
+@torch.compile(**TORCH_JIT_KWDS)  # type: ignore[misc]
 def _compute_discrete_entropy_from_counts_torch(n: int, c: LongTensor) -> float:
     c = c[c > 0]
     c = c.to(torch.float64)
@@ -170,18 +129,20 @@ def _compute_discrete_entropy_from_counts_torch(n: int, c: LongTensor) -> float:
     return float(h)
 
 
-@nb.jit(**NUMBA_JIT_KWDS)
+@nb.jit(**NUMBA_JIT_KWDS)  # type: ignore[misc]
 def _compute_discrete_entropy_numpy(x: npt.NDArray[np.uint8]) -> float:
     n = len(x)
     c = np.bincount(x, minlength=256)
-    return _compute_discrete_entropy_from_counts_numpy(n, c)
+    h: float = _compute_discrete_entropy_from_counts_numpy(n, c)
+    return h
 
 
-@torch.compile(**TORCH_JIT_KWDS)
+@torch.compile(**TORCH_JIT_KWDS)  # type: ignore[misc]
 def _compute_discrete_entropy_torch(x: npt.NDArray[np.uint8]) -> float:
     n = len(x)
     c = torch.bincount(x, minlength=256)
-    return _compute_discrete_entropy_from_counts_torch(n, c)
+    h: float = _compute_discrete_entropy_from_counts_torch(n, c)
+    return h
 
 
 def _check_inputs(length: int, radius: int, stride: int) -> None:
@@ -195,7 +156,7 @@ def _check_inputs(length: int, radius: int, stride: int) -> None:
         raise ValueError(f"Stride {stride} is too large for the specified radius {radius}.")
 
 
-@nb.jit(**NUMBA_JIT_KWDS)
+@nb.jit(**NUMBA_JIT_KWDS)  # type: ignore[misc]
 def _compute_entropy_naive_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) -> npt.NDArray[np.float64]:
     w = 2 * r + 1
     o = np.full((len(x),), float("nan"), dtype=np.float64)
@@ -211,10 +172,11 @@ def _compute_entropy_naive_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) -
 
 def compute_entropy_naive_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) -> npt.NDArray[np.float64]:
     _check_inputs(len(x), r, s)
-    return _compute_entropy_naive_numpy(x, r, s)
+    h: npt.NDArray[np.float64] = _compute_entropy_naive_numpy(x, r, s)
+    return h
 
 
-@torch.compile(**TORCH_JIT_KWDS)
+@torch.compile(**TORCH_JIT_KWDS)  # type: ignore[misc]
 def compute_entropy_naive_torch(x: ByteTensor, r: int, s: int = 1) -> DoubleTensor:
     _check_inputs(len(x), r, s)
     w = 2 * r + 1
@@ -230,7 +192,7 @@ def compute_entropy_naive_torch(x: ByteTensor, r: int, s: int = 1) -> DoubleTens
     return o
 
 
-@nb.jit(**NUMBA_JIT_KWDS)
+@nb.jit(**NUMBA_JIT_KWDS)  # type: ignore[misc]
 def _compute_entropy_rolling_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) -> npt.NDArray[np.float64]:
     w = 2 * r + 1
     o = np.full((len(x),), float("nan"), dtype=np.float64)
@@ -251,12 +213,62 @@ def _compute_entropy_rolling_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1)
         o[l:u] = h
     return o
 
+@nb.jit(**NUMBA_JIT_KWDS)  # type: ignore[misc]
+def _compute_entropy_rolling_numpy_fast(x: npt.NDArray[np.uint8], r: int) -> npt.NDArray[np.float64]:
+    w = 2 * r + 1
+    o = np.full((len(x)), float("nan"), np.float64)
+
+    # precompute logs once
+    log_tbl = np.empty(w + 1, np.float64)
+    log_tbl[0] = 0.0
+    for k in range(1, w + 1):
+        log_tbl[k] = np.log2(k)
+    logW = log_tbl[w]
+
+    counts = np.zeros(256, np.int32)
+
+    # initial histogram over [0:W)
+    for i in range(w):
+        counts[int(x[i])] += 1
+
+    # initial s_clogc = sum c*log(c)
+    s_clogc = 0.0
+    for v in range(256):
+        c = counts[v]
+        if c:
+            s_clogc += c * log_tbl[c]
+
+    # place entropy at center of first window
+    o[r] = logW - (s_clogc / w)
+
+    # slide one-by-one
+    for i in range(w, len(x)):
+        v_out = int(x[i - w])
+        v_in  = int(x[i])
+        if v_out != v_in:
+            co = counts[v_out]
+            ci = counts[v_in]
+            # remove old contributions
+            s_clogc -= co * log_tbl[co]
+            s_clogc -= ci * log_tbl[ci]
+            # update counts
+            co -= 1; ci += 1
+            counts[v_out] = co
+            counts[v_in]  = ci
+            # add new contributions
+            s_clogc += co * log_tbl[co]
+            s_clogc += ci * log_tbl[ci]
+        o[i - r] = logW - (s_clogc / w)
+
+    return o
+
 def compute_entropy_rolling_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) -> npt.NDArray[np.float64]:
     _check_inputs(len(x), r, s)
-    return _compute_entropy_rolling_numpy(x, r, s)
+    h: npt.NDArray[np.float64] = _compute_entropy_rolling_numpy_fast(x, r) if s == 1 else _compute_entropy_rolling_numpy(x, r, s)
+    return h
 
 
-@torch.compile(**TORCH_JIT_KWDS)
+@torch.compile(**TORCH_JIT_KWDS)  # type: ignore[misc]
 def compute_entropy_rolling_torch(x: ByteTensor, r: int, s: int = 1) -> DoubleTensor:
     _check_inputs(len(x), r, s)
     w = 2 * r + 1
@@ -268,7 +280,6 @@ def compute_entropy_rolling_torch(x: ByteTensor, r: int, s: int = 1) -> DoubleTe
             c[x[j].item()] += 1
         for j in range(max(i - s - w, 0), i - w):
             c[x[j].item()] -= 1
-        print(c)
         if len(torch.nonzero(c, as_tuple=True)[0]) > w:
             raise RuntimeError(f"Expected at most {w} unique values in the window, got {len(torch.nonzero(c, as_tuple=True)[0])} at iteration {i}. {c}")
         if torch.sum(c) != w:
