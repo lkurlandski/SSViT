@@ -7,35 +7,12 @@ import math
 import pytest
 import torch
 
-from src.architectures import TensorError
+from src.utils import TensorError
 from src.architectures import ClassifificationHead
 from src.architectures import MultiChannelDiscreteEmbedding
 from src.architectures import MultiChannelDiscreteSequenceVisionTransformer
 from src.architectures import MultiChannelMalConv
 from src.architectures import SequenceEmbeddingEncoder
-
-
-class TestTensorError:
-    def test_check_good(self):
-        TensorError.check(torch.randn(4, 5), (None, 5), torch.float)
-        TensorError.check(torch.randn(4, 5), (None, None), None)
-        TensorError.check(torch.randn(4, 5), (4, 5), torch.float)
-
-    def test_check_bad_dtype(self):
-        with pytest.raises(TensorError):
-            TensorError.check(torch.randn(4, 5), (None, 5), torch.int)
-        with pytest.raises(TensorError):
-            TensorError.check(torch.randn(4, 5), (None, None), torch.int)
-        with pytest.raises(TensorError):
-            TensorError.check(torch.randn(4, 5), (4, 5), torch.int)
-
-    def test_check_bad_shape(self):
-        with pytest.raises(TensorError):
-            TensorError.check(torch.randn(4, 5), (None, 3), torch.float)
-        with pytest.raises(TensorError):
-            TensorError.check(torch.randn(4, 5), (None,), None)
-        with pytest.raises(TensorError):
-            TensorError.check(torch.randn(4, 5), (4, 5, None), torch.float)
 
 
 class TestClassificationHead:

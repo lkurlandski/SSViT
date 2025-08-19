@@ -20,14 +20,11 @@ class TensorError(ValueError):
             f"Expected tensor with dtype {t} and shape {s}. Got tensor with dtype {x.dtype} and shape {tuple(x.shape)}."
         )
 
-    @staticmethod
-    def check(x: Tensor, s: Optional[tuple[Optional[int], ...]], t: Optional[torch.dtype]) -> None:
-        warnings.warn("TensorError.check is deprecated. Use check_tensor instead.", DeprecationWarning, stacklevel=2)
-        check_tensor(x, s, t)
 
-
-def check_tensor(x: Tensor, s: Optional[tuple[Optional[int], ...]] = None, t: Optional[torch.dtype] = None) -> None:
-    if t is not None and x.dtype != t:
+def check_tensor(x: Tensor, s: Optional[tuple[Optional[int], ...]] = None, t: Optional[torch.dtype | tuple[torch.dtype]] = None) -> None:
+    if t is not None and isinstance(t, torch.dtype):
+        t = (t,)
+    if t is not None and x.dtype not in t:
         raise TensorError(x, s, t)
     if s is not None and len(x.shape) != len(s):
         raise TensorError(x, s, t)

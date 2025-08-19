@@ -13,6 +13,8 @@ Notations:
     M: Number of classes
 """
 
+from collections.abc import Iterable
+from dataclasses import dataclass
 import math
 import sys
 from typing import Protocol
@@ -26,6 +28,14 @@ from torch.nn.utils.rnn import pad_sequence
 
 from src.utils import TensorError
 from src.utils import check_tensor
+
+
+@dataclass(frozen=True, slots=True)
+class ModelOutput:
+    logits: FloatTensor
+
+    def __iter__(self) -> Iterable[tuple[Tensor]]:
+        return iter((self.logits,))
 
 
 class ClassifificationHead(nn.Module):  # type: ignore[misc]
@@ -364,7 +374,7 @@ class MultiChannelMalConv(nn.Module):  # type: ignore[misc]
             Output tensor of shape (B, M).
         """
         for x_ in x:
-            check_tensor(x_, tuple(x[0].shape), torch.int64)
+            check_tensor(x_, tuple(x[0].shape), (torch.int32, torch.int64))
 
         B = x[0].shape[0]
         T = x[0].shape[1]
