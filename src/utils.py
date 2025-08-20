@@ -50,38 +50,45 @@ def smallest_unsigned_integer_dtype(n: int) -> torch.dtype:
     raise ValueError(f"Cannot represent {n} bits with an unsigned integer dtype.")
 
 
+@torch.no_grad()  # type: ignore[misc]
 def pack_bool_tensor(b: BoolTensor) -> Tensor:
     """
-    Packs a two-dimensional boolean tensor into a one-dimensional integer tensor.
+    Packs a boolean tensor along the last dimension into an integer tensor.
 
     NOTE: unpack(pack(b)) == b, but pack(unpack(x)) != x.
     """
-    check_tensor(b, (None, None), torch.bool)
-    if not (1 <= b.shape[1] <= 64):
-        raise ValueError(f"Cannot pack boolean tensor with {b.shape[1]} channels.")
+    if b.dtype is not torch.bool:
+        raise TypeError(f"b must be bool, got {b.dtype}")
+    if b.ndim < 1:
+        raise ValueError("b must have at least 1 dimension")
 
-    # Use torch.int64 because shift operations are not implemented for most uint dtypes.
-    weights = (1 << torch.arange(b.shape[1], device=b.device, dtype=torch.int64))
-    x = (b.to(torch.int64) * weights).sum(dim=1)
+    d = b.shape[-1]
+    if not (1 <= d <= 64):
+        raise ValueError(f"Cannot pack boolean tensor with {d} channels.")
 
-    # This mangles the value, but all we care about is the bits, so its okay.
-    dtype = smallest_unsigned_integer_dtype(b.shape[1])
-    return x.to(dtype)
+    # Use torch.int64 because shift ops aren’t implemented for smaller uint types on CPU
+    weights = (1 << torch.arange(d, device=b.device, dtype=torch.int64))
+    x = (b.to(torch.int64) * weights).sum(dim=-1)
+
+    # Cast down to the minimal unsigned dtype (storage stays compact for transfer)
+    out_dtype = smallest_unsigned_integer_dtype(d)
+    return x.to(out_dtype)
 
 
+@torch.no_grad()  # type: ignore[misc]
 def unpack_bit_tensor(x: Tensor, d: int, dtype: torch.dtype = torch.bool) -> Tensor:
     """
-    Unpacks a one-dimensional unsigned integer tensor into a two-dimensional boolean tensor.
+    Unpacks an integer tensor into a boolean (or other) tensor along a new last dimension.
 
     NOTE: unpack(pack(b)) == b, but pack(unpack(x)) != x.
     """
-    check_tensor(x, (None,), (torch.uint8, torch.uint16, torch.uint32, torch.uint64))
     if not (1 <= d <= 64):
         raise ValueError(f"Cannot unpack bit tensor with {d} channels.")
+    if x.dtype not in (torch.uint8, torch.uint16, torch.uint32, torch.uint64):
+        raise TypeError(f"x must be an unsigned integer tensor, got {x.dtype}")
 
-    # Use torch.int64 because shift operations are not implemented for most uint dtypes.
+    # Use torch.int64 workspace for safe shifts
     x = x.to(torch.int64)
     masks = (1 << torch.arange(d, device=x.device, dtype=torch.int64))
     z = (x.unsqueeze(-1) & masks) != 0
-
     return z.to(dtype)
