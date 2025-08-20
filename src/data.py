@@ -13,7 +13,6 @@ from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import replace
 import math
-import mmap
 import os
 from pathlib import Path
 import sys
@@ -449,18 +448,7 @@ class Preprocessor:
     def __call__(self, file: StrPath, label: int) -> Sample:
         name = Name(file)
         label = torch.tensor(label)
-
-        # TODO: experiment with using torch.from_file instead of mmap.
-        # inputs = torch.from_file(str(file), shared=False, size=os.path.getsize(file), dtype=torch.uint8)
-
-        with open(file, "rb") as fp:
-            with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                mv = memoryview(mm)
-                try:
-                    inputs = torch.frombuffer(mv, dtype=torch.uint8)
-                    inputs = inputs.clone()  # Detach reference to the memoryview.
-                finally:
-                    mv.release()
+        inputs = torch.from_file(str(file), shared=False, size=os.path.getsize(file), dtype=torch.uint8)
 
         if self.do_parser or self.do_entropy or self.do_characteristics or self.level != HierarchicalLevel.NONE:
             pe, size = _parse_pe_and_get_size(file)
