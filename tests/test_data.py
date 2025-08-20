@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 import torch
+from torch import Tensor
 from torch import LongTensor
 
 from src.binanal import HierarchicalStructureNone
@@ -48,7 +49,7 @@ class TestSemanticGuider:
         assert bool(sample.characteristics is None) != do_characteristics
 
 
-class TestDataset:
+class TestBinaryDataset:
 
     num_samples = 100
     labels = [random.randint(0, 1) for _ in range(num_samples)]
@@ -60,8 +61,8 @@ class TestDataset:
             x = sample.inputs
             y = sample.label
             assert isinstance(n, str)
-            assert isinstance(x, LongTensor)
-            assert isinstance(y, LongTensor)
+            assert isinstance(x, Tensor)
+            assert isinstance(y, Tensor)
             assert len(n) == 64
             assert tuple(x.shape) == (len(buffers[i]),)
             assert tuple(y.shape) == ()
@@ -86,10 +87,10 @@ class TestDataset:
 
             def __call__(self, file: Path, label: int) -> tuple[LongTensor, SemanticGuides, StructureMap]:
                 b = file.read_bytes()
-                inputs = torch.frombuffer(b, dtype=torch.uint8).to(torch.long),
-                guides = SemanticGuides(None, None, None),
+                inputs = torch.frombuffer(b, dtype=torch.uint8).to(torch.long)
+                guides = SemanticGuides(None, None, None)
                 structure = StructureMap(torch.full((len(b), 1), False), {0: HierarchicalStructureNone.ANY})
-                Sample(file, file.stem, label, inputs, guides, structure)
+                return Sample(file, file.stem, torch.tensor(label, dtype=torch.int32), inputs, guides, structure)
 
         preprocessor = PreprocessorMock(False, False, False)
         with tempfile.TemporaryDirectory() as tmpdir:
