@@ -38,6 +38,8 @@ from torch.utils.data import Sampler
 from torch.nn.utils.rnn import pad_sequence as _pad_sequence
 
 from src.utils import check_tensor
+from src.utils import pack_bool_tensor
+from src.utils import unpack_bit_tensor
 from src.binanal import _parse_pe_and_get_size
 from src.binanal import _get_size_of_liefparse
 from src.binanal import LiefParse
@@ -66,10 +68,11 @@ class Name(str):
         return super().__new__(cls, value)
 
 
+# TODO: improve design and clarity (mutating datatypes).
 @dataclass(frozen=True, slots=True)
 class _SemanticGuideOrSemanticGuides(ABC):
     parse: Optional[BoolTensor] = None
-    entropy: Optional[HalfTensor | FloatTensor | DoubleTensor] = None
+    entropy: Optional[FloatTensor] = None
     characteristics: Optional[BoolTensor] = None
 
     def clone(self) -> Self:
@@ -97,21 +100,19 @@ class _SemanticGuideOrSemanticGuides(ABC):
         )
 
     def compress(self) -> Self:
-        # TODO: implement BitTensor for parse and characteristics.
         return replace(
             self,
-            parse=self.parse,
+            parse=pack_bool_tensor(self.parse) if self.parse is not None else None,
             entropy=self.entropy.to(torch.float16) if self.entropy is not None else None,
-            characteristics=self.characteristics,
+            characteristics=pack_bool_tensor(self.characteristics) if self.characteristics is not None else None,
         )
 
     def decompress(self) -> Self:
-        # TODO: implement BitTensor for parse and characteristics.
         return replace(
             self,
-            parse=self.parse,
+            parse=unpack_bit_tensor(self.parse, len(ParserGuider.PARSEERRORS), dtype=torch.float32) if self.parse is not None else None,
             entropy=self.entropy.to(torch.float32) if self.entropy is not None else None,
-            characteristics=self.characteristics.to(torch.float32) if self.characteristics is not None else None,
+            characteristics=unpack_bit_tensor(self.characteristics, len(CharacteristicGuider.CHARACTERISTICS), dtype=torch.float32) if self.characteristics is not None else None,
         )
 
     def trim(self, length: Optional[int]) -> Self:
@@ -145,13 +146,15 @@ class SemanticGuides(_SemanticGuideOrSemanticGuides):
 
         parse = None
         if guides[0].parse is not None:
-            parse = pad_sequence([g.parse for g in guides], True, False, "right", pin_memory)
+            padding_value = False if guides[0].parse.dtype == torch.bool else 0.0
+            parse = pad_sequence([g.parse for g in guides], True, padding_value, "right", pin_memory)
         entropy = None
         if guides[0].entropy is not None:
             entropy = pad_sequence([g.entropy for g in guides], True, 0.0, "right", pin_memory)
         characteristics = None
         if guides[0].characteristics is not None:
-            characteristics = pad_sequence([g.characteristics for g in guides], True, False, "right", pin_memory)
+            padding_value = False if guides[0].characteristics.dtype == torch.bool else 0.0
+            characteristics = pad_sequence([g.characteristics for g in guides], True, padding_value, "right", pin_memory)
         return cls(parse, entropy, characteristics)
 
 
@@ -197,6 +200,7 @@ class SemanticGuider:
         return SemanticGuide(parse, entropy, characteristics)
 
 
+# TODO: improve design and clarity (mutating datatypes).
 @dataclass(frozen=True, slots=True)
 class _StructureMapOrStructureMaps(ABC):
     index: BoolTensor
@@ -224,18 +228,16 @@ class _StructureMapOrStructureMaps(ABC):
         )
 
     def compress(self) -> Self:
-        # TODO: implement BitTensor for index.
         return replace(
             self,
-            index=self.index,
+            index=pack_bool_tensor(self.index),
             lexicon=self.lexicon,
         )
 
     def decompress(self) -> Self:
-        # TODO: implement BitTensor for index.
         return replace(
             self,
-            index=self.index,
+            index=unpack_bit_tensor(self.index),
             lexicon=self.lexicon,
         )
 
@@ -272,7 +274,8 @@ class StructureMaps(_StructureMapOrStructureMaps):
         for m in maps[1:]:
             if m.lexicon != lexicon:
                 raise ValueError("All StructureMaps must have the same lexicon to be batched.")
-        index = pad_sequence([m.index for m in maps], True, False, "right", pin_memory)
+        padding_value = False if maps[0].index.dtype == torch.bool else 0.0
+        index = pad_sequence([m.index for m in maps], True, padding_value, "right", pin_memory)
         return cls(index, lexicon)
 
 
@@ -326,6 +329,9 @@ class _SampleOrSamples(ABC):
     guides: _SemanticGuideOrSemanticGuides
     structure: _StructureMapOrStructureMaps
 
+    # NOTE: the _StructureMapOrStructureMaps does not get moved to the GPU, since it is only used for indexing.
+    # Therefore, it is intentionally ignored in the to(), pin_memory(), compress(), and decompress() methods.
+
     def __iter__(self) -> Iterable[tuple[StrPath, Name, IntTensor, IntTensor, SemanticGuides, StructureMap]]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
 
@@ -341,7 +347,6 @@ class _SampleOrSamples(ABC):
         )
 
     def to(self, device: torch.device, non_blocking: bool = False) -> Self:
-        # No reason to move the structure map.
         return replace(
             self,
             file=self.file,
@@ -353,7 +358,6 @@ class _SampleOrSamples(ABC):
         )
 
     def pin_memory(self) -> Self:
-        # No reason to move the structure map.
         return replace(
             self,
             file=self.file,
@@ -372,7 +376,7 @@ class _SampleOrSamples(ABC):
             label=self.label.to(torch.int16),
             inputs=self.inputs.to(torch.uint16),
             guides=self.guides.compress(),
-            structure=self.structure.compress(),
+            structure=self.structure,
         )
 
     def decompress(self) -> Self:
@@ -383,7 +387,7 @@ class _SampleOrSamples(ABC):
             label=self.label.to(torch.int64),
             inputs=self.inputs.to(torch.int32),
             guides=self.guides.decompress(),
-            structure=self.structure.decompress(),
+            structure=self.structure,
         )
 
 
@@ -513,7 +517,7 @@ class CollateFn:
             name=[s.name for s in batch],
             label=torch.stack([s.label for s in batch]),
             inputs=pad_sequence([s.inputs.to(torch.int16) + 1 for s in batch], True, 0, "right", self.pin_memory),
-            guides=SemanticGuides.from_singles([s.guides for s in batch], pin_memory=self.pin_memory),
+            guides=SemanticGuides.from_singles([s.guides.compress() for s in batch], pin_memory=self.pin_memory),
             structure=StructureMaps.from_singles([s.structure for s in batch], pin_memory=self.pin_memory),
         )
 
