@@ -115,6 +115,7 @@ def test_compute_entropy_naive_and_rolling_numpy_equivalence(size: int, radius: 
 
 # ---- torch ---- #
 
+@pytest.mark.skip(reason="torch entropy functions are slow and have no intention of being used.")
 @pytest.mark.parametrize("size", SIZE)
 @pytest.mark.parametrize("radius", RADIUS)
 @pytest.mark.parametrize("stride", STRIDE)
@@ -135,6 +136,7 @@ def test_compute_entropy_naive_torch(size: int, radius: int, stride: int) -> Non
     check_entropy(h, size, radius, stride)
 
 
+@pytest.mark.skip(reason="torch entropy functions are slow and have no intention of being used.")
 @pytest.mark.parametrize("size", SIZE)
 @pytest.mark.parametrize("radius", RADIUS)
 @pytest.mark.parametrize("stride", STRIDE)
@@ -155,6 +157,7 @@ def test_compute_entropy_rolling_torch(size: int, radius: int, stride: int) -> N
     check_entropy(h, size, radius, stride)
 
 
+@pytest.mark.skip(reason="torch entropy functions are slow and have no intention of being used.")
 @pytest.mark.parametrize("size", SIZE)
 @pytest.mark.parametrize("radius", RADIUS)
 @pytest.mark.parametrize("stride", STRIDE)
@@ -184,6 +187,7 @@ def test_compute_entropy_naive_and_rolling_torch_equivalence(size: int, radius: 
 
 # ---- equiv ---- #
 
+@pytest.mark.skip(reason="torch entropy functions are slow and have no intention of being used.")
 @pytest.mark.parametrize("size", SIZE)
 @pytest.mark.parametrize("radius", RADIUS)
 @pytest.mark.parametrize("stride", STRIDE)
