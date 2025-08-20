@@ -11,8 +11,10 @@ from pathlib import Path
 import sys
 from typing import Optional
 
+import lief
 import numpy as np
 import torch
+from torch.nn import Embedding
 from torch.nn import CrossEntropyLoss
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
@@ -25,8 +27,10 @@ from torch import Tensor
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.architectures import MultiChannelMalConv
-from src.architectures import MultiChannelDiscreteSequenceVisionTransformer
+from src.architectures import ClassifificationHead
+from src.architectures import FiLM
+from src.architectures import MalConv
+from src.architectures import MalConvClassifier
 from src.binanal import HierarchicalLevel
 from src.data import BinaryDataset
 from src.data import CollateFn
@@ -38,6 +42,9 @@ from src.trainer import Trainer
 from src.trainer import TrainerArgumentParser
 from src.trainer import TrainerArgs
 from src.trainer import EarlyStopper
+
+
+lief.logging.set_level(lief.logging.LEVEL.OFF)
 
 
 def get_materials() -> tuple[list[Path], list[Path], list[int], list[int]]:
@@ -107,10 +114,11 @@ def main() -> None:
     tr_loader = get_loader(tr_dataset, tr_sampler)
     vl_loader = get_loader(vl_dataset, vl_sampler)
 
-
-    model = MultiChannelMalConv(
-        [256 + 8],
-        [8],
+    model = MalConvClassifier(
+        Embedding(256 + 8, 8),
+        FiLM(12, 8, 16),
+        MalConv(8, 128, 512, 512),
+        ClassifificationHead(128, 2, 32, 2),
     )
 
     loss_fn = CrossEntropyLoss()

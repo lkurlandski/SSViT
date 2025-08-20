@@ -80,7 +80,7 @@ class TrainerArgs:
             if os.environ.get("OMP_NUM_THREADS") is None:
                 warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but OMP_NUM_THREADS is not set, which could result in CPU oversubscription.")
             if os.environ.get("MKL_NUM_THREADS") is None:
-                warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but MLK_NUM_THREADS is not set, which could result in CPU oversubscription.")
+                warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but MKL_NUM_THREADS is not set, which could result in CPU oversubscription.")
 
     @classmethod
     def from_namespace(cls, namespace: Namespace) -> Self:
@@ -370,7 +370,7 @@ class Trainer:
         Returns:
             tuple: model output(s).
         """
-        return self.model.forward(batch.inputs)
+        return self.model.forward(batch.inputs, batch.guides.characteristics)
 
     def compute_loss(self, batch: Samples, outputs: FTensor) -> FTensor:
         """Compute the loss over a batch of examples.

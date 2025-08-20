@@ -111,7 +111,7 @@ class _SemanticGuideOrSemanticGuides(ABC):
             self,
             parse=self.parse,
             entropy=self.entropy.to(torch.float32) if self.entropy is not None else None,
-            characteristics=self.characteristics,
+            characteristics=self.characteristics.to(torch.float32) if self.characteristics is not None else None,
         )
 
     def trim(self, length: Optional[int]) -> Self:
@@ -370,7 +370,7 @@ class _SampleOrSamples(ABC):
             file=self.file,
             name=self.name,
             label=self.label.to(torch.int16),
-            inputs=self.inputs.to(torch.int16),
+            inputs=self.inputs.to(torch.uint16),
             guides=self.guides.compress(),
             structure=self.structure.compress(),
         )
