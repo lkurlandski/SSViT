@@ -6,6 +6,7 @@ from __future__ import annotations
 from argparse import ArgumentParser
 from argparse import Namespace
 from collections import defaultdict
+from collections.abc import Collection
 from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -13,43 +14,52 @@ from functools import partial
 import gc
 import inspect
 import json
-import math
+import os
 from pathlib import Path
 import shutil
 from statistics import mean
-import sys
 import time
 from typing import Any
 from typing import Callable
+from typing import TypedDict
 from typing import Optional
 from typing import Self
-from typing import TypeVar
+from typing import Union
 import warnings
 
 import torch
 from torch import Tensor
+from torch import BFloat16Tensor
+from torch import HalfTensor
+from torch import FloatTensor
+from torch import DoubleTensor
+from torch import CharTensor
+from torch import ByteTensor
+from torch import ShortTensor
+from torch import IntTensor
+from torch import LongTensor
 from torch.nn import Module
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
-from src.architectures import ModelOutput
-from src.data import CUDAPrefetcher
 from src.data import Samples
+
+
+FTensor = Union[BFloat16Tensor | HalfTensor | FloatTensor | DoubleTensor]
+ITensor = Union[CharTensor | ByteTensor | ShortTensor | IntTensor | LongTensor]
 
 
 @dataclass
 class TrainerArgs:
     outdir: Path = Path("./output/tmp")
-    device: torch.cuda.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device: torch.device = torch.device("cpu")
     epochs: int = 1
-    tr_batch_size: int = 2
-    vl_batch_size: int = 2
-    num_workers: int = 0
-    pin_memory: bool = True
+    tr_batch_size: int = 1   # TODO: move
+    vl_batch_size: int = 1   # TODO: move
+    num_workers: int = 0     # TODO: move
+    pin_memory: bool = True  # TODO: move
     disable_tqdm: bool = False
     logging_steps: int = -1
     metric: str = "vl_loss"
@@ -57,6 +67,20 @@ class TrainerArgs:
     max_norm: float = 1.0
     gradient_accumulation_steps: int = 1
     find_executable_batch_size: bool = False
+
+    def __post_init__(self) -> None:
+        if self.device.type == "cuda":
+            if not torch.cuda.is_available():
+                warnings.warn("CUDA device specified but not available, using CPU instead.")
+                self.device = torch.device("cpu")
+            if os.environ.get("CUDA_VISIBLE_DEVICES") is None:
+                warnings.warn("CUDA_VISIBLE_DEVICES is not set, which could result in unexpected behavior if multiple GPUs are available.")
+
+        if self.num_workers > 0:
+            if os.environ.get("OMP_NUM_THREADS") is None:
+                warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but OMP_NUM_THREADS is not set, which could result in CPU oversubscription.")
+            if os.environ.get("MKL_NUM_THREADS") is None:
+                warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but MLK_NUM_THREADS is not set, which could result in CPU oversubscription.")
 
     @classmethod
     def from_namespace(cls, namespace: Namespace) -> Self:
@@ -68,12 +92,12 @@ class TrainerArgumentParser(ArgumentParser):
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
         self.add_argument("--outdir", type=Path, default=Path("./output/tmp"))
-        self.add_argument("--device", type=torch.device, default=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        self.add_argument("--device", type=torch.device, default=torch.device("cpu"))
         self.add_argument("--epochs", type=int, default=1)
-        self.add_argument("--tr_batch_size", type=int, default=2)
-        self.add_argument("--vl_batch_size", type=int, default=2)
-        self.add_argument("--num_workers", type=int, default=0)
-        self.add_argument("--pin_memory", action="store_true")
+        self.add_argument("--tr_batch_size", type=int, default=1)  # TODO: move
+        self.add_argument("--vl_batch_size", type=int, default=1)  # TODO: move
+        self.add_argument("--num_workers", type=int, default=0)    # TODO: move
+        self.add_argument("--pin_memory", action="store_true")     # TODO: move
         self.add_argument("--disable_tqdm", action="store_true")
         self.add_argument("--logging_steps", type=int, default=-1)
         self.add_argument("--metric", type=str, default="vl_loss")
@@ -85,7 +109,7 @@ class TrainerArgumentParser(ArgumentParser):
 
 class EarlyStopper:
 
-    def __init__(self, patience: int = 0, threshold: float = 0.0001, lower_is_worse: bool = False) -> None:
+    def __init__(self, patience: int | float = 0, threshold: float = 0.0001, lower_is_worse: bool = False) -> None:
         self.patience = patience
         self.threshold = threshold
         self.lower_is_worse = lower_is_worse
@@ -179,21 +203,21 @@ def find_executable_batch_size(
     return decorator
 
 
+def pformat_dict(d: Mapping[str, int | float]) -> dict[str, str]:
+    return {k: f"{v:.6f}" if isinstance(v, float) else f"{v}" for k, v in d.items()}
+
+
 class Trainer:
     """
     Trainer class for training models.
     """
 
-    OVERWRITE_OUTDIRS = ("tmp", "test")
-    tr_metric_keys = ("tr_loss", "tr_time")
-
     def __init__(
         self,
         args: TrainerArgs,
         model: Module,
-        tr_dataset: Dataset | IterableDataset,
-        vl_dataset: Dataset | IterableDataset,
-        collate_fn: Callable[[list[Tensor]], Tensor],
+        tr_loader: Collection[Samples] | DataLoader[Samples],
+        vl_loader: Collection[Samples] | DataLoader[Samples],
         loss_fn: Module,
         optimizer: Optimizer,
         scheduler: Optional[LRScheduler] = None,
@@ -201,15 +225,14 @@ class Trainer:
     ) -> None:
         self.args = args
         self.model: Module = model.to(args.device)
-        self.tr_dataset = tr_dataset
-        self.vl_dataset = vl_dataset
-        self.collate_fn = collate_fn
+        self.tr_loader = tr_loader
+        self.vl_loader = vl_loader
         self.loss_fn = loss_fn
         self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.stopper = stopper
-        self.log: list[dict[str, Any]] = []
-        self.best_epoch = -1.0
+        self.scheduler = scheduler if scheduler is not None else LRScheduler(optimizer)
+        self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
+        self.log: list[Mapping[str, int | float]] = []
+        self.best_epoch = -1
         self.best_metric = -float("inf") if args.lower_is_worse else float("inf")
 
     def __call__(self) -> Self:
@@ -239,63 +262,50 @@ class Trainer:
             evaluate = self.evaluate
             train = self.train
 
-        tr_metrics = {k: float("nan") for k in self.tr_metric_keys}
-        vl_metrics = evaluate()
-        d = {"epoch": 0.0, "learning_rate": float("nan"), "teacher_ratio": float("nan")} | tr_metrics | vl_metrics
-        self._update_logs(d)
-        self._update_best(d)
-        self._update_save(d)
+        tr_report = {"tr_loss": float("nan"), "tr_time": float("nan")}
+        vl_report = evaluate()
+        report = {"epoch": 0, "lr": float("nan")} | tr_report | vl_report
+        self._update_logs(report)
+        self._update_best(report)
+        self._update_save(report)
 
-        pbar = self._get_pbar(range(1, self.args.epochs + 1), desc="Epochs")
+        pbar = tqdm(list(range(1, self.args.epochs + 1)), "Epochs", disable=self.args.disable_tqdm, ascii=True)
         for epoch in pbar:
-            tr_metrics = train()
-            vl_metrics = evaluate()
-            learning_rate = self.scheduler.get_last_lr()[0] if self.scheduler is not None else self.optimizer.defaults.get("lr", float("nan"))
-            d = {"epoch": float(epoch), "learning_rate": learning_rate} | tr_metrics | vl_metrics
-            self._update_logs(d)
-            self._update_best(d)
-            self._update_save(d)
-            if self.scheduler is not None:
-                self.scheduler.step()
+            tr_report = train()
+            vl_report = evaluate()
+            report = {"epoch": 0, "lr": self.scheduler.get_last_lr()[0]} | tr_report | vl_report
+            self._update_logs(report)
+            self._update_best(report)
+            self._update_save(report)
+            self.scheduler.step()
             if self.stopper is not None:
-                self.stopper.step(vl_metrics[self.args.metric])
+                self.stopper.step(vl_report[self.args.metric])
                 if self.stopper.stop:
                     break
-            if any(math.isnan(d[m]) or math.isinf(d[m]) for m in ("tr_loss", "vl_loss")):
-                raise ValueError("NaN/Inf Loss Detected!")
 
         return self
 
     def train(self) -> dict[str, float]:
         t_0 = time.time()
+        results = defaultdict(list)
+        report = {}
 
         self.model.train()
-        dataloader = self.get_tr_dataloader()
-        dataloader = CUDAPrefetcher(dataloader, self.args.device) if torch.cuda.is_available() else dataloader
-        num_steps = math.ceil(len(dataloader) / self.args.gradient_accumulation_steps)
-        results: defaultdict[str, list[float]] = defaultdict(lambda: [0.0] * num_steps)
+        dataloader = self.tr_loader
+        iterable: Iterable[tuple[int, Samples]] = enumerate(dataloader)
+        iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
+
         step = 0
 
-        pbar = self._get_pbar(dataloader, total=len(dataloader), desc="Training...", leave=False)
-        for mini_step, batch in enumerate(pbar):
+        for mini_step, batch in iterable:
 
-            batch = batch.to(self.args.device, non_blocking=True)
+            batch = batch.to(self.args.device, non_blocking=True).decompress()
 
-            # Compute normalized loss, skip noisy losses
+            # Compute normalized loss
             outputs = self.forward(batch)
-            loss, losses = self.compute_loss(batch, outputs)
-            loss = loss / self.args.gradient_accumulation_steps
-            losses = {k: v / self.args.gradient_accumulation_steps for k, v in losses.items()}
-            # NOTE: this could theoretically cause the weights to never step, which should probably be handled.
-            if math.isnan(loss.item()) or math.isinf(loss.item()):
-                warnings.warn(f"NaN/Inf Loss Detected! {mini_step=} loss={loss.item()}")
-                continue
+            loss = self.compute_loss(batch, outputs) / self.args.gradient_accumulation_steps
             loss.backward()
-
-            # Add to running metrics
-            results["tr_loss"][step] += loss.item()
-            for k, v_1 in losses.items():
-                results[f"tr_{k}"][step] += v_1
+            results["tr_loss"].append(loss.item())
 
             # Update weights every `gradient_accumulation_steps` `mini_steps`
             condition_1 = (mini_step + 1) % self.args.gradient_accumulation_steps == 0
@@ -306,54 +316,52 @@ class Trainer:
                 self.optimizer.zero_grad()
                 step += 1
 
-            # Perform logging every `logging_steps` `steps` (not minibatch steps!)
+            # Perform logging every `logging_steps` `steps`
             condition_1 = self.args.logging_steps > 0
             condition_2 = step > 0
             condition_3 = step % self.args.logging_steps == 0
             if condition_1 and condition_2 and condition_3:
-                d: dict[str, float] = {"step": step}
-                for k, v_2 in results.items():
+                d = {"step": step}
+                for k in results:
                     start = step - self.args.logging_steps
                     stop = start + self.args.logging_steps
-                    d[f"_{k}"] = mean(v_2[start:stop])
-                print(self._fmt_dict(d))
+                    d[k] = mean(results[k][start:stop])
+                print(pformat_dict(d))
 
         # Average statistics over epoch
-        for k, v_3 in results.items():
-            results[k] = mean(v_3)
-        results["tr_time"] = time.time() - t_0
+        for k in results:
+            report[k] = mean(results[k])
+        report["tr_time"] = time.time() - t_0
 
-        # If all we got was NaN's for Inf's, add to the dict and let the caller handle.
-        results["tr_loss"] = results.get("tr_loss", float("nan"))
-
-        return dict(results)
+        return report
 
     def evaluate(self) -> dict[str, float]:
         t_0 = time.time()
+        results = defaultdict(list)
+        report = {}
 
         self.model.eval()
-        dataloader = self.get_vl_dataloader()
-        iterable = self.get_wrapped_dataloader(dataloader, total=len(dataloader), desc="Validating...", leave=False)
+        dataloader = self.vl_loader
+        iterable: Iterable[tuple[int, Samples]] = enumerate(dataloader)
+        iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
 
         with torch.no_grad():
-            results: defaultdict[str, list[float]] = defaultdict(list)
-            for step, batch in iterable:
+            for mini_step, batch in iterable:
                 batch = batch.to(self.args.device, non_blocking=True).decompress()
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 metrics = self.compute_metrics(batch, outputs)
-                results["loss"].append(loss.item())
+                results["vl_loss"].append(loss.item())
                 for k in metrics:
-                    results[k].append(float(metrics[k]))
+                    results[f"vl_{k}"].append(float(metrics[k]))
 
-        report = {}
         for k in results:
             report[k] = mean(results[k])
-        report["time"] = time.time() - t_0
+        report["vl_time"] = time.time() - t_0
 
-        return dict(report)
+        return report
 
-    def forward(self, batch: Samples) -> ModelOutput:
+    def forward(self, batch: Samples) -> FTensor:
         """Send a batch of inputs forward through the model.
 
         Args:
@@ -362,9 +370,9 @@ class Trainer:
         Returns:
             tuple: model output(s).
         """
-        return self.model.forward(batch.inputs)  # type: ignore[no-any-return]
+        return self.model.forward(batch.inputs)
 
-    def compute_loss(self, batch: Samples, outputs: ModelOutput) -> Tensor:
+    def compute_loss(self, batch: Samples, outputs: FTensor) -> FTensor:
         """Compute the loss over a batch of examples.
 
         Args:
@@ -374,9 +382,9 @@ class Trainer:
         Returns:
             loss over the batch.
         """
-        return self.loss_fn.forward(outputs.logits, batch.label)
+        return self.loss_fn.forward(outputs, batch.label)
 
-    def compute_metrics(self, batch: Samples, outputs: ModelOutput) -> dict[str, float]:
+    def compute_metrics(self, batch: Samples, outputs: FTensor) -> dict[str, float]:
         """Compute the validation metrics over a set of examples.
 
         Args:
@@ -388,58 +396,25 @@ class Trainer:
         """
         return {}
 
-    def get_dataloader(self, dataset: Dataset | IterableDataset, batch_size: int, shuffle: bool) -> DataLoader:
-        return DataLoader(
-            dataset,
-            batch_size,
-            shuffle,
-            num_workers=self.args.num_workers,
-            collate_fn=self.collate_fn,
-            pin_memory=self.args.pin_memory,
-            drop_last=True,
-        )
-
-    def get_tr_dataloader(self) -> DataLoader:
-        return self.get_dataloader(self.tr_dataset, self.args.tr_batch_size, True)
-
-    def get_vl_dataloader(self) -> DataLoader:
-        return self.get_dataloader(self.vl_dataset, self.args.vl_batch_size, False)
-
-    def get_wrapped_dataloader(self, iterable: DataLoader, **kwds) -> Iterable[tuple[int, Samples]]:
-        if self.args.device != torch.device("cpu"):
-            iterable = CUDAPrefetcher(iterable, self.args.device)
-        iterable = enumerate(iterable)
-        if not self.args.disable_tqdm:
-            iterable = tqdm(iterable, **kwds)
-        return iterable
-
-    def _update_logs(self, results: dict[str, float]) -> None:
+    def _update_logs(self, results: Mapping[str, int | float]) -> None:
         self.log.append(results)
         if self.args.logging_steps > 0:
-            print(self._fmt_dict(results))
+            print(pformat_dict(results))
         with open(self.args.outdir / "results.jsonl", "a") as fp:
             fp.write(json.dumps(results) + "\n")
 
-    def _update_best(self, results: dict[str, float]) -> None:
+    def _update_best(self, results: Mapping[str, int | float]) -> None:
         if self.args.lower_is_worse and results[self.args.metric] > self.best_metric:
-            self.best_epoch = results["epoch"]
+            self.best_epoch = results["epoch"]  # type: ignore[assignment]
             self.best_metric = results[self.args.metric]
         elif not self.args.lower_is_worse and results[self.args.metric] < self.best_metric:
-            self.best_epoch = results["epoch"]
+            self.best_epoch = results["epoch"]  # type: ignore[assignment]
             self.best_metric = results[self.args.metric]
 
-    def _update_save(self, results: dict[str, float]) -> None:
+    def _update_save(self, results: Mapping[str, int | float]) -> None:
         torch.save(self.model, self.args.outdir / f"model_{results['epoch']}.pth")
         checkpoints = sorted(self.args.outdir.glob("model_*.pth"), key=lambda p: int(p.stem.split("_")[1]))
         for checkpoint in checkpoints:
             e = int(checkpoint.stem.split("_")[1])
             if e not in (self.best_epoch, results["epoch"]):
                 checkpoint.unlink()
-
-    def _get_pbar(self, iterable: Iterable, **kwds) -> tqdm | Iterable:
-        if self.args.disable_tqdm:
-            return iterable
-        return tqdm(iterable, **kwds)
-
-    def _fmt_dict(self, d: Mapping[str, float | int]) -> dict[str, str]:
-        return {k: f"{v:.6f}" if isinstance(v, float) else v for k, v in d.items()}
