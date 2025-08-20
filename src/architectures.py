@@ -1,22 +1,31 @@
 """
 Neural architectures and their components.
 
-Notations:
+Notations (general):
     B: Batch size
     T: Sequence length
+    E: Embedding dimension
+    G: Guide dimension
+    M: Number of classes
+
+Notations (MalConv):
+    C: Number of channels
+    K: Kernel size
+    W: Stride
+    S: Post-conv length, i.e., ⌊(T - K) / W + 1)⌋
+
+Notations (ViT):
     N: Number of patches
     P: Patch size
-    E: Embedding dimension
-    C: Number of channels
-    S: Post-conv length
     H: Hidden dimension
-    M: Number of classes
+    L: Number of layers
 """
 
 from collections.abc import Iterable
 from dataclasses import dataclass
 import math
 import sys
+from typing import Optional
 from typing import Protocol
 
 import torch
@@ -308,7 +317,7 @@ class MultiChannelDiscreteSequenceVisionTransformer(nn.Module):  # type: ignore[
             Output tensor of shape (B, M).
         """
         for x_ in x:
-            check_tensor(x_, tuple(x[0].shape), torch.int64)
+            check_tensor(x_, tuple(x[0].shape), (torch.int32, torch.int64))
 
         print(x[0].shape)
         z = self.embedding.forward(*x)  # (B, T, E)
@@ -320,67 +329,113 @@ class MultiChannelDiscreteSequenceVisionTransformer(nn.Module):  # type: ignore[
         return z
 
 
-class MultiChannelMalConv(nn.Module):  # type: ignore[misc]
+class FiLM(nn.Module):  # type: ignore[misc]
     """
-    MalConv model for discrete sequential inputs.
+    Feature-wise linear modulation (FiLM) layer.
+
+    See: Perez "Film: Visual reasoning with a general conditioning layer" AAAI 2018.
+    """
+
+    def __init__(self, guide_dim: int, embedding_dim: int, hidden_size: int):
+        super().__init__()
+
+        self.mlp = nn.Sequential(
+            nn.Linear(guide_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 2 * embedding_dim)
+        )
+
+        self.guide_dim = guide_dim
+        self.embedding_dim = embedding_dim
+        self.hidden_size = hidden_size
+
+    def forward(self, x: FloatTensor, g: FloatTensor) -> FloatTensor:
+        """
+        Args:
+            x: Input embeddings of shape (B, T, E).
+            g: FiLM conditioning vector of shape (B, T, G).
+
+        Returns:
+            z: FiLM modulated embeddings of shape (B, T, E).
+        """
+        check_tensor(x, (None, None, self.embedding_dim), torch.float)
+        check_tensor(g, (x.shape[0], x.shape[1], self.guide_dim), torch.float)
+    
+        film: FloatTensor = self.mlp.forward(g)  # [B, T, 2E]
+        gamma, beta = film.chunk(2, dim=-1)      # [B, T, E], [B, T, E]
+        z = x * gamma + beta                     # [B, T, E]
+
+        check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), torch.float)
+        return z
+
+
+class MalConv(nn.Module):  # type: ignore[misc]
+    """
+    MalConv backbone.
     """
 
     def __init__(
         self,
-        num_embeddings: list[int],
-        embedding_dim: list[int],
-        out_channels: int = 128,
+        embedding_dim: int = 8,
+        channels: int = 128,
         kernel_size: int = 512,
         stride: int = 512,
-        num_classes: int = 2,
     ) -> None:
         super().__init__()
 
-        self.embedding = MultiChannelDiscreteEmbedding(num_embeddings, embedding_dim)
-        self.conv_1 = nn.Conv1d(sum(embedding_dim), out_channels, kernel_size, stride)
-        self.conv_2 = nn.Conv1d(sum(embedding_dim), out_channels, kernel_size, stride)
+        self.conv_1 = nn.Conv1d(embedding_dim, channels, kernel_size, stride)
+        self.conv_2 = nn.Conv1d(embedding_dim, channels, kernel_size, stride)
         self.pool = nn.AdaptiveMaxPool1d(1)
         self.sigmoid = nn.Sigmoid()
-        self.head = ClassifificationHead(out_channels, num_classes)
 
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = sum(embedding_dim)
-        self.out_channels = out_channels
+        self.embedding_dim = embedding_dim
+        self.channels = channels
         self.kernel_size = kernel_size
         self.stride = stride
-        self.num_classes = num_classes
 
-    @property
-    def max_length(self) -> int:
-        return sys.maxsize
+    def forward(self, x: FloatTensor) -> FloatTensor:
+        """
+        Args:
+            x: Input embeddings of shape (B, T, E).
+        Returns:
+            z: Hidden representation of shape (B, C).
+        """
+        check_tensor(x, (None, None, self.embedding_dim), torch.float)
+        if x.shape[1] < self.kernel_size:
+            raise ValueError(f"Input sequence with length {x.shape[1]} is shorter than the kernel size {self.kernel_size}.")
 
-    @property
-    def min_length(self) -> int:
-        return self.kernel_size
+        z = x.transpose(1, 2)                # [B, E, T]
+        c_1 = self.conv_1.forward(z)         # [B, C, S - 1]
+        c_2 = self.conv_2.forward(z)         # [B, C, S - 1]
+        g = c_1 * self.sigmoid.forward(c_2)  # [B, C, S - 1]
+        z = self.pool.forward(g)             # [B, C, 1]
+        z = z.squeeze(-1)                    # [B, C]
 
-    def forward(self, *x: IntTensor) -> FloatTensor:
+        check_tensor(z, (x.shape[0], self.channels), torch.float)
+        return z
+
+
+class MalConvClassifier(nn.Module):  # type: ignore[misc]
+
+    def __init__(self, embedding: nn.Embedding, filmer: FiLM | nn.Identity, backbone: MalConv, head: ClassifificationHead) -> None:
+        super().__init__()
+
+        self.embedding = embedding
+        self.filmer = filmer
+        self.backbone = backbone
+        self.head = head
+
+    def forward(self, x: FloatTensor, g: FloatTensor) -> FloatTensor:
         """
         Args:
             x: Input tensor of shape (B, T).
         Returns:
-            Output tensor of shape (B, M).
+            z: Classification logits of shape (B, M).
         """
-        for x_ in x:
-            check_tensor(x_, tuple(x[0].shape), (torch.int32, torch.int64))
 
-        B = x[0].shape[0]
-        T = x[0].shape[1]
-        E = self.embedding_dim
-        C = self.out_channels
-        S = math.floor((T - self.kernel_size) / self.stride + 1)
-
-        z = self.embedding.forward(*x)  # [B, L, E]
-        z = z.transpose(1, 2)  # [B, E, L]
-        c_1 = self.conv_1.forward(z)  # [B, C, S - 1]
-        c_2 = self.conv_2.forward(z)  # [B, C, S - 1]
-        g = c_1 * self.sigmoid.forward(c_2)  # [B, C, S - 1]
-        z = self.pool.forward(g)  # [B, C, 1]
-        z = z.squeeze(-1)  # [B, C]
-        z = self.head.forward(z)  # [B, M]
+        z = self.embedding.forward(x)  # (B, T, E)
+        z = self.filmer.forward(z, g)  # (B, T, E)
+        z = self.backbone.forward(z)   # (B, C)
+        z = self.head.forward(z)       # (B, M)
 
         return z
