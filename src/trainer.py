@@ -299,7 +299,7 @@ class Trainer:
 
         for mini_step, batch in iterable:
 
-            batch = batch.to(self.args.device, non_blocking=True).decompress()
+            batch = batch.decompress()
 
             # Compute normalized loss
             outputs = self.forward(batch)
@@ -347,7 +347,7 @@ class Trainer:
 
         with torch.no_grad():
             for mini_step, batch in iterable:
-                batch = batch.to(self.args.device, non_blocking=True).decompress()
+                batch = batch.decompress()
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 metrics = self.compute_metrics(batch, outputs)
