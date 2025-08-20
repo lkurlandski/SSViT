@@ -8,9 +8,11 @@ from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import replace
+import math
 import mmap
 import os
 from pathlib import Path
@@ -33,6 +35,7 @@ from torch import IntTensor
 from torch import LongTensor
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
+from torch.utils.data import Sampler
 from torch.nn.utils.rnn import pad_sequence as _pad_sequence
 
 from src.utils import check_tensor
@@ -535,6 +538,9 @@ class CUDAPrefetcher:
         self.stream = torch.cuda.Stream()
         self.next_batch: Optional[Samples] = None
 
+    def __contains__(self, item: object) -> bool:
+        return item in self.loader
+
     def __iter__(self) -> Iterator[Samples]:
         self.it = iter(self.loader)
         self.next_batch = None
@@ -560,3 +566,67 @@ class CUDAPrefetcher:
             return
         with torch.cuda.stream(self.stream):
             self.next_batch = batch.to(self.device, non_blocking=True)
+
+
+class GroupedLengthBatchSampler(Sampler[list[int]]):  # type: ignore[misc]
+
+    def __init__(self, chunks: Sequence[IntTensor | list[int]], first: bool, shuffle: bool, drop_last: bool) -> None:
+        self.chunks = chunks
+        self.first = first
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.length = self._get_length()
+        self.order: Optional[list[int]] = self._get_chunk_order() if shuffle is False else None
+
+    def __iter__(self) -> Iterator[list[int]]:
+        order = self.order if not self.shuffle else self._get_chunk_order()
+        if order is None:
+            raise RuntimeError("Order was not established.")
+        for i in order:
+            indices = self.chunks[i]
+            if isinstance(indices, IntTensor):
+                indices = indices.tolist()
+            yield indices
+
+    def __len__(self) -> int:
+        return self.length
+
+    @classmethod
+    def from_lengths(cls, batch_size: int, lengths: Sequence[int], *, first: bool = False, shuffle: bool = False, drop_last: bool = False) -> GroupedLengthBatchSampler:
+        lengths = torch.tensor(lengths)
+        idxsorted = torch.argsort(lengths, descending=True)
+        chunks = torch.chunk(idxsorted, math.ceil(len(lengths) / batch_size))
+        return cls(chunks, first, shuffle, drop_last)
+
+    def _get_length(self) -> int:
+        if not self.drop_last:
+            return len(self.chunks)
+        bsizes = [len(c) for c in self.chunks]
+        csizes = Counter(bsizes)
+        if len(csizes) == 1:
+            return len(self.chunks)
+        if len(csizes) == 2 and csizes.most_common(None)[-1][1] == 1:
+            return len(self.chunks) - 1
+        raise RuntimeError(f"Unexpected batch sizes: {csizes} when self.drop_last is {self.drop_last}.")
+
+    def _get_chunk_order(self) -> list[int]:
+        options = torch.arange(len(self.chunks))
+        if self.drop_last:
+            bsizes = [len(c) for c in self.chunks]
+            csizes = Counter(bsizes)
+            if len(csizes) == 1:
+                pass
+            elif len(csizes) == 2 and csizes.most_common(None)[-1][1] == 1:
+                idx = torch.tensor(bsizes) != csizes.most_common(None)[-1][0]
+                options = options[idx]
+            else:
+                raise RuntimeError(f"Unexpected batch sizes: {csizes} when self.drop_last is {self.drop_last}.")
+
+        if self.first:
+            order = options[torch.randperm(len(self) - 1) + 1]
+            order = torch.cat((torch.tensor([0]), order))
+        else:
+            order = options[torch.randperm(len(self))]
+
+        order_: list[int] = order.tolist()
+        return order_
