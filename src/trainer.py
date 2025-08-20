@@ -343,7 +343,7 @@ class Trainer:
         self.model.eval()
         dataloader = self.vl_loader
         iterable: Iterable[tuple[int, Samples]] = enumerate(dataloader)
-        iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
+        iterable = tqdm(iterable, "Validating...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
 
         with torch.no_grad():
             for mini_step, batch in iterable:
