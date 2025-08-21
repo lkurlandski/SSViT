@@ -2,10 +2,7 @@
 Train and validate models.
 """
 
-from collections.abc import Callable
 from collections.abc import Collection
-from collections.abc import Iterable
-from functools import partial
 import os
 from pathlib import Path
 import sys
@@ -13,22 +10,20 @@ from typing import Optional
 
 import lief
 import numpy as np
-import torch
 from torch.nn import Embedding
 from torch.nn import CrossEntropyLoss
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
 from torch.utils.data import Dataset
-from torch.utils.data import IterableDataset
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
-from torch import Tensor
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.architectures import ClassifificationHead
 from src.architectures import FiLM
+from src.architectures import FiLMNoP
 from src.architectures import MalConv
 from src.architectures import MalConvClassifier
 from src.binanal import HierarchicalLevel
@@ -47,6 +42,7 @@ from src.trainer import EarlyStopper
 lief.logging.set_level(lief.logging.LEVEL.OFF)
 
 
+# FIXME: things may not be shuffled properly here.
 def get_materials() -> tuple[list[Path], list[Path], list[int], list[int]]:
     # TODO: define a temporal (not random) train/test split.
     benfiles = list(filter(lambda f: f.is_file(), Path("./data/ass").rglob("*")))
@@ -115,8 +111,8 @@ def main() -> None:
     vl_loader = get_loader(vl_dataset, vl_sampler)
 
     model = MalConvClassifier(
-        Embedding(256 + 8, 8),
-        FiLM(12, 8, 16),
+        Embedding(256 + 8, 8, padding_idx=0),
+        FiLM(12, 8, 16) if args.do_characteristics else FiLMNoP(),
         MalConv(8, 128, 512, 512),
         ClassifificationHead(128, 2, 32, 2),
     )
