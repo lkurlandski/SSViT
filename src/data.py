@@ -532,8 +532,16 @@ def pad_sequence(
     padding_value: float | int | bool = 0.0,
     padding_side: Literal["right", "left"] = "right",
     pin_memory: bool = False,
+    pad_to_multiple_of: int = 8,
 ) -> Tensor:
-    if not pin_memory:
+    # NOTE: bitpacked booleans implicitly pad to a multiple of 8, so using pad_to_multiple_of=8 is safe.
+
+    if len(sequences) == 0:
+        raise ValueError("Cannot pad an empty list of sequences.")
+    if pad_to_multiple_of < 1:
+        raise ValueError(f"pad_to_multiple_of must be a positive integer. Got {pad_to_multiple_of}.")
+
+    if not pin_memory and pad_to_multiple_of == 1:
         return _pad_sequence(sequences, batch_first, padding_value, padding_side)
 
     if padding_side != "right":
@@ -541,20 +549,20 @@ def pad_sequence(
     if not batch_first:
         raise NotImplementedError("pad_sequence with pin_memory=True requires batch_first=True.")
 
-    if len(sequences) == 0:
-        raise ValueError("Cannot pad an empty list of sequences.")
     for s in sequences:
-        if s.device.type != "cpu":
+        if pin_memory and s.device.type != "cpu":
             raise ValueError("All sequences must be on CPU when pin_memory=True.")
         if s.shape[1:] != sequences[0].shape[1:]:
             raise ValueError("All sequences must have the same shape except for the first dimension.")
         if s.dtype != sequences[0].dtype:
             raise ValueError("All sequences must have the same dtype.")
 
-    size = tuple([len(sequences), max(s.shape[0] for s in sequences)] + list(sequences[0].shape[1:]))
-    dtype = sequences[0].dtype
+    batch_size = len(sequences)
+    seq_length = math.ceil(max(s.shape[0] for s in sequences) / pad_to_multiple_of) * pad_to_multiple_of
+    other_dims = sequences[0].shape[1:]
+    size = (batch_size, seq_length) + tuple(other_dims)
 
-    padded = torch.full(size, fill_value=padding_value, dtype=dtype, pin_memory=True)
+    padded = torch.full(size, fill_value=padding_value, dtype=sequences[0].dtype, pin_memory=pin_memory)
     for i, s in enumerate(sequences):
         s = s.contiguous() if not s.is_contiguous() else s
         padded[i, :s.shape[0]].copy_(s)
