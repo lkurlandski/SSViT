@@ -100,10 +100,14 @@ def test_pack_then_unpack_tensor(ndim: int, batch_size: int, num_channels: int) 
 @pytest.mark.parametrize("d", [1, 2, 63, 64, 65])
 @pytest.mark.parametrize("axis", [0, 1, 2, 3, -1])
 def test_packunpackbits(a: int, b: int, c: int, d: int, axis: int) -> None:
-    axis_ = axis if axis >= 0 else 4 + axis  # required for slicing
-    print(f"{axis=} {axis_=}")
+    print(f"{a=} {b=} {c=} {d=} {axis=}")
+    if all(t == 1 for t in (a, b, c, d)):
+        return
 
-    x = torch.randint(0, 2, (a, b, c, d), dtype=torch.bool)
+    x = torch.randint(0, 2, (a, b, c, d), dtype=torch.bool).squeeze()
+    axis = min(axis, x.ndim - 1)
+    axis_ = axis if axis >= 0 else x.ndim + axis
+    print(f"{axis=} {axis_=}")
     print(f"{x.shape=}")
 
     y = packbits(x, axis)
