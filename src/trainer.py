@@ -82,6 +82,9 @@ class TrainerArgs:
             if os.environ.get("MKL_NUM_THREADS") is None:
                 warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but MKL_NUM_THREADS is not set, which could result in CPU oversubscription.")
 
+        if self.logging_steps > 0:
+            warnings.warn(f"Logging every {self.logging_steps} `logging_steps` is enabled, which may slow down training.")
+
     @classmethod
     def from_namespace(cls, namespace: Namespace) -> Self:
         return cls(**{k: v for k, v in vars(namespace).items() if k in cls.__dataclass_fields__})
@@ -287,16 +290,16 @@ class Trainer:
 
     def train(self) -> dict[str, float]:
         t_0 = time.time()
-        results = defaultdict(list)
-        report = {}
 
         self.model.train()
         dataloader = self.tr_loader
         iterable: Iterable[tuple[int, Samples]] = enumerate(dataloader)
         iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
 
-        step = 0
+        num_samples = 0
+        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.args.device))
 
+        step = 0
         for mini_step, batch in iterable:
 
             batch = batch.decompress()
@@ -305,7 +308,7 @@ class Trainer:
             outputs = self.forward(batch)
             loss = self.compute_loss(batch, outputs) / self.args.gradient_accumulation_steps
             loss.backward()
-            results["tr_loss"].append(loss.item())
+            results["tr_loss"] += loss.detach() * len(batch)
 
             # Update weights every `gradient_accumulation_steps` `mini_steps`
             condition_1 = (mini_step + 1) % self.args.gradient_accumulation_steps == 0
@@ -323,27 +326,29 @@ class Trainer:
             if condition_1 and condition_2 and condition_3:
                 d = {"step": step}
                 for k in results:
-                    start = step - self.args.logging_steps
-                    stop = start + self.args.logging_steps
-                    d[k] = mean(results[k][start:stop])
+                    d[k] = results[k].item() / num_samples
                 print(pformat_dict(d))
 
+            num_samples += len(batch)
+
         # Average statistics over epoch
+        report = {}
         for k in results:
-            report[k] = mean(results[k])
+            report[k] = results[k].item() / num_samples
         report["tr_time"] = time.time() - t_0
 
         return report
 
     def evaluate(self) -> dict[str, float]:
         t_0 = time.time()
-        results = defaultdict(list)
-        report = {}
 
         self.model.eval()
         dataloader = self.vl_loader
         iterable: Iterable[tuple[int, Samples]] = enumerate(dataloader)
         iterable = tqdm(iterable, "Validating...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
+
+        num_samples = 0
+        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.args.device))
 
         with torch.no_grad():
             for mini_step, batch in iterable:
@@ -351,12 +356,14 @@ class Trainer:
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 metrics = self.compute_metrics(batch, outputs)
-                results["vl_loss"].append(loss.item())
+                results["vl_loss"] += loss * len(batch)
                 for k in metrics:
-                    results[f"vl_{k}"].append(float(metrics[k]))
+                    results[f"vl_{k}"] += metrics[k] * len(batch)
+                num_samples += len(batch)
 
+        report = {}
         for k in results:
-            report[k] = mean(results[k])
+            report[k] = results[k].item() / num_samples
         report["vl_time"] = time.time() - t_0
 
         return report
