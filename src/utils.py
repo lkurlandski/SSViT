@@ -100,6 +100,8 @@ def unpack_bit_tensor(x: Tensor, d: int, dtype: torch.dtype = torch.bool) -> Ten
 def packbits(x: BoolTensor, axis: int = -1) -> CharTensor:
     """
     Torch variant of numpy.packbits(..., bitorder='little').
+
+    NOTE: uses torch.unfold() to work on views without requiring torch.contiguous().
     """
     if x.dtype is not torch.bool:
         raise TypeError(f"packbits: expected bool tensor, got {x.dtype}")
@@ -111,15 +113,23 @@ def packbits(x: BoolTensor, axis: int = -1) -> CharTensor:
     if d == 0:
         raise ValueError("packbits: cannot pack an empty axis")
 
-    y = x.movedim(axis, -1).contiguous()
+    # Move target axis to the end (view only; no copy)
+    y = x.movedim(axis, -1)  # [..., d]
+
+    # Pad to multiple of 8 along the last dim (only small tail gets padded)
     pad = (-d) % 8
     if pad:
-        y = F.pad(y, (0, pad), value=False)
-    bytes_ = y.shape[-1] // 8
+        y = F.pad(y, (0, pad), value=False)  # [..., d+pad]
 
-    y = y.reshape(*y.shape[:-1], bytes_, 8).to(torch.uint8)
-    weights = (1 << torch.arange(8, device=y.device, dtype=torch.uint8))
-    out = (y * weights).sum(dim=-1, dtype=torch.uint8)
+    # Group bits into bytes using unfold (view; no copy)
+    # Result shape: [..., B, 8] where B = (d+pad)//8
+    y8 = y.unfold(dimension=-1, size=8, step=8)  # bool [..., B, 8]
+
+    # Pack each 8-bit block into a byte (little-endian: first element -> LSB)
+    weights = (1 << torch.arange(8, device=y8.device, dtype=torch.uint8))  # [8]
+    out = (y8.to(torch.uint8) * weights).sum(dim=-1, dtype=torch.uint8)    # [..., B]
+
+    # Move bytes axis back to original position
     return out.movedim(-1, axis)
 
 
@@ -127,22 +137,32 @@ def packbits(x: BoolTensor, axis: int = -1) -> CharTensor:
 def unpackbits(x: CharTensor, count: int = -1, axis: int = -1) -> BoolTensor:
     """
     Torch variant of numpy.unpackbits(..., bitorder='little').
+
+    NOTE: uses torch.unfold() to work on views without requiring torch.contiguous().
     """
-    if x.dtype is not torch.uint8:
-        raise TypeError(f"unpackbits: expected torch.uint8, got {x.dtype}") 
     count = x.shape[axis] * 8 if count == -1 else count
-    if count < 1:
-        raise ValueError(f"unpackbits: count must be >= 1, got {count}")
+    if x.dtype is not torch.uint8:
+        raise TypeError(f"unpackbits: expected torch.uint8, got {x.dtype}")
     if x.ndim == 0:
         raise ValueError("unpackbits: input must have at least 1 dimension")
+    if count < 1:
+        raise ValueError(f"unpackbits: count must be >= 1, got {count}")
 
     axis = axis if axis >= 0 else x.ndim + axis
-    y = x.movedim(axis, -1).contiguous()
-    total_bits = y.shape[-1] * 8
+
+    # Move byte-axis to the end (view only)
+    y = x.movedim(axis, -1)  # [..., B]
+    total_bits = int(y.shape[-1]) * 8
     if count > total_bits:
         raise ValueError(f"unpackbits: count={count} exceeds capacity={total_bits} along axis")
 
-    masks = (1 << torch.arange(8, device=y.device, dtype=torch.uint8))
-    bits = ((y.unsqueeze(-1) & masks) != 0).reshape(*y.shape[:-1], total_bits)
-    z = bits[..., :count]
+    # Expand each byte to 8 bits: [..., B, 8] (viewed/broadcast, no big copy)
+    masks = (1 << torch.arange(8, device=y.device, dtype=torch.uint8))  # [8]
+    bits = (y.unsqueeze(-1) & masks) != 0  # bool [..., B, 8]
+
+    # Flatten the (B,8) pair to total_bits; use flatten to avoid unnecessary copies
+    bits_flat = bits.flatten(-2)           # [..., total_bits]
+    z = bits_flat[..., :count]             # [..., count]
+
+    # Move the expanded bit-axis back
     return z.movedim(-1, axis)
