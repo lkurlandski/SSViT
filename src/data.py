@@ -4,6 +4,7 @@ Manage data and datasets.
 
 from __future__ import annotations
 from abc import ABC
+from abc import abstractmethod
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
@@ -38,8 +39,8 @@ from torch.utils.data import Sampler
 from torch.nn.utils.rnn import pad_sequence as _pad_sequence
 
 from src.utils import check_tensor
-from src.utils import pack_bool_tensor
-from src.utils import unpack_bit_tensor
+from src.utils import packbits
+from src.utils import unpackbits
 from src.binanal import _parse_pe_and_get_size
 from src.binanal import _get_size_of_liefparse
 from src.binanal import LiefParse
@@ -68,76 +69,118 @@ class Name(str):
         return super().__new__(cls, value)
 
 
-# TODO: improve design and clarity (mutating datatypes).
-@dataclass(frozen=True, slots=True)
 class _SemanticGuideOrSemanticGuides(ABC):
-    parse: Optional[BoolTensor] = None
-    entropy: Optional[FloatTensor] = None
-    characteristics: Optional[BoolTensor] = None
+
+    # NOTE: compression/decompression with bitpacking will implicitly zero pad tensors to a multiple of 8.
+    # NOTE: the boolean tensors are converted to floating point internally, to prepare for learning.
+
+    parse: Optional[BoolTensor | ByteTensor | FloatTensor | HalfTensor | DoubleTensor]
+    entropy: Optional[HalfTensor | FloatTensor | DoubleTensor]
+    characteristics: Optional[BoolTensor | ByteTensor | HalfTensor | FloatTensor | DoubleTensor]
+
+    def __init__(self, parse: Optional[Tensor], entropy: Optional[Tensor], characteristics: Optional[Tensor]) -> None:
+        if parse is not None and parse.dtype not in (torch.bool, torch.uint8):
+            raise TypeError(f"Expected parse to be bool or uint8, got {parse.dtype}")
+        if entropy is not None and entropy.dtype not in (torch.float16, torch.float32, torch.float64):
+            raise TypeError(f"Expected entropy to be float16, float32, or float64, got {entropy.dtype}")
+        if characteristics is not None and characteristics.dtype not in (torch.bool, torch.uint8):
+            raise TypeError(f"Expected characteristics to be bool or uint8, got {characteristics.dtype}")
+
+        self.parse = parse
+        self.entropy = entropy
+        self.characteristics = characteristics
+
+    @property
+    @abstractmethod
+    def length_axis(self) -> int:
+        ...
 
     def clone(self) -> Self:
-        return replace(
-            self,
-            parse=self.parse.clone() if self.parse is not None else None,
-            entropy=self.entropy.clone() if self.entropy is not None else None,
-            characteristics=self.characteristics.clone() if self.characteristics is not None else None,
-        )
+        if self.parse is not None:
+            self.parse = self.parse.clone()
+        if self.entropy is not None:
+            self.entropy = self.entropy.clone()
+        if self.characteristics is not None:
+            self.characteristics = self.characteristics.clone()
+        return self
 
     def to(self, device: torch.device, non_blocking: bool = False) -> Self:
-        return replace(
-            self,
-            parse=self.parse.to(device, non_blocking=non_blocking) if self.parse is not None else None,
-            entropy=self.entropy.to(device, non_blocking=non_blocking) if self.entropy is not None else None,
-            characteristics=self.characteristics.to(device, non_blocking=non_blocking) if self.characteristics is not None else None,
-        )
+        if self.parse is not None:
+            self.parse = self.parse.to(device, non_blocking=non_blocking)
+        if self.entropy is not None:
+            self.entropy = self.entropy.to(device, non_blocking=non_blocking)
+        if self.characteristics is not None:
+            self.characteristics = self.characteristics.to(device, non_blocking=non_blocking)
+        return self
 
     def pin_memory(self) -> Self:
-        return replace(
-            self,
-            parse=self.parse.pin_memory() if self.parse is not None else None,
-            entropy=self.entropy.pin_memory() if self.entropy is not None else None,
-            characteristics=self.characteristics.pin_memory() if self.characteristics is not None else None,
-        )
+        if self.parse is not None:
+            self.parse = self.parse.pin_memory()
+        if self.entropy is not None:
+            self.entropy = self.entropy.pin_memory()
+        if self.characteristics is not None:
+            self.characteristics = self.characteristics.pin_memory()
+        return self
 
     def compress(self) -> Self:
-        return replace(
-            self,
-            parse=pack_bool_tensor(self.parse) if self.parse is not None else None,
-            entropy=self.entropy.to(torch.float16) if self.entropy is not None else None,
-            characteristics=pack_bool_tensor(self.characteristics) if self.characteristics is not None else None,
-        )
+        if self.parse is not None and self.parse.dtype == torch.bool:
+            self.parse = packbits(self.parse, axis=self.length_axis)
+        if self.entropy is not None and self.entropy.dtype != torch.float16:
+            self.entropy = self.entropy.to(torch.float16)
+        if self.characteristics is not None and self.characteristics.dtype == torch.bool:
+            self.characteristics = packbits(self.characteristics, axis=self.length_axis)
+        return self
 
     def decompress(self) -> Self:
-        return replace(
-            self,
-            parse=unpack_bit_tensor(self.parse, len(ParserGuider.PARSEERRORS), dtype=torch.float32) if self.parse is not None else None,
-            entropy=self.entropy.to(torch.float32) if self.entropy is not None else None,
-            characteristics=unpack_bit_tensor(self.characteristics, len(CharacteristicGuider.CHARACTERISTICS), dtype=torch.float32) if self.characteristics is not None else None,
-        )
+        if self.parse is not None:
+            if self.parse.dtype == torch.uint8:
+                self.parse = unpackbits(self.parse, axis=self.length_axis)
+            self.parse = self.parse.to(torch.float32)
+        if self.entropy is not None and self.entropy.dtype != torch.float32:
+            self.entropy = self.entropy.to(torch.float32)
+        if self.characteristics is not None:
+            if self.characteristics.dtype == torch.uint8:
+                self.characteristics = unpackbits(self.characteristics, axis=self.length_axis)
+            self.characteristics = self.characteristics.to(torch.float32)
+        return self
 
     def trim(self, length: Optional[int]) -> Self:
-        return replace(
-            self,
-            parse=self.parse[:length, :] if self.parse is not None else None,
-            entropy=self.entropy[:length] if self.entropy is not None else None,
-            characteristics=self.characteristics[:length, :] if self.characteristics is not None else None,
-        )
+        if length is None:
+            return self
+
+        if self.parse is not None:
+            length_ = length
+            if self.parse.dtype == torch.uint8:
+                length_ = math.ceil(length / 8)
+            slice_ = [slice(length_) if i == self.length_axis else slice(None) for i in range(self.parse.ndim)]
+            self.parse = self.parse[tuple(slice_)]
+
+        if self.entropy is not None:
+            slice_ = [slice(length) if i == self.length_axis else slice(None) for i in range(self.parse.ndim)]
+            self.parse = self.parse[tuple(slice_)]
+
+        if self.characteristics is not None:
+            length_ = length
+            if self.characteristics.dtype == torch.uint8:
+                length_ = math.ceil(length / 8)
+            slice_ = [slice(length_) if i == self.length_axis else slice(None) for i in range(self.characteristics.ndim)]
+            self.characteristics = self.characteristics[tuple(slice_)]
+
+        return self
 
 
 class SemanticGuide(_SemanticGuideOrSemanticGuides):
 
-    def __post_init__(self) -> None:
-        lengths = [x.shape[0] for x in (self.parse, self.entropy, self.characteristics) if x is not None]
-        if len(set(lengths)) > 1:
-            raise ValueError(f"All non-None guides must have the same length. Got lengths: {lengths}")
+    @property
+    def length_axis(self) -> int:
+        return 0
 
 
 class SemanticGuides(_SemanticGuideOrSemanticGuides):
 
-    def __post_init__(self) -> None:
-        lengths = [x.shape[1] for x in (self.parse, self.entropy, self.characteristics) if x is not None]
-        if len(set(lengths)) > 1:
-            raise ValueError(f"All non-None guides must have the same length. Got lengths: {lengths}")
+    @property
+    def length_axis(self) -> int:
+        return 1
 
     @classmethod
     def from_singles(cls, guides: Sequence[SemanticGuide], pin_memory: bool = False) -> SemanticGuides:
@@ -146,15 +189,16 @@ class SemanticGuides(_SemanticGuideOrSemanticGuides):
 
         parse = None
         if guides[0].parse is not None:
-            padding_value = False if guides[0].parse.dtype == torch.bool else 0.0
+            padding_value = False if guides[0].parse.dtype == torch.bool else 0
             parse = pad_sequence([g.parse for g in guides], True, padding_value, "right", pin_memory)
         entropy = None
         if guides[0].entropy is not None:
             entropy = pad_sequence([g.entropy for g in guides], True, 0.0, "right", pin_memory)
         characteristics = None
         if guides[0].characteristics is not None:
-            padding_value = False if guides[0].characteristics.dtype == torch.bool else 0.0
+            padding_value = False if guides[0].characteristics.dtype == torch.bool else 0
             characteristics = pad_sequence([g.characteristics for g in guides], True, padding_value, "right", pin_memory)
+
         return cls(parse, entropy, characteristics)
 
 
@@ -172,7 +216,7 @@ class SemanticGuider:
 
     def __call__(self, data: Optional[LiefParse | lief.PE.Binary], size: Optional[int] = None, inputs: Optional[torch.CharTensor] = None) -> SemanticGuide:
         if not any((self.do_parse, self.do_entropy, self.do_characteristics)):
-            return SemanticGuide()
+            return SemanticGuide(None, None, None)
 
         if data is None:
             raise ValueError("Data must be provided for semantic guides.")
@@ -200,69 +244,80 @@ class SemanticGuider:
         return SemanticGuide(parse, entropy, characteristics)
 
 
-# TODO: improve design and clarity (mutating datatypes).
-@dataclass(frozen=True, slots=True)
 class _StructureMapOrStructureMaps(ABC):
-    index: BoolTensor
+
+    # NOTE: compression/decompression with bitpacking will implicitly zero pad tensors to a multiple of 8.
+    # NOTE: the boolean tensors are used only for slicing, so its not advisable to compress, pin, or move them.
+
+    index: BoolTensor | CharTensor
     lexicon: Mapping[int, HierarchicalStructure]
 
+    def __init__(self, index: BoolTensor | CharTensor, lexicon: Mapping[int, HierarchicalStructure]) -> None:
+        self.index = index
+        self.lexicon = lexicon
+        self.verify_inputs()
+
+    @property
+    @abstractmethod
+    def length_axis(self) -> int:
+        ...
+
+    @abstractmethod
+    def verify_inputs(self) -> None:
+        ...
+
     def clone(self) -> Self:
-        return replace(
-            self,
-            index=self.index.clone(),
-            lexicon=deepcopy(self.lexicon),
-        )
+        self.index = self.index.clone()
+        self.lexicon = deepcopy(self.lexicon)
+        return self
 
     def to(self, device: torch.device, non_blocking: bool = False) -> Self:
-       return replace(
-            self,
-            index=self.index.to(device, non_blocking=non_blocking),
-            lexicon=deepcopy(self.lexicon),
-        )
+        self.index = self.index.to(device, non_blocking=non_blocking)
+        return self
 
     def pin_memory(self) -> Self:
-        return replace(
-            self,
-            index=self.index.pin_memory(),
-            lexicon=deepcopy(self.lexicon),
-        )
+        self.index = self.index.pin_memory()
+        return self
 
     def compress(self) -> Self:
-        return replace(
-            self,
-            index=pack_bool_tensor(self.index),
-            lexicon=self.lexicon,
-        )
+        self.index = packbits(self.index, self.length_axis)
+        return self
 
     def decompress(self) -> Self:
-        return replace(
-            self,
-            index=unpack_bit_tensor(self.index),
-            lexicon=self.lexicon,
-        )
+        self.index = unpackbits(self.index, self.length_axis)
+        return self
 
     def trim(self, length: Optional[int]) -> Self:
-        return replace(
-            self,
-            index=self.index[:length, :],
-            lexicon=self.lexicon,
-        )
+        if length is None:
+            return self
+        length_ = length
+        if self.index.dtype == torch.uint8:
+            length_ = math.ceil(length / 8)
+        slice_ = [slice(length_) if i == self.length_axis else slice(None) for i in range(self.index.ndim)]
+        self.index = self.index[tuple(slice_)]
+        return self
 
 
 class StructureMap(_StructureMapOrStructureMaps):
 
-    def __post_init__(self) -> None:
-        if self.index.dim() != 2:
-            raise ValueError("StructureMap index must be a 2D tensor.")
+    @property
+    def length_axis(self) -> int:
+        return 0
+
+    def verify_inputs(self) -> None:
+        check_tensor(self.index, (None, None), (torch.bool, torch.uint8))
         if self.index.shape[1] != len(list(self.lexicon.keys())):
             raise ValueError("StructureMap index does not match lexicon keys.")
 
 
 class StructureMaps(_StructureMapOrStructureMaps):
 
-    def __post_init__(self) -> None:
-        if self.index.dim() != 3:
-            raise ValueError("BatchedStructureMap index must be a 3D tensor.")
+    @property
+    def length_axis(self) -> int:
+        return 1
+
+    def verify_inputs(self) -> None:
+        check_tensor(self.index, (None, None, None), (torch.bool, torch.uint8))
         if self.index.shape[2] != len(list(self.lexicon.keys())):
             raise ValueError("BatchedStructureMap index does not match lexicon keys.")
 
