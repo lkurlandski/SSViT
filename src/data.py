@@ -204,7 +204,7 @@ class SemanticGuides(_SemanticGuideOrSemanticGuides):
         if guides[0].characteristics is not None:
             padding_value = False if guides[0].characteristics.dtype == torch.bool else 0
             pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if guides[0].characteristics.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
-            characteristics = pad_sequence([g.characteristics for g in guides], True, padding_value, "right", pin_memory)
+            characteristics = pad_sequence([g.characteristics for g in guides], True, padding_value, "right", pin_memory, pad_to_multiple_of)
 
         return cls(parse, entropy, characteristics)
 
@@ -590,8 +590,9 @@ def pad_sequence(
 
 class CollateFn:
 
-    def __init__(self, pin_memory: bool) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool) -> None:
         self.pin_memory = pin_memory
+        self.bitpack = bitpack
 
     def __call__(self, batch: Sequence[Sample]) -> Samples:
         return Samples(
@@ -599,7 +600,7 @@ class CollateFn:
             name=[s.name for s in batch],
             label=torch.stack([s.label for s in batch]),
             inputs=pad_sequence([s.inputs.to(torch.int16) + 1 for s in batch], True, 0, "right", self.pin_memory, PAD_TO_MULTIPLE_OF),
-            guides=SemanticGuides.from_singles([s.guides.compress() for s in batch], pin_memory=self.pin_memory),
+            guides=SemanticGuides.from_singles([s.guides.compress() if self.bitpack else s.guides for s in batch], pin_memory=self.pin_memory),
             structure=StructureMaps.from_singles([s.structure for s in batch], pin_memory=self.pin_memory),
         )
 
