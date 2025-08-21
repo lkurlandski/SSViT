@@ -25,6 +25,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 import math
 import sys
+from typing import Any
+from typing import Literal
 from typing import Optional
 from typing import Protocol
 
@@ -369,6 +371,22 @@ class FiLM(nn.Module):  # type: ignore[misc]
         return z
 
 
+class FiLMNoP(nn.Module):  # type: ignore[misc]
+    """
+    No-op FiLM layer that does nothing but check the inputs.
+    """
+
+    def __init__(self, *args: Any, **kwds: Any) -> None:
+        super().__init__()
+
+    def forward(self, x: FloatTensor, g: Literal[None]) -> FloatTensor:
+        check_tensor(x, (None, None, None), torch.float)
+        if g is not None:
+            raise ValueError(f"Expected g to be None, got {type(g)} instead.")
+
+        return x
+
+
 class MalConv(nn.Module):  # type: ignore[misc]
     """
     MalConv backbone.
@@ -417,18 +435,19 @@ class MalConv(nn.Module):  # type: ignore[misc]
 
 class MalConvClassifier(nn.Module):  # type: ignore[misc]
 
-    def __init__(self, embedding: nn.Embedding, filmer: FiLM | nn.Identity, backbone: MalConv, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, backbone: MalConv, head: ClassifificationHead) -> None:
         super().__init__()
 
         self.embedding = embedding
-        self.filmer = filmer
+        self.filmer = filmer if filmer is not None else lambda z, _: z
         self.backbone = backbone
         self.head = head
 
-    def forward(self, x: FloatTensor, g: FloatTensor) -> FloatTensor:
+    def forward(self, x: FloatTensor, g: Optional[FloatTensor]) -> FloatTensor:
         """
         Args:
             x: Input tensor of shape (B, T).
+            g: FiLM conditioning vector of shape (B, T, G).
         Returns:
             z: Classification logits of shape (B, M).
         """
