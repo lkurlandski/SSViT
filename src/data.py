@@ -59,6 +59,11 @@ from src.binentropy import compute_entropy_rolling_numpy
 StrPath = str | os.PathLike[str]
 
 
+PAD_TO_MULTIPLE_OF = 8
+if PAD_TO_MULTIPLE_OF % 8 != 0:
+    raise ValueError("PAD_TO_MULTIPLE_OF must be a multiple of 8.")
+
+
 class Name(str):
 
     def __new__(cls, value: StrPath) -> Name:
@@ -190,13 +195,15 @@ class SemanticGuides(_SemanticGuideOrSemanticGuides):
         parse = None
         if guides[0].parse is not None:
             padding_value = False if guides[0].parse.dtype == torch.bool else 0
-            parse = pad_sequence([g.parse for g in guides], True, padding_value, "right", pin_memory)
+            pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if guides[0].parse.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
+            parse = pad_sequence([g.parse for g in guides], True, padding_value, "right", pin_memory, pad_to_multiple_of)
         entropy = None
         if guides[0].entropy is not None:
-            entropy = pad_sequence([g.entropy for g in guides], True, 0.0, "right", pin_memory)
+            entropy = pad_sequence([g.entropy for g in guides], True, 0.0, "right", pin_memory, PAD_TO_MULTIPLE_OF)
         characteristics = None
         if guides[0].characteristics is not None:
             padding_value = False if guides[0].characteristics.dtype == torch.bool else 0
+            pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if guides[0].characteristics.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
             characteristics = pad_sequence([g.characteristics for g in guides], True, padding_value, "right", pin_memory)
 
         return cls(parse, entropy, characteristics)
@@ -330,7 +337,8 @@ class StructureMaps(_StructureMapOrStructureMaps):
             if m.lexicon != lexicon:
                 raise ValueError("All StructureMaps must have the same lexicon to be batched.")
         padding_value = False if maps[0].index.dtype == torch.bool else 0.0
-        index = pad_sequence([m.index for m in maps], True, padding_value, "right", pin_memory)
+        pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if maps[0].index.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
+        index = pad_sequence([m.index for m in maps], True, padding_value, "right", pin_memory, pad_to_multiple_of)
         return cls(index, lexicon)
 
 
@@ -384,11 +392,17 @@ class _SampleOrSamples(ABC):
     guides: _SemanticGuideOrSemanticGuides
     structure: _StructureMapOrStructureMaps
 
+    # TODO: this class needs is getting sloppy and needs to be re-written.
+
     # NOTE: the _StructureMapOrStructureMaps does not get moved to the GPU, since it is only used for indexing.
     # Therefore, it is intentionally ignored in the to(), pin_memory(), compress(), and decompress() methods.
 
     def __iter__(self) -> Iterable[tuple[StrPath, Name, IntTensor, IntTensor, SemanticGuides, StructureMap]]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
+
+    @abstractmethod
+    def __len__(self) -> int:
+        ...
 
     def clone(self) -> Self:
         return replace(
@@ -454,6 +468,9 @@ class Sample(_SampleOrSamples):
     guides: SemanticGuide
     structure: StructureMap
 
+    def __len__(self) -> int:
+        return 1
+
     def __post__init__(self) -> None:
         check_tensor(self.label, (), torch.int)
         check_tensor(self.inputs, (None,), torch.int)
@@ -466,6 +483,9 @@ class Samples(_SampleOrSamples):
     inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
     guides: SemanticGuides
     structure: StructureMaps
+
+    def __len__(self) -> int:
+        return len(self.file)
 
     def __post__init__(self) -> None:
         check_tensor(self.label, (None,), torch.int)
@@ -532,9 +552,8 @@ def pad_sequence(
     padding_value: float | int | bool = 0.0,
     padding_side: Literal["right", "left"] = "right",
     pin_memory: bool = False,
-    pad_to_multiple_of: int = 8,
+    pad_to_multiple_of: int = 1,
 ) -> Tensor:
-    # NOTE: bitpacked booleans implicitly pad to a multiple of 8, so using pad_to_multiple_of=8 is safe.
 
     if len(sequences) == 0:
         raise ValueError("Cannot pad an empty list of sequences.")
@@ -579,7 +598,7 @@ class CollateFn:
             file=[s.file for s in batch],
             name=[s.name for s in batch],
             label=torch.stack([s.label for s in batch]),
-            inputs=pad_sequence([s.inputs.to(torch.int16) + 1 for s in batch], True, 0, "right", self.pin_memory),
+            inputs=pad_sequence([s.inputs.to(torch.int16) + 1 for s in batch], True, 0, "right", self.pin_memory, PAD_TO_MULTIPLE_OF),
             guides=SemanticGuides.from_singles([s.guides.compress() for s in batch], pin_memory=self.pin_memory),
             structure=StructureMaps.from_singles([s.structure for s in batch], pin_memory=self.pin_memory),
         )
@@ -621,6 +640,10 @@ class CUDAPrefetcher:
             return
         with torch.cuda.stream(self.stream):
             self.next_batch = batch.to(self.device, non_blocking=True)
+
+    @property
+    def dataset(self) -> Dataset:
+        return self.loader.dataset
 
 
 class GroupedLengthBatchSampler(Sampler[list[int]]):  # type: ignore[misc]
