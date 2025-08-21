@@ -111,13 +111,13 @@ def packbits(x: BoolTensor, axis: int = -1) -> CharTensor:
     if d == 0:
         raise ValueError("packbits: cannot pack an empty axis")
 
-    y = x.movedim(axis, -1)
+    y = x.movedim(axis, -1).contiguous()
     pad = (-d) % 8
     if pad:
         y = F.pad(y, (0, pad), value=False)
     bytes_ = y.shape[-1] // 8
 
-    y = y.view(*y.shape[:-1], bytes_, 8).to(torch.uint8)
+    y = y.reshape(*y.shape[:-1], bytes_, 8).to(torch.uint8)
     weights = (1 << torch.arange(8, device=y.device, dtype=torch.uint8))
     out = (y * weights).sum(dim=-1, dtype=torch.uint8)
     return out.movedim(-1, axis)
@@ -136,14 +136,13 @@ def unpackbits(x: CharTensor, count: int = -1, axis: int = -1) -> BoolTensor:
     if x.ndim == 0:
         raise ValueError("unpackbits: input must have at least 1 dimension")
 
-
     axis = axis if axis >= 0 else x.ndim + axis
-    y = x.movedim(axis, -1)
+    y = x.movedim(axis, -1).contiguous()
     total_bits = y.shape[-1] * 8
     if count > total_bits:
         raise ValueError(f"unpackbits: count={count} exceeds capacity={total_bits} along axis")
 
     masks = (1 << torch.arange(8, device=y.device, dtype=torch.uint8))
-    bits = ((y.unsqueeze(-1) & masks) != 0).view(*y.shape[:-1], total_bits)
+    bits = ((y.unsqueeze(-1) & masks) != 0).reshape(*y.shape[:-1], total_bits)
     z = bits[..., :count]
     return z.movedim(-1, axis)
