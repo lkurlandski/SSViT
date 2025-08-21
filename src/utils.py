@@ -7,8 +7,10 @@ from typing import Optional
 import warnings
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from torch import BoolTensor
+from torch import CharTensor
 
 
 class TensorError(ValueError):
@@ -92,3 +94,56 @@ def unpack_bit_tensor(x: Tensor, d: int, dtype: torch.dtype = torch.bool) -> Ten
     masks = (1 << torch.arange(d, device=x.device, dtype=torch.int64))
     z = (x.unsqueeze(-1) & masks) != 0
     return z.to(dtype)
+
+
+@torch.no_grad()  # type: ignore[misc]
+def packbits(x: BoolTensor, axis: int = -1) -> CharTensor:
+    """
+    Torch variant of numpy.packbits(..., bitorder='little').
+    """
+    if x.dtype is not torch.bool:
+        raise TypeError(f"packbits: expected bool tensor, got {x.dtype}")
+    if x.ndim == 0:
+        raise ValueError("packbits: input must have at least 1 dimension")
+
+    axis = axis if axis >= 0 else x.ndim + axis
+    d = x.shape[axis]
+    if d == 0:
+        raise ValueError("packbits: cannot pack an empty axis")
+
+    y = x.movedim(axis, -1)
+    pad = (-d) % 8
+    if pad:
+        y = F.pad(y, (0, pad), value=False)
+    bytes_ = y.shape[-1] // 8
+
+    y = y.view(*y.shape[:-1], bytes_, 8).to(torch.uint8)
+    weights = (1 << torch.arange(8, device=y.device, dtype=torch.uint8))
+    out = (y * weights).sum(dim=-1, dtype=torch.uint8)
+    return out.movedim(-1, axis)
+
+
+@torch.no_grad()  # type: ignore[misc]
+def unpackbits(x: CharTensor, count: int = -1, axis: int = -1) -> BoolTensor:
+    """
+    Torch variant of numpy.unpackbits(..., bitorder='little').
+    """
+    if x.dtype is not torch.uint8:
+        raise TypeError(f"unpackbits: expected torch.uint8, got {x.dtype}") 
+    count = x.shape[axis] * 8 if count == -1 else count
+    if count < 1:
+        raise ValueError(f"unpackbits: count must be >= 1, got {count}")
+    if x.ndim == 0:
+        raise ValueError("unpackbits: input must have at least 1 dimension")
+
+
+    axis = axis if axis >= 0 else x.ndim + axis
+    y = x.movedim(axis, -1)
+    total_bits = y.shape[-1] * 8
+    if count > total_bits:
+        raise ValueError(f"unpackbits: count={count} exceeds capacity={total_bits} along axis")
+
+    masks = (1 << torch.arange(8, device=y.device, dtype=torch.uint8))
+    bits = ((y.unsqueeze(-1) & masks) != 0).view(*y.shape[:-1], total_bits)
+    z = bits[..., :count]
+    return z.movedim(-1, axis)
