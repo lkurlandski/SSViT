@@ -604,6 +604,9 @@ class CollateFn:
             structure=StructureMaps.from_singles([s.structure for s in batch], pin_memory=self.pin_memory),
         )
 
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack})"
+
 
 class CUDAPrefetcher:
 
@@ -633,9 +636,12 @@ class CUDAPrefetcher:
     def __len__(self) -> int:
         return len(self.loader)
 
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(loader={self.loader}, device={self.device})"
+
     def _preload(self) -> None:
         try:
-            batch = next(self.it)
+            batch: Samples = next(self.it)
         except StopIteration:
             self.next_batch = None
             return
