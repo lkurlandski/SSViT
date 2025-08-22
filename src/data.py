@@ -408,25 +408,42 @@ class StructurePartitioner:
         return StructureMap(index, lexicon)
 
 
-@dataclass(frozen=False, slots=True)
 class _SampleOrSamples(ABC):
     file: StrPath | list[StrPath]
     name: Name | list[Name]
-    label: IntTensor
+    label: ShortTensor | IntTensor | LongTensor
     inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
     guides: _SemanticGuideOrSemanticGuides
     structure: _StructureMapOrStructureMaps
 
-    # TODO: this class needs is getting sloppy and needs to be re-written.
+    # NOTE: the _StructureMapOrStructureMaps does not need to be involved in GPU operations.
 
-    # NOTE: the _StructureMapOrStructureMaps does not get moved to the GPU, since it is only used for indexing.
-    # Therefore, it is intentionally ignored in the to(), pin_memory(), compress(), and decompress() methods.
+    def __init__(
+        self,
+        file: StrPath | list[StrPath],
+        name: Name | list[Name],
+        label: ShortTensor | IntTensor | LongTensor,
+        inputs: ByteTensor | ShortTensor | IntTensor | LongTensor,
+        guides: _SemanticGuideOrSemanticGuides,
+        structure: _StructureMapOrStructureMaps,
+    ) -> None:
+        self.file = file
+        self.name = name
+        self.label = label
+        self.inputs = inputs
+        self.guides = guides
+        self.structure = structure
+        self.verify_inputs()
 
-    def __iter__(self) -> Iterable[tuple[StrPath, Name, IntTensor, IntTensor, SemanticGuides, StructureMap]]:
+    def __iter__(self) -> Iterable[tuple[StrPath | list[StrPath], Name | list[Name], IntTensor, IntTensor, SemanticGuides, StructureMap]]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
 
     @abstractmethod
     def __len__(self) -> int:
+        ...
+
+    @abstractmethod
+    def verify_inputs(self) -> None:
         ...
 
     @property
@@ -443,65 +460,42 @@ class _SampleOrSamples(ABC):
         self.guides.record_stream(s)
 
     def clone(self) -> Self:
-        return replace(
-            self,
-            file=deepcopy(self.file),
-            name=deepcopy(self.name),
-            label=self.label.clone(),
-            inputs=self.inputs.clone(),
-            guides=self.guides.clone(),
-            structure=self.structure.clone(),
-        )
+        self.file = deepcopy(self.file)
+        self.name = deepcopy(self.name)
+        self.inputs = self.inputs.clone()
+        self.label = self.label.clone()
+        self.guides = self.guides.clone()
+        self.structure = self.structure.clone()
+        return self
 
     def to(self, device: torch.device, non_blocking: bool = False) -> Self:
-        return replace(
-            self,
-            file=self.file,
-            name=self.name,
-            label=self.label.to(device, non_blocking=non_blocking),
-            inputs=self.inputs.to(device, non_blocking=non_blocking),
-            guides=self.guides.to(device, non_blocking=non_blocking),
-            structure=self.structure,
-        )
+        self.label = self.label.to(device, non_blocking=non_blocking)
+        self.inputs = self.inputs.to(device, non_blocking=non_blocking)
+        self.guides = self.guides.to(device, non_blocking=non_blocking)
+        return self
 
     def pin_memory(self) -> Self:
-        return replace(
-            self,
-            file=self.file,
-            name=self.name,
-            label=self.label.pin_memory(),
-            inputs=self.inputs.pin_memory(),
-            guides=self.guides.pin_memory(),
-            structure=self.structure,
-        )
+        self.label = self.label.pin_memory()
+        self.inputs = self.inputs.pin_memory()
+        self.guides = self.guides.pin_memory()
+        return self
 
     def compress(self) -> Self:
-        return replace(
-            self,
-            file=self.file,
-            name=self.name,
-            label=self.label.to(torch.int16),
-            inputs=self.inputs.to(torch.uint16),
-            guides=self.guides.compress(),
-            structure=self.structure,
-        )
+        self.inputs = self.inputs.to(torch.int16)
+        self.guides = self.guides.compress()
+        return self
 
     def decompress(self) -> Self:
-        return replace(
-            self,
-            file=self.file,
-            name=self.name,
-            label=self.label.to(torch.int64),
-            inputs=self.inputs.to(torch.int32),
-            guides=self.guides.decompress(),
-            structure=self.structure,
-        )
+        self.label = self.label.to(torch.int64)
+        self.inputs = self.inputs.to(torch.int32)
+        self.guides = self.guides.decompress()
+        return self
 
 
 class Sample(_SampleOrSamples):
     file: StrPath
     name: Name
-    label: IntTensor
+    label: ShortTensor | IntTensor | LongTensor
     inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
     guides: SemanticGuide
     structure: StructureMap
@@ -509,15 +503,15 @@ class Sample(_SampleOrSamples):
     def __len__(self) -> int:
         return 1
 
-    def __post__init__(self) -> None:
-        check_tensor(self.label, (), torch.int)
-        check_tensor(self.inputs, (None,), torch.int)
+    def verify_inputs(self) -> None:
+        check_tensor(self.label, (), (torch.int16, torch.int32, torch.int64))
+        check_tensor(self.inputs, (None,), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
 class Samples(_SampleOrSamples):
     file: list[StrPath]
     name: list[Name]
-    label: IntTensor
+    label: ShortTensor | IntTensor | LongTensor
     inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
     guides: SemanticGuides
     structure: StructureMaps
@@ -525,9 +519,9 @@ class Samples(_SampleOrSamples):
     def __len__(self) -> int:
         return len(self.file)
 
-    def __post__init__(self) -> None:
-        check_tensor(self.label, (None,), torch.int)
-        check_tensor(self.inputs, (self.label.shape[0], None), torch.int)
+    def verify_inputs(self) -> None:
+        check_tensor(self.label, (None,), (torch.int16, torch.int32, torch.int64))
+        check_tensor(self.inputs, (self.label.shape[0], None), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
 class BinaryDataset(Dataset):  # type: ignore[misc]
