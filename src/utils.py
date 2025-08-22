@@ -9,6 +9,7 @@ from typing import Optional
 import warnings
 
 import numpy as np
+import psutil
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -22,7 +23,8 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def get_optimal_num_workers(ncpu: int = len(os.sched_getaffinity(0)), ngpu: int = torch.cuda.device_count()) -> int:
+def get_optimal_num_workers(ncpu: int = psutil.cpu_count(logical=False), ngpu: int = torch.cuda.device_count()) -> int:
+    # TODO: its unclear how the CPU check will behave with SLURM and torchrun.
     if ncpu <= 0:
         raise RuntimeError(f"Number of CPU cores ({ncpu}) must be greater than 0.")
     if ngpu > ncpu:
@@ -30,7 +32,8 @@ def get_optimal_num_workers(ncpu: int = len(os.sched_getaffinity(0)), ngpu: int 
     return max(0, ncpu // max(1, ngpu) - 1)
 
 
-def get_optimal_num_worker_threads(num_workers: int = 0, ncpu: int = len(os.sched_getaffinity(0))) -> int:
+def get_optimal_num_worker_threads(num_workers: int = 0, ncpu: int = psutil.cpu_count(logical=False)) -> int:
+    # TODO: its unclear how the CPU check will behave with SLURM and torchrun.
     if ncpu <= 0:
         raise RuntimeError(f"Number of CPU cores ({ncpu}) must be greater than 0.")
     if num_workers - 1 > ncpu:
