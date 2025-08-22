@@ -3,14 +3,41 @@ Utilities.
 """
 
 from __future__ import annotations
+import os
+import random
 from typing import Optional
 import warnings
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch import BoolTensor
 from torch import CharTensor
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def get_optimal_num_workers(ncpu: int = len(os.sched_getaffinity(0)), ngpu: int = torch.cuda.device_count()) -> int:
+    if ncpu <= 0:
+        raise RuntimeError(f"Number of CPU cores ({ncpu}) must be greater than 0.")
+    if ngpu > ncpu:
+        raise RuntimeError(f"Number of GPUs ({ngpu}) exceeds number of CPU cores ({ncpu}).")
+    return max(0, ncpu // max(1, ngpu) - 1)
+
+
+def get_optimal_num_worker_threads(num_workers: int = 0, ncpu: int = len(os.sched_getaffinity(0))) -> int:
+    if ncpu <= 0:
+        raise RuntimeError(f"Number of CPU cores ({ncpu}) must be greater than 0.")
+    if num_workers - 1 > ncpu:
+        raise RuntimeError(f"Number of worker processes ({num_workers} + 1) exceeds number of CPU cores ({ncpu}).")
+    if num_workers == 0:
+        return ncpu
+    return max(1, ncpu // num_workers - 1)
 
 
 class TensorError(ValueError):
