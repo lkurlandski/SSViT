@@ -451,6 +451,7 @@ class MalConvClassifier(nn.Module):  # type: ignore[misc]
         Returns:
             z: Classification logits of shape (B, M).
         """
+        check_tensor(x, (None, None), (torch.int32, torch.int64))
 
         z = self.embedding.forward(x)  # (B, T, E)
         z = self.filmer.forward(z, g)  # (B, T, E)
