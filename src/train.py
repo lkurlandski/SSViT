@@ -40,10 +40,14 @@ from src.trainer import Trainer
 from src.trainer import TrainerArgumentParser
 from src.trainer import TrainerArgs
 from src.trainer import EarlyStopper
+from src.utils import seed_everything
+from src.utils import get_optimal_num_workers
+from src.utils import get_optimal_num_worker_threads
 
 
 @dataclass
 class MainArgs:
+    seed: int = 0
     do_parser: bool = False
     do_entropy: bool = False
     do_characteristics: bool = False
@@ -61,11 +65,6 @@ class MainArgs:
     weight_decay: float = 1e-5
 
     def __post_init__(self) -> None:
-        if self.num_workers > 0:
-            if os.environ.get("OMP_NUM_THREADS") is None:
-                warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but OMP_NUM_THREADS is not set, which could result in CPU oversubscription.")
-            if os.environ.get("MKL_NUM_THREADS") is None:
-                warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but MKL_NUM_THREADS is not set, which could result in CPU oversubscription.")
         if self.tr_batch_size == 1 or self.vl_batch_size == 1:
             raise NotImplementedError("Batch size of 1 is not supported right now. See https://docs.pytorch.org/docs/stable/data#working-with-collate-fn.")
 
@@ -74,6 +73,7 @@ class MainArgumentParser(ArgumentParser):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
+        self.add_argument("--seed", type=int, default=MainArgs.seed)
         self.add_argument("--do_parser", action="store_true", default=MainArgs.do_parser)
         self.add_argument("--do_entropy", action="store_true", default=MainArgs.do_entropy)
         self.add_argument("--do_characteristics", action="store_true", default=MainArgs.do_characteristics)
@@ -91,7 +91,7 @@ class MainArgumentParser(ArgumentParser):
         self.add_argument("--weight_decay", type=float, default=MainArgs.weight_decay)
 
 
-def get_materials() -> tuple[list[Path], list[Path], list[int], list[int]]:
+def get_materials(tr_num_samples: Optional[int] = None, vl_num_samples: Optional[int] = None) -> tuple[list[Path], list[Path], list[int], list[int]]:
     # TODO: define a temporal (not random) train/test split.
     # FIXME: this doesn't actually randomize things properly.
     benfiles = list(filter(lambda f: f.is_file(), Path("./data/ass").rglob("*")))
@@ -100,18 +100,41 @@ def get_materials() -> tuple[list[Path], list[Path], list[int], list[int]]:
     mallabel = [1] * len(malfiles)
     files = benfiles + malfiles
     labels = benlabels + mallabel
+
     idx = np.arange(len(files))
     tr_idx = np.random.choice(idx, size=int(0.8 * len(files)), replace=False)
     vl_idx = np.setdiff1d(idx, tr_idx)  # type: ignore[no-untyped-call]
-    tr_files = [files[i] for i in tr_idx]
-    vl_files = [files[i] for i in vl_idx]
+
+    tr_files  = [files[i] for i in tr_idx]
+    vl_files  = [files[i] for i in vl_idx]
     tr_labels = [labels[i] for i in tr_idx]
     vl_labels = [labels[i] for i in vl_idx]
+
+    if tr_num_samples is not None:
+        if tr_num_samples > len(tr_files):
+            warnings.warn(f"Requested {tr_num_samples} training samples, but only {len(tr_files)} are available.")
+            tr_num_samples = len(tr_files)
+
+    if vl_num_samples is not None:
+        if vl_num_samples > len(vl_files):
+            warnings.warn(f"Requested {vl_num_samples} validation samples, but only {len(vl_files)} are available.")
+            vl_num_samples = len(vl_files)
+
+    tr_files = tr_files[0:tr_num_samples]
+    vl_files = vl_files[0:vl_num_samples]
+    tr_labels = tr_labels[0:tr_num_samples]
+    vl_labels = vl_labels[0:vl_num_samples]
+
     return tr_files, vl_files, tr_labels, vl_labels
 
 
-def worker_init_fn(_):
+def worker_init_fn(worker_id: int) -> None:
+    info = torch.utils.data.get_worker_info()
     lief.logging.set_level(lief.logging.LEVEL.OFF)
+    org_num_threads = torch.get_num_threads()
+    new_num_threads = get_optimal_num_worker_threads(info.num_workers)
+    torch.set_num_threads(new_num_threads)
+    print(f"Worker {worker_id} of {info.num_workers} using {org_num_threads} --> {torch.get_num_threads()} threads.")
 
 
 def main() -> None:
@@ -122,6 +145,8 @@ def main() -> None:
     parser = Parser(description="Train and validate models.")
     args = parser.parse_args()
 
+    seed_everything(args.seed)
+
     preprocessor = Preprocessor(
         args.do_parser,
         args.do_entropy,
@@ -130,15 +155,16 @@ def main() -> None:
         max_length=args.max_length,
     )
 
-    tr_files, vl_files, tr_labels, vl_labels = get_materials()
+    tr_files, vl_files, tr_labels, vl_labels = get_materials(args.tr_num_samples, args.vl_num_samples)
 
-    tr_dataset = BinaryDataset(tr_files[0:args.tr_num_samples], tr_labels[0:args.tr_num_samples], preprocessor)
-    vl_dataset = BinaryDataset(vl_files[0:args.vl_num_samples], vl_labels[0:args.vl_num_samples], preprocessor)
+    tr_dataset = BinaryDataset(tr_files, tr_labels, preprocessor)
+    vl_dataset = BinaryDataset(vl_files, vl_labels, preprocessor)
 
     collate_fn = CollateFn(pin_memory=False, bitpack=args.bitpack)
     print(f"{collate_fn=}")
 
     def get_loader(dataset: Dataset, sampler: Sampler) -> DataLoader | CUDAPrefetcher:
+
         dataloader = DataLoader(
             dataset=dataset,
             batch_sampler=sampler,
@@ -179,7 +205,8 @@ def main() -> None:
 
     trainer = Trainer(TrainerArgs.from_namespace(args), model, tr_loader, vl_loader, loss_fn, optimizer, scheduler, stopper)
 
-    trainer = trainer()
+    # trainer = trainer()
+    trainer.evaluate()
 
 
 if __name__ == "__main__":
