@@ -263,7 +263,7 @@ class SemanticGuider:
 
         characteristics = None
         if self.do_characteristics:
-            characteristics = CharacteristicGuider(data, size)()
+            characteristics = CharacteristicGuider(data, size, use_packed=True)()
             characteristics = torch.from_numpy(characteristics)
 
         return SemanticGuide(parse, entropy, characteristics)
