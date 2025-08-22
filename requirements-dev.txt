@@ -1,9 +1,9 @@
 mypy
 pandas
-psutil
+pyinstrument
 pylint
 pytest
-pyinstrument
 ruff
-types-tqdm
+scalene
 scipy
+types-tqdm
