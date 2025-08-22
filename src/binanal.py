@@ -317,18 +317,75 @@ class CharacteristicGuider:
         lief.PE.Section.CHARACTERISTICS.MEM_WRITE,
     ]
 
-    def __init__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> None:
+    def __init__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None, use_packed: bool = False) -> None:
         self.pe, self.size = _parse_pe_and_get_size(data, size)
+        self.use_packed = use_packed
 
-    def __call__(self) -> npt.NDArray[np.bool_]:
+    def _get_bool_mask(self) -> npt.NDArray[np.bool_]:
+        # NOTE: allocating the (T, C) array is quite expensive.
         x = np.full((self.size, len(self.CHARACTERISTICS)), False, dtype=bool)
-        # TODO: account for sections with invalid offsets/sizes (use the StructureParser).
         for section in self.pe.sections:
             offset = section.offset
             size = section.size
+            lo = max(0, offset)
+            hi = min(self.size, offset + size)
+            if hi <= lo:
+                continue
+
             for i, c in enumerate(self.CHARACTERISTICS):
-                x[offset:offset + size, i] = True if section.has_characteristic(c) else False
+                x[lo:hi, i] |= section.has_characteristic(c)
+
         return x
+
+    def _get_bit_mask(self) -> npt.NDArray[np.uint8]:
+        x = np.zeros(((self.size + 7) // 8, len(self.CHARACTERISTICS)), dtype=np.uint8)
+
+        for section in self.pe.sections:
+            offset = section.offset
+            size = section.size
+            lo = max(0, offset)
+            hi = min(self.size, offset + size)
+            if hi <= lo:
+                continue
+
+            # Byte-span and bit positions (hi is exclusive)
+            last = hi - 1
+            b0 = lo >> 3
+            b1 = last >> 3
+            start_bit = lo & 7
+            end_bits  = (last & 7) + 1
+            count = b1 - b0 + 1
+
+            # Build the mask vector for this [lo, hi) once (little-endian bit order)
+            if count == 1:
+                head = (0xFF << start_bit) & 0xFF
+                tail = (1 << end_bits) - 1
+                masks = np.array([head & tail], dtype=np.uint8)
+            else:
+                masks = np.empty(count, dtype=np.uint8)
+                masks[0] = (0xFF << start_bit) & 0xFF
+                if count > 2:
+                    masks[1:-1] = 0xFF
+                masks[-1] = (1 << end_bits) - 1
+
+            # Which characteristics apply to this section?
+            flags = np.fromiter(  # type: ignore[no-untyped-call]
+                (section.has_characteristic(c) for c in self.CHARACTERISTICS),
+                count=len(self.CHARACTERISTICS), dtype=np.bool_
+            )
+            if not flags.any():
+                continue
+            cols = np.flatnonzero(flags)
+
+            # Broadcast OR into those columns at once
+            x[b0:b1 + 1, cols] |= masks[:, None]
+
+        return x
+
+    def __call__(self) -> npt.NDArray[np.bool_] | npt.NDArray[np.uint8]:
+        if self.use_packed:
+            return self._get_bit_mask()
+        return self._get_bool_mask()
 
 
 class ParserGuider:

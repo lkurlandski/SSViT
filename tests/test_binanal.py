@@ -2,6 +2,7 @@
 Tests.
 """
 
+import math
 import os
 from pathlib import Path
 import sys
@@ -144,13 +145,37 @@ class TestCharacteristicGuider:
 
     @pytest.mark.parametrize("file", FILES)
     @pytest.mark.parametrize("input_type", [str, Path, bytes])
-    def test(self, file: Path, input_type: type[str | Path | bytes]) -> None:
+    def test_bool(self, file: Path, input_type: type[str | Path | bytes]) -> None:
         data = _path_to_input_type(file, input_type)
-        x = CharacteristicGuider(data)()
+        x = CharacteristicGuider(data, use_packed=False)()
         assert x.ndim == 2
         assert x.shape[0] == os.path.getsize(file)
         assert x.shape[1] == len(CharacteristicGuider.CHARACTERISTICS)
-        # assert torch.all(torch.isin(x, torch.tensor([0, 1, -1])))
+        assert x.dtype == np.bool_
+
+    @pytest.mark.parametrize("file", FILES)
+    @pytest.mark.parametrize("input_type", [str, Path, bytes])
+    def test_bit(self, file: Path, input_type: type[str | Path | bytes]) -> None:
+        data = _path_to_input_type(file, input_type)
+        x = CharacteristicGuider(data, use_packed=True)()
+        assert x.ndim == 2
+        assert x.shape[0] == math.ceil(os.path.getsize(file) / 8)
+        assert x.shape[1] == len(CharacteristicGuider.CHARACTERISTICS)
+        assert x.dtype == np.uint8
+
+    @pytest.mark.parametrize("file", FILES)
+    def test_equivalence(self, file: Path, input_type: type[str | Path | bytes] = str) -> None:
+        data = _path_to_input_type(file, input_type)
+        x_1 = CharacteristicGuider(data, use_packed=False)()
+        x_2 = CharacteristicGuider(data, use_packed=True)()
+
+        z = np.packbits(x_1, axis=0, bitorder="little")
+        assert z.shape == x_2.shape
+        assert np.all(x_2 == z)
+
+        z = np.unpackbits(x_2, axis=0, count=x_1.shape[0], bitorder="little")
+        assert z.shape == x_1.shape
+        assert np.all(x_1 == z)
 
 
 class TestStructureParser:
