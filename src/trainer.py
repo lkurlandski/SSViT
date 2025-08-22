@@ -302,8 +302,6 @@ class Trainer:
         step = 0
         for mini_step, batch in iterable:
 
-            batch = batch.decompress()
-
             # Compute normalized loss
             outputs = self.forward(batch)
             loss = self.compute_loss(batch, outputs) / self.args.gradient_accumulation_steps
@@ -352,7 +350,6 @@ class Trainer:
 
         with torch.no_grad():
             for mini_step, batch in iterable:
-                batch = batch.decompress()
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 metrics = self.compute_metrics(batch, outputs)

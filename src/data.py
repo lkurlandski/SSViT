@@ -631,7 +631,7 @@ class CUDAPrefetcher:
         torch.cuda.current_stream().wait_stream(self.stream)
         batch = self.next_batch
         self._preload()
-        return batch
+        return batch.decompress()
 
     def __len__(self) -> int:
         return len(self.loader)
