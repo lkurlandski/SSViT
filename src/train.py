@@ -13,6 +13,7 @@ import warnings
 
 import lief
 import numpy as np
+import torch
 from torch.nn import Embedding
 from torch.nn import CrossEntropyLoss
 from torch.optim import AdamW
@@ -109,6 +110,10 @@ def get_materials() -> tuple[list[Path], list[Path], list[int], list[int]]:
     return tr_files, vl_files, tr_labels, vl_labels
 
 
+def worker_init_fn(_):
+    lief.logging.set_level(lief.logging.LEVEL.OFF)
+
+
 def main() -> None:
 
     lief.logging.set_level(lief.logging.LEVEL.OFF)
@@ -140,6 +145,7 @@ def main() -> None:
             num_workers=args.num_workers,
             collate_fn=collate_fn,
             pin_memory=args.pin_memory and args.device.type == "cuda",
+            worker_init_fn=worker_init_fn,
             multiprocessing_context=None if args.num_workers == 0 else "forkserver",
             prefetch_factor=None if args.num_workers == 0 else args.prefetch_factor,
             persistent_workers=None if args.num_workers == 0 else True,
