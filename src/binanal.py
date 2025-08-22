@@ -17,6 +17,7 @@ from typing import Self
 import warnings
 
 import lief
+import numba as nb
 import numpy as np
 import numpy.typing as npt
 
@@ -340,52 +341,91 @@ class CharacteristicGuider:
     def _get_bit_mask(self) -> npt.NDArray[np.uint8]:
         x = np.zeros(((self.size + 7) // 8, len(self.CHARACTERISTICS)), dtype=np.uint8)
 
-        for section in self.pe.sections:
-            offset = section.offset
-            size = section.size
-            lo = max(0, offset)
-            hi = min(self.size, offset + size)
-            if hi <= lo:
-                continue
+        sections = list(self.pe.sections)
+        n_sec = len(sections)
+        K = len(self.CHARACTERISTICS)
 
-            # Byte-span and bit positions (hi is exclusive)
-            last = hi - 1
-            b0 = lo >> 3
-            b1 = last >> 3
-            start_bit = lo & 7
-            end_bits  = (last & 7) + 1
-            count = b1 - b0 + 1
+        offsets = np.empty(n_sec, dtype=np.int64)
+        sizes   = np.empty(n_sec, dtype=np.int64)
+        flags   = np.zeros((n_sec, K), dtype=np.uint8)
 
-            # Build the mask vector for this [lo, hi) once (little-endian bit order)
-            if count == 1:
-                head = (0xFF << start_bit) & 0xFF
-                tail = (1 << end_bits) - 1
-                masks = np.array([head & tail], dtype=np.uint8)
-            else:
-                masks = np.empty(count, dtype=np.uint8)
-                masks[0] = (0xFF << start_bit) & 0xFF
-                if count > 2:
-                    masks[1:-1] = 0xFF
-                masks[-1] = (1 << end_bits) - 1
+        for s, sec in enumerate(sections):
+            offsets[s] = int(getattr(sec, "offset", 0) or 0)
+            sizes[s]   = int(getattr(sec, "size",   0) or 0)
+            for i, c in enumerate(self.CHARACTERISTICS):
+                flags[s, i] = 1 if sec.has_characteristic(c) else 0
 
-            # Which characteristics apply to this section?
-            flags = np.fromiter(  # type: ignore[no-untyped-call]
-                (section.has_characteristic(c) for c in self.CHARACTERISTICS),
-                count=len(self.CHARACTERISTICS), dtype=np.bool_
-            )
-            if not flags.any():
-                continue
-            cols = np.flatnonzero(flags)
-
-            # Broadcast OR into those columns at once
-            x[b0:b1 + 1, cols] |= masks[:, None]
-
+        _paint_packed_or(x, offsets, sizes, flags, self.size)
         return x
 
     def __call__(self) -> npt.NDArray[np.bool_] | npt.NDArray[np.uint8]:
         if self.use_packed:
             return self._get_bit_mask()
         return self._get_bool_mask()
+
+
+@nb.njit(cache=True, parallel=False, fastmath=True)  # type: ignore[misc]
+def _paint_bool_or(x: npt.NDArray[np.uint8], offsets: npt.NDArray[np.int64], sizes: npt.NDArray[np.int64], flags: npt.NDArray[np.uint8], T: int) -> None:
+    """
+    This is the equivalent of _paint_bool_or that could be used for the boolean version of the CharacteristicGuider.
+
+    NOTE: This has not been tested.
+    """
+    n_sec, C = flags.shape
+    for s in range(n_sec):
+        lo = offsets[s]
+        hi = lo + sizes[s]
+        if lo < 0:
+            lo = 0
+        if hi > T:
+            hi = T
+        if hi <= lo:
+            continue
+        for k in range(C):
+            if flags[s, k] != 0:
+                for j in range(lo, hi):
+                    x[j, k] = True
+
+
+@nb.njit(cache=True, parallel=False, fastmath=True)  # type: ignore[misc]
+def _paint_packed_or(x: npt.NDArray[np.uint8], offsets: npt.NDArray[np.int64], sizes: npt.NDArray[np.int64], flags: npt.NDArray[np.uint8], T: int) -> None:
+    """
+    I honestly have no idea how this works, but it seems to be correct and is super fast.
+
+    See commit 2b74f189e5ca5fcd9f25e855d25d40877a16399b for the native numpy version.
+
+    Using njit(parellel=True) appeared to be slower for sequences of length ~1MiB.
+    """
+    n_sec, C = flags.shape
+    for s in range(n_sec):
+        lo = offsets[s]
+        hi = lo + sizes[s]
+        if lo < 0:
+            lo = 0
+        if hi > T:
+            hi = T
+        if hi <= lo:
+            continue
+
+        last = hi - 1
+        b0 = lo >> 3
+        b1 = last >> 3
+        start_bit = lo & 7
+        end_bits = (last & 7) + 1
+
+        for k in nb.prange(C):
+            if flags[s, k] == 0:
+                continue
+            if b0 == b1:
+                m = ((0xFF << start_bit) & 0xFF) & ((1 << end_bits) - 1)
+                x[b0, k] = x[b0, k] | m
+            else:
+                m0 = (0xFF << start_bit) & 0xFF
+                x[b0, k] = x[b0, k] | m0
+                for b in range(b0 + 1, b1):
+                    x[b, k] = x[b, k] | 0xFF
+                m1 = (1 << end_bits) - 1
+                x[b1, k] = x[b1, k] | m1
 
 
 class ParserGuider:
