@@ -21,7 +21,6 @@ from statistics import mean
 import time
 from typing import Any
 from typing import Callable
-from typing import TypedDict
 from typing import Optional
 from typing import Self
 from typing import Union
@@ -56,17 +55,12 @@ class TrainerArgs:
     outdir: Path = Path("./output/tmp")
     device: torch.device = torch.device("cpu")
     epochs: int = 1
-    tr_batch_size: int = 1   # TODO: move
-    vl_batch_size: int = 1   # TODO: move
-    num_workers: int = 0     # TODO: move
-    pin_memory: bool = True  # TODO: move
     disable_tqdm: bool = False
     logging_steps: int = -1
     metric: str = "vl_loss"
     lower_is_worse: bool = False
     max_norm: float = 1.0
     gradient_accumulation_steps: int = 1
-    find_executable_batch_size: bool = False
 
     def __post_init__(self) -> None:
         if self.device.type == "cuda":
@@ -75,12 +69,6 @@ class TrainerArgs:
                 self.device = torch.device("cpu")
             if os.environ.get("CUDA_VISIBLE_DEVICES") is None:
                 warnings.warn("CUDA_VISIBLE_DEVICES is not set, which could result in unexpected behavior if multiple GPUs are available.")
-
-        if self.num_workers > 0:
-            if os.environ.get("OMP_NUM_THREADS") is None:
-                warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but OMP_NUM_THREADS is not set, which could result in CPU oversubscription.")
-            if os.environ.get("MKL_NUM_THREADS") is None:
-                warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but MKL_NUM_THREADS is not set, which could result in CPU oversubscription.")
 
         if self.logging_steps > 0:
             warnings.warn(f"Logging every {self.logging_steps} `logging_steps` is enabled, which may slow down training.")
@@ -94,20 +82,15 @@ class TrainerArgumentParser(ArgumentParser):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
-        self.add_argument("--outdir", type=Path, default=Path("./output/tmp"))
-        self.add_argument("--device", type=torch.device, default=torch.device("cpu"))
-        self.add_argument("--epochs", type=int, default=1)
-        self.add_argument("--tr_batch_size", type=int, default=1)  # TODO: move
-        self.add_argument("--vl_batch_size", type=int, default=1)  # TODO: move
-        self.add_argument("--num_workers", type=int, default=0)    # TODO: move
-        self.add_argument("--pin_memory", action="store_true")     # TODO: move
-        self.add_argument("--disable_tqdm", action="store_true")
-        self.add_argument("--logging_steps", type=int, default=-1)
-        self.add_argument("--metric", type=str, default="vl_loss")
-        self.add_argument("--lower_is_worse", action="store_true")
-        self.add_argument("--max_norm", type=float, default=1.0)
-        self.add_argument("--gradient_accumulation_steps", type=int, default=1)
-        self.add_argument("--find_executable_batch_size", action="store_true")
+        self.add_argument("--outdir", type=Path, default=TrainerArgs.outdir)
+        self.add_argument("--device", type=torch.device, default=TrainerArgs.device)
+        self.add_argument("--epochs", type=int, default=TrainerArgs.epochs)
+        self.add_argument("--disable_tqdm", action="store_true", default=TrainerArgs.disable_tqdm)
+        self.add_argument("--logging_steps", type=int, default=TrainerArgs.logging_steps)
+        self.add_argument("--metric", type=str, default=TrainerArgs.metric)
+        self.add_argument("--lower_is_worse", action="store_true", default=TrainerArgs.lower_is_worse)
+        self.add_argument("--max_norm", type=float, default=TrainerArgs.max_norm)
+        self.add_argument("--gradient_accumulation_steps", type=int, default=TrainerArgs.gradient_accumulation_steps)
 
 
 class EarlyStopper:
@@ -242,31 +225,8 @@ class Trainer:
         shutil.rmtree(self.args.outdir, ignore_errors=True)
         self.args.outdir.mkdir(parents=True, exist_ok=True)
 
-        @find_executable_batch_size(  # type: ignore[call-arg, arg-type]
-            starting_batch_size=self.args.vl_batch_size,
-            starting_gradient_accumulation_steps=self.args.gradient_accumulation_steps,
-        )
-        def evaluate(batch_size: int, gradient_accumulation_steps: int) -> dict[str, float]:
-            nonlocal self
-            self.args.vl_batch_size = batch_size
-            return self.evaluate()
-
-        @find_executable_batch_size(  # type: ignore[call-arg, arg-type]
-            starting_batch_size=self.args.vl_batch_size,
-            starting_gradient_accumulation_steps=self.args.gradient_accumulation_steps,
-        )
-        def train(batch_size: int, gradient_accumulation_steps: int) -> dict[str, float]:
-            nonlocal self
-            self.args.tr_batch_size = batch_size
-            self.args.gradient_accumulation_steps = gradient_accumulation_steps
-            return self.train()
-
-        if not self.args.find_executable_batch_size:
-            evaluate = self.evaluate
-            train = self.train
-
         tr_report = {"tr_loss": float("nan"), "tr_time": float("nan")}
-        vl_report = evaluate()
+        vl_report = self.evaluate()
         report = {"epoch": 0, "lr": float("nan")} | tr_report | vl_report
         self._update_logs(report)
         self._update_best(report)
@@ -274,9 +234,9 @@ class Trainer:
 
         pbar = tqdm(list(range(1, self.args.epochs + 1)), "Epochs", disable=self.args.disable_tqdm, ascii=True)
         for epoch in pbar:
-            tr_report = train()
-            vl_report = evaluate()
-            report = {"epoch": 0, "lr": self.scheduler.get_last_lr()[0]} | tr_report | vl_report
+            tr_report = self.train()
+            vl_report = self.evaluate()
+            report = {"epoch": epoch, "lr": self.scheduler.get_last_lr()[0]} | tr_report | vl_report
             self._update_logs(report)
             self._update_best(report)
             self._update_save(report)

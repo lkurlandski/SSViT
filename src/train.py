@@ -2,11 +2,14 @@
 Train and validate models.
 """
 
-from collections.abc import Collection
+from argparse import ArgumentParser
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
+from typing import Any
 from typing import Optional
+import warnings
 
 import lief
 import numpy as np
@@ -31,7 +34,6 @@ from src.data import BinaryDataset
 from src.data import CollateFn
 from src.data import CUDAPrefetcher
 from src.data import Preprocessor
-from src.data import Samples
 from src.data import GroupedLengthBatchSampler
 from src.trainer import Trainer
 from src.trainer import TrainerArgumentParser
@@ -39,12 +41,58 @@ from src.trainer import TrainerArgs
 from src.trainer import EarlyStopper
 
 
-lief.logging.set_level(lief.logging.LEVEL.OFF)
+@dataclass
+class MainArgs:
+    do_parser: bool = False
+    do_entropy: bool = False
+    do_characteristics: bool = False
+    level: HierarchicalLevel = HierarchicalLevel.NONE
+    tr_num_samples: Optional[int] = None
+    vl_num_samples: Optional[int] = None
+    max_length: Optional[int] = None
+    bitpack: bool = False
+    num_workers: int = 0
+    pin_memory: bool = False
+    prefetch_factor: int = 1
+    tr_batch_size: int = 1
+    vl_batch_size: int = 1
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-5
+
+    def __post_init__(self) -> None:
+        if self.num_workers > 0:
+            if os.environ.get("OMP_NUM_THREADS") is None:
+                warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but OMP_NUM_THREADS is not set, which could result in CPU oversubscription.")
+            if os.environ.get("MKL_NUM_THREADS") is None:
+                warnings.warn(f"Parallel data loading is enabled with num_workers={self.num_workers}, but MKL_NUM_THREADS is not set, which could result in CPU oversubscription.")
+        if self.tr_batch_size == 1 or self.vl_batch_size == 1:
+            raise NotImplementedError("Batch size of 1 is not supported right now. See https://docs.pytorch.org/docs/stable/data#working-with-collate-fn.")
 
 
-# FIXME: things may not be shuffled properly here.
+class MainArgumentParser(ArgumentParser):
+
+    def __init__(self, *args: Any, **kwds: Any) -> None:
+        super().__init__(*args, **kwds)
+        self.add_argument("--do_parser", action="store_true", default=MainArgs.do_parser)
+        self.add_argument("--do_entropy", action="store_true", default=MainArgs.do_entropy)
+        self.add_argument("--do_characteristics", action="store_true", default=MainArgs.do_characteristics)
+        self.add_argument("--level", type=HierarchicalLevel, default=MainArgs.level)
+        self.add_argument("--max_length", type=int, default=MainArgs.max_length)
+        self.add_argument("--tr_num_samples", type=int, default=MainArgs.tr_num_samples)
+        self.add_argument("--vl_num_samples", type=int, default=MainArgs.vl_num_samples)
+        self.add_argument("--bitpack", action="store_true", default=MainArgs.bitpack)
+        self.add_argument("--num_workers", type=int, default=MainArgs.num_workers)
+        self.add_argument("--pin_memory", action="store_true", default=MainArgs.pin_memory)
+        self.add_argument("--prefetch_factor", type=int, default=MainArgs.prefetch_factor)
+        self.add_argument("--tr_batch_size", type=int, default=MainArgs.tr_batch_size)
+        self.add_argument("--vl_batch_size", type=int, default=MainArgs.vl_batch_size)
+        self.add_argument("--learning_rate", type=float, default=MainArgs.learning_rate)
+        self.add_argument("--weight_decay", type=float, default=MainArgs.weight_decay)
+
+
 def get_materials() -> tuple[list[Path], list[Path], list[int], list[int]]:
     # TODO: define a temporal (not random) train/test split.
+    # FIXME: this doesn't actually randomize things properly.
     benfiles = list(filter(lambda f: f.is_file(), Path("./data/ass").rglob("*")))
     benlabels = [0] * len(benfiles)
     malfiles = list(filter(lambda f: f.is_file(), Path("./data/sor").rglob("*")))
@@ -63,18 +111,11 @@ def get_materials() -> tuple[list[Path], list[Path], list[int], list[int]]:
 
 def main() -> None:
 
-    parser = TrainerArgumentParser()
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-5)
-    parser.add_argument("--do_parser", action="store_true", default=False)
-    parser.add_argument("--do_entropy", action="store_true", default=False)
-    parser.add_argument("--do_characteristics", action="store_true", default=False)
-    parser.add_argument("--level", type=HierarchicalLevel, default=HierarchicalLevel.NONE)
-    parser.add_argument("--max_length", type=int, default=None)
-    parser.add_argument("--num_samples", type=int, default=None)
-    args = parser.parse_args()
+    lief.logging.set_level(lief.logging.LEVEL.OFF)
 
-    targs = TrainerArgs.from_namespace(args)
+    Parser = type("Parser", (MainArgumentParser, TrainerArgumentParser), {})
+    parser = Parser(description="Train and validate models.")
+    args = parser.parse_args()
 
     preprocessor = Preprocessor(
         args.do_parser,
@@ -86,29 +127,34 @@ def main() -> None:
 
     tr_files, vl_files, tr_labels, vl_labels = get_materials()
 
-    tr_dataset = BinaryDataset(tr_files[0:args.num_samples], tr_labels[0:args.num_samples], preprocessor)
-    vl_dataset = BinaryDataset(vl_files[0:args.num_samples], vl_labels[0:args.num_samples], preprocessor)
+    tr_dataset = BinaryDataset(tr_files[0:args.tr_num_samples], tr_labels[0:args.tr_num_samples], preprocessor)
+    vl_dataset = BinaryDataset(vl_files[0:args.vl_num_samples], vl_labels[0:args.vl_num_samples], preprocessor)
 
-    collate_fn = CollateFn(pin_memory=True if targs.device.type == "cuda" else False)
+    collate_fn = CollateFn(pin_memory=False, bitpack=args.bitpack)
+    print(f"{collate_fn=}")
 
-    def get_loader(dataset: Dataset, sampler: Sampler) -> Collection[Samples]:
-        iterable: Collection[Samples] = DataLoader(
+    def get_loader(dataset: Dataset, sampler: Sampler) -> DataLoader | CUDAPrefetcher:
+        dataloader = DataLoader(
             dataset=dataset,
             batch_sampler=sampler,
-            num_workers=targs.num_workers,
+            num_workers=args.num_workers,
             collate_fn=collate_fn,
+            pin_memory=args.pin_memory and args.device.type == "cuda",
             multiprocessing_context=None if args.num_workers == 0 else "forkserver",
-            prefetch_factor=None if args.num_workers == 0 else 1,
+            prefetch_factor=None if args.num_workers == 0 else args.prefetch_factor,
             persistent_workers=None if args.num_workers == 0 else True,
         )
-        if targs.device.type == "cuda":
-            iterable = CUDAPrefetcher(iterable, targs.device)
-        return iterable
+        print(f"dataloader=DataLoader(pin_memory={dataloader.pin_memory})")
+        if args.device.type == "cuda":
+            dataloader = CUDAPrefetcher(dataloader, args.device)
+        return dataloader
 
-    tr_sampler = GroupedLengthBatchSampler.from_lengths(targs.tr_batch_size, list(map(os.path.getsize, tr_dataset.files)), first=True, shuffle=True)
-    vl_sampler = GroupedLengthBatchSampler.from_lengths(targs.vl_batch_size, list(map(os.path.getsize, vl_dataset.files)), first=True, shuffle=False)
+    tr_sampler = GroupedLengthBatchSampler.from_lengths(args.tr_batch_size, list(map(os.path.getsize, tr_dataset.files)), first=True, shuffle=True)
+    vl_sampler = GroupedLengthBatchSampler.from_lengths(args.vl_batch_size, list(map(os.path.getsize, vl_dataset.files)), first=True, shuffle=False)
     tr_loader = get_loader(tr_dataset, tr_sampler)
     vl_loader = get_loader(vl_dataset, vl_sampler)
+    print(f"{tr_loader=}")
+    print(f"{vl_loader=}")
 
     model = MalConvClassifier(
         Embedding(256 + 8, 8, padding_idx=0),
@@ -125,7 +171,7 @@ def main() -> None:
 
     stopper: Optional[EarlyStopper] = None
 
-    trainer = Trainer(targs, model, tr_loader, vl_loader, loss_fn, optimizer, scheduler, stopper)
+    trainer = Trainer(TrainerArgs.from_namespace(args), model, tr_loader, vl_loader, loss_fn, optimizer, scheduler, stopper)
 
     trainer = trainer()
 
