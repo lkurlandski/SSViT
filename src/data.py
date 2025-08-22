@@ -36,6 +36,7 @@ from torch import LongTensor
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
+from torch.utils._pytree import tree_map
 from torch.nn.utils.rnn import pad_sequence as _pad_sequence
 
 from src.utils import check_tensor
@@ -99,6 +100,23 @@ class _SemanticGuideOrSemanticGuides(ABC):
     @abstractmethod
     def length_axis(self) -> int:
         ...
+
+    @property
+    def is_cuda(self) -> bool:
+        is_cuda = [t.is_cuda for t in (self.parse, self.entropy, self.characteristics) if t is not None]
+        if all(is_cuda):
+            return True
+        if not any(is_cuda):
+            return False
+        raise RuntimeError(f"Unexpected tensor device state: {is_cuda=}")
+
+    def record_stream(self, s: torch.cuda.Stream) -> None:
+        if self.parse is not None:
+            self.parse.record_stream(s)
+        if self.entropy is not None:
+            self.entropy.record_stream(s)
+        if self.characteristics is not None:
+            self.characteristics.record_stream(s)
 
     def clone(self) -> Self:
         if self.parse is not None:
@@ -273,6 +291,13 @@ class _StructureMapOrStructureMaps(ABC):
     def verify_inputs(self) -> None:
         ...
 
+    @property
+    def is_cuda(self) -> bool:
+        return self.index.is_cuda  # type: ignore[no-any-return]
+
+    def record_stream(self, s: torch.cuda.Stream) -> None:
+        self.index.record_stream(s)
+
     def clone(self) -> Self:
         self.index = self.index.clone()
         self.lexicon = deepcopy(self.lexicon)
@@ -383,7 +408,7 @@ class StructurePartitioner:
         return StructureMap(index, lexicon)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=False, slots=True)
 class _SampleOrSamples(ABC):
     file: StrPath | list[StrPath]
     name: Name | list[Name]
@@ -403,6 +428,19 @@ class _SampleOrSamples(ABC):
     @abstractmethod
     def __len__(self) -> int:
         ...
+
+    @property
+    def is_cuda(self) -> bool:
+        if self.label.is_cuda and self.inputs.is_cuda and self.guides.is_cuda and not self.structure.is_cuda:
+            return True
+        if not self.label.is_cuda and not self.inputs.is_cuda and not self.guides.is_cuda and not self.structure.is_cuda:
+            return False
+        raise RuntimeError(f"Unexpected tensor device state: {self.label.is_cuda=}, {self.inputs.is_cuda=}, {self.guides.is_cuda=}, {self.structure.is_cuda=}")
+
+    def record_stream(self, s: torch.cuda.Stream) -> None:
+        self.label.record_stream(s)
+        self.inputs.record_stream(s)
+        self.guides.record_stream(s)
 
     def clone(self) -> Self:
         return replace(
@@ -628,10 +666,22 @@ class CUDAPrefetcher:
     def __next__(self) -> Samples:
         if self.next_batch is None:
             raise StopIteration
-        torch.cuda.current_stream().wait_stream(self.stream)
-        batch = self.next_batch
+
+        curr = torch.cuda.current_stream(self.device)
+        curr.wait_stream(self.stream)   # fence: H2D of next_batch is now done (or almost)
+
+        # Protect CUDA storage from early reuse by other streams
+        def _record(t: Samples) -> Samples:
+            if t.is_cuda:
+                t.record_stream(curr)
+            return t
+        batch: Samples = tree_map(_record, self.next_batch)
+
+        # Immediately begin prefetch for the subsequent batch (max overlap)
         self._preload()
-        return batch.decompress()
+
+        # Do GPU-side transforms after the wait/record
+        return batch.decompress()       # safe here; runs on curr stream
 
     def __len__(self) -> int:
         return len(self.loader)
@@ -641,12 +691,15 @@ class CUDAPrefetcher:
 
     def _preload(self) -> None:
         try:
-            batch: Samples = next(self.it)
+            cpu_batch = next(self.it)
         except StopIteration:
             self.next_batch = None
             return
+
         with torch.cuda.stream(self.stream):
-            self.next_batch = batch.to(self.device, non_blocking=True)
+            def _to(t: Samples) -> Samples:
+                return t.to(self.device, non_blocking=True)
+            self.next_batch = tree_map(_to, cpu_batch)
 
     @property
     def dataset(self) -> Dataset:
