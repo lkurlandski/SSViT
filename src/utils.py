@@ -40,7 +40,7 @@ def get_optimal_num_worker_threads(num_workers: int = 0, ncpu: int = psutil.cpu_
         raise RuntimeError(f"Number of worker processes ({num_workers} + 1) exceeds number of CPU cores ({ncpu}).")
     if num_workers == 0:
         return ncpu
-    return max(1, ncpu // num_workers - 1)
+    return max(1, (ncpu - 1) // num_workers)
 
 
 class TensorError(ValueError):
