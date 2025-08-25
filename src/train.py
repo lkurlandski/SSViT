@@ -3,6 +3,7 @@ Train and validate models.
 """
 
 from argparse import ArgumentParser
+from collections import Counter
 from dataclasses import dataclass
 import math
 import os
@@ -101,9 +102,9 @@ def get_materials(tr_num_samples: Optional[int] = None, vl_num_samples: Optional
     benfiles = list(filter(lambda f: f.is_file(), Path("./data/ass").rglob("*")))
     benlabels = [0] * len(benfiles)
     malfiles = list(filter(lambda f: f.is_file(), Path("./data/sor").rglob("*")))
-    mallabel = [1] * len(malfiles)
+    mallabels = [1] * len(malfiles)
     files = benfiles + malfiles
-    labels = benlabels + mallabel
+    labels = benlabels + mallabels
 
     idx = np.arange(len(files))
     tr_idx = np.random.choice(idx, size=int(0.8 * len(files)), replace=False)
@@ -160,6 +161,8 @@ def main() -> None:
     )
 
     tr_files, vl_files, tr_labels, vl_labels = get_materials(args.tr_num_samples, args.vl_num_samples)
+    print(f"{len(tr_files)=} {Counter(tr_labels)=}")
+    print(f"{len(vl_files)=} {Counter(vl_labels)=}")
 
     tr_dataset = BinaryDataset(tr_files, tr_labels, preprocessor)
     vl_dataset = BinaryDataset(vl_files, vl_labels, preprocessor)
@@ -231,8 +234,7 @@ def main() -> None:
 
     trainer = Trainer(TrainerArgs.from_namespace(args), model, tr_loader, vl_loader, loss_fn, optimizer, scheduler, stopper)
 
-    # trainer = trainer()
-    trainer.evaluate()
+    trainer = trainer()
 
 
 if __name__ == "__main__":
