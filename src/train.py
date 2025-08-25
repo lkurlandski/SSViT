@@ -78,6 +78,7 @@ class MainArgumentParser(ArgumentParser):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
+        self.add_argument("--backbone", type=str, choices=["malconv", "vit"], required=True)
         self.add_argument("--seed", type=int, default=MainArgs.seed)
         self.add_argument("--do_parser", action="store_true", default=MainArgs.do_parser)
         self.add_argument("--do_entropy", action="store_true", default=MainArgs.do_entropy)
@@ -98,13 +99,14 @@ class MainArgumentParser(ArgumentParser):
 
 def get_materials(tr_num_samples: Optional[int] = None, vl_num_samples: Optional[int] = None) -> tuple[list[Path], list[Path], list[int], list[int]]:
     # TODO: define a temporal (not random) train/test split.
-    # FIXME: this doesn't actually randomize things properly.
     benfiles = list(filter(lambda f: f.is_file(), Path("./data/ass").rglob("*")))
     benlabels = [0] * len(benfiles)
     malfiles = list(filter(lambda f: f.is_file(), Path("./data/sor").rglob("*")))
     mallabels = [1] * len(malfiles)
     files = benfiles + malfiles
     labels = benlabels + mallabels
+    print(f"{len(benfiles)=}")
+    print(f"{len(malfiles)=}")
 
     idx = np.arange(len(files))
     tr_idx = np.random.choice(idx, size=int(0.8 * len(files)), replace=False)
@@ -119,16 +121,18 @@ def get_materials(tr_num_samples: Optional[int] = None, vl_num_samples: Optional
         if tr_num_samples > len(tr_files):
             warnings.warn(f"Requested {tr_num_samples} training samples, but only {len(tr_files)} are available.")
             tr_num_samples = len(tr_files)
+        tr_files = tr_files[0:tr_num_samples]
+        tr_labels = tr_labels[0:tr_num_samples]
 
     if vl_num_samples is not None:
         if vl_num_samples > len(vl_files):
             warnings.warn(f"Requested {vl_num_samples} validation samples, but only {len(vl_files)} are available.")
             vl_num_samples = len(vl_files)
+        vl_files = vl_files[0:vl_num_samples]
+        vl_labels = vl_labels[0:vl_num_samples]
 
-    tr_files = tr_files[0:tr_num_samples]
-    vl_files = vl_files[0:vl_num_samples]
-    tr_labels = tr_labels[0:tr_num_samples]
-    vl_labels = vl_labels[0:vl_num_samples]
+    print(f"{len(tr_files)=} {Counter(tr_labels)=}")
+    print(f"{len(vl_files)=} {Counter(vl_labels)=}")
 
     return tr_files, vl_files, tr_labels, vl_labels
 
@@ -161,14 +165,13 @@ def main() -> None:
     )
 
     tr_files, vl_files, tr_labels, vl_labels = get_materials(args.tr_num_samples, args.vl_num_samples)
-    print(f"{len(tr_files)=} {Counter(tr_labels)=}")
-    print(f"{len(vl_files)=} {Counter(vl_labels)=}")
 
     tr_dataset = BinaryDataset(tr_files, tr_labels, preprocessor)
     vl_dataset = BinaryDataset(vl_files, vl_labels, preprocessor)
  
     def get_model() -> Classifier:
 
+        padding_idx = 0
         num_embeddings = 256 + 8
         embedding_dim = 8
         guide_dim = 12
@@ -179,13 +182,18 @@ def main() -> None:
         clf_hidden = 32
         clf_layers = 1
 
-        embedding = Embedding(num_embeddings, embedding_dim, padding_idx=0)
-        filmer = FiLMNoP()
-        if args.do_characteristics:
-            filmer = FiLM(guide_dim, embedding_dim, guide_hidden)
-        patcher = PatchEncoder(embedding_dim, d_model, num_patches=num_patches, patch_size=None)
-        # backbone=MalConv(embedding_dim, d_model)
-        backbone = ViT(d_model, d_model)
+        embedding = Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
+        filmer = FiLM(guide_dim, embedding_dim, guide_hidden) if args.do_characteristics else FiLMNoP()
+
+        if args.backbone == "malconv":
+            patcher = None
+            backbone=MalConv(embedding_dim, d_model)
+        elif args.backbone == "vit":
+            patcher = PatchEncoder(embedding_dim, d_model, num_patches=num_patches, patch_size=None)
+            backbone = ViT(d_model, d_model)
+        else:
+            raise ValueError(f"{args.backbone}")
+
         head = ClassifificationHead(d_model, num_classes, clf_hidden, clf_layers)
 
         return Classifier(embedding, filmer, patcher, backbone, head)
