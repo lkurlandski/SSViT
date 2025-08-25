@@ -308,6 +308,8 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--progress", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--num_samples", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=0)
     args = parser.parse_args()
 
     if args.assemblage:
@@ -317,8 +319,8 @@ def main() -> None:
             MAGIC["pe"],
             None,
             Path("./tmp/WindowsBinaries.zip"),
-            num_samples=100000,
-            num_workers=8,
+            num_samples=args.num_samples,
+            num_workers=args.num_workers,
             verbose=args.verbose,
             progress=args.progress,
             quiet=args.quiet,
@@ -328,8 +330,8 @@ def main() -> None:
         PrepareSorel(
             Path("./data/sor"),
             Path("./data/sor.txt"),
-            num_samples=100000,
-            num_workers=8,
+            num_samples=args.num_samples,
+            num_workers=args.num_workers,
             verbose=args.verbose,
             progress=args.progress,
             quiet=args.quiet,
