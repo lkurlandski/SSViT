@@ -17,29 +17,46 @@ Notations (MalConv):
 Notations (ViT):
     N: Number of patches
     P: Patch size
-    H: Hidden dimension
+    D: Hidden dimension
+    H: Num attention heads
     L: Number of layers
 """
 
-from collections.abc import Iterable
-from dataclasses import dataclass
 import math
-import sys
 from typing import Any
+from typing import Callable
 from typing import Literal
 from typing import Optional
-from typing import Protocol
+import warnings
 
 import torch
+from torch.nn import functional as F
 from torch import nn
 from torch import Tensor
-from torch import IntTensor
-from torch import FloatTensor
 from torch.nn.utils.rnn import pad_sequence
 
-from src.utils import TensorError
 from src.utils import check_tensor
 
+
+NORMS: dict[str, nn.Module] = {
+    "layer": nn.LayerNorm,
+    "rms": nn.RMSNorm,
+}
+
+ACTVS: dict[str, Callable[[Tensor], Tensor]] = {
+    "gelu": F.gelu,
+    "leaky_relu": F.leaky_relu,
+    "relu": F.relu,
+    "silu": F.silu,
+    "tanh": F.tanh,
+}
+
+FLOATS = (torch.bfloat16, torch.float16, torch.float32)  # Commonly used for training and evaluating models.
+INTEGERS = (torch.int32, torch.int64)                    # Used for indices compatible with nn.Embedding.
+
+# -------------------------------------------------------------------------------- #
+# Other
+# -------------------------------------------------------------------------------- #
 
 class ClassifificationHead(nn.Module):  # type: ignore[misc]
     """
@@ -81,255 +98,22 @@ class ClassifificationHead(nn.Module):  # type: ignore[misc]
         self.num_layers = num_layers
         self.dropout = dropout
 
-    def forward(self, x: FloatTensor) -> FloatTensor:
+    def forward(self, x: Tensor) -> Tensor:
         """
         Args:
-            x: Input tensor of shape (B, H).
+            x: Input tensor of shape (B, D).
         Returns:
             Output tensor of shape (B, M).
         """
-        check_tensor(x, (None, self.input_size), torch.float)
+        check_tensor(x, (None, self.input_size), FLOATS)
 
         z = self.layers.forward(x)
 
         return z
 
-
-class MultiChannelDiscreteSequenceClassifier(Protocol):
-    """
-    Multi-channel classifier for discrete sequence inputs.
-    """
-
-    def __init__(self, num_embeddings: list[int], embedding_dim: list[int], num_classes: int) -> None: ...
-
-    def forward(self, *x: IntTensor) -> FloatTensor:
-        """
-        Args:
-            x: Input tensor(s) of shape (B, T).
-        Returns:
-            Output tensor of shape (B, C).
-        """
-        ...
-
-
-class LatentPooler(Protocol):
-    """
-    Pooling layer for latent representations.
-    """
-
-    def forward(self, z: FloatTensor) -> FloatTensor:
-        """
-        Args:
-            z: Input tensor of shape (B, T, E).
-        Returns:
-            Output tensor of shape (B, E).
-        """
-        ...
-
-
-class MeanLatentPooler(nn.Module):  # type: ignore[misc]
-    """
-    Mean pooling layer for latent representations.
-    """
-
-    def forward(self, z: FloatTensor) -> FloatTensor:
-        """
-        Args:
-            z: Input tensor of shape (B, T, E).
-        Returns:
-            Output tensor of shape (B, E).
-        """
-        check_tensor(z, (None, None, None), torch.float)
-        return z.mean(dim=1)
-
-
-class MultiChannelDiscreteEmbedding(nn.Module):  # type: ignore[misc]
-    """
-    Multi-channel embedding layer for discrete sequence inputs.
-    """
-
-    def __init__(self, num_embeddings: list[int], embedding_dim: list[int]) -> None:
-        super().__init__()
-
-        self.embedding = nn.ModuleList()
-        for num_embeddings_, embedding_dim_ in zip(num_embeddings, embedding_dim, strict=True):
-            embedding = nn.Embedding(num_embeddings_, embedding_dim_)
-            self.embedding.append(embedding)
-
-    @property
-    def max_length(self) -> int:
-        return sys.maxsize
-
-    @property
-    def min_length(self) -> int:
-        return 0
-
-    def forward(self, *x: IntTensor) -> FloatTensor:
-        """
-        Args:
-            x: Input tensor(s) of shape (B, T).
-        Returns:
-            Output tensor of shape (B, T, E).
-        """
-        for x_ in x:
-            check_tensor(x_, tuple(x[0].shape), (torch.int64, torch.int32))
-
-        z = torch.cat([self.embedding[i].forward(x[i]) for i in range(len(x))], dim=-1)
-
-        return z
-
-
-class SequenceEmbeddingEncoder(nn.Module):  # type: ignore[misc]
-    """
-    Patch embedding layer for discrete sequence inputs.
-    """
-
-    def __init__(
-        self, patch_size: int, in_channels: int, out_channels: int, kernel_size: int = 64, stride: int = 64
-    ) -> None:
-        super().__init__()
-
-        if patch_size < kernel_size:
-            raise ValueError("Patch size must be greater than or equal to kernel size.")
-
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride)
-        self.pool = nn.AdaptiveMaxPool1d(1)
-
-        self.patch_size = patch_size
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-
-    @property
-    def max_length(self) -> int:
-        return sys.maxsize
-
-    @property
-    def min_length(self) -> int:
-        return self.kernel_size
-
-    def forward(self, z: FloatTensor) -> FloatTensor:
-        """
-        Args:
-            x: Input tensor of shape (B, T, E).
-        Returns:
-            Output tensor of shape (B, N, C).
-        """
-        check_tensor(z, (None, None, None), torch.float)
-
-        B = z.shape[0]
-        T = z.shape[1]
-        E = z.shape[2]
-        P = min(self.patch_size, T)
-        N = math.ceil(T / P)
-        C = self.out_channels
-        S = math.floor((T - self.kernel_size) / self.stride + 1)
-
-        if T < self.min_length:
-            raise RuntimeError(f"Input sequence length {T} is less than the minimum required length {self.min_length}.")
-
-        z = self.split_patches(z)  # (B,  N, P, E)
-        z = z.reshape(B * N, P, E)  # (BN, P, E)
-        z = z.permute(0, 2, 1)  # (BN, E, P)
-        z = self.conv.forward(z)  # (BN, C, S)
-        z = self.pool.forward(z)  # (BN, C, 1)
-        z = z.squeeze(-1)  # (BN, C)
-        z = z.reshape(B, N, C)  # (B,  N, C)
-
-        return z
-
-    @staticmethod
-    def _split_patches(z: FloatTensor, patch_size: int) -> FloatTensor:
-        """
-        Args:
-            z: Input tensor of shape (B, T, E).
-        Returns:
-            Output tensor of shape (B, N, P, E).
-        """
-        check_tensor(z, (None, None, None), torch.float)
-
-        if z.shape[1] <= patch_size:
-            return z.unsqueeze(1)
-
-        patches = torch.split(z.permute(1, 0, 2), patch_size)  # N x (P, B, E)
-        patches = pad_sequence(patches, batch_first=True)  # (N, P, B, E)
-        patches = patches.permute(2, 0, 1, 3)  # (B, N, P, E)
-
-        return patches
-
-    def split_patches(self, z: FloatTensor) -> FloatTensor:
-        """
-        Args:
-            z: Input tensor of shape (B, T, E).
-        Returns:
-            Output tensor of shape (B, N, P, E).
-        """
-        check_tensor(z, (None, None, self.in_channels), torch.float)
-        return self._split_patches(z, self.patch_size)
-
-
-class MultiChannelDiscreteSequenceVisionTransformer(nn.Module):  # type: ignore[misc]
-    """
-    Vision Transformer for discrete sequential inputs.
-    """
-
-    def __init__(
-        self,
-        num_embeddings: list[int],
-        embedding_dim: list[int],
-        patch_size: int,
-        d_model: int,
-        nhead: int,
-        num_layers: int = 1,
-        num_classes: int = 2,
-    ) -> None:
-        super().__init__()
-
-        self.embedding = MultiChannelDiscreteEmbedding(num_embeddings, embedding_dim)
-        self.encoder = SequenceEmbeddingEncoder(patch_size, sum(embedding_dim), d_model)
-        layer = nn.TransformerEncoderLayer(d_model, nhead, 4 * d_model, activation="gelu", batch_first=True)
-        self.backbone = nn.TransformerEncoder(layer, num_layers, norm=nn.RMSNorm(d_model))
-        self.pool = MeanLatentPooler()
-        self.head = ClassifificationHead(d_model, num_classes)
-
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = sum(embedding_dim)
-        self.patch_size = patch_size
-        self.d_model = d_model
-        self.nhead = nhead
-        self.num_layers = num_layers
-        self.num_classes = num_classes
-
-    @property
-    def max_length(self) -> int:
-        mods = [self.embedding, self.encoder, self.backbone, self.head]
-        return min(getattr(mod, "max_length", 0) for mod in [mods])
-
-    @property
-    def min_length(self) -> int:
-        mods = [self.embedding, self.encoder, self.backbone, self.head]
-        return max(getattr(mod, "min_length", 0) for mod in [mods])
-
-    def forward(self, *x: IntTensor) -> FloatTensor:
-        """
-        Args:
-            x: Input tensor(s) of shape (B, T).
-        Returns:
-            Output tensor of shape (B, M).
-        """
-        for x_ in x:
-            check_tensor(x_, tuple(x[0].shape), (torch.int32, torch.int64))
-
-        print(x[0].shape)
-        z = self.embedding.forward(*x)  # (B, T, E)
-        z = self.encoder.forward(z)  # (B, N, H)
-        z = self.backbone.forward(z)  # (B, N, H)
-        z = self.pool.forward(z)  # (B, H)
-        z = self.head.forward(z)  # (B, M)
-
-        return z
-
+# -------------------------------------------------------------------------------- #
+# FiLM
+# -------------------------------------------------------------------------------- #
 
 class FiLM(nn.Module):  # type: ignore[misc]
     """
@@ -351,7 +135,7 @@ class FiLM(nn.Module):  # type: ignore[misc]
         self.embedding_dim = embedding_dim
         self.hidden_size = hidden_size
 
-    def forward(self, x: FloatTensor, g: FloatTensor) -> FloatTensor:
+    def forward(self, x: Tensor, g: Tensor) -> Tensor:
         """
         Args:
             x: Input embeddings of shape (B, T, E).
@@ -360,14 +144,14 @@ class FiLM(nn.Module):  # type: ignore[misc]
         Returns:
             z: FiLM modulated embeddings of shape (B, T, E).
         """
-        check_tensor(x, (None, None, self.embedding_dim), torch.float)
-        check_tensor(g, (x.shape[0], x.shape[1], self.guide_dim), torch.float)
+        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
+        check_tensor(g, (x.shape[0], x.shape[1], self.guide_dim), FLOATS)
     
-        film: FloatTensor = self.mlp.forward(g)  # [B, T, 2E]
-        gamma, beta = film.chunk(2, dim=-1)      # [B, T, E], [B, T, E]
-        z = x * gamma + beta                     # [B, T, E]
+        film: Tensor = self.mlp.forward(g)  # (B, T, 2E)
+        gamma, beta = film.chunk(2, dim=-1)      # (B, T, E), (B, T, E)
+        z = x * gamma + beta                     # (B, T, E)
 
-        check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), torch.float)
+        check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), FLOATS)
         return z
 
 
@@ -379,17 +163,253 @@ class FiLMNoP(nn.Module):  # type: ignore[misc]
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__()
 
-    def forward(self, x: FloatTensor, g: Literal[None]) -> FloatTensor:
-        check_tensor(x, (None, None, None), torch.float)
+    def forward(self, x: Tensor, g: Literal[None]) -> Tensor:
+        check_tensor(x, (None, None, None), FLOATS)
         if g is not None:
             raise ValueError(f"Expected g to be None, got {type(g)} instead.")
 
         return x
 
+# -------------------------------------------------------------------------------- #
+# ViT
+# -------------------------------------------------------------------------------- #
+
+class SinusoidalPositionalEncoding(nn.Module):  # type: ignore[misc]
+    """
+    Sinusoidal Positional Encoding.
+
+    See: Vaswani "Attention is all you need" NeurIPS 2017.
+
+    Source: https://github.com/tatp22/multidim-positional-encoding
+    """
+
+    inv_freq: Tensor
+
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+
+        if embedding_dim % 2 != 0 or embedding_dim <= 0:
+            raise ValueError(f"The embedding dimension must a positive be even number. Got {embedding_dim} instead.")
+
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, embedding_dim, 2).float() / embedding_dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer("cached_penc", None, persistent=False)
+
+        self.embedding_dim = embedding_dim
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input tensor of shape (B, T, E).
+
+        Returns:
+            z: Positional encoded tensor of shape (B, T, E).
+        """
+        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
+
+        pos = torch.arange(x.shape[1], device=x.device, dtype=self.inv_freq.dtype)  # (T,)
+        sin_inp = torch.einsum("i,j->ij", pos, self.inv_freq)                       # (T, E/2)
+
+        z = torch.stack((sin_inp.sin(), sin_inp.cos()), dim=-1)                     # (T, E/2, 2)
+        z = z.flatten(-2, -1)                                                       # (T, E)
+        z = z.repeat(x.shape[0], 1, 1)                                              # (B, T, E)
+
+        check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), FLOATS)
+
+        return z
+
+
+class PatchEncoder(nn.Module):  # type: ignore[misc]
+    """
+    Breaks a sequence into patches and convolves them fixed-size kernels.
+
+    NOTE: `N` refers to the number of patches for a sequence of particular length
+        which is often less than PatchEncoder.num_patches.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 64, stride: int = 64, *, patch_size: Optional[int], num_patches: Optional[int]) -> None:
+        """
+        Args:
+            in_channels: Number of input channels.
+            out_channels: Number of output channels.
+            kernel_size: Size of the convolutional kernel.
+            stride: Stride of the convolutional kernel.
+            patch_size: Size of each patch. The sequence will broken into patch(es) of this size
+                with at most one smaller patch if necessary.
+            num_patches: Number of patches. The sequence will be broken into up into this many patches of equal size
+                with at most one smaller patch if necessary.
+        """
+        super().__init__()
+
+        if bool(patch_size is None) == bool(num_patches is None):
+            raise ValueError(f"Exactly one of patch_size or num_patches must be specified. Got {patch_size=} and {num_patches=}.")
+
+        if patch_size is not None and patch_size < kernel_size:
+            raise ValueError(f"Patch size must be greater than or equal to kernel size. Got {patch_size=} and {kernel_size=}.")
+
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride)
+        self.pool = nn.AdaptiveMaxPool1d(1)
+
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+
+    def forward(self, z: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input tensor of shape (B, T, E).
+        Returns:
+            Output tensor of shape (B, N, C).
+        """
+        check_tensor(z, (None, None, None), FLOATS)
+        if z.shape[1] < self.min_length:
+            raise RuntimeError(f"Input sequence length {z.shape[1]} is less than the minimum required length {self.min_length}.")
+
+        B = z.shape[0]
+        T = z.shape[1]
+        E = z.shape[2]
+        P = self.patch_dims(T, self.patch_size, self.num_patches)[0]
+        N = self.patch_dims(T, self.patch_size, self.num_patches)[1]
+        C = self.out_channels
+        S = math.floor((T - self.kernel_size) / self.stride + 1)
+
+        z = self.split_patches(z, P)  # (B,  N, P, E)
+        z = z.reshape(B * N, P, E)    # (BN, P, E)
+        z = z.permute(0, 2, 1)        # (BN, E, P)
+        z = self.conv.forward(z)      # (BN, C, S)
+        z = self.pool.forward(z)      # (BN, C, 1)
+        z = z.squeeze(-1)             # (BN, C)
+        z = z.reshape(B, N, C)        # (B,  N, C)
+
+        return z
+
+    @staticmethod
+    def split_patches(z: Tensor, patch_size: int) -> Tensor:
+        """
+        Args:
+            z: Input tensor of shape (B, T, E).
+        Returns:
+            Output tensor of shape (B, N, P, E).
+        """
+        if z.shape[1] <= patch_size:
+            return z.unsqueeze(1)
+
+        patches = torch.split(z.permute(1, 0, 2), patch_size)  # N x (P, B, E)
+        patches = pad_sequence(patches, batch_first=True)      # (N, P, B, E)
+        patches = patches.permute(2, 0, 1, 3)                  # (B, N, P, E)
+
+        return patches
+
+    @staticmethod
+    def patch_dims(seq_length: int, patch_size: Optional[int], num_patches: Optional[int]) -> tuple[int, int]:
+        """
+        Determine the patch_size and num_patches given one of them for patchifying a sequence of length seq_length.
+        """
+        if seq_length <= 0:
+            raise ValueError(f"Sequence length must be positive. Got {seq_length}.")
+        if bool(patch_size is None) == bool(num_patches is None):
+            raise ValueError(f"Exactly one of patch_size or num_patches must be specified. Got {patch_size=} and {num_patches=}.")
+        if patch_size is not None and (not 0 < patch_size <= seq_length):
+            raise ValueError(f"Patch size must be positive and less than or equal to the sequence length. Got {patch_size=} and {seq_length=}.")
+        if num_patches is not None and (not 0 < num_patches <= seq_length):
+            raise ValueError(f"Number of patches must be positive and less than or equal to the sequence length. Got {num_patches=} and {seq_length=}.")
+
+        if patch_size is not None:
+            num_patches = (seq_length + patch_size - 1) // patch_size
+            return patch_size, num_patches
+        if num_patches is not None:
+            patch_size = (seq_length + num_patches - 1) // num_patches
+            num_patches = (seq_length + patch_size - 1) // patch_size
+            return patch_size, num_patches
+
+        raise RuntimeError("This should never happen.")
+
+    @property
+    def min_length(self) -> int:
+        if self.patch_size is not None:
+            return max(self.kernel_size, self.patch_size)
+        if self.num_patches is not None:
+            return self.num_patches * self.kernel_size
+        raise RuntimeError("This should never happen.")
+
+
+class ViT(nn.Module):  # type: ignore[misc]
+    """
+    Vision Transformer.
+
+    See: Dosovitskiy "An image is worth 16x16 words: Transformers for image recognition at scale" ICLR 2021.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int = 8,
+        d_model: int = 256,
+        nhead: int = 1,
+        dim_feedforward: int = -1,
+        activation: str = "gelu",
+        num_layers: int = 1,
+        norm: Optional[str] = "rms",
+        pooling: Literal["mean", "cls"] = "cls",
+    ) -> None:
+        super().__init__()
+
+        dim_feedforward = 4 * d_model if dim_feedforward == -1 else dim_feedforward
+
+        self.posencoder = SinusoidalPositionalEncoding(embedding_dim)
+        self.proj = nn.Linear(embedding_dim, d_model)
+        layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, activation=ACTVS[activation], batch_first=True)
+        self.transformer = nn.TransformerEncoder(layer, num_layers, norm=NORMS[norm](d_model) if norm is not None else None)
+
+        if pooling == "cls":
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+        elif pooling == "mean":
+            self.cls_token = None
+        else:
+            raise ValueError(f"Unknown pooling method: {pooling}. Supported methods are 'mean' and 'cls'.")
+
+        self.embedding_dim = embedding_dim
+        self.d_model = d_model
+        self.dim_feedforward = dim_feedforward
+        self.activation = activation
+        self.nhead = nhead
+        self.num_layers = num_layers
+        self.norm = norm
+        self.pooling = pooling
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input embeddings of shape (B, T, E).
+        Returns:
+            z: Hidden representation of shape (B, D).
+        """
+        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
+
+        if self.pooling == "cls":  # T <-- T + 1
+            t = self.cls_token.expand(x.shape[0], -1, -1)  # (B, 1, E)
+            x = torch.cat((t, x), dim=1)  # (B, T, E)
+        z = self.posencoder.forward(x)    # (B, T, E)
+        z = self.proj.forward(z)          # (B, T, D)
+        z = self.transformer.forward(z)   # (B, T, D)
+        if self.pooling == "cls":
+            z = z[:, 0, :].unsqueeze(1)   # (B, 1, D)
+        z = z.mean(dim=1)                 # (B, D)
+
+        check_tensor(z, (x.shape[0], self.d_model), FLOATS)
+        return z
+
+# -------------------------------------------------------------------------------- #
+# MalConv
+# -------------------------------------------------------------------------------- #
 
 class MalConv(nn.Module):  # type: ignore[misc]
     """
     MalConv backbone.
+
+    See: Raff "Malware detection by eating a whole EXE." AICS 2018.
     """
 
     def __init__(
@@ -403,47 +423,56 @@ class MalConv(nn.Module):  # type: ignore[misc]
 
         self.conv_1 = nn.Conv1d(embedding_dim, channels, kernel_size, stride)
         self.conv_2 = nn.Conv1d(embedding_dim, channels, kernel_size, stride)
-        self.pool = nn.AdaptiveMaxPool1d(1)
         self.sigmoid = nn.Sigmoid()
+        self.pool = nn.AdaptiveMaxPool1d(1)
 
         self.embedding_dim = embedding_dim
         self.channels = channels
         self.kernel_size = kernel_size
         self.stride = stride
 
-    def forward(self, x: FloatTensor) -> FloatTensor:
+    def forward(self, x: Tensor) -> Tensor:
         """
         Args:
             x: Input embeddings of shape (B, T, E).
         Returns:
             z: Hidden representation of shape (B, C).
         """
-        check_tensor(x, (None, None, self.embedding_dim), torch.float)
+        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
         if x.shape[1] < self.kernel_size:
             raise ValueError(f"Input sequence with length {x.shape[1]} is shorter than the kernel size {self.kernel_size}.")
 
-        z = x.transpose(1, 2)                # [B, E, T]
-        c_1 = self.conv_1.forward(z)         # [B, C, S - 1]
-        c_2 = self.conv_2.forward(z)         # [B, C, S - 1]
-        g = c_1 * self.sigmoid.forward(c_2)  # [B, C, S - 1]
-        z = self.pool.forward(g)             # [B, C, 1]
-        z = z.squeeze(-1)                    # [B, C]
+        z = x.transpose(1, 2)                # (B, E, T)
+        c_1 = self.conv_1.forward(z)         # (B, C, S - 1)
+        c_2 = self.conv_2.forward(z)         # (B, C, S - 1)
+        g = c_1 * self.sigmoid.forward(c_2)  # (B, C, S - 1)
+        z = self.pool.forward(g)             # (B, C, 1)
+        z = z.squeeze(-1)                    # (B, C)
 
-        check_tensor(z, (x.shape[0], self.channels), torch.float)
+        check_tensor(z, (x.shape[0], self.channels), FLOATS)
         return z
 
+# -------------------------------------------------------------------------------- #
+# Classifier
+# -------------------------------------------------------------------------------- #
 
-class MalConvClassifier(nn.Module):  # type: ignore[misc]
+class Classifier(nn.Module):  # type: ignore[misc]
 
-    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, backbone: MalConv, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, patcher: Optional[PatchEncoder], backbone: MalConv | ViT, head: ClassifificationHead) -> None:
         super().__init__()
 
+        if patcher is None and isinstance(backbone, ViT):
+            warnings.warn("ViT backbone is being used without a PatchEncoder.")
+        if patcher is not None and isinstance(backbone, MalConv):
+            warnings.warn("MalConv backbone is being used with a PatchEncoder.")
+
         self.embedding = embedding
-        self.filmer = filmer if filmer is not None else lambda z, _: z
+        self.filmer = filmer
+        self.patcher = patcher if patcher is not None else nn.Identity()
         self.backbone = backbone
         self.head = head
 
-    def forward(self, x: FloatTensor, g: Optional[FloatTensor]) -> FloatTensor:
+    def forward(self, x: Tensor, g: Optional[Tensor]) -> Tensor:
         """
         Args:
             x: Input tensor of shape (B, T).
@@ -451,11 +480,13 @@ class MalConvClassifier(nn.Module):  # type: ignore[misc]
         Returns:
             z: Classification logits of shape (B, M).
         """
-        check_tensor(x, (None, None), (torch.int32, torch.int64))
+        check_tensor(x, (None, None), INTEGERS)
 
         z = self.embedding.forward(x)  # (B, T, E)
         z = self.filmer.forward(z, g)  # (B, T, E)
-        z = self.backbone.forward(z)   # (B, C)
+        z = self.patcher.forward(z)    # (B, N, E') or (B, T, E)
+        z = self.backbone.forward(z)   # (B, D)
         z = self.head.forward(z)       # (B, M)
 
+        check_tensor(z, (x.shape[0], self.head.num_classes), FLOATS)
         return z

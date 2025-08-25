@@ -3,20 +3,23 @@ Tests.
 """
 
 import math
+from typing import Literal
+from typing import Optional
 
 import pytest
 import torch
 
 from src.utils import TensorError
 from src.architectures import ClassifificationHead
-from src.architectures import MultiChannelDiscreteEmbedding
-from src.architectures import MultiChannelDiscreteSequenceVisionTransformer
-from src.architectures import SequenceEmbeddingEncoder
 from src.architectures import FiLM
+from src.architectures import FiLMNoP
+from src.architectures import SinusoidalPositionalEncoding
+from src.architectures import PatchEncoder
+from src.architectures import ViT
 from src.architectures import MalConv
-from src.architectures import MalConvClassifier
 
 
+# TODO: clean this up.
 class TestClassificationHead:
     B = 4
 
@@ -36,31 +39,24 @@ class TestClassificationHead:
         assert z.shape == (self.B, num_classes)
 
 
-class TestMultiChannelDiscreteEmbedding:
-    B = 4
-    T = 256
+class TestSinusoidalPositionalEncoding:
 
-    @pytest.mark.parametrize("num_embedding", [[8], [16, 32], [8, 16, 32]])
-    @pytest.mark.parametrize("embedding_dim", [[4], [8, 16], [4, 8, 16]])
-    def test_forward(self, num_embedding: list[int], embedding_dim: list[int]) -> None:
-        if len(num_embedding) != len(embedding_dim):
-            with pytest.raises(ValueError):
-                MultiChannelDiscreteEmbedding(num_embedding, embedding_dim)
-            return
+    @pytest.mark.parametrize("batch_size", [1, 2, 3])
+    @pytest.mark.parametrize("seq_length", [1, 2, 3, 15, 16, 17, 63, 64, 65, 255, 256, 257])
+    @pytest.mark.parametrize("embedding_dim", [2, 4])
+    def test_forward(self, batch_size: int, seq_length: int, embedding_dim: int) -> None:
+        model = SinusoidalPositionalEncoding(embedding_dim=embedding_dim)
+        x = torch.rand((batch_size, seq_length, embedding_dim))
+        z = model.forward(x)
+        assert z.shape == (batch_size, seq_length, embedding_dim)
 
-        model = MultiChannelDiscreteEmbedding(num_embedding, embedding_dim)
-        x = [torch.randint(0, v, (self.B, self.T), dtype=torch.long) for v in num_embedding]
-        z = model.forward(*x)
-        assert z.shape == (self.B, self.T, sum(embedding_dim))
-
-        if len(num_embedding) > 1:
-            x = [torch.randint(0, v, (self.B, self.T - i), dtype=torch.long) for i, v in enumerate(num_embedding)]
-            with pytest.raises(TensorError):
-                model.forward(*x)
+    @pytest.mark.parametrize("embedding_dim", [-1, 0, 1, 3])
+    def test_invalid_configuration(self, embedding_dim: int) -> None:
+        with pytest.raises(ValueError):
+            SinusoidalPositionalEncoding(embedding_dim=embedding_dim)
 
 
-class TestSequenceEmbeddingEncoder:
-    B = 4
+class TestPatchEncoder:
 
     @pytest.mark.parametrize("batch_size", [1, 2, 3, 5])
     @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
@@ -68,102 +64,116 @@ class TestSequenceEmbeddingEncoder:
     @pytest.mark.parametrize("in_channels", [3, 5, 7])
     def test_split_patches(self, batch_size: int, seq_length: int, patch_size: int, in_channels: int) -> None:
         z = torch.rand(batch_size, seq_length, in_channels)
-        patches = SequenceEmbeddingEncoder._split_patches(z, patch_size)
+        patches = PatchEncoder.split_patches(z, patch_size)
         assert patches.shape[0] == batch_size
         assert patches.shape[1] == math.ceil(seq_length / patch_size)
         assert patches.shape[2] == min(patch_size, seq_length)
         assert patches.shape[3] == in_channels
 
-    def _test_forward(self, seq_length: int, patch_size: int, in_channels: int, out_channels: int, kernel_size: int, stride: int) -> None:
-        model = SequenceEmbeddingEncoder(patch_size, in_channels, out_channels, kernel_size, stride)
-        z = torch.rand(self.B, seq_length, in_channels)
+    @pytest.mark.parametrize("seq_length", list(range(258)))
+    @pytest.mark.parametrize("patch_size", [0, 1, 2, 3, 4, 5, 11, 17, 53, 255, 256, 257, 258, None])
+    @pytest.mark.parametrize("num_patches", [0, 1, 2, 3, 4, 5, 11, 17, 53, 255, 256, 257, 258, None])
+    def test_patch_dims(self, seq_length: int, patch_size: Optional[int], num_patches: Optional[int]) -> None:
+
+        if seq_length <= 0:
+            with pytest.raises(ValueError):
+                PatchEncoder.patch_dims(seq_length, patch_size, num_patches)
+            return
+        
+        if patch_size is not None and num_patches is not None:
+            with pytest.raises(ValueError):
+                PatchEncoder.patch_dims(seq_length, patch_size, num_patches)
+            return
+
+        if patch_size is None and num_patches is None:
+            with pytest.raises(ValueError):
+                PatchEncoder.patch_dims(seq_length, patch_size, num_patches)
+            return
+
+        if patch_size is not None and (patch_size <= 0 or patch_size > seq_length):
+            with pytest.raises(ValueError):
+                PatchEncoder.patch_dims(seq_length, patch_size, num_patches)
+            return
+
+        if num_patches is not None and (num_patches <= 0 or num_patches > seq_length):
+            with pytest.raises(ValueError):
+                PatchEncoder.patch_dims(seq_length, patch_size, num_patches)
+            return
+
+        P, N = PatchEncoder.patch_dims(seq_length, patch_size, num_patches)
+
+        assert isinstance(P, int) and isinstance(N, int)
+        assert P > 0 and N > 0
+        assert P <= seq_length and N <= seq_length
+        assert seq_length <= P * N <= seq_length + P
+
+        if patch_size is not None:
+            assert P == patch_size
+            assert N == (seq_length + patch_size - 1) // patch_size
+            assert (N - 1) * P < seq_length
+            if seq_length % patch_size == 0:
+                assert P * N == seq_length
+
+        if num_patches is not None:
+            assert N <= num_patches
+            assert P == (seq_length + num_patches - 1) // num_patches
+            assert (P - 1) * N < seq_length
+            if seq_length % num_patches == 0:
+                assert P * N == seq_length
+
+    @pytest.mark.parametrize("batch_size", [1, 3])
+    @pytest.mark.parametrize("seq_length", [1, 2, 3, 15, 16, 17, 63, 64, 65, 255, 256, 257])
+    @pytest.mark.parametrize("in_channels", [3, 5])
+    @pytest.mark.parametrize("out_channels", [7, 11])
+    @pytest.mark.parametrize("kernel_size", [3, 5])
+    @pytest.mark.parametrize("stride", [1, 2, 3])
+    @pytest.mark.parametrize("patch_size", [1, 2, 3, 4, 5, 255, 256, 257, 258, None])
+    @pytest.mark.parametrize("num_patches", [1, 2, 3, 4, 5, 255, 256, 257, 258, None])
+    def test_forward(self, batch_size: int, seq_length: int, in_channels: int, out_channels: int, kernel_size: int, stride: int, patch_size: Optional[int], num_patches: Optional[int]) -> None:
+        if patch_size is not None and num_patches is not None:
+            with pytest.raises(ValueError):
+                PatchEncoder(in_channels, out_channels, kernel_size, stride, patch_size=patch_size, num_patches=num_patches)
+            return
+
+        if patch_size is None and num_patches is None:
+            with pytest.raises(ValueError):
+                PatchEncoder(in_channels, out_channels, kernel_size, stride, patch_size=patch_size, num_patches=num_patches)
+            return
+
+        if patch_size is not None and patch_size < kernel_size:
+            with pytest.raises(ValueError):
+                PatchEncoder(in_channels, out_channels, kernel_size, stride, patch_size=patch_size, num_patches=num_patches)
+            return
+
+
+        model = PatchEncoder(in_channels, out_channels, kernel_size, stride, patch_size=patch_size, num_patches=num_patches)
+        z = torch.rand(batch_size, seq_length, in_channels)
+
+        if seq_length < model.min_length:
+            with pytest.raises(RuntimeError):
+                model.forward(z)
+            return
+
         z = model.forward(z)
-        assert z.shape[0] == self.B
-        assert z.shape[1] == math.ceil(seq_length / patch_size)
+        num_patches = num_patches if num_patches is not None else math.ceil(seq_length / patch_size)
+        assert z.shape[0] == batch_size
+        assert 0 < z.shape[1] <= num_patches
         assert z.shape[2] == out_channels
 
-    @pytest.mark.parametrize("seq_length", [11, 17, 53])
-    @pytest.mark.parametrize("patch_size", [11, 17, 53])
-    @pytest.mark.parametrize("in_channels", [3, 5, 7])
-    @pytest.mark.parametrize("out_channels", [8, 16, 32])
-    @pytest.mark.parametrize("kernel_size", [3, 5])
-    @pytest.mark.parametrize("stride", [1, 2])
-    def test_forward(self, seq_length: int, patch_size: int, in_channels: int, out_channels: int, kernel_size: int, stride: int) -> None:
-        self._test_forward(seq_length, patch_size, in_channels, out_channels, kernel_size, stride)
 
-    @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 63])
-    def test_forward_seq_length_too_short(self, seq_length: int) -> None:
-        # Any sequence length less than the kernel size should raise an error.
-        with pytest.raises(RuntimeError):
-            self._test_forward(seq_length, patch_size=64, in_channels=16, out_channels=12, kernel_size=64, stride=4)
+class TestViT:
 
-    @pytest.mark.parametrize("patch_size", [1, 2, 3, 11, 17, 63])
-    def test_forward_patch_size_too_small(self, patch_size: int) -> None:
-        # Any patch size less than the kernel size should raise an error.
-        with pytest.raises(ValueError):
-            self._test_forward(
-                seq_length=1024, patch_size=patch_size, in_channels=16, out_channels=12, kernel_size=64, stride=4
-            )
-
-
-class TestMultiChannelDiscreteSequenceVisionTransformer:
-    B = 2
-
-    def _test_forward(
-        self,
-        seq_length: int,
-        num_embeddings: list[int],
-        embedding_dim: list[int],
-        patch_size: int,
-        d_model: int,
-        nhead: int,
-        num_layers: int,
-        num_classes: int,
-    ) -> None:
-        model = MultiChannelDiscreteSequenceVisionTransformer(
-            num_embeddings, embedding_dim, patch_size, d_model, nhead, num_layers, num_classes
-        )
-        x = [torch.randint(0, v, (self.B, seq_length), dtype=torch.long) for v in num_embeddings]
-        y = model.forward(*x)
-        assert y.shape == (self.B, num_classes)
-
-    @pytest.mark.parametrize("seq_length", [359, 512])
-    @pytest.mark.parametrize("num_embeddings", [[8], [16, 32], [8, 16, 32]])
-    @pytest.mark.parametrize("embedding_dim", [[4], [8, 16], [4, 8, 16]])
-    @pytest.mark.parametrize("patch_size", [255, 256, 257])
+    @pytest.mark.parametrize("batch_size", [1, 2, 3])
+    @pytest.mark.parametrize("seq_length", [1, 2, 3, 15, 16, 17, 63, 64, 65, 255, 256, 257])
+    @pytest.mark.parametrize("embedding_dim", [2, 4])
     @pytest.mark.parametrize("d_model", [16, 32])
     @pytest.mark.parametrize("nhead", [1, 2])
-    @pytest.mark.parametrize("num_layers", [1, 2])
-    @pytest.mark.parametrize("num_classes", [2, 4, 8])
-    def test_forward(
-        self,
-        seq_length: int,
-        num_embeddings: list[int],
-        embedding_dim: list[int],
-        patch_size: int,
-        d_model: int,
-        nhead: int,
-        num_layers: int,
-        num_classes: int,
-    ) -> None:
-        if len(num_embeddings) != len(embedding_dim):
-            return
-        self._test_forward(
-            seq_length, num_embeddings, embedding_dim, patch_size, d_model, nhead, num_layers, num_classes
-        )
-
-    def test_forward_patch_size_too_small(self) -> None:
-        with pytest.raises(ValueError):
-            self._test_forward(
-                seq_length=1024,
-                num_embeddings=[8],
-                embedding_dim=[8],
-                patch_size=63,
-                d_model=64,
-                nhead=1,
-                num_layers=1,
-                num_classes=1,
-            )
+    @pytest.mark.parametrize("pooling", ["cls", "mean"])
+    def test_forward(self, batch_size: int, seq_length: int, embedding_dim: int, d_model: int, nhead: int, pooling: Literal["cls", "mean"]) -> None:
+        model = ViT(embedding_dim, d_model, nhead, num_layers=1, pooling=pooling)
+        z = torch.rand(batch_size, seq_length, embedding_dim)
+        z = model.forward(z)
+        assert z.shape == (batch_size, d_model)
 
 
 class TestFiLM:
