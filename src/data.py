@@ -206,7 +206,7 @@ class SemanticGuides(_SemanticGuideOrSemanticGuides):
         return 1
 
     @classmethod
-    def from_singles(cls, guides: Sequence[SemanticGuide], pin_memory: bool = False) -> SemanticGuides:
+    def from_singles(cls, guides: Sequence[SemanticGuide], pin_memory: bool = False, min_length: int = 0) -> SemanticGuides:
         if len(guides) == 0:
             raise ValueError("Cannot create Guides from empty list.")
 
@@ -214,15 +214,15 @@ class SemanticGuides(_SemanticGuideOrSemanticGuides):
         if guides[0].parse is not None:
             padding_value = False if guides[0].parse.dtype == torch.bool else 0
             pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if guides[0].parse.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
-            parse = pad_sequence([g.parse for g in guides], True, padding_value, "right", pin_memory, pad_to_multiple_of)
+            parse = pad_sequence([g.parse for g in guides], True, padding_value, "right", pin_memory, pad_to_multiple_of, min_length)
         entropy = None
         if guides[0].entropy is not None:
-            entropy = pad_sequence([g.entropy for g in guides], True, 0.0, "right", pin_memory, PAD_TO_MULTIPLE_OF)
+            entropy = pad_sequence([g.entropy for g in guides], True, 0.0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
         characteristics = None
         if guides[0].characteristics is not None:
             padding_value = False if guides[0].characteristics.dtype == torch.bool else 0
             pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if guides[0].characteristics.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
-            characteristics = pad_sequence([g.characteristics for g in guides], True, padding_value, "right", pin_memory, pad_to_multiple_of)
+            characteristics = pad_sequence([g.characteristics for g in guides], True, padding_value, "right", pin_memory, pad_to_multiple_of, min_length)
 
         return cls(parse, entropy, characteristics)
 
@@ -354,7 +354,7 @@ class StructureMaps(_StructureMapOrStructureMaps):
             raise ValueError("BatchedStructureMap index does not match lexicon keys.")
 
     @classmethod
-    def from_singles(cls, maps: Sequence[StructureMap], pin_memory: bool = False) -> _StructureMapOrStructureMaps:
+    def from_singles(cls, maps: Sequence[StructureMap], pin_memory: bool = False, min_length: int = 0) -> _StructureMapOrStructureMaps:
         if len(maps) == 0:
             raise ValueError("Cannot create BatchedStructureMap from empty list.")
         lexicon = maps[0].lexicon
@@ -363,7 +363,7 @@ class StructureMaps(_StructureMapOrStructureMaps):
                 raise ValueError("All StructureMaps must have the same lexicon to be batched.")
         padding_value = False if maps[0].index.dtype == torch.bool else 0.0
         pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if maps[0].index.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
-        index = pad_sequence([m.index for m in maps], True, padding_value, "right", pin_memory, pad_to_multiple_of)
+        index = pad_sequence([m.index for m in maps], True, padding_value, "right", pin_memory, pad_to_multiple_of, min_length)
         return cls(index, lexicon)
 
 
@@ -585,6 +585,7 @@ def pad_sequence(
     padding_side: Literal["right", "left"] = "right",
     pin_memory: bool = False,
     pad_to_multiple_of: int = 1,
+    min_length: int = 0,
 ) -> Tensor:
 
     if len(sequences) == 0:
@@ -592,7 +593,7 @@ def pad_sequence(
     if pad_to_multiple_of < 1:
         raise ValueError(f"pad_to_multiple_of must be a positive integer. Got {pad_to_multiple_of}.")
 
-    if not pin_memory and pad_to_multiple_of == 1:
+    if not pin_memory and pad_to_multiple_of == 1 and min_length == 0:
         return _pad_sequence(sequences, batch_first, padding_value, padding_side)
 
     if padding_side != "right":
@@ -609,7 +610,7 @@ def pad_sequence(
             raise ValueError("All sequences must have the same dtype.")
 
     batch_size = len(sequences)
-    seq_length = math.ceil(max(s.shape[0] for s in sequences) / pad_to_multiple_of) * pad_to_multiple_of
+    seq_length = max(min_length, math.ceil(max(s.shape[0] for s in sequences) / pad_to_multiple_of) * pad_to_multiple_of)
     other_dims = sequences[0].shape[1:]
     size = (batch_size, seq_length) + tuple(other_dims)
 
@@ -622,19 +623,24 @@ def pad_sequence(
 
 class CollateFn:
 
-    def __init__(self, pin_memory: bool, bitpack: bool) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, min_length: int = 0) -> None:
         self.pin_memory = pin_memory
         self.bitpack = bitpack
+        self.min_length = min_length
+        if self.min_length % 8 != 0:
+            raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {min_length}.")
 
     def __call__(self, batch: Sequence[Sample]) -> Samples:
-        return Samples(
-            file=[s.file for s in batch],
-            name=[s.name for s in batch],
-            label=torch.stack([s.label for s in batch]),
-            inputs=pad_sequence([s.inputs.to(torch.int16) + 1 for s in batch], True, 0, "right", self.pin_memory, PAD_TO_MULTIPLE_OF),
-            guides=SemanticGuides.from_singles([s.guides.compress() if self.bitpack else s.guides for s in batch], pin_memory=self.pin_memory),
-            structure=StructureMaps.from_singles([s.structure for s in batch], pin_memory=self.pin_memory),
-        )
+        file = [s.file for s in batch]
+        name = [s.name for s in batch]
+        label = torch.stack([s.label for s in batch])
+        inputs = [s.inputs.to(torch.int16) + 1 for s in batch]
+        inputs = pad_sequence(inputs, True, 0, "right", self.pin_memory, PAD_TO_MULTIPLE_OF, self.min_length)
+        guides = [s.guides.compress() if self.bitpack else s.guides for s in batch]
+        guides = SemanticGuides.from_singles(guides, self.pin_memory, int(self.min_length / 8))
+        structure = [s.structure for s in batch]
+        structure = StructureMaps.from_singles(structure, self.pin_memory, self.min_length)
+        return Samples(file, name, label, inputs, guides, structure)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack})"

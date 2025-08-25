@@ -4,6 +4,7 @@ Train and validate models.
 
 from argparse import ArgumentParser
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import sys
@@ -25,11 +26,14 @@ from torch.utils.data import Sampler
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.architectures import get_model_input_lengths
 from src.architectures import ClassifificationHead
 from src.architectures import FiLM
 from src.architectures import FiLMNoP
 from src.architectures import MalConv
-from src.architectures import MalConvClassifier
+from src.architectures import ViT
+from src.architectures import Classifier
+from src.architectures import PatchEncoder
 from src.binanal import HierarchicalLevel
 from src.data import BinaryDataset
 from src.data import CollateFn
@@ -159,8 +163,37 @@ def main() -> None:
 
     tr_dataset = BinaryDataset(tr_files, tr_labels, preprocessor)
     vl_dataset = BinaryDataset(vl_files, vl_labels, preprocessor)
+ 
+    def get_model() -> Classifier:
 
-    collate_fn = CollateFn(pin_memory=False, bitpack=args.bitpack)
+        num_embeddings = 256 + 8
+        embedding_dim = 8
+        guide_dim = 12
+        guide_hidden = 16
+        num_patches = 256
+        d_model = 128
+        num_classes = 2
+        clf_hidden = 32
+        clf_layers = 1
+
+        embedding = Embedding(num_embeddings, embedding_dim, padding_idx=0)
+        filmer = FiLMNoP()
+        if args.do_characteristics:
+            filmer = FiLM(guide_dim, embedding_dim, guide_hidden)
+        patcher = PatchEncoder(embedding_dim, d_model, num_patches=num_patches, patch_size=None)
+        # backbone=MalConv(embedding_dim, d_model)
+        backbone = ViT(d_model, d_model)
+        head = ClassifificationHead(d_model, num_classes, clf_hidden, clf_layers)
+
+        return Classifier(embedding, filmer, patcher, backbone, head)
+
+    model = get_model()
+    print(f"{model=}")
+
+    min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
+    print(f"{min_length=}")
+
+    collate_fn = CollateFn(pin_memory=False, bitpack=args.bitpack, min_length=min_length)
     print(f"{collate_fn=}")
 
     def get_loader(dataset: Dataset, sampler: Sampler) -> DataLoader | CUDAPrefetcher:
@@ -187,13 +220,6 @@ def main() -> None:
     vl_loader = get_loader(vl_dataset, vl_sampler)
     print(f"{tr_loader=}")
     print(f"{vl_loader=}")
-
-    model = MalConvClassifier(
-        Embedding(256 + 8, 8, padding_idx=0),
-        FiLM(12, 8, 16) if args.do_characteristics else FiLMNoP(),
-        MalConv(8, 128, 512, 512),
-        ClassifificationHead(128, 2, 32, 2),
-    )
 
     loss_fn = CrossEntropyLoss()
 

@@ -23,6 +23,7 @@ Notations (ViT):
 """
 
 import math
+import sys
 from typing import Any
 from typing import Callable
 from typing import Literal
@@ -53,6 +54,20 @@ ACTVS: dict[str, Callable[[Tensor], Tensor]] = {
 
 FLOATS = (torch.bfloat16, torch.float16, torch.float32)  # Commonly used for training and evaluating models.
 INTEGERS = (torch.int32, torch.int64)                    # Used for indices compatible with nn.Embedding.
+
+
+def get_model_input_lengths(model: nn.Module) -> tuple[int, int]:
+    lo = 0
+    hi = sys.maxsize
+
+    for m in model.modules():
+        if isinstance(l := getattr(m, "max_length", None), int):
+            hi = min(hi, l)
+        if isinstance(l := getattr(m, "min_length", None), int):
+            lo = max(lo, l)
+
+    return lo, hi
+
 
 # -------------------------------------------------------------------------------- #
 # Other
@@ -439,8 +454,8 @@ class MalConv(nn.Module):  # type: ignore[misc]
             z: Hidden representation of shape (B, C).
         """
         check_tensor(x, (None, None, self.embedding_dim), FLOATS)
-        if x.shape[1] < self.kernel_size:
-            raise ValueError(f"Input sequence with length {x.shape[1]} is shorter than the kernel size {self.kernel_size}.")
+        if x.shape[1] < self.min_length:
+            raise RuntimeError(f"Input sequence length {x.shape[1]} is less than the minimum required length {self.min_length}.")
 
         z = x.transpose(1, 2)                # (B, E, T)
         c_1 = self.conv_1.forward(z)         # (B, C, S - 1)
@@ -451,6 +466,10 @@ class MalConv(nn.Module):  # type: ignore[misc]
 
         check_tensor(z, (x.shape[0], self.channels), FLOATS)
         return z
+
+    @property
+    def min_length(self) -> int:
+        return self.kernel_size
 
 # -------------------------------------------------------------------------------- #
 # Classifier
