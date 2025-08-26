@@ -5,6 +5,7 @@ Train and validate models.
 from argparse import ArgumentParser
 from collections import Counter
 from dataclasses import dataclass
+from enum import Enum
 import math
 import os
 from pathlib import Path
@@ -18,8 +19,9 @@ import numpy as np
 import torch
 from torch.nn import Embedding
 from torch.nn import CrossEntropyLoss
+from torch.nn import Module
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR
+from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
@@ -36,6 +38,7 @@ from src.architectures import ViT
 from src.architectures import Classifier
 from src.architectures import PatchEncoder
 from src.binanal import HierarchicalLevel
+from src.binanal import CharacteristicGuider
 from src.data import BinaryDataset
 from src.data import CollateFn
 from src.data import CUDAPrefetcher
@@ -48,6 +51,17 @@ from src.trainer import EarlyStopper
 from src.utils import seed_everything
 from src.utils import get_optimal_num_workers
 from src.utils import get_optimal_num_worker_threads
+
+
+class Architecture(Enum):
+    MALCONV = "malconv"
+    VIT     = "vit"
+
+
+class ModelSize(Enum):
+    SM = "sm"
+    MD = "md"
+    LG = "lg"
 
 
 @dataclass
@@ -78,7 +92,8 @@ class MainArgumentParser(ArgumentParser):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
-        self.add_argument("--backbone", type=str, choices=["malconv", "vit"], required=True)
+        self.add_argument("--arch", type=Architecture, required=True)
+        self.add_argument("--size", type=ModelSize, required=True)
         self.add_argument("--seed", type=int, default=MainArgs.seed)
         self.add_argument("--do_parser", action="store_true", default=MainArgs.do_parser)
         self.add_argument("--do_entropy", action="store_true", default=MainArgs.do_entropy)
@@ -97,6 +112,67 @@ class MainArgumentParser(ArgumentParser):
         self.add_argument("--weight_decay", type=float, default=MainArgs.weight_decay)
 
 
+def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool) -> Classifier:
+
+    f = None
+    if size == ModelSize.SM:
+        f = 1
+    if size == ModelSize.MD:
+        f = 2
+    if size == ModelSize.LG:
+        f = 4
+    if f is None:
+        raise ValueError(f"{size}")
+
+    # Embedding
+    padding_idx    = 0
+    num_embeddings = 256 + 8
+    embedding_dim  = 4 * f
+    # FiLM
+    guide_dim      = len(CharacteristicGuider.CHARACTERISTICS)
+    guide_hidden   = 4 * f
+    # Patcher
+    num_patches    = 256
+    patch_size     = None
+    # MalConv
+    mcnv_channels  = 128
+    mcnv_kernel    = 512
+    mcnv_stride    = 512
+    # ViT
+    vit_d_model    = 128 * f
+    vit_nhead      = 2 * f
+    vit_feedfrwd   = 4 * vit_d_model
+    vit_layers     = 2 * f
+    # Head
+    num_classes    = 2
+    clf_hidden     = 64 * f
+    clf_layers     = 2
+    clf_input_size = -1
+
+    embedding = Embedding(num_embeddings, embedding_dim, padding_idx)
+
+    if do_characteristics:
+        filmer = FiLM(guide_dim, embedding_dim, guide_hidden)
+    else:
+        filmer = FiLMNoP()
+
+    if arch == Architecture.MALCONV:
+        patcher = None
+        backbone=MalConv(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
+        clf_input_size = mcnv_channels
+    elif arch == Architecture.VIT:
+        patcher = PatchEncoder(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
+        backbone = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
+        clf_input_size = vit_d_model
+    else:
+        raise NotImplementedError(f"{arch}")
+
+    head = ClassifificationHead(clf_input_size, num_classes, clf_hidden, clf_layers)
+
+    return Classifier(embedding, filmer, patcher, backbone, head)
+
+
+
 def get_materials(tr_num_samples: Optional[int] = None, vl_num_samples: Optional[int] = None) -> tuple[list[Path], list[Path], list[int], list[int]]:
     # TODO: define a temporal (not random) train/test split.
     benfiles = list(filter(lambda f: f.is_file(), Path("./data/ass").rglob("*")))
@@ -111,6 +187,7 @@ def get_materials(tr_num_samples: Optional[int] = None, vl_num_samples: Optional
     idx = np.arange(len(files))
     tr_idx = np.random.choice(idx, size=int(0.8 * len(files)), replace=False)
     vl_idx = np.setdiff1d(idx, tr_idx)  # type: ignore[no-untyped-call]
+    vl_idx = np.random.permutation(vl_idx)
 
     tr_files  = [files[i] for i in tr_idx]
     vl_files  = [files[i] for i in vl_idx]
@@ -135,6 +212,10 @@ def get_materials(tr_num_samples: Optional[int] = None, vl_num_samples: Optional
     print(f"{len(vl_files)=} {Counter(vl_labels)=}")
 
     return tr_files, vl_files, tr_labels, vl_labels
+
+
+def count_parameters(model: Module, requires_grad: bool = False) -> int:
+    return sum(p.numel() for p in model.parameters() if (not requires_grad or p.requires_grad))
 
 
 def worker_init_fn(worker_id: int) -> None:
@@ -168,41 +249,16 @@ def main() -> None:
 
     tr_dataset = BinaryDataset(tr_files, tr_labels, preprocessor)
     vl_dataset = BinaryDataset(vl_files, vl_labels, preprocessor)
- 
-    def get_model() -> Classifier:
 
-        padding_idx = 0
-        num_embeddings = 256 + 8
-        embedding_dim = 8
-        guide_dim = 12
-        guide_hidden = 16
-        num_patches = 256
-        d_model = 128
-        num_classes = 2
-        clf_hidden = 32
-        clf_layers = 1
-
-        embedding = Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
-        filmer = FiLM(guide_dim, embedding_dim, guide_hidden) if args.do_characteristics else FiLMNoP()
-
-        if args.backbone == "malconv":
-            patcher = None
-            backbone=MalConv(embedding_dim, d_model)
-        elif args.backbone == "vit":
-            patcher = PatchEncoder(embedding_dim, d_model, num_patches=num_patches, patch_size=None)
-            backbone = ViT(d_model, d_model)
-        else:
-            raise ValueError(f"{args.backbone}")
-
-        head = ClassifificationHead(d_model, num_classes, clf_hidden, clf_layers)
-
-        return Classifier(embedding, filmer, patcher, backbone, head)
-
-    model = get_model()
+    model = get_model(args.arch, args.size, args.do_characteristics)
     print(f"{model=}")
 
+    # NOTE: this will need to be adjusted for the multiple structure case,
+    # where different encoders may have different requirements.
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
     print(f"{min_length=}")
+
+    print(f"num_parameters={count_parameters(model, requires_grad=True)}")
 
     collate_fn = CollateFn(pin_memory=False, bitpack=args.bitpack, min_length=min_length)
     print(f"{collate_fn=}")
@@ -236,7 +292,7 @@ def main() -> None:
 
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
-    scheduler = LinearLR(optimizer)
+    scheduler: Optional[LRScheduler] = None
 
     stopper: Optional[EarlyStopper] = None
 
