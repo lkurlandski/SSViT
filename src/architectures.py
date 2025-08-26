@@ -356,6 +356,8 @@ class ViT(nn.Module):  # type: ignore[misc]
     Vision Transformer.
 
     See: Dosovitskiy "An image is worth 16x16 words: Transformers for image recognition at scale" ICLR 2021.
+
+    # FIXME: remove proj; upscaling the embeddings should be done outside of ViT, e.g., in PatchEncoder.
     """
 
     def __init__(
@@ -500,6 +502,8 @@ class Classifier(nn.Module):  # type: ignore[misc]
             z: Classification logits of shape (B, M).
         """
         check_tensor(x, (None, None), INTEGERS)
+        if g is not None:
+            check_tensor(g, (x.shape[0], x.shape[1], None), FLOATS)
 
         z = self.embedding.forward(x)  # (B, T, E)
         z = self.filmer.forward(z, g)  # (B, T, E)
@@ -509,3 +513,156 @@ class Classifier(nn.Module):  # type: ignore[misc]
 
         check_tensor(z, (x.shape[0], self.head.num_classes), FLOATS)
         return z
+
+# -------------------------------------------------------------------------------- #
+# Hierarchical Models.
+# -------------------------------------------------------------------------------- #
+
+def _check_hierarchical_inputs(x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]], num_structures: int) -> None:
+    if len(x_g) != num_structures:
+        raise ValueError(f"Expected {num_structures} structures, got {len(x_g)} instead.")
+
+    if all(x_g[i] is None for i in range(num_structures)):
+        raise ValueError("At least one structure must have input.")
+
+    x_ref = next((x_g[i] for i in range(num_structures) if x_g[i] is not None))[0]  # type: ignore[index]
+
+    for i in range(num_structures):
+        if x_g[i] is None:
+            continue
+        x, g = x_g[i]  # type: ignore[misc]
+        check_tensor(x, (x_ref.shape[0], None), INTEGERS)
+        if g is not None:
+            check_tensor(g, (x_ref.shape[0], x.shape[1], None), FLOATS)
+
+
+class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
+    """
+    Uses disparate MalConv models (Embedding + FiLM + MalConv) to process multiple input structures
+        and averages these hidden representations before feeding them to a classification head.
+    """
+
+    def __init__(self, embeddings: list[nn.Embedding], filmers: list[FiLM | FiLMNoP], backbones: list[MalConv], head: ClassifificationHead) -> None:
+        super().__init__()
+
+        if not (len(embeddings) == len(filmers) == len(backbones)):
+            raise ValueError("The number of embeddings, filmers, and backbones must be the same.")
+        self.num_structures = len(embeddings)
+
+        self.embeddings = embeddings
+        self.filmers = filmers
+        self.backbones = backbones
+        self.head = head
+
+    def forward(self, x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]]) -> Tensor:
+        """
+        Args:
+            x_g: list of optional (x, g) tuples for each level, where x is of shape (B, T) and g is of shape (B, T, G) or None.
+                If no input for a specific structure is extracted, the value for that structure will be None.
+        Returns:
+            z: Classification logits of shape (B, M).
+        """
+        _check_hierarchical_inputs(x_g, self.num_structures)
+
+        zs: list[Tensor] = []
+        for i in range(self.num_structures):
+            if x_g[i] is None:
+                continue
+            x, g = x_g[i]  # type: ignore[misc]
+            z = self.embeddings[i].forward(x)  # (B, T, E)
+            z = self.filmers[i].forward(z, g)  # (B, T, E)
+            z = self.backbones[i].forward(z)   # (B, C)
+            zs.append(z)
+
+        z = torch.stack(zs, dim=1)  # (B, sum(C))
+        z = torch.mean(z, dim=1)    # (B, C)
+        z = self.head.forward(z)    # (B, M)
+
+        check_tensor(z, (zs[0].shape[0], self.head.num_classes), FLOATS)
+        return z
+
+    def _get_min_max_lengths(self) -> list[tuple[int, int]]:
+        lengths = []
+        for i in range(self.num_structures):
+            lo_e, hi_e = get_model_input_lengths(self.embeddings[i])
+            lo_f, hi_f = get_model_input_lengths(self.filmers[i])
+            lo_b, hi_b = get_model_input_lengths(self.backbones[i])
+            lo = max(lo_e, lo_f, lo_b)
+            hi = min(hi_e, hi_f, hi_b)
+            lengths.append((lo, hi))
+        return lengths
+
+    @property
+    def min_lengths(self) -> list[int]:
+        return [l[0] for l in self._get_min_max_lengths()]
+
+    @property
+    def max_lengths(self) -> list[int]:
+        return [l[1] for l in self._get_min_max_lengths()]
+
+
+class HierarchicalViTClassifier(nn.Module):  # type: ignore[misc]
+    """
+    Uses disparate ViT trunks (Embedding + FiLM + PatchEncoder) to process multiple input structures
+        and feeds the encoded patches to a shared ViT backbone followed by a classification head.
+    """
+
+    def __init__(self, embeddings: list[nn.Embedding], filmers: list[FiLM | FiLMNoP], patchers: list[PatchEncoder], backbone: ViT, head: ClassifificationHead) -> None:
+        super().__init__()
+
+        if not (len(embeddings) == len(filmers) == len(patchers)):
+            raise ValueError("The number of embeddings, filmers, and patchers must be the same.")
+        self.num_structures = len(embeddings)
+
+        self.embeddings = embeddings
+        self.filmers = filmers
+        self.patchers = patchers
+        self.backbone = backbone
+        self.head = head
+
+    def forward(self, x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]]) -> Tensor:
+        """
+        Args:
+            x_g: list of optional (x, g) tuples for each level, where x is of shape (B, T) and g is of shape (B, T, G) or None.
+                If no input for a specific structure is extracted, the value for that structure will be None.
+        Returns:
+            z: Classification logits of shape (B, M).
+        """
+        _check_hierarchical_inputs(x_g, self.num_structures)
+
+        zs = []
+        for i in range(self.num_structures):
+            if x_g[i] is None:
+                continue
+            x, g = x_g[i]  # type: ignore[misc]
+            z = self.embeddings[i].forward(x)  # (B, T, E)
+            z = self.filmers[i].forward(z, g)  # (B, T, E)
+            z = self.patchers[i].forward(z)    # (B, N, D)
+            zs.append(z)
+
+        z = torch.cat(zs, dim=1)      # (B, sum(N), D)
+        z = self.backbone.forward(z)  # (B, D)
+        z = self.head.forward(z)      # (B, M)
+
+        check_tensor(z, (zs[0].shape[0], self.head.num_classes), FLOATS)
+        return z
+
+    def _get_min_max_lengths(self) -> list[tuple[int, int]]:
+        lengths = []
+        for i in range(self.num_structures):
+            lo_e, hi_e = get_model_input_lengths(self.embeddings[i])
+            lo_f, hi_f = get_model_input_lengths(self.filmers[i])
+            lo_p, hi_p = get_model_input_lengths(self.patchers[i])
+            lo_b, hi_b = get_model_input_lengths(self.backbone)
+            lo = max(lo_e, lo_f, lo_p, lo_b)
+            hi = min(hi_e, hi_f, hi_p, hi_b)
+            lengths.append((lo, hi))
+        return lengths
+
+    @property
+    def min_lengths(self) -> list[int]:
+        return [l[0] for l in self._get_min_max_lengths()]
+
+    @property
+    def max_lengths(self) -> list[int]:
+        return [l[1] for l in self._get_min_max_lengths()]
