@@ -326,39 +326,40 @@ class Trainer:
         return report
 
     def forward(self, batch: Samples) -> FTensor:
-        """Send a batch of inputs forward through the model.
-
-        Args:
-            batch: batch of inputs.
-
-        Returns:
-            tuple: model output(s).
+        """
+        Send a batch of inputs forward through the model.
         """
         return self.model.forward(batch.inputs, batch.guides.characteristics)
 
     def compute_loss(self, batch: Samples, outputs: FTensor) -> FTensor:
-        """Compute the loss over a batch of examples.
-
-        Args:
-            batch: batch of inputs.
-            outputs: model output.
-
-        Returns:
-            loss over the batch.
+        """
+        Compute the loss over a batch of examples.
         """
         return self.loss_fn.forward(outputs, batch.label)
 
     def compute_metrics(self, batch: Samples, outputs: FTensor) -> dict[str, float]:
-        """Compute the validation metrics over a set of examples.
-
-        Args:
-            batch: batch of inputs.
-            outputs: model output.
-
-        Returns:
-            metrics for the set.
         """
-        return {}
+        Compute the validation metrics over a set of examples.
+        """
+        labels = batch.label
+        preds = torch.argmax(outputs, dim=1)
+
+        tp = ((preds == 1) & (labels == 1)).sum().item()
+        tn = ((preds == 0) & (labels == 0)).sum().item()
+        fp = ((preds == 1) & (labels == 0)).sum().item()
+        fn = ((preds == 0) & (labels == 1)).sum().item()
+
+        acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+        pre = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f_1 = 2 * pre * rec / (pre + rec) if (pre + rec) > 0 else 0.0
+
+        return {
+            "acc": acc,
+            "pre": pre,
+            "rec": rec,
+            "f-1": f_1,
+        }
 
     def _update_logs(self, results: Mapping[str, int | float]) -> None:
         self.log.append(results)
