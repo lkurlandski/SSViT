@@ -40,6 +40,7 @@ from torch import LongTensor
 from torch.nn import Module
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -215,7 +216,7 @@ class Trainer:
         self.vl_loader = vl_loader
         self.loss_fn = loss_fn
         self.optimizer = optimizer
-        self.scheduler = scheduler if scheduler is not None else LRScheduler(optimizer)
+        self.scheduler = scheduler if scheduler is not None else LambdaLR(optimizer, lambda _: 1.0)
         self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
         self.log: list[Mapping[str, int | float]] = []
         self.best_epoch = -1
