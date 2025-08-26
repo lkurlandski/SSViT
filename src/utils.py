@@ -3,18 +3,21 @@ Utilities.
 """
 
 from __future__ import annotations
+import math
 import os
 import random
+from typing import Literal
 from typing import Optional
 import warnings
 
 import numpy as np
 import psutil
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 from torch import BoolTensor
 from torch import CharTensor
+import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence as _pad_sequence
 
 
 def seed_everything(seed: int) -> None:
@@ -196,3 +199,46 @@ def unpackbits(x: CharTensor, count: int = -1, axis: int = -1) -> BoolTensor:
 
     # Move the expanded bit-axis back
     return z.movedim(-1, axis)
+
+
+def pad_sequence(
+    sequences: list[Tensor],
+    batch_first: bool = False,
+    padding_value: float | int | bool = 0.0,
+    padding_side: Literal["right", "left"] = "right",
+    pin_memory: bool = False,
+    pad_to_multiple_of: int = 1,
+    min_length: int = 0,
+) -> Tensor:
+
+    if len(sequences) == 0:
+        raise ValueError("Cannot pad an empty list of sequences.")
+    if pad_to_multiple_of < 1:
+        raise ValueError(f"pad_to_multiple_of must be a positive integer. Got {pad_to_multiple_of}.")
+
+    if not pin_memory and pad_to_multiple_of == 1 and min_length == 0:
+        return _pad_sequence(sequences, batch_first, padding_value, padding_side)
+
+    if padding_side != "right":
+        raise NotImplementedError("pad_sequence with pin_memory=True requires padding_side='right'.")
+    if not batch_first:
+        raise NotImplementedError("pad_sequence with pin_memory=True requires batch_first=True.")
+
+    for s in sequences:
+        if pin_memory and s.device.type != "cpu":
+            raise ValueError("All sequences must be on CPU when pin_memory=True.")
+        if s.shape[1:] != sequences[0].shape[1:]:
+            raise ValueError("All sequences must have the same shape except for the first dimension.")
+        if s.dtype != sequences[0].dtype:
+            raise ValueError("All sequences must have the same dtype.")
+
+    batch_size = len(sequences)
+    seq_length = max(min_length, math.ceil(max(s.shape[0] for s in sequences) / pad_to_multiple_of) * pad_to_multiple_of)
+    other_dims = sequences[0].shape[1:]
+    size = (batch_size, seq_length) + tuple(other_dims)
+
+    padded = torch.full(size, fill_value=padding_value, dtype=sequences[0].dtype, pin_memory=pin_memory)
+    for i, s in enumerate(sequences):
+        s = s.contiguous() if not s.is_contiguous() else s
+        padded[i, :s.shape[0]].copy_(s)
+    return padded

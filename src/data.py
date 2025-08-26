@@ -37,11 +37,11 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
 from torch.utils._pytree import tree_map
-from torch.nn.utils.rnn import pad_sequence as _pad_sequence
 
 from src.utils import check_tensor
 from src.utils import packbits
 from src.utils import unpackbits
+from src.utils import pad_sequence
 from src.binanal import _parse_pe_and_get_size
 from src.binanal import _get_size_of_liefparse
 from src.binanal import LiefParse
@@ -578,49 +578,6 @@ class Preprocessor:
         return Sample(file, name, label, inputs, guides, structure)
 
 
-def pad_sequence(
-    sequences: list[Tensor],
-    batch_first: bool = False,
-    padding_value: float | int | bool = 0.0,
-    padding_side: Literal["right", "left"] = "right",
-    pin_memory: bool = False,
-    pad_to_multiple_of: int = 1,
-    min_length: int = 0,
-) -> Tensor:
-
-    if len(sequences) == 0:
-        raise ValueError("Cannot pad an empty list of sequences.")
-    if pad_to_multiple_of < 1:
-        raise ValueError(f"pad_to_multiple_of must be a positive integer. Got {pad_to_multiple_of}.")
-
-    if not pin_memory and pad_to_multiple_of == 1 and min_length == 0:
-        return _pad_sequence(sequences, batch_first, padding_value, padding_side)
-
-    if padding_side != "right":
-        raise NotImplementedError("pad_sequence with pin_memory=True requires padding_side='right'.")
-    if not batch_first:
-        raise NotImplementedError("pad_sequence with pin_memory=True requires batch_first=True.")
-
-    for s in sequences:
-        if pin_memory and s.device.type != "cpu":
-            raise ValueError("All sequences must be on CPU when pin_memory=True.")
-        if s.shape[1:] != sequences[0].shape[1:]:
-            raise ValueError("All sequences must have the same shape except for the first dimension.")
-        if s.dtype != sequences[0].dtype:
-            raise ValueError("All sequences must have the same dtype.")
-
-    batch_size = len(sequences)
-    seq_length = max(min_length, math.ceil(max(s.shape[0] for s in sequences) / pad_to_multiple_of) * pad_to_multiple_of)
-    other_dims = sequences[0].shape[1:]
-    size = (batch_size, seq_length) + tuple(other_dims)
-
-    padded = torch.full(size, fill_value=padding_value, dtype=sequences[0].dtype, pin_memory=pin_memory)
-    for i, s in enumerate(sequences):
-        s = s.contiguous() if not s.is_contiguous() else s
-        padded[i, :s.shape[0]].copy_(s)
-    return padded
-
-
 class CollateFn:
 
     def __init__(self, pin_memory: bool, bitpack: bool, min_length: int = 0) -> None:
@@ -643,7 +600,7 @@ class CollateFn:
         return Samples(file, name, label, inputs, guides, structure)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack})"
+        return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, min_length={self.min_length})"
 
 
 class CUDAPrefetcher:
