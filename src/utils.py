@@ -231,13 +231,15 @@ def pad_sequence(
             raise ValueError("All sequences must have the same shape except for the first dimension.")
         if s.dtype != sequences[0].dtype:
             raise ValueError("All sequences must have the same dtype.")
+        if s.device != sequences[0].device:
+            raise ValueError("All sequences must be on the same device.")
 
     batch_size = len(sequences)
     seq_length = max(min_length, math.ceil(max(s.shape[0] for s in sequences) / pad_to_multiple_of) * pad_to_multiple_of)
     other_dims = sequences[0].shape[1:]
     size = (batch_size, seq_length) + tuple(other_dims)
 
-    padded = torch.full(size, fill_value=padding_value, dtype=sequences[0].dtype, pin_memory=pin_memory)
+    padded = torch.full(size, fill_value=padding_value, dtype=sequences[0].dtype, device=sequences[0].device, pin_memory=pin_memory)
     for i, s in enumerate(sequences):
         s = s.contiguous() if not s.is_contiguous() else s
         padded[i, :s.shape[0]].copy_(s)
