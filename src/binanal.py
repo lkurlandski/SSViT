@@ -668,6 +668,14 @@ class HierarchicalStructureFine(HierarchicalStructure):
     OTHERDIR = "otherdir"        # Other directory  (DIRECTORY)
 
 
+LEVEL_STRUCTURE_MAP = {
+    HierarchicalLevel.NONE: HierarchicalStructureNone,
+    HierarchicalLevel.COARSE: HierarchicalStructureCoarse,
+    HierarchicalLevel.MIDDLE: HierarchicalStructureMiddle,
+    HierarchicalLevel.FINE: HierarchicalStructureFine,
+}
+
+
 class StructureParser:
 
     _SCN_MEM_EXECUTE = 0x20000000
