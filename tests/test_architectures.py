@@ -204,8 +204,8 @@ class TestMalConv:
     def test_forward(self, batch_size: int, seq_length: int, embedding_dim: int, channels: int, kernel_size: int, stride: int) -> None:
         net = MalConv(embedding_dim, channels, kernel_size, stride)
         x = torch.rand((batch_size, seq_length, embedding_dim))
-        if seq_length < kernel_size:
-            with pytest.raises(ValueError):
+        if seq_length < net.min_length:
+            with pytest.raises(RuntimeError):
                 net.forward(x)
             return
         z = net.forward(x)
