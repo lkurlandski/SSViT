@@ -258,7 +258,7 @@ class TestHierarchicalViTClassifier:
     @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
     @pytest.mark.parametrize("num_structures", [1, 2, 3, 5, 7])
     @pytest.mark.parametrize("add_none", [False, True])
-    def test_forward(self, batch_size: int, seq_length: int, num_structures: int, add_none: bool, vocab_size: int = 11, guide_dim: int = 3, d_model: int = 8, num_classes: int = 2) -> None:
+    def test_forward_a(self, batch_size: int, seq_length: int, num_structures: int, add_none: bool, vocab_size: int = 11, guide_dim: int = 3, d_model: int = 8, num_classes: int = 2) -> None:
         embeddings = [torch.nn.Embedding(vocab_size, embedding_dim=8 + 2 * i) for i in range(num_structures)]
         filmers = [FiLM(guide_dim, embedding_dim=8 + 2 * i, hidden_size=3) for i in range(num_structures)]
         patchers = [PatchEncoder(in_channels=8 + 2 * i, out_channels=d_model, kernel_size=2, stride=3, patch_size=3, num_patches=None) for i in range(num_structures)]
@@ -290,4 +290,34 @@ class TestHierarchicalViTClassifier:
             return
 
         z = net.forward(x_g)
+        assert z.shape == (batch_size, num_classes)
+
+    @pytest.mark.parametrize("batch_size", [1, 2, 3, 5])
+    @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
+    @pytest.mark.parametrize("num_structures", [1, 2, 3, 5, 7])
+    @pytest.mark.parametrize("add_none", [False, True])
+    def test_forward_b(self, batch_size: int, seq_length: int, num_structures: int, add_none: bool, vocab_size: int = 11, guide_dim: int = 3, d_model: int = 8, num_classes: int = 2) -> None:
+        embeddings = [torch.nn.Embedding(vocab_size, embedding_dim=8 + 2 * i) for i in range(num_structures)]
+        filmers = [FiLM(guide_dim, embedding_dim=8 + 2 * i, hidden_size=3) for i in range(num_structures)]
+        patchers = [PatchEncoder(in_channels=8 + 2 * i, out_channels=d_model, kernel_size=2, stride=3, patch_size=3, num_patches=None) for i in range(num_structures)]
+        backbone = ViT(embedding_dim=d_model, d_model=d_model, nhead=1, num_layers=1, pooling="cls")
+        head = ClassifificationHead(d_model, num_classes=num_classes)
+        net = HierarchicalViTClassifier(embeddings, filmers, patchers, backbone, head)
+
+        x = torch.randint(0, vocab_size, (batch_size, seq_length))
+        g = torch.rand((batch_size, seq_length, guide_dim))
+        while not (m := torch.randint(0, 2, (batch_size, seq_length, num_structures), dtype=torch.bool)).any():
+            pass
+
+        if add_none:
+            m[:,:,0] = False
+            if not m.any() and num_structures > 1:
+                m[0,0,1] = True
+
+        if add_none and num_structures == 1:
+            with pytest.raises(ValueError):
+                net.forward((x, g, m))
+            return
+
+        z = net.forward((x, g, m))
         assert z.shape == (batch_size, num_classes)
