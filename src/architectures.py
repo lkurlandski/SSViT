@@ -225,9 +225,11 @@ class SinusoidalPositionalEncoding(nn.Module):  # type: ignore[misc]
         pos = torch.arange(x.shape[1], device=x.device, dtype=self.inv_freq.dtype)  # (T,)
         sin_inp = torch.einsum("i,j->ij", pos, self.inv_freq)                       # (T, E/2)
 
-        z = torch.stack((sin_inp.sin(), sin_inp.cos()), dim=-1)                     # (T, E/2, 2)
-        z = z.flatten(-2, -1)                                                       # (T, E)
-        z = z.repeat(x.shape[0], 1, 1)                                              # (B, T, E)
+        p = torch.stack((sin_inp.sin(), sin_inp.cos()), dim=-1)                     # (T, E/2, 2)
+        p = p.flatten(-2, -1)                                                       # (T, E)
+        p = p.repeat(x.shape[0], 1, 1)                                              # (B, T, E)
+
+        z = p + x
 
         check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), FLOATS)
 
