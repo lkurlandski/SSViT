@@ -341,6 +341,9 @@ class Trainer:
     def compute_metrics(self, batch: Samples, outputs: FTensor) -> dict[str, float]:
         """
         Compute the validation metrics over a set of examples.
+
+        NOTE: This method (summing over batches) may not be ideal for metrics that
+            may be more likely to be not-well defined on smaller sets of examples, e.g., F1.
         """
         labels = batch.label
         preds = torch.argmax(outputs, dim=1)
