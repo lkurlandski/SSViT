@@ -553,9 +553,9 @@ class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
             raise ValueError("The number of embeddings, filmers, and backbones must be the same.")
         self.num_structures = len(embeddings)
 
-        self.embeddings = embeddings
-        self.filmers = filmers
-        self.backbones = backbones
+        self.embeddings = nn.ModuleList(embeddings)
+        self.filmers = nn.ModuleList(filmers)
+        self.backbones = nn.ModuleList(backbones)
         self.head = head
 
     def forward(self, x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]]) -> Tensor:
@@ -618,9 +618,9 @@ class HierarchicalViTClassifier(nn.Module):  # type: ignore[misc]
             raise ValueError("The number of embeddings, filmers, and patchers must be the same.")
         self.num_structures = len(embeddings)
 
-        self.embeddings = embeddings
-        self.filmers = filmers
-        self.patchers = patchers
+        self.embeddings = nn.ModuleList(embeddings)
+        self.filmers = nn.ModuleList(filmers)
+        self.patchers = nn.ModuleList(patchers)
         self.backbone = backbone
         self.head = head
 
