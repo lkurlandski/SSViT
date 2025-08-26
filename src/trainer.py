@@ -362,8 +362,7 @@ class Trainer:
 
     def _update_logs(self, results: Mapping[str, int | float]) -> None:
         self.log.append(results)
-        if self.args.logging_steps > 0:
-            print(pformat_dict(results))
+        print(pformat_dict(results))
         with open(self.args.outdir / "results.jsonl", "a") as fp:
             fp.write(json.dumps(results) + "\n")
 
