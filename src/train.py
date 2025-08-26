@@ -3,6 +3,7 @@ Train and validate models.
 """
 
 from argparse import ArgumentParser
+from argparse import Namespace
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
@@ -12,6 +13,7 @@ from pathlib import Path
 import sys
 from typing import Any
 from typing import Optional
+from typing import Self
 import warnings
 
 import lief
@@ -37,8 +39,12 @@ from src.architectures import MalConv
 from src.architectures import ViT
 from src.architectures import Classifier
 from src.architectures import PatchEncoder
+from src.architectures import HierarchicalMalConvClassifier
+from src.architectures import HierarchicalViTClassifier
 from src.binanal import HierarchicalLevel
 from src.binanal import CharacteristicGuider
+from src.binanal import LEVEL_STRUCTURE_MAP
+from src.binanal import HierarchicalStructure
 from src.data import BinaryDataset
 from src.data import CollateFn
 from src.data import CUDAPrefetcher
@@ -64,8 +70,11 @@ class ModelSize(Enum):
     LG = "lg"
 
 
+# TODO: figure out how to integrate this into the main loop properly (inheritence hacks didn't work).
 @dataclass
 class MainArgs:
+    arch: Architecture = Architecture.MALCONV
+    size: ModelSize = ModelSize.SM
     seed: int = 0
     do_parser: bool = False
     do_entropy: bool = False
@@ -87,13 +96,17 @@ class MainArgs:
         if self.tr_batch_size == 1 or self.vl_batch_size == 1:
             raise NotImplementedError("Batch size of 1 is not supported right now. See https://docs.pytorch.org/docs/stable/data#working-with-collate-fn.")
 
+    @classmethod
+    def from_namespace(cls, namespace: Namespace) -> Self:
+        return cls(**{k: v for k, v in vars(namespace).items() if k in cls.__dataclass_fields__})
+
 
 class MainArgumentParser(ArgumentParser):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
-        self.add_argument("--arch", type=Architecture, required=True)
-        self.add_argument("--size", type=ModelSize, required=True)
+        self.add_argument("--arch", type=Architecture, default=MainArgs.arch)
+        self.add_argument("--size", type=ModelSize, default=MainArgs.size)
         self.add_argument("--seed", type=int, default=MainArgs.seed)
         self.add_argument("--do_parser", action="store_true", default=MainArgs.do_parser)
         self.add_argument("--do_entropy", action="store_true", default=MainArgs.do_entropy)
@@ -112,7 +125,7 @@ class MainArgumentParser(ArgumentParser):
         self.add_argument("--weight_decay", type=float, default=MainArgs.weight_decay)
 
 
-def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool) -> Classifier:
+def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool, level: HierarchicalLevel) -> Classifier:
 
     f = None
     if size == ModelSize.SM:
@@ -123,6 +136,11 @@ def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool) -> 
         f = 4
     if f is None:
         raise ValueError(f"{size}")
+
+    HierarchicalStructureCls: type[HierarchicalStructure] = LEVEL_STRUCTURE_MAP[level]
+    num_structures = len(HierarchicalStructureCls)
+    if num_structures <= 0:
+        raise RuntimeError(f"{level} yielded no structures.")
 
     # Embedding
     padding_idx    = 0
@@ -149,28 +167,36 @@ def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool) -> 
     clf_layers     = 2
     clf_input_size = -1
 
-    embedding = Embedding(num_embeddings, embedding_dim, padding_idx)
+    embedding = [Embedding(num_embeddings, embedding_dim, padding_idx) for _ in range(num_structures)]
 
     if do_characteristics:
-        filmer = FiLM(guide_dim, embedding_dim, guide_hidden)
+        filmer = [FiLM(guide_dim, embedding_dim, guide_hidden) for _ in range(num_structures)]
     else:
-        filmer = FiLMNoP()
+        filmer = [FiLMNoP(guide_dim, embedding_dim, guide_hidden) for _ in range(num_structures)]
 
     if arch == Architecture.MALCONV:
-        patcher = None
-        backbone=MalConv(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
+        patcher = [None for _ in range(num_structures)]
+        backbone = [MalConv(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride) for _ in range(num_structures)]
         clf_input_size = mcnv_channels
     elif arch == Architecture.VIT:
-        patcher = PatchEncoder(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
-        backbone = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
+        patcher = [PatchEncoder(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size) for _ in range(num_structures)]
+        backbone = [ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)]  # Only one ViT backbone
         clf_input_size = vit_d_model
     else:
         raise NotImplementedError(f"{arch}")
 
     head = ClassifificationHead(clf_input_size, num_classes, clf_hidden, clf_layers)
 
-    return Classifier(embedding, filmer, patcher, backbone, head)
+    if num_structures == 1:
+        return Classifier(embedding[0], filmer[0], patcher[0], backbone[0], head)
 
+    if arch == Architecture.MALCONV:
+        return HierarchicalMalConvClassifier(embedding, filmer, backbone, head)
+
+    if arch == Architecture.VIT:
+        return HierarchicalViTClassifier(embedding, filmer, patcher, backbone[0], head)  # Only one ViT backbone
+
+    raise ValueError(f"Invalid combination of {arch=} and {level=}.")
 
 
 def get_materials(tr_num_samples: Optional[int] = None, vl_num_samples: Optional[int] = None) -> tuple[list[Path], list[Path], list[int], list[int]]:
@@ -235,6 +261,9 @@ def main() -> None:
     parser = Parser(description="Train and validate models.")
     args = parser.parse_args()
 
+    if args.device.type != "cuda":
+        raise NotImplementedError("Training on CPU is not supported right now because the CUDAPrefetcher is responsible for decompressing inputs.")
+
     seed_everything(args.seed)
 
     preprocessor = Preprocessor(
@@ -250,7 +279,7 @@ def main() -> None:
     tr_dataset = BinaryDataset(tr_files, tr_labels, preprocessor)
     vl_dataset = BinaryDataset(vl_files, vl_labels, preprocessor)
 
-    model = get_model(args.arch, args.size, args.do_characteristics)
+    model = get_model(args.arch, args.size, args.do_characteristics, args.level)
     print(f"{model=}")
 
     # NOTE: this will need to be adjusted for the multiple structure case,
