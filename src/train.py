@@ -174,6 +174,8 @@ def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool, lev
     else:
         filmer = [FiLMNoP(guide_dim, embedding_dim, guide_hidden) for _ in range(num_structures)]
 
+    patcher: list[Optional[PatchEncoder]]
+    backbone: list[MalConv | ViT]
     if arch == Architecture.MALCONV:
         patcher = [None for _ in range(num_structures)]
         backbone = [MalConv(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride) for _ in range(num_structures)]
@@ -194,7 +196,7 @@ def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool, lev
         return HierarchicalMalConvClassifier(embedding, filmer, backbone, head)
 
     if arch == Architecture.VIT:
-        return HierarchicalViTClassifier(embedding, filmer, patcher, backbone[0], head)  # Only one ViT backbone
+        return HierarchicalViTClassifier(embedding, filmer, patcher, backbone[0], head)  # type: ignore[arg-type]  # Only one ViT backbone
 
     raise ValueError(f"Invalid combination of {arch=} and {level=}.")
 
