@@ -15,7 +15,8 @@ import psutil
 import torch
 from torch import Tensor
 from torch import BoolTensor
-from torch import CharTensor
+from torch import ByteTensor
+from torch import IntTensor
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence as _pad_sequence
 
@@ -130,7 +131,7 @@ def unpack_bit_tensor(x: Tensor, d: int, dtype: torch.dtype = torch.bool) -> Ten
 
 
 @torch.no_grad()  # type: ignore[misc]
-def packbits(x: BoolTensor, axis: int = -1) -> CharTensor:
+def packbits(x: BoolTensor, axis: int = -1) -> ByteTensor:
     """
     Torch variant of numpy.packbits(..., bitorder='little').
 
@@ -167,7 +168,7 @@ def packbits(x: BoolTensor, axis: int = -1) -> CharTensor:
 
 
 @torch.no_grad()  # type: ignore[misc]
-def unpackbits(x: CharTensor, count: int = -1, axis: int = -1) -> BoolTensor:
+def unpackbits(x: ByteTensor, count: int = -1, axis: int = -1) -> BoolTensor:
     """
     Torch variant of numpy.unpackbits(..., bitorder='little').
 
@@ -199,6 +200,63 @@ def unpackbits(x: CharTensor, count: int = -1, axis: int = -1) -> BoolTensor:
 
     # Move the expanded bit-axis back
     return z.movedim(-1, axis)
+
+
+@torch.no_grad()
+def mask_select_packed(packed: ByteTensor, mask: BoolTensor, axis: int = -1) -> ByteTensor:
+    """
+    Slice a bit-packed tensor along `axis` using a boolean mask that refers to the
+    *unpacked* bit positions, then return the result *re-packed* along that axis.
+
+    Args:
+        packed: uint8 (ByteTensor) produced by `packbits` (little-endian).
+        mask: is 1D of length `d` (the original bit length before packing).
+    """
+    if packed.dtype != torch.uint8:
+        raise TypeError(f"expected packed uint8 tensor, got {packed.dtype}")
+    if mask.dtype is not torch.bool:
+        raise TypeError(f"expected bool mask, got {mask.dtype}")
+    if mask.ndim != 1:
+        raise ValueError("mask must be 1D (one mask for the packed axis)")
+
+    axis = axis if axis >= 0 else packed.ndim + axis
+    if not (0 <= axis < packed.ndim):
+        raise IndexError("axis out of range")
+
+    # Move bytes axis to the end: [..., B]
+    p = packed.movedim(axis, -1)
+    B = p.shape[-1]
+    d = mask.numel()
+    if d > 8 * B:
+        raise ValueError(f"mask length ({d}) exceeds available bits ({8*B}) in packed tensor")
+
+    # Indices of kept bits (0..d-1)
+    sel = torch.nonzero(mask, as_tuple=False).flatten()  # [k]
+    k = sel.numel()
+
+    # If nothing selected, return empty along that axis (bytes dimension becomes 0)
+    if k == 0:
+        empty = p[..., :0]  # [..., 0]
+        return empty.movedim(-1, axis)
+
+    # Map bit positions -> (byte index, bit offset)
+    byte_idx = torch.div(sel, 8, rounding_mode='floor')        # [k]
+    bit_off  = (sel % 8).to(torch.uint8)                       # [k]
+
+    # Gather referenced bytes then extract bit offsets (little-endian)
+    gathered = torch.index_select(p, dim=-1, index=byte_idx)   # [..., k]
+    shifts = bit_off.view(*(1,)* (gathered.ndim - 1), k)       # [1,...,k]
+    bits = ((gathered >> shifts) & 1).to(torch.uint8)          # [..., k]
+
+    # Re-pack selected bits into bytes along the last dim
+    pad = (-k) % 8
+    if pad:
+        bits = F.pad(bits, (0, pad), value=0)                  # [..., k+pad]
+    blocks = bits.unfold(-1, 8, 8)                             # [..., Kbytes, 8]
+    weights = (1 << torch.arange(8, device=bits.device, dtype=torch.uint8))  # [8]
+    out = (blocks * weights).sum(-1, dtype=torch.uint8)        # [..., Kbytes]
+
+    return out.movedim(-1, axis)
 
 
 def pad_sequence(
