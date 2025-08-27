@@ -473,7 +473,7 @@ def mask_select_packed_vfast(packed: torch.ByteTensor, mask: torch.BoolTensor, a
     return out.to(torch.uint8).movedim(-1, axis)
 
 
-@torch.no_grad()
+@torch.no_grad()  # type: ignore[misc]
 def mask_select_packed_vvfast(packed: torch.ByteTensor, mask: torch.BoolTensor, axis: int = -1) -> torch.ByteTensor:
     # NOTE: this is optimized for large, contiguous masks. It is about 4x faster than mask_select_packed_vfast (11.895s --> 2.846s).
 
