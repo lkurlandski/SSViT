@@ -44,11 +44,16 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data import Samples
+from src.data import Samples as SamplesFlat
+from src.data import SamplesHierarchical
 
 
 FTensor = Union[BFloat16Tensor | HalfTensor | FloatTensor | DoubleTensor]
 ITensor = Union[CharTensor | ByteTensor | ShortTensor | IntTensor | LongTensor]
+
+
+# TODO: this is a temporary hack
+Samples = Union[SamplesFlat, SamplesHierarchical]
 
 
 @dataclass
@@ -330,7 +335,7 @@ class Trainer:
         """
         Send a batch of inputs forward through the model.
         """
-        return self.model.forward(batch.inputs, batch.guides.characteristics)
+        return self.model.forward(batch.inputs, batch.characteristics)
 
     def compute_loss(self, batch: Samples, outputs: FTensor) -> FTensor:
         """
