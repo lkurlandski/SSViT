@@ -239,3 +239,122 @@ class TestMaskSelectPacked:
 
         assert got.is_cuda and ref.is_cuda
         assert torch.equal(got.cpu(), ref.cpu())
+
+    # Helper: safe reference (unpacked -> mask -> repack), works even when mask.sum()==0
+    def _ref(self, x: torch.Tensor, mask: torch.BoolTensor, axis: int) -> torch.Tensor:
+        if not bool(mask.any()):
+            # produce a correctly-shaped empty packed tensor by slicing an existing packed
+            base = packbits(x, axis=axis)
+            pos_axis = axis if axis >= 0 else base.ndim + axis
+            sl = [slice(None)] * base.ndim
+            sl[pos_axis] = slice(0, 0)
+            return base[tuple(sl)]
+        x_sel = x.movedim(axis, -1)[..., mask].movedim(-1, axis)
+        return packbits(x_sel, axis=axis)
+
+    @pytest.mark.parametrize("B", [1, 2, 3, 4, 8, 64, 256, 512])
+    @pytest.mark.parametrize("axis", [0, -1])
+    def test_trailing_zero_mask_bytes_multiple_of_8_no_oob(self, B: int, axis: int) -> None:
+        """
+        Select exactly 8*m bits (multiple of 8) with m < B, leaving trailing zero mask bytes.
+        Used to trigger OOB in scatter_add_.
+        """
+        d = 8 * B
+        for m in [0, 1, max(0, B - 2), B - 1]:
+            k = 8 * m
+            shape = (d,) if axis == 0 else (3, d)          # d is the axis length
+            x = (torch.arange(int(torch.prod(torch.tensor(shape)))) % 2 == 0).reshape(shape).to(torch.bool)
+            mask = torch.zeros(d, dtype=torch.bool)
+            mask[:k] = True
+
+            packed = packbits(x, axis=axis)
+            got = mask_select_packed(packed, mask, axis=axis)
+            ref = self._ref(x, mask, axis)
+
+            assert got.dtype == torch.uint8
+            assert torch.equal(got, ref), f"Mismatch for B={B}, m={m}, axis={axis}"
+
+    @pytest.mark.parametrize("B", [1, 2, 3, 4, 8, 64, 256, 512])
+    @pytest.mark.parametrize("axis", [0, -1])
+    def test_trailing_zero_mask_bytes_non_multiple_of_8(self, B: int, axis: int) -> None:
+        """
+        Select k = 8*m + r bits (r in {1,3,7}), ensuring at least one trailing zero mask byte.
+        """
+        d = 8 * B
+        for m in [0, 1, max(0, B - 2)]:
+            for r in [1, 3, 7]:
+                k = 8 * m + r
+                if k > d:
+                    continue
+                shape = (d,) if axis == 0 else (2, 3, d)     # put d on the last axis when axis=-1
+                x = (torch.rand(shape) < 0.5)
+                mask = torch.zeros(d, dtype=torch.bool)
+                mask[:k] = True
+
+                packed = packbits(x, axis=axis)
+                got = mask_select_packed(packed, mask, axis=axis)
+                ref = self._ref(x, mask, axis)
+
+                assert torch.equal(got, ref), f"Mismatch for B={B}, m={m}, r={r}, axis={axis}"
+
+    @pytest.mark.parametrize(
+        "shape,axis",
+        [
+            ((8 * 5,), 0),         # 5 bytes on axis 0
+            ((3, 8 * 7), -1),      # last axis has d
+            ((8 * 9, 2), 0),       # axis 0 has d, extra dim
+            ((2, 8 * 11, 3), 1),   # middle axis has d
+        ],
+    )
+    def test_random_sparse_masks_with_long_zero_runs(self, shape: tuple[int, ...], axis: int) -> None:
+        torch.manual_seed(1234)
+        d = shape[axis if axis >= 0 else len(shape) + axis]
+        x = (torch.rand(shape) < 0.5)
+
+        mask = (torch.rand(d) < 0.3)
+        if d >= 16:
+            mask[-16:] = 0  # zero tail of 2 bytes
+        if d >= 24:
+            mid = d // 2
+            mask[mid:mid + 8] = 0  # zero a middle byte
+
+        packed = packbits(x, axis=axis)
+        got = mask_select_packed(packed, mask, axis=axis)
+        ref = self._ref(x, mask, axis)
+
+        assert torch.equal(got, ref)
+
+    @pytest.mark.parametrize("B", [32, 64, 128])
+    def test_large_dim_many_patterns_cpu(self, B: int) -> None:
+        """
+        Fuzz k across byte boundaries; includes k==0 without calling packbits on empty.
+        """
+        torch.manual_seed(0)
+        d = 8 * B
+        x = (torch.rand(d) < 0.5)
+        packed = packbits(x, axis=0)
+
+        ks = list(range(0, d + 1, max(1, d // 17))) + [1, 7, 8, 9, d - 9, d - 8, d - 1, d]
+        ks = sorted(set(k for k in ks if 0 <= k <= d))
+        for k in ks:
+            mask = torch.zeros(d, dtype=torch.bool)
+            mask[:k] = True
+            got = mask_select_packed(packed, mask, axis=0)
+            ref = self._ref(x, mask, axis=0)
+            assert torch.equal(got, ref), f"Mismatch for B={B}, k={k}"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_trailing_zero_bytes_boundary(self) -> None:
+        """
+        Specifically target the prior OOB on GPU (e.g., 512 bytes; select 8*511 bits).
+        """
+        B = 512
+        d = 8 * B
+        x = (torch.rand(d, device="cuda") < 0.5)
+        mask = torch.zeros(d, dtype=torch.bool)
+        mask[: 8 * (B - 1)] = True  # last byte all zeros
+
+        packed = packbits(x, axis=0)
+        got = mask_select_packed(packed, mask.cuda(), axis=0)
+        ref = self._ref(x, mask, axis=0)
+        assert torch.equal(got.cpu(), ref.cpu())

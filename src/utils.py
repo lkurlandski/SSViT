@@ -7,6 +7,7 @@ import math
 import os
 import random
 from typing import Literal
+from typing import NamedTuple
 from typing import Optional
 import warnings
 
@@ -203,7 +204,7 @@ def unpackbits(x: ByteTensor, count: int = -1, axis: int = -1) -> BoolTensor:
 
 
 @torch.no_grad()  # type: ignore[misc]
-def mask_select_packed(packed: ByteTensor, mask: BoolTensor, axis: int = -1) -> ByteTensor:
+def mask_select_packed_slow(packed: ByteTensor, mask: BoolTensor, axis: int = -1) -> ByteTensor:
     """
     Slice a bit-packed tensor along `axis` using a boolean mask that refers to the
     *unpacked* bit positions, then return the result *re-packed* along that axis.
@@ -257,6 +258,132 @@ def mask_select_packed(packed: ByteTensor, mask: BoolTensor, axis: int = -1) -> 
     out = (blocks * weights).sum(-1, dtype=torch.uint8)        # [..., Kbytes]
 
     return out.movedim(-1, axis)
+
+
+# Helpers for mask_select_packed_fast
+
+class _BitLUTs(NamedTuple):
+    popcnt: torch.Tensor           # [256] uint8
+    pext:   torch.Tensor           # [256,256] uint8
+
+_LUTS: dict[torch.device, _BitLUTs] = {}
+
+def _get_luts(device: torch.device) -> _BitLUTs:
+    if device in _LUTS:
+        return _LUTS[device]
+    pop = torch.tensor([bin(i).count("1") for i in range(256)],
+                       dtype=torch.uint8, device=device)
+    pext = torch.empty((256, 256), dtype=torch.uint8, device=device)
+    with torch.no_grad():
+        for m in range(256):
+            pos = [b for b in range(8) if (m >> b) & 1]
+            for x in range(256):
+                v = 0
+                for r, b in enumerate(pos):
+                    v |= ((x >> b) & 1) << r
+                pext[m, x] = v
+    _LUTS[device] = _BitLUTs(popcnt=pop, pext=pext)
+    return _LUTS[device]
+
+# optional tiny cache for weights per device (avoids re-alloc each call)
+_WEIGHTS: dict[torch.device, torch.Tensor] = {}
+
+def _weights8(device: torch.device) -> torch.Tensor:
+    w = _WEIGHTS.get(device)
+    if w is None:
+        w = (1 << torch.arange(8, device=device, dtype=torch.uint8))
+        _WEIGHTS[device] = w
+    return w
+
+@torch.no_grad()  # type: ignore[misc]
+def mask_select_packed_fast(packed: torch.ByteTensor, mask: torch.BoolTensor, axis: int = -1) -> torch.ByteTensor:
+    if packed.dtype is not torch.uint8:
+        raise TypeError("packed must be uint8")
+    if mask.dtype is not torch.bool:
+        raise TypeError("mask must be bool")
+    if mask.ndim != 1:
+        raise ValueError("mask must be 1-D")
+
+    axis = axis if axis >= 0 else packed.ndim + axis
+    if not (0 <= axis < packed.ndim):
+        raise IndexError("axis out of range")
+
+    p = packed.movedim(axis, -1).contiguous()  # [..., B]
+    B = p.shape[-1]
+    device = p.device
+
+    # ensure mask is on same device as packed
+    mask = mask.to(device)
+
+    d = mask.numel()
+    if d > 8 * B:
+        raise ValueError(f"mask length ({d}) exceeds available bits ({8*B})")
+
+    # fast exits
+    if d == 0 or not bool(mask.any()):
+        return p[..., :0].movedim(-1, axis)
+    if d == 8 * B and bool(mask.all()):
+        return p.movedim(-1, axis)
+
+    luts = _get_luts(device)
+
+    # pack mask into bytes (little-endian)
+    pad = (-d) % 8
+    if pad:
+        mask = F.pad(mask, (0, pad), value=False)
+    m8 = mask.view(-1, 8).to(torch.uint8)                            # [B,8]
+    mask_bytes = (m8 * _weights8(device)).sum(dim=1)                 # [B] uint8
+
+    # popcount + prefix sum → start bit positions
+    cnt = luts.popcnt[mask_bytes]                                    # [B] uint8
+    if B == 0:
+        return p[..., :0].movedim(-1, axis)
+
+    start_bits = torch.cumsum(cnt.to(torch.int32), dim=0) - cnt.to(torch.int32)
+    total_bits = int(start_bits[-1] + cnt[-1])
+    outB = (total_bits + 7) // 8
+    if outB == 0:
+        return p[..., :0].movedim(-1, axis)
+
+    start_byte = (start_bits // 8).to(torch.long)                    # [B]
+    start_bit  = (start_bits % 8).to(torch.uint8)                    # [B]
+
+    # byte-wise “pext”: index with LONG tensors (uint8 indexing is mask semantics)
+    MB = mask_bytes.view(*([1] * (p.ndim - 1)), B).expand_as(p)      # [...,B]
+    comp = luts.pext[MB.long(), p.long()]                            # [...,B] uint8
+
+    # place each compressed byte into output (≤2 target bytes / source byte)
+    sb   = start_byte.view(*([1] * (p.ndim - 1)), B).expand_as(p)    # [...,B] long
+    sbit = start_bit.view(*([1] * (p.ndim - 1)), B).expand_as(p)     # [...,B] uint8
+
+    comp16 = comp.to(torch.int16)
+    low  = (comp16 << sbit.to(torch.int16))                          # [...,B]
+    high = (comp16 >> (8 - sbit).to(torch.int16))                    # [...,B]
+
+    out = torch.zeros((*p.shape[:-1], outB), dtype=torch.int16, device=device)
+
+    # --- FIX: skip bytes where the mask popcount is 0 to avoid OOB at sb==outB ---
+    activeB = (cnt != 0)                                             # [B] bool
+    act = activeB.view(*([1] * (p.ndim - 1)), B).expand_as(p)        # [...,B] bool
+
+    # Low scatter: clamp indices (extra safety), zero-out inactive contributions
+    sb_clamped = sb.clamp_max(outB - 1)
+    out.scatter_add_(-1, sb_clamped, torch.where(act, low, torch.zeros_like(low)))
+
+    # High/ spill scatter: only when there is a spill and the next byte exists
+    spill = act & (sbit != 0) & (sb < (outB - 1))
+    if spill.any():
+        out.scatter_add_(
+            -1,
+            (sb + 1).clamp_max(outB - 1),
+            torch.where(spill, high, torch.zeros_like(high)),
+        )
+
+    # no overlaps by construction; addition == bitwise OR
+    return out.to(torch.uint8).movedim(-1, axis)
+
+
+mask_select_packed = mask_select_packed_fast
 
 
 def pad_sequence(
