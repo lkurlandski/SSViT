@@ -522,6 +522,11 @@ class Classifier(nn.Module):  # type: ignore[misc]
 # Hierarchical Models.
 # -------------------------------------------------------------------------------- #
 
+# TODO: implement _partition_to_hierarchical_inputs with slices instead of a boolean indicator.
+# TODO: combine the MalConv and ViT models into one generic HierarchicalClassifier.
+# TODO: move the _partition_to_hierarchical_inputs outside of the architecture and off the GPU.
+
+
 def _check_hierarchical_inputs(x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]], num_structures: int) -> None:
     if len(x_g) != num_structures:
         raise ValueError(f"Expected {num_structures} structures, got {len(x_g)} instead.")
@@ -538,6 +543,50 @@ def _check_hierarchical_inputs(x_g: list[Optional[tuple[Tensor, Optional[Tensor]
         check_tensor(x, (x_ref.shape[0], None), INTEGERS)
         if g is not None:
             check_tensor(g, (x_ref.shape[0], x.shape[1], None), FLOATS)
+
+
+def _partition_to_hierarchical_inputs(x: Tensor, g: Optional[Tensor], m: Tensor, min_lengths: Optional[list[int]] = None) -> list[Optional[tuple[Tensor, Optional[Tensor]]]]:
+    """
+    Partitions the input tensor x (and guide tensor g) into multiple structures based on the structure indicator m.
+
+    Args:
+        x: Tensor: Input tensor of shape (B, T).
+        g: Optional[Tensor]: FiLM conditioning vector of shape (B, T, G).
+        m: Tensor: Structure indicator of shape (B, T, R) where R is the number of structures.
+        min_lengths: Optional[list[int]]: Minimum lengths for each structure to pad to.
+            If None, no minimum length padding is applied.
+    """
+    check_tensor(x, (None, None), INTEGERS)
+    if g is not None:
+        check_tensor(g, (x.shape[0], x.shape[1], None), FLOATS)
+    check_tensor(m, (x.shape[0], x.shape[1], None), torch.bool)
+
+    num_structures = m.shape[2]
+    if min_lengths is None:
+        min_lengths = [0] * num_structures
+    if len(min_lengths) != num_structures:
+        raise ValueError(f"Expected {num_structures} min_lengths, got {len(min_lengths)} instead.")
+
+    x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]] = []
+    for i in range(num_structures):
+        xs = []
+        gs = []
+        all_none = True
+        for j in range(x.shape[0]):
+            idx = m[j, :, i]
+            all_none = all_none and not bool(idx.any())
+            x_i_j = x[j, idx]
+            g_i_j = g[j, idx, :] if g is not None else None
+            xs.append(x_i_j)
+            gs.append(g_i_j)
+        if not all_none:
+            xs = pad_sequence(xs, batch_first=True, padding_value=0,   pad_to_multiple_of=8, min_length=min_lengths[i])
+            gs = pad_sequence(gs, batch_first=True, padding_value=0.0, pad_to_multiple_of=8, min_length=min_lengths[i]) if g is not None else None
+            x_g.append((xs, gs))
+        else:
+            x_g.append(None)
+
+    return x_g
 
 
 class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
@@ -558,13 +607,23 @@ class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
         self.backbones = nn.ModuleList(backbones)
         self.head = head
 
-    def forward(self, x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]]) -> Tensor:
+    @singledispatchmethod
+    def forward(self, x_g: Any) -> Tensor:
+        """
+        Args:
+            list[Optional[tuple[Tensor, Optional[Tensor]]]]: presumed to be a list of preprocessed inputs (x, g) for each encoder.
+            tuple[Tensor, Optional[Tensor], Tensor]: presumed to be raw inputs (x, g, s) which still require splitting and padding.
+        Returns:
+            z: Classification logits of shape (B, M).
+        """
+        raise NotImplementedError(f"Unsupported input type: {type(x_g)}")
+
+    @forward.register(list)
+    def _(self, x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]]) -> Tensor:
         """
         Args:
             x_g: list of optional (x, g) tuples for each level, where x is of shape (B, T) and g is of shape (B, T, G) or None.
-                If no input for a specific structure is extracted, the value for that structure will be None.
-        Returns:
-            z: Classification logits of shape (B, M).
+                If no input for a specific structure is extracted, the value for that structure will be None and the encoder skipped.
         """
         _check_hierarchical_inputs(x_g, self.num_structures)
 
@@ -584,6 +643,18 @@ class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
 
         check_tensor(z, (zs[0].shape[0], self.head.num_classes), FLOATS)
         return z
+
+    @forward.register(tuple)
+    def _(self, x_g: tuple[Tensor, Optional[Tensor], Tensor]) -> Tensor:
+        """
+        Args:
+            x: Tensor: Input tensor of shape (B, T).
+            g: Optional[Tensor]: FiLM conditioning vector of shape (B, T, G).
+            m: Tensor: Structure indicator of shape (B, T, R) where R is the number of structures.
+        """
+        x, g, m = x_g
+        x_g = _partition_to_hierarchical_inputs(x, g, m, self.min_lengths)
+        return self.forward(x_g)
 
     def _get_min_max_lengths(self) -> list[tuple[int, int]]:
         lengths = []
@@ -668,37 +739,9 @@ class HierarchicalViTClassifier(nn.Module):  # type: ignore[misc]
             x: Tensor: Input tensor of shape (B, T).
             g: Optional[Tensor]: FiLM conditioning vector of shape (B, T, G).
             m: Tensor: Structure indicator of shape (B, T, R) where R is the number of structures.
-
-        NOTE: this function will pad the sequences up to the length required for the associated encoder.
-
-        TODO: implement this function using slices instead of BoolTensor.
         """
         x, g, m = x_g
-
-        check_tensor(x, (None, None), INTEGERS)
-        if g is not None:
-            check_tensor(g, (x.shape[0], x.shape[1], None), FLOATS)
-        check_tensor(m, (x.shape[0], x.shape[1], self.num_structures), torch.bool)
-
-        x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]] = []
-        for i in range(self.num_structures):
-            xs = []
-            gs = []
-            all_none = True
-            for j in range(x.shape[0]):
-                idx = m[j, :, i]
-                all_none = all_none and not bool(idx.any())
-                x_i_j = x[j, idx]
-                g_i_j = g[j, idx, :] if g is not None else None
-                xs.append(x_i_j)
-                gs.append(g_i_j)
-            if not all_none:
-                xs = pad_sequence(xs, batch_first=True, padding_value=0,   pad_to_multiple_of=8, min_length=self.min_lengths[i])
-                gs = pad_sequence(gs, batch_first=True, padding_value=0.0, pad_to_multiple_of=8, min_length=self.min_lengths[i]) if g is not None else None
-                x_g.append((xs, gs))
-            else:
-                x_g.append(None)
-
+        x_g = _partition_to_hierarchical_inputs(x, g, m, self.min_lengths)
         return self.forward(x_g)
 
     def _get_min_max_lengths(self) -> list[tuple[int, int]]:
