@@ -22,7 +22,6 @@ Notations (ViT):
     L: Number of layers
 """
 
-from functools import singledispatchmethod
 import math
 import sys
 from typing import Any
@@ -522,27 +521,24 @@ class Classifier(nn.Module):  # type: ignore[misc]
 # Hierarchical Models.
 # -------------------------------------------------------------------------------- #
 
-# TODO: implement _partition_to_hierarchical_inputs with slices instead of a boolean indicator.
 # TODO: combine the MalConv and ViT models into one generic HierarchicalClassifier.
-# TODO: move the _partition_to_hierarchical_inputs outside of the architecture and off the GPU.
 
 
-def _check_hierarchical_inputs(x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]], num_structures: int) -> None:
-    if len(x_g) != num_structures:
-        raise ValueError(f"Expected {num_structures} structures, got {len(x_g)} instead.")
+def _check_hierarchical_inputs(x: list[Optional[Tensor]], g: list[Optional[Tensor]], num_structures: int) -> None:
+    if not (len(x) == len(g) == num_structures):
+        raise ValueError(f"Expected {num_structures} structures, got {len(x)=} and {len(g)=} instead.")
 
-    if all(x_g[i] is None for i in range(num_structures)):
+    if all(x[i] is None for i in range(num_structures)):
         raise ValueError("At least one structure must have input.")
 
-    x_ref = next((x_g[i] for i in range(num_structures) if x_g[i] is not None))[0]  # type: ignore[index]
+    x_ref: Tensor = next((x[i] for i in range(num_structures) if x[i] is not None))
 
     for i in range(num_structures):
-        if x_g[i] is None:
+        if x[i] is None:
             continue
-        x, g = x_g[i]  # type: ignore[misc]
-        check_tensor(x, (x_ref.shape[0], None), INTEGERS)
-        if g is not None:
-            check_tensor(g, (x_ref.shape[0], x.shape[1], None), FLOATS)
+        check_tensor(x[i], (x_ref.shape[0], None), INTEGERS)
+        if g[i] is not None:
+            check_tensor(g[i], (x_ref.shape[0], x[i].shape[1], None), FLOATS)  # type: ignore[union-attr]
 
 
 def _partition_to_hierarchical_inputs(x: Tensor, g: Optional[Tensor], m: Tensor, min_lengths: Optional[list[int]] = None) -> list[Optional[tuple[Tensor, Optional[Tensor]]]]:
@@ -556,6 +552,8 @@ def _partition_to_hierarchical_inputs(x: Tensor, g: Optional[Tensor], m: Tensor,
         min_lengths: Optional[list[int]]: Minimum lengths for each structure to pad to.
             If None, no minimum length padding is applied.
     """
+    warnings.warn("src::architectures::_partition_to_hierarchical_inputs is depracated.")
+
     check_tensor(x, (None, None), INTEGERS)
     if g is not None:
         check_tensor(g, (x.shape[0], x.shape[1], None), FLOATS)
@@ -607,34 +605,23 @@ class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
         self.backbones = nn.ModuleList(backbones)
         self.head = head
 
-    @singledispatchmethod
-    def forward(self, x_g: Any) -> Tensor:
+    def forward(self, x: list[Optional[Tensor]], g: list[Optional[Tensor]]) -> Tensor:
         """
         Args:
-            list[Optional[tuple[Tensor, Optional[Tensor]]]]: presumed to be a list of preprocessed inputs (x, g) for each encoder.
-            tuple[Tensor, Optional[Tensor], Tensor]: presumed to be raw inputs (x, g, s) which still require splitting and padding.
+            x: Input tensors of shape (B, T_i) for each structure i. None if no input for that structure.
+            g: FiLM conditioning vectors of shape (B, T_i, G) for each structure i. None if no input for that structure or not using guides.
         Returns:
             z: Classification logits of shape (B, M).
         """
-        raise NotImplementedError(f"Unsupported input type: {type(x_g)}")
-
-    @forward.register(list)
-    def _(self, x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]]) -> Tensor:
-        """
-        Args:
-            x_g: list of optional (x, g) tuples for each level, where x is of shape (B, T) and g is of shape (B, T, G) or None.
-                If no input for a specific structure is extracted, the value for that structure will be None and the encoder skipped.
-        """
-        _check_hierarchical_inputs(x_g, self.num_structures)
+        _check_hierarchical_inputs(x, g, self.num_structures)
 
         zs: list[Tensor] = []
         for i in range(self.num_structures):
-            if x_g[i] is None:
+            if x[i] is None:
                 continue
-            x, g = x_g[i]  # type: ignore[misc]
-            z = self.embeddings[i].forward(x)  # (B, T, E)
-            z = self.filmers[i].forward(z, g)  # (B, T, E)
-            z = self.backbones[i].forward(z)   # (B, C)
+            z = self.embeddings[i].forward(x[i])  # (B, T, E)
+            z = self.filmers[i].forward(z, g[i])  # (B, T, E)
+            z = self.backbones[i].forward(z)      # (B, C)
             zs.append(z)
 
         z = torch.stack(zs, dim=1)  # (B, sum(C))
@@ -643,18 +630,6 @@ class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
 
         check_tensor(z, (zs[0].shape[0], self.head.num_classes), FLOATS)
         return z
-
-    @forward.register(tuple)
-    def _(self, x_g: tuple[Tensor, Optional[Tensor], Tensor]) -> Tensor:
-        """
-        Args:
-            x: Tensor: Input tensor of shape (B, T).
-            g: Optional[Tensor]: FiLM conditioning vector of shape (B, T, G).
-            m: Tensor: Structure indicator of shape (B, T, R) where R is the number of structures.
-        """
-        x, g, m = x_g
-        x_g = _partition_to_hierarchical_inputs(x, g, m, self.min_lengths)
-        return self.forward(x_g)
 
     def _get_min_max_lengths(self) -> list[tuple[int, int]]:
         lengths = []
@@ -695,34 +670,23 @@ class HierarchicalViTClassifier(nn.Module):  # type: ignore[misc]
         self.backbone = backbone
         self.head = head
 
-    @singledispatchmethod
-    def forward(self, x_g: Any) -> Tensor:
+    def forward(self, x: list[Optional[Tensor]], g: list[Optional[Tensor]]) -> Tensor:
         """
         Args:
-            list[Optional[tuple[Tensor, Optional[Tensor]]]]: presumed to be a list of preprocessed inputs (x, g) for each encoder.
-            tuple[Tensor, Optional[Tensor], Tensor]: presumed to be raw inputs (x, g, s) which still require splitting and padding.
+            x: Input tensors of shape (B, T_i) for each structure i. None if no input for that structure.
+            g: FiLM conditioning vectors of shape (B, T_i, G) for each structure i. None if no input for that structure or not using guides.
         Returns:
             z: Classification logits of shape (B, M).
         """
-        raise NotImplementedError(f"Unsupported input type: {type(x_g)}")
-
-    @forward.register(list)
-    def _(self, x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]]) -> Tensor:
-        """
-        Args:
-            x_g: list of optional (x, g) tuples for each level, where x is of shape (B, T) and g is of shape (B, T, G) or None.
-                If no input for a specific structure is extracted, the value for that structure will be None and the encoder skipped.
-        """
-        _check_hierarchical_inputs(x_g, self.num_structures)
+        _check_hierarchical_inputs(x, g, self.num_structures)
 
         zs = []
         for i in range(self.num_structures):
-            if x_g[i] is None:
+            if x[i] is None:
                 continue
-            x, g = x_g[i]  # type: ignore[misc]
-            z = self.embeddings[i].forward(x)  # (B, T, E)
-            z = self.filmers[i].forward(z, g)  # (B, T, E)
-            z = self.patchers[i].forward(z)    # (B, N, D)
+            z = self.embeddings[i].forward(x[i])  # (B, T, E)
+            z = self.filmers[i].forward(z, g[i])  # (B, T, E)
+            z = self.patchers[i].forward(z)       # (B, N, D)
             zs.append(z)
 
         z = torch.cat(zs, dim=1)      # (B, sum(N), D)
@@ -731,18 +695,6 @@ class HierarchicalViTClassifier(nn.Module):  # type: ignore[misc]
 
         check_tensor(z, (zs[0].shape[0], self.head.num_classes), FLOATS)
         return z
-
-    @forward.register(tuple)
-    def _(self, x_g: tuple[Tensor, Optional[Tensor], Tensor]) -> Tensor:
-        """
-        Args:
-            x: Tensor: Input tensor of shape (B, T).
-            g: Optional[Tensor]: FiLM conditioning vector of shape (B, T, G).
-            m: Tensor: Structure indicator of shape (B, T, R) where R is the number of structures.
-        """
-        x, g, m = x_g
-        x_g = _partition_to_hierarchical_inputs(x, g, m, self.min_lengths)
-        return self.forward(x_g)
 
     def _get_min_max_lengths(self) -> list[tuple[int, int]]:
         lengths = []

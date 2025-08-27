@@ -9,7 +9,6 @@ from typing import Optional
 import pytest
 import torch
 
-from src.utils import TensorError
 from src.architectures import ClassifificationHead
 from src.architectures import FiLM
 from src.architectures import FiLMNoP
@@ -157,7 +156,7 @@ class TestPatchEncoder:
             return
 
         z = model.forward(z)
-        num_patches = num_patches if num_patches is not None else math.ceil(seq_length / patch_size)
+        num_patches = num_patches if num_patches is not None else math.ceil(seq_length / patch_size)  # type: ignore[operator]
         assert z.shape[0] == batch_size
         assert 0 < z.shape[1] <= num_patches
         assert z.shape[2] == out_channels
@@ -218,7 +217,7 @@ class TestHierarchicalMalConvClassifier:
     @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
     @pytest.mark.parametrize("num_structures", [1, 2, 3, 5, 7])
     @pytest.mark.parametrize("add_none", [False, True])
-    def test_forward_a(self, batch_size: int, seq_length: int, num_structures: int, add_none: bool, vocab_size: int = 11, guide_dim: int = 3, channels: int = 7, num_classes: int = 2) -> None:
+    def test_forward(self, batch_size: int, seq_length: int, num_structures: int, add_none: bool, vocab_size: int = 11, guide_dim: int = 3, channels: int = 7, num_classes: int = 2) -> None:
         embeddings = [torch.nn.Embedding(vocab_size, embedding_dim=8 + i) for i in range(num_structures)]
         filmers = [FiLM(guide_dim, embedding_dim=8 + i, hidden_size=3) for i in range(num_structures)]
         backbones = [MalConv(embedding_dim=8 + i, channels=channels, kernel_size=3, stride=3) for i in range(num_structures)]
@@ -228,56 +227,27 @@ class TestHierarchicalMalConvClassifier:
         x = [torch.randint(0, vocab_size, (batch_size, seq_length + i)) for i in range(num_structures)]
         g = [torch.rand((batch_size, seq_length + i, guide_dim)) for i in range(num_structures)]
 
-        x_g = list(zip(x, g))
         if add_none:
-            x_g[0] = None
+            x[0] = None
+            g[0] = None
 
         if add_none and num_structures == 1:
             with pytest.raises(ValueError):
-                net.forward(x_g)
+                net.forward(x, g)
             return
 
         too_short = False
         for i in range(num_structures):
-            if x_g[i] is not None and x_g[i][0].shape[1] < net.min_lengths[i]:
+            if x[i] is not None and x[i].shape[1] < net.min_lengths[i]:
                 too_short = True
                 break
 
         if too_short:
             with pytest.raises(RuntimeError):
-                net.forward(x_g)
+                net.forward(x, g)
             return
 
-        z = net.forward(x_g)
-        assert z.shape == (batch_size, num_classes)
-
-    @pytest.mark.parametrize("batch_size", [1, 2, 3, 5])
-    @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
-    @pytest.mark.parametrize("num_structures", [1, 2, 3, 5, 7])
-    @pytest.mark.parametrize("add_none", [False, True])
-    def test_forward_b(self, batch_size: int, seq_length: int, num_structures: int, add_none: bool, vocab_size: int = 11, guide_dim: int = 3, channels: int = 7, num_classes: int = 2) -> None:
-        embeddings = [torch.nn.Embedding(vocab_size, embedding_dim=8 + i) for i in range(num_structures)]
-        filmers = [FiLM(guide_dim, embedding_dim=8 + i, hidden_size=3) for i in range(num_structures)]
-        backbones = [MalConv(embedding_dim=8 + i, channels=channels, kernel_size=3, stride=3) for i in range(num_structures)]
-        head = ClassifificationHead(channels, num_classes=num_classes)
-        net = HierarchicalMalConvClassifier(embeddings, filmers, backbones, head)
-
-        x = torch.randint(0, vocab_size, (batch_size, seq_length))
-        g = torch.rand((batch_size, seq_length, guide_dim))
-        while not (m := torch.randint(0, 2, (batch_size, seq_length, num_structures), dtype=torch.bool)).any():
-            pass
-
-        if add_none:
-            m[:,:,0] = False
-            if not m.any() and num_structures > 1:
-                m[0,0,1] = True
-
-        if add_none and num_structures == 1:
-            with pytest.raises(ValueError):
-                net.forward((x, g, m))
-            return
-
-        z = net.forward((x, g, m))
+        z = net.forward(x, g)
         assert z.shape == (batch_size, num_classes)
 
 
@@ -287,7 +257,7 @@ class TestHierarchicalViTClassifier:
     @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
     @pytest.mark.parametrize("num_structures", [1, 2, 3, 5, 7])
     @pytest.mark.parametrize("add_none", [False, True])
-    def test_forward_a(self, batch_size: int, seq_length: int, num_structures: int, add_none: bool, vocab_size: int = 11, guide_dim: int = 3, d_model: int = 8, num_classes: int = 2) -> None:
+    def test_forward(self, batch_size: int, seq_length: int, num_structures: int, add_none: bool, vocab_size: int = 11, guide_dim: int = 3, d_model: int = 8, num_classes: int = 2) -> None:
         embeddings = [torch.nn.Embedding(vocab_size, embedding_dim=8 + 2 * i) for i in range(num_structures)]
         filmers = [FiLM(guide_dim, embedding_dim=8 + 2 * i, hidden_size=3) for i in range(num_structures)]
         patchers = [PatchEncoder(in_channels=8 + 2 * i, out_channels=d_model, kernel_size=2, stride=3, patch_size=3, num_patches=None) for i in range(num_structures)]
@@ -298,55 +268,25 @@ class TestHierarchicalViTClassifier:
         x = [torch.randint(0, vocab_size, (batch_size, seq_length + i)) for i in range(num_structures)]
         g = [torch.rand((batch_size, seq_length + i, guide_dim)) for i in range(num_structures)]
 
-        x_g = list(zip(x, g))
         if add_none:
-            x_g[0] = None
+            x[0] = None
+            g[0] = None
 
         if add_none and num_structures == 1:
             with pytest.raises(ValueError):
-                net.forward(x_g)
+                net.forward(x, g)
             return
 
         too_short = False
         for i in range(num_structures):
-            if x_g[i] is not None and x_g[i][0].shape[1] < net.min_lengths[i]:
+            if x[i] is not None and x[i].shape[1] < net.min_lengths[i]:
                 too_short = True
                 break
 
         if too_short:
             with pytest.raises(RuntimeError):
-                net.forward(x_g)
+                net.forward(x, g)
             return
 
-        z = net.forward(x_g)
-        assert z.shape == (batch_size, num_classes)
-
-    @pytest.mark.parametrize("batch_size", [1, 2, 3, 5])
-    @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
-    @pytest.mark.parametrize("num_structures", [1, 2, 3, 5, 7])
-    @pytest.mark.parametrize("add_none", [False, True])
-    def test_forward_b(self, batch_size: int, seq_length: int, num_structures: int, add_none: bool, vocab_size: int = 11, guide_dim: int = 3, d_model: int = 8, num_classes: int = 2) -> None:
-        embeddings = [torch.nn.Embedding(vocab_size, embedding_dim=8 + 2 * i) for i in range(num_structures)]
-        filmers = [FiLM(guide_dim, embedding_dim=8 + 2 * i, hidden_size=3) for i in range(num_structures)]
-        patchers = [PatchEncoder(in_channels=8 + 2 * i, out_channels=d_model, kernel_size=2, stride=3, patch_size=3, num_patches=None) for i in range(num_structures)]
-        backbone = ViT(embedding_dim=d_model, d_model=d_model, nhead=1, num_layers=1, pooling="cls")
-        head = ClassifificationHead(d_model, num_classes=num_classes)
-        net = HierarchicalViTClassifier(embeddings, filmers, patchers, backbone, head)
-
-        x = torch.randint(0, vocab_size, (batch_size, seq_length))
-        g = torch.rand((batch_size, seq_length, guide_dim))
-        while not (m := torch.randint(0, 2, (batch_size, seq_length, num_structures), dtype=torch.bool)).any():
-            pass
-
-        if add_none:
-            m[:,:,0] = False
-            if not m.any() and num_structures > 1:
-                m[0,0,1] = True
-
-        if add_none and num_structures == 1:
-            with pytest.raises(ValueError):
-                net.forward((x, g, m))
-            return
-
-        z = net.forward((x, g, m))
+        z = net.forward(x, g)
         assert z.shape == (batch_size, num_classes)
