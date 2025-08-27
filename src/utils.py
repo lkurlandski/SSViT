@@ -202,7 +202,7 @@ def unpackbits(x: ByteTensor, count: int = -1, axis: int = -1) -> BoolTensor:
     return z.movedim(-1, axis)
 
 
-@torch.no_grad()
+@torch.no_grad()  # type: ignore[misc]
 def mask_select_packed(packed: ByteTensor, mask: BoolTensor, axis: int = -1) -> ByteTensor:
     """
     Slice a bit-packed tensor along `axis` using a boolean mask that refers to the
