@@ -628,25 +628,17 @@ class _HSampleOrSamples(Generic[TGuide], ABC):
     def num_structures(self) -> int:
         return len(self.inputs)
 
-    def _poke_guides(self, attr: Literal["parse", "entropy", "characteristics"]) -> Optional[list[Tensor]]:
-        t = [getattr(g, attr) for g in self.guides]
-        if all(x is None for x in t):
-            return None
-        if any(x is None for x in t):
-            raise ValueError(f"All guides must have {attr} or none.")
-        return t
+    @property
+    def parse(self) -> list[Optional[Tensor]]:
+        return [g.parse for g in self.guides]
 
     @property
-    def parse(self) -> Optional[list[Tensor]]:
-        return self._poke_guides("parse")
+    def entropy(self) -> list[Optional[Tensor]]:
+        return [g.entropy for g in self.guides]
 
     @property
-    def entropy(self) -> Optional[list[Tensor]]:
-        return self._poke_guides("entropy")
-
-    @property
-    def characteristics(self) -> Optional[list[Tensor]]:
-        return self._poke_guides("characteristics")
+    def characteristics(self) -> list[Optional[Tensor]]:
+        return [g.characteristics for g in self.guides]
 
     @abstractmethod
     def __len__(self) -> int:
