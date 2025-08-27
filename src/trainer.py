@@ -44,16 +44,11 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data import Samples as SamplesFlat
-from src.data import SamplesHierarchical
+from src.data import FOrHSamples
 
 
 FTensor = Union[BFloat16Tensor | HalfTensor | FloatTensor | DoubleTensor]
 ITensor = Union[CharTensor | ByteTensor | ShortTensor | IntTensor | LongTensor]
-
-
-# TODO: this is a temporary hack
-Samples = Union[SamplesFlat, SamplesHierarchical]
 
 
 @dataclass
@@ -208,8 +203,8 @@ class Trainer:
         self,
         args: TrainerArgs,
         model: Module,
-        tr_loader: Collection[Samples] | DataLoader[Samples],
-        vl_loader: Collection[Samples] | DataLoader[Samples],
+        tr_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
+        vl_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
         loss_fn: Module,
         optimizer: Optimizer,
         scheduler: Optional[LRScheduler] = None,
@@ -259,7 +254,7 @@ class Trainer:
 
         self.model.train()
         dataloader = self.tr_loader
-        iterable: Iterable[tuple[int, Samples]] = enumerate(dataloader)
+        iterable: Iterable[tuple[int, FOrHSamples]] = enumerate(dataloader)
         iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
 
         num_samples = 0
@@ -308,7 +303,7 @@ class Trainer:
 
         self.model.eval()
         dataloader = self.vl_loader
-        iterable: Iterable[tuple[int, Samples]] = enumerate(dataloader)
+        iterable: Iterable[tuple[int, FOrHSamples]] = enumerate(dataloader)
         iterable = tqdm(iterable, "Validating...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
 
         num_samples = 0
@@ -331,19 +326,19 @@ class Trainer:
 
         return report
 
-    def forward(self, batch: Samples) -> FTensor:
+    def forward(self, batch: FOrHSamples) -> FTensor:
         """
         Send a batch of inputs forward through the model.
         """
         return self.model.forward(batch.inputs, batch.characteristics)
 
-    def compute_loss(self, batch: Samples, outputs: FTensor) -> FTensor:
+    def compute_loss(self, batch: FOrHSamples, outputs: FTensor) -> FTensor:
         """
         Compute the loss over a batch of examples.
         """
         return self.loss_fn.forward(outputs, batch.label)
 
-    def compute_metrics(self, batch: Samples, outputs: FTensor) -> dict[str, float]:
+    def compute_metrics(self, batch: FOrHSamples, outputs: FTensor) -> dict[str, float]:
         """
         Compute the validation metrics over a set of examples.
 

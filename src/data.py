@@ -456,7 +456,7 @@ class StructurePartitioner:
         return StructureMap(index, lexicon)
 
 
-class _SampleOrSamples(ABC):
+class _FSampleOrSamples(ABC):
     file: StrPath | list[StrPath]
     name: Name | list[Name]
     label: ShortTensor | IntTensor | LongTensor
@@ -466,7 +466,7 @@ class _SampleOrSamples(ABC):
 
     # NOTE: the _StructureMapOrStructureMaps does not need to be involved in GPU operations.
     # TODO: some of this functionality is redundant or unnecessary, since the original design for the
-        # hierarchical pipeline did not work well and we had to implement the _SampleOrSamplesHierarchical class.
+        # hierarchical pipeline did not work well and we had to implement the _HSampleOrSamples class.
 
     def __init__(
         self,
@@ -555,7 +555,7 @@ class _SampleOrSamples(ABC):
         return self
 
 
-class Sample(_SampleOrSamples):
+class FSample(_FSampleOrSamples):
     file: StrPath
     name: Name
     label: ShortTensor | IntTensor | LongTensor
@@ -571,7 +571,7 @@ class Sample(_SampleOrSamples):
         check_tensor(self.inputs, (None,), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
-class Samples(_SampleOrSamples):
+class FSamples(_FSampleOrSamples):
     file: list[StrPath]
     name: list[Name]
     label: ShortTensor | IntTensor | LongTensor
@@ -589,9 +589,9 @@ class Samples(_SampleOrSamples):
 
 TGuide = TypeVar("TGuide", bound=_SemanticGuideOrSemanticGuides)
 
-class _SampleOrSamplesHierarchical(Generic[TGuide], ABC):
+class _HSampleOrSamples(Generic[TGuide], ABC):
     """
-    A similar container as _SampleOrSamples, but specifically for hierarchical models.
+    A similar container as _FSampleOrSamples, but specifically for hierarchical models.
     The main difference is that the guides and structure are lists, one per hierarchical structure.
 
     NOTE: its unclear whether or not the lists of tensors can be moved efficiently across processes,
@@ -655,11 +655,11 @@ class _SampleOrSamplesHierarchical(Generic[TGuide], ABC):
     @abstractmethod
     def verify_inputs(self) -> None:
         if len(self.guides) != len(self.inputs):
-            raise ValueError(f"SampleHierarchical inputs and guides must have the same length. Got {len(self.inputs)} and {len(self.guides)}.")
+            raise ValueError(f"HSample inputs and guides must have the same length. Got {len(self.inputs)} and {len(self.guides)}.")
         if self.num_structures == 0:
-            raise ValueError("SampleHierarchical must have at least one structure.")
+            raise ValueError("HSample must have at least one structure.")
         if self.num_structures == 1:
-            warnings.warn("_SampleOrSamplesHierarchical has only one structure. Consider using _SampleOrSamples instead.")
+            warnings.warn("_HSampleOrSamples has only one structure. Consider using _FSampleOrSamples instead.")
 
     @property
     def is_cuda(self) -> bool:
@@ -726,7 +726,7 @@ class _SampleOrSamplesHierarchical(Generic[TGuide], ABC):
         return self
 
 
-class SampleHierarchical(_SampleOrSamplesHierarchical[SemanticGuide]):
+class HSample(_HSampleOrSamples[SemanticGuide]):
     file: StrPath
     name: Name
     label: ShortTensor | IntTensor | LongTensor
@@ -744,7 +744,7 @@ class SampleHierarchical(_SampleOrSamplesHierarchical[SemanticGuide]):
             check_tensor(inp, (None,), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
-class SamplesHierarchical(_SampleOrSamplesHierarchical[SemanticGuides]):
+class HSamples(_HSampleOrSamples[SemanticGuides]):
     file: list[StrPath]
     name: list[Name]
     label: ShortTensor | IntTensor | LongTensor
@@ -762,6 +762,10 @@ class SamplesHierarchical(_SampleOrSamplesHierarchical[SemanticGuides]):
             check_tensor(inp, (self.label.shape[0], None), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
+FOrHSample  = FSample | HSample
+FOrHSamples = FSamples | HSamples
+
+
 class BinaryDataset(Dataset):  # type: ignore[misc]
 
     def __init__(self, files: Sequence[StrPath], labels: Sequence[int], preprocessor: Preprocessor) -> None:
@@ -769,7 +773,7 @@ class BinaryDataset(Dataset):  # type: ignore[misc]
         self.labels = labels
         self.preprocessor = preprocessor
 
-    def __getitem__(self, i: int) -> Sample:
+    def __getitem__(self, i: int) -> FSample:
         return self.preprocessor(self.files[i], self.labels[i])
 
     def __len__(self) -> int:
@@ -794,7 +798,7 @@ class Preprocessor:
         self.guider = SemanticGuider(do_parser, do_entropy, do_characteristics)
         self.partitioner = StructurePartitioner(HierarchicalLevel(level))
 
-    def __call__(self, file: StrPath, label: int) -> Sample:
+    def __call__(self, file: StrPath, label: int) -> FSample:
         name = Name(file)
         label = torch.tensor(label)
         inputs = torch.from_file(str(file), shared=False, size=os.path.getsize(file), dtype=torch.uint8)
@@ -813,7 +817,7 @@ class Preprocessor:
             guides = guides.trim(self.max_length)
             structure = structure.trim(self.max_length)
 
-        return Sample(file, name, label, inputs, guides, structure)
+        return FSample(file, name, label, inputs, guides, structure)
 
 
 class CollateFn:
@@ -825,7 +829,7 @@ class CollateFn:
         if self.min_length % 8 != 0:
             raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {min_length}.")
 
-    def __call__(self, batch: Sequence[Sample]) -> Samples:
+    def __call__(self, batch: Sequence[FSample]) -> FSamples:
         file = [s.file for s in batch]
         name = [s.name for s in batch]
         label = torch.stack([s.label for s in batch])
@@ -836,7 +840,7 @@ class CollateFn:
         guides = SemanticGuides.from_singles(guides, self.pin_memory, min_length_)
         structure = [s.structure for s in batch]
         structure = StructureMaps.from_singles(structure, self.pin_memory, self.min_length)
-        return Samples(file, name, label, inputs, guides, structure)
+        return FSamples(file, name, label, inputs, guides, structure)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, min_length={self.min_length})"
@@ -852,7 +856,7 @@ class CollateFnHierarchical:
         if any(l % 8 != 0 for l in self.min_lengths):
             raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {self.min_lengths}.")
 
-    def __call__(self, batch: Sequence[Sample]) -> SamplesHierarchical:
+    def __call__(self, batch: Sequence[FSample]) -> HSamples:
         file = [s.file for s in batch]
         name = [s.name for s in batch]
         label = torch.stack([s.label for s in batch])
@@ -875,7 +879,7 @@ class CollateFnHierarchical:
 
         structure = [s.structure for s in batch]
         structure = StructureMaps.from_singles(structure, self.pin_memory)
-        return SamplesHierarchical(file, name, label, inputs, guides, structure)
+        return HSamples(file, name, label, inputs, guides, structure)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, num_structures={self.num_structures}, min_lengths={self.min_lengths})"
@@ -887,18 +891,18 @@ class CUDAPrefetcher:
         self.loader = loader
         self.device = device
         self.stream = torch.cuda.Stream()
-        self.next_batch: Optional[Samples] = None
+        self.next_batch: Optional[FOrHSamples] = None
 
     def __contains__(self, item: object) -> bool:
         return item in self.loader
 
-    def __iter__(self) -> Iterator[Samples]:
+    def __iter__(self) -> Iterator[FOrHSamples]:
         self.it = iter(self.loader)
         self.next_batch = None
         self._preload()
         return self
 
-    def __next__(self) -> Samples:
+    def __next__(self) -> FOrHSamples:
         if self.next_batch is None:
             raise StopIteration
 
@@ -906,11 +910,11 @@ class CUDAPrefetcher:
         curr.wait_stream(self.stream)   # fence: H2D of next_batch is now done (or almost)
 
         # Protect CUDA storage from early reuse by other streams
-        def _record(t: Samples) -> Samples:
+        def _record(t: FOrHSamples) -> FOrHSamples:
             if t.is_cuda:
                 t.record_stream(curr)
             return t
-        batch: Samples = tree_map(_record, self.next_batch)
+        batch: FOrHSamples = tree_map(_record, self.next_batch)
 
         # Immediately begin prefetch for the subsequent batch (max overlap)
         self._preload()
@@ -932,7 +936,7 @@ class CUDAPrefetcher:
             return
 
         with torch.cuda.stream(self.stream):
-            def _to(t: Samples) -> Samples:
+            def _to(t: FOrHSamples) -> FOrHSamples:
                 return t.to(self.device, non_blocking=True)
             self.next_batch = tree_map(_to, cpu_batch)
 

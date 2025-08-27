@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.binanal import HierarchicalLevel
 from src.binentropy import compute_entropy_rolling_numpy
-from src.data import Samples
+from src.data import FSamples
 from src.data import BinaryDataset
 from src.data import CollateFn
 from src.data import Preprocessor
@@ -89,7 +89,7 @@ def main() -> None:
     )
     iterable = CUDAPrefetcher(dataloader, device) if torch.cuda.is_available() else dataloader
     iterable = enumerate(iterable)
-    iterable: Iterable[tuple[int, Samples]] = tqdm(iterable, leave=False, total=len(dataset) // args.batch_size)
+    iterable: Iterable[tuple[int, FSamples]] = tqdm(iterable, leave=False, total=len(dataset) // args.batch_size)
 
     start = time.time()
 

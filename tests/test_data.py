@@ -17,10 +17,10 @@ from torch import LongTensor
 
 from src.binanal import HierarchicalStructureNone
 from src.data import Name
-from src.data import Sample
-from src.data import Samples
-from src.data import SampleHierarchical
-from src.data import SamplesHierarchical
+from src.data import FSample
+from src.data import FSamples
+from src.data import HSample
+from src.data import HSamples
 from src.data import SemanticGuide
 from src.data import SemanticGuides
 from src.data import SemanticGuider
@@ -80,7 +80,7 @@ class TestCollateFn:
             inputs = torch.randint(0, 256, (seq_length + i,), dtype=torch.uint8)
             guides = SemanticGuide(None, None, None)
             structure = StructureMap(torch.full((seq_length + i, 1), True), {0: HierarchicalStructureNone.ANY})
-            sample = Sample(file, name, label, inputs, guides, structure)
+            sample = FSample(file, name, label, inputs, guides, structure)
             samples.append(sample)
 
         # Everything should be padded to the nearest multiple of 8.
@@ -88,7 +88,7 @@ class TestCollateFn:
         out_seq_length = math.ceil(out_seq_length / 8) * 8
 
         batch = collate_fn(samples)
-        assert isinstance(batch, Samples)
+        assert isinstance(batch, FSamples)
 
         assert isinstance(batch.file, list)
         assert len(batch.file) == batch_size
@@ -136,7 +136,7 @@ class TestCollateFn:
                 characteristics = packbits(characteristics, axis=0)
             guides = SemanticGuide(None, None, characteristics)
             structure = StructureMap(torch.full((seq_length + i, 1), True), {0: HierarchicalStructureNone.ANY})
-            sample = Sample(file, name, label, inputs, guides, structure)
+            sample = FSample(file, name, label, inputs, guides, structure)
             samples.append(sample)
 
         # Everything should be padded to the nearest multiple of 8.
@@ -144,7 +144,7 @@ class TestCollateFn:
         out_seq_length = math.ceil(out_seq_length / 8) * 8
 
         batch = collate_fn(samples)
-        assert isinstance(batch, Samples)
+        assert isinstance(batch, FSamples)
 
         assert isinstance(batch.file, list)
         assert len(batch.file) == batch_size
@@ -202,11 +202,11 @@ class TestCollateFnHierarchical:
                 torch.randint(0, 2, (seq_length + i, num_structures), dtype=torch.bool),
                 {k: HierarchicalStructureNone.ANY for k in range(num_structures)}
             )
-            sample = Sample(file, name, label, inputs, guides, structure)
+            sample = FSample(file, name, label, inputs, guides, structure)
             samples.append(sample)
 
         batch = collate_fn(samples)
-        assert isinstance(batch, SamplesHierarchical)
+        assert isinstance(batch, HSamples)
 
         assert isinstance(batch.file, list)
         assert len(batch.file) == batch_size
@@ -249,7 +249,7 @@ class TestCollateFnHierarchical:
             min_lengths=[min_length + i * 8 for i in range(num_structures)],
         )
 
-        samples: list[Sample] = []
+        samples: list[FSample] = []
         for i in range(batch_size):
             file = f"{get_random_str(16)}/{get_random_bytes(32).hex()}"
             name = Name(file.split("/")[-1])
@@ -263,11 +263,11 @@ class TestCollateFnHierarchical:
                 torch.randint(0, 2, (seq_length + i, num_structures), dtype=torch.bool),
                 {k: HierarchicalStructureNone.ANY for k in range(num_structures)}
             )
-            sample = Sample(file, name, label, inputs, guides, structure)
+            sample = FSample(file, name, label, inputs, guides, structure)
             samples.append(sample)
 
         batch = collate_fn(samples)
-        assert isinstance(batch, SamplesHierarchical)
+        assert isinstance(batch, HSamples)
 
         assert isinstance(batch.file, list)
         assert len(batch.file) == batch_size
@@ -341,7 +341,7 @@ class TestBinaryDataset:
                 inputs = torch.frombuffer(b, dtype=torch.uint8).to(torch.long)
                 guides = SemanticGuides(None, None, None)
                 structure = StructureMap(torch.full((len(b), 1), False), {0: HierarchicalStructureNone.ANY})
-                return Sample(file, file.stem, torch.tensor(label, dtype=torch.int32), inputs, guides, structure)
+                return FSample(file, file.stem, torch.tensor(label, dtype=torch.int32), inputs, guides, structure)
 
         preprocessor = PreprocessorMock(False, False, False)
         with tempfile.TemporaryDirectory() as tmpdir:
