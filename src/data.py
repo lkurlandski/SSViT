@@ -208,13 +208,14 @@ class _SemanticGuideOrSemanticGuides(ABC):
     def select(self, idx: BoolTensor) -> Self:
         check_tensor(idx, (None,), torch.bool)
 
+        entropy = None
+        if self.entropy is not None:
+            entropy = self.entropy[idx]
+
         if not self.is_bitpacked:
             parse = None
             if self.parse is not None:
                 parse = self.parse[idx]
-            entropy = None
-            if self.entropy is not None:
-                entropy = self.entropy[idx]
             characteristics = None
             if self.characteristics is not None:
                 characteristics = self.characteristics[idx]
@@ -229,12 +230,6 @@ class _SemanticGuideOrSemanticGuides(ABC):
             if idx.shape[self.length_axis] != self.parse.shape[self.length_axis] * 8:
                 raise RuntimeError("Index length does not match unpacked data length.")
             parse = mask_select_packed(self.parse, idx, self.length_axis)
-
-        entropy = None
-        if self.entropy is not None:
-            if idx.shape[self.length_axis] != self.entropy.shape[self.length_axis] * 8:
-                raise RuntimeError("Index length does not match unpacked data length.")
-            entropy = mask_select_packed(self.entropy, idx, self.length_axis)
 
         characteristics = None
         if self.characteristics is not None:
