@@ -44,6 +44,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from src.utils import str_to_bool
 from src.data import FOrHSamples
 
 
@@ -86,10 +87,10 @@ class TrainerArgumentParser(ArgumentParser):
         self.add_argument("--outdir", type=Path, default=TrainerArgs.outdir)
         self.add_argument("--device", type=torch.device, default=TrainerArgs.device)
         self.add_argument("--epochs", type=int, default=TrainerArgs.epochs)
-        self.add_argument("--disable_tqdm", action="store_true", default=TrainerArgs.disable_tqdm)
+        self.add_argument("--disable_tqdm", type=str_to_bool, default=TrainerArgs.disable_tqdm)
         self.add_argument("--logging_steps", type=int, default=TrainerArgs.logging_steps)
         self.add_argument("--metric", type=str, default=TrainerArgs.metric)
-        self.add_argument("--lower_is_worse", action="store_true", default=TrainerArgs.lower_is_worse)
+        self.add_argument("--lower_is_worse", type=str_to_bool, default=TrainerArgs.lower_is_worse)
         self.add_argument("--max_norm", type=float, default=TrainerArgs.max_norm)
         self.add_argument("--gradient_accumulation_steps", type=int, default=TrainerArgs.gradient_accumulation_steps)
 

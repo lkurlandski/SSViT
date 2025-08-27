@@ -22,6 +22,17 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence as _pad_sequence
 
 
+def str_to_bool(v: bool | str) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        if v.lower() in ("yes", "true", "t", "y", "1"):
+            return True
+        if v.lower() in ("no", "false", "f", "n", "0"):
+            return False
+    raise ValueError(f"Boolean value expected, got {v!r}.")
+
+
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)

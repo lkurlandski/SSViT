@@ -47,6 +47,7 @@ from src.binanal import LEVEL_STRUCTURE_MAP
 from src.binanal import HierarchicalStructure
 from src.data import BinaryDataset
 from src.data import CollateFn
+from src.data import CollateFnHierarchical
 from src.data import CUDAPrefetcher
 from src.data import Preprocessor
 from src.data import GroupedLengthBatchSampler
@@ -55,8 +56,8 @@ from src.trainer import TrainerArgumentParser
 from src.trainer import TrainerArgs
 from src.trainer import EarlyStopper
 from src.utils import seed_everything
-from src.utils import get_optimal_num_workers
 from src.utils import get_optimal_num_worker_threads
+from src.utils import str_to_bool
 
 
 class Architecture(Enum):
@@ -83,7 +84,6 @@ class MainArgs:
     tr_num_samples: Optional[int] = None
     vl_num_samples: Optional[int] = None
     max_length: Optional[int] = None
-    bitpack: bool = False
     num_workers: int = 0
     pin_memory: bool = False
     prefetch_factor: int = 1
@@ -108,16 +108,15 @@ class MainArgumentParser(ArgumentParser):
         self.add_argument("--arch", type=Architecture, default=MainArgs.arch)
         self.add_argument("--size", type=ModelSize, default=MainArgs.size)
         self.add_argument("--seed", type=int, default=MainArgs.seed)
-        self.add_argument("--do_parser", action="store_true", default=MainArgs.do_parser)
-        self.add_argument("--do_entropy", action="store_true", default=MainArgs.do_entropy)
-        self.add_argument("--do_characteristics", action="store_true", default=MainArgs.do_characteristics)
+        self.add_argument("--do_parser", type=str_to_bool, default=MainArgs.do_parser)
+        self.add_argument("--do_entropy", type=str_to_bool, default=MainArgs.do_entropy)
+        self.add_argument("--do_characteristics", type=str_to_bool, default=MainArgs.do_characteristics)
         self.add_argument("--level", type=HierarchicalLevel, default=MainArgs.level)
         self.add_argument("--max_length", type=int, default=MainArgs.max_length)
         self.add_argument("--tr_num_samples", type=int, default=MainArgs.tr_num_samples)
         self.add_argument("--vl_num_samples", type=int, default=MainArgs.vl_num_samples)
-        self.add_argument("--bitpack", action="store_true", default=MainArgs.bitpack)
         self.add_argument("--num_workers", type=int, default=MainArgs.num_workers)
-        self.add_argument("--pin_memory", action="store_true", default=MainArgs.pin_memory)
+        self.add_argument("--pin_memory", type=str_to_bool, default=MainArgs.pin_memory)
         self.add_argument("--prefetch_factor", type=int, default=MainArgs.prefetch_factor)
         self.add_argument("--tr_batch_size", type=int, default=MainArgs.tr_batch_size)
         self.add_argument("--vl_batch_size", type=int, default=MainArgs.vl_batch_size)
@@ -125,7 +124,7 @@ class MainArgumentParser(ArgumentParser):
         self.add_argument("--weight_decay", type=float, default=MainArgs.weight_decay)
 
 
-def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool, level: HierarchicalLevel) -> Classifier:
+def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool, level: HierarchicalLevel) -> Classifier | HierarchicalMalConvClassifier | HierarchicalViTClassifier:
 
     f = None
     if size == ModelSize.SM:
@@ -283,15 +282,19 @@ def main() -> None:
 
     model = get_model(args.arch, args.size, args.do_characteristics, args.level)
     print(f"{model=}")
-
-    # NOTE: this will need to be adjusted for the multiple structure case,
-    # where different encoders may have different requirements.
-    min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
-    print(f"{min_length=}")
-
     print(f"num_parameters={count_parameters(model, requires_grad=True)}")
 
-    collate_fn = CollateFn(pin_memory=False, bitpack=args.bitpack, min_length=min_length)
+    min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
+    min_lengths = getattr(model, "min_lengths", [min_length])
+    min_lengths = [max(m, min_length) for m in min_lengths]
+    print(f"{min_length=}")
+    print(f"{min_lengths=}")
+
+    collate_fn: CollateFn | CollateFnHierarchical
+    if args.level == HierarchicalLevel.NONE:
+        collate_fn = CollateFn(pin_memory=False, bitpack=False, min_length=min_length)
+    else:
+        collate_fn = CollateFnHierarchical(pin_memory=False, bitpack=False, num_structures=len(LEVEL_STRUCTURE_MAP[args.level]), min_lengths=min_lengths)
     print(f"{collate_fn=}")
 
     def get_loader(dataset: Dataset, sampler: Sampler) -> DataLoader | CUDAPrefetcher:
