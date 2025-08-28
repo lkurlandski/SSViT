@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Collection
 from collections.abc import Iterable
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
 import gc
@@ -18,6 +19,7 @@ import os
 from pathlib import Path
 import shutil
 from statistics import mean
+import threading
 import time
 from typing import Any
 from typing import Callable
@@ -26,6 +28,9 @@ from typing import Self
 from typing import Union
 import warnings
 
+import numpy as np
+import psutil
+import pynvml
 import torch
 from torch import Tensor
 from torch import BFloat16Tensor
@@ -192,13 +197,15 @@ def find_executable_batch_size(
 
 
 def pformat_dict(d: Mapping[str, int | float]) -> dict[str, str]:
-    return {k: f"{v:.6f}" if isinstance(v, float) else f"{v}" for k, v in d.items()}
+    return {k: f"{v:.3f}" if isinstance(v, float) else f"{v}" for k, v in d.items()}
 
 
 class Trainer:
     """
     Trainer class for training models.
     """
+
+    PRINTKEYS = ("tr_loss", "tr_gpu_utl", "vl_loss", "vl_acc", "vl_gpu_utl")
 
     def __init__(
         self,
@@ -219,6 +226,7 @@ class Trainer:
         self.optimizer = optimizer
         self.scheduler = scheduler if scheduler is not None else LambdaLR(optimizer, lambda _: 1.0)
         self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
+        self.monitor = Monitor(device=args.device)
         self.log: list[Mapping[str, int | float]] = []
         self.best_epoch = -1
         self.best_metric = -float("inf") if args.lower_is_worse else float("inf")
@@ -226,19 +234,29 @@ class Trainer:
     def __call__(self) -> Self:
         shutil.rmtree(self.args.outdir, ignore_errors=True)
         self.args.outdir.mkdir(parents=True, exist_ok=True)
+        self.monitor.start()
 
-        tr_report = {"tr_loss": float("nan"), "tr_time": float("nan")}
-        vl_report = self.evaluate()
-        report = {"epoch": 0, "lr": float("nan")} | tr_report | vl_report
+        tr_report  = {"tr_loss": float("nan"), "tr_time": float("nan")}
+        tr_report |= {f"tr_{k}": float("nan") for k, _ in self.monitor.get_report(clear=True).items()}
+        vl_report  = self.evaluate()
+        vl_report |= {f"vl_{k}": v for k, v in self.monitor.get_report(clear=True).items()}
+        report  = {"epoch": 0, "lr": float("nan")}
+        report |= tr_report | vl_report
+        self._update_cons(report)
         self._update_logs(report)
         self._update_best(report)
         self._update_save(report)
 
         pbar = tqdm(list(range(1, self.args.epochs + 1)), "Epochs", disable=self.args.disable_tqdm, ascii=True)
         for epoch in pbar:
-            tr_report = self.train()
-            vl_report = self.evaluate()
-            report = {"epoch": epoch, "lr": self.scheduler.get_last_lr()[0]} | tr_report | vl_report
+            self.monitor.clear()
+            tr_report  = self.train()
+            tr_report |= {f"tr_{k}": v for k, v in self.monitor.get_report(clear=True).items()}
+            vl_report  = self.evaluate()
+            vl_report |= {f"vl_{k}": v for k, v in self.monitor.get_report(clear=True).items()}
+            report  = {"epoch": epoch, "lr": self.scheduler.get_last_lr()[0]}
+            report |= tr_report | vl_report
+            self._update_cons(report)
             self._update_logs(report)
             self._update_best(report)
             self._update_save(report)
@@ -247,6 +265,8 @@ class Trainer:
                 self.stopper.step(vl_report[self.args.metric])
                 if self.stopper.stop:
                     break
+
+        self.monitor.stop()
 
         return self
 
@@ -368,9 +388,12 @@ class Trainer:
 
     def _update_logs(self, results: Mapping[str, int | float]) -> None:
         self.log.append(results)
-        print(pformat_dict(results))
         with open(self.args.outdir / "results.jsonl", "a") as fp:
             fp.write(json.dumps(results) + "\n")
+
+    def _update_cons(self, results: Mapping[str, int | float]) -> None:
+        d = {k: results[k] for k in self.PRINTKEYS}
+        print(pformat_dict(d))
 
     def _update_best(self, results: Mapping[str, int | float]) -> None:
         if self.args.lower_is_worse and results[self.args.metric] > self.best_metric:
@@ -387,3 +410,136 @@ class Trainer:
             e = int(checkpoint.stem.split("_")[1])
             if e not in (self.best_epoch, results["epoch"]):
                 checkpoint.unlink()
+
+
+class Monitor:
+    """
+    Basic CPU/GPU monitoring.
+
+    Collects:
+        - cpu_utl: CPU utilization as a proportion, e.g., 0.50 = 50% of one CPU
+        - cpu_mem: CPU memory used in bytes
+        - gpu_utl: GPU utilization as a proportion, e.g., 0.50 = 50% of one GPU
+        - gpu_mem: GPU memory used in bytes
+        - h_to_d: Host to Device PCIe throughput in bytes/second
+        - d_to_h: Device to Host PCIe throughput in bytes/second
+
+    See: https://docs.nvidia.com/deploy/nvml-api/group__nvmlDeviceQueries.html
+    """
+
+    COLLECT = (
+        "cpu_utl",
+        "cpu_mem",
+        "gpu_utl",
+        "gpu_mem",
+        "h_to_d",
+        "d_to_h",
+    )
+
+    def __init__(self, *, device: Optional[torch.device] = None, dindex: Optional[int] = None, interval_s: float = 0.1) -> None:
+        if bool(device is None) == bool(dindex is None):
+            raise ValueError("Exactly one of `device` or `dindex` must be specified.")
+        self.device = device
+        self.dindex = dindex
+        self.interval = interval_s
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._samples: dict[str, list[float]] = {k: [] for k in self.COLLECT}
+
+    def start(self) -> Monitor:
+        pynvml.nvmlInit()
+        self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.dindex) if self.dindex is not None else self._get_handle_from_device(self.device)
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> Monitor:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+        return self
+
+    def clear(self) -> Monitor:
+        self._samples = defaultdict(list)
+        return self
+
+    def get_report(self, clear: bool = False) -> dict[str, float]:
+        d = {k: np.mean(v) if len(v) > 0 else float("nan") for k, v in self._samples.items()}
+        if clear:
+            self.clear()
+        return d
+
+    def _run(self) -> None:
+        while self._running:
+            d = self._collect()
+            for k, v in d.items():
+                self._samples[k].append(v)
+            time.sleep(self.interval)
+
+    def _collect(self) -> dict[str, float]:
+        cpu_utl = psutil.cpu_percent(interval=0.0) / 100.0
+        cpu_mem = psutil.virtual_memory().used
+        gpu_utl = pynvml.nvmlDeviceGetUtilizationRates(self.handle).gpu / 100.0
+        gpu_mem = pynvml.nvmlDeviceGetMemoryInfo(self.handle).used
+        h_to_d  = pynvml.nvmlDeviceGetPcieThroughput(self.handle, pynvml.NVML_PCIE_UTIL_TX_BYTES) * 1024.0
+        d_to_h  = pynvml.nvmlDeviceGetPcieThroughput(self.handle, pynvml.NVML_PCIE_UTIL_RX_BYTES) * 1024.0
+        return {
+            "cpu_utl": cpu_utl,
+            "cpu_mem": cpu_mem,
+            "gpu_utl": gpu_utl,
+            "gpu_mem": gpu_mem,
+            "h_to_d": h_to_d,
+            "d_to_h": d_to_h,
+        }
+
+    @staticmethod
+    def _get_handle_from_device(device: torch.device) -> Any:
+        # NOTE: pynvml must be initialized before calling this method with pynvml.nvmlInit()
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available")
+        if device.type != "cuda":
+            raise ValueError(f"Expected a CUDA device, got {device!r}")
+
+        # Resolve CUDA runtime index (visible index)
+        cuda_idx = device.index if device.index is not None else torch.cuda.current_device()
+
+        # Query CUDA device properties
+        props = torch.cuda.get_device_properties(cuda_idx)
+
+        # Prefer UUID mapping (robust across reordering)
+        dev_uuid = getattr(props, "uuid", None)
+        if dev_uuid is not None:
+            try:
+                return pynvml.nvmlDeviceGetHandleByUUID(str(dev_uuid))
+            except pynvml.NVMLError:
+                pass
+
+        # Fallback: PCI bus ID mapping (also robust)
+        pci_bus_id = getattr(props, "pci_bus_id", None)
+        if pci_bus_id is not None:
+            try:
+                return pynvml.nvmlDeviceGetHandleByPciBusId(str(pci_bus_id))
+            except pynvml.NVMLError:
+                pass
+
+        # Last resort: map via CUDA_VISIBLE_DEVICES if present
+        cvd = os.getenv("CUDA_VISIBLE_DEVICES")
+        if cvd:
+            physical_idx = int(cvd.split(",")[cuda_idx].strip())
+            try:
+                return pynvml.nvmlDeviceGetHandleByIndex(physical_idx)
+            except pynvml.NVMLError:
+                pass
+
+        # Absolute last fallback: assume CUDA and NVML indices align
+        try:
+            return pynvml.nvmlDeviceGetHandleByIndex(cuda_idx)
+        except pynvml.NVMLError:
+            pass
+
+        raise RuntimeError(f"Failed to find NVML handle for device {device}.")
