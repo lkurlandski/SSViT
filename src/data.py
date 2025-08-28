@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
 from collections.abc import MutableSequence
+from collections import deque
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
@@ -902,58 +903,104 @@ class CollateFnHierarchical:
 
 class CUDAPrefetcher:
 
-    def __init__(self, loader: DataLoader, device: torch.device) -> None:
+    def __init__(self, loader: DataLoader, device: torch.device, num_streams: int) -> None:
+        if num_streams > 0 and (device.type != "cuda" or not torch.cuda.is_available()):
+            raise ValueError(f"{self.__class__.__name__} with num_streams > 0 requires a CUDA device.")
+
         self.loader = loader
         self.device = device
-        self.stream = torch.cuda.Stream()
-        self.next_batch: Optional[FOrHSamples] = None
+        self.num_streams = max(0, int(num_streams))
+        self.streams = [torch.cuda.Stream(device=device) for _ in range(self.num_streams)]
+        self._rr = 0
+        self._buf: deque[tuple[torch.cuda.Stream, FOrHSamples]] = deque()
+        self.it: Optional[Iterator[FOrHSamples]] = None
 
     def __contains__(self, item: object) -> bool:
         return item in self.loader
 
     def __iter__(self) -> Iterator[FOrHSamples]:
         self.it = iter(self.loader)
-        self.next_batch = None
-        self._preload()
+        self._buf.clear()
+        self._rr = 0
+        if self.num_streams > 0:
+            self._preload(self.num_streams)
         return self
 
     def __next__(self) -> FOrHSamples:
-        if self.next_batch is None:
+        if self.it is None:
             raise StopIteration
 
-        curr = torch.cuda.current_stream(self.device)
-        curr.wait_stream(self.stream)   # fence: H2D of next_batch is now done (or almost)
+        # Not using CUDA at all: copy on CPU
+        if self.device.type != "cuda":
+            try:
+                cpu_batch = next(self.it)
+            except StopIteration:
+                raise StopIteration
 
-        # Protect CUDA storage from early reuse by other streams
+            return cpu_batch.decompress()
+
+        curr = torch.cuda.current_stream(self.device)
+
+        # No prefetch streams: copy on current stream
+        if self.num_streams == 0:
+            try:
+                cpu_batch = next(self.it)
+            except StopIteration:
+                raise StopIteration
+
+            def _to(t: FOrHSamples) -> FOrHSamples:
+                return t.to(self.device, non_blocking=True)
+
+            dev_batch: FOrHSamples = tree_map(_to, cpu_batch)
+            return dev_batch.decompress()
+
+        # Prefetched path: pop one batch whose H2D was done on its stream
+        if not self._buf:
+            # Try topping up once in case we finished priming exactly
+            self._preload(1)
+            if not self._buf:
+                raise StopIteration
+
+        copy_stream, dev_batch = self._buf.popleft()
+        curr.wait_stream(copy_stream)
+
         def _record(t: FOrHSamples) -> FOrHSamples:
-            if t.is_cuda:
+            if getattr(t, "is_cuda", False):
                 t.record_stream(curr)
             return t
-        batch: FOrHSamples = tree_map(_record, self.next_batch)
 
-        # Immediately begin prefetch for the subsequent batch (max overlap)
-        self._preload()
+        dev_batch = tree_map(_record, dev_batch)
 
-        # Do GPU-side transforms after the wait/record
-        return batch.decompress()       # safe here; runs on curr stream
+        # Keep the pipeline full
+        self._preload(1)
+
+        return dev_batch.decompress()
 
     def __len__(self) -> int:
         return len(self.loader)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(loader={self.loader}, device={self.device})"
+        return f"{self.__class__.__name__}(loader={self.loader}, device={self.device}, num_streams={self.num_streams})"
 
-    def _preload(self) -> None:
-        try:
-            cpu_batch = next(self.it)
-        except StopIteration:
-            self.next_batch = None
+    def _preload(self, n: int) -> None:
+        if self.it is None or self.num_streams == 0:
             return
 
-        with torch.cuda.stream(self.stream):
-            def _to(t: FOrHSamples) -> FOrHSamples:
-                return t.to(self.device, non_blocking=True)
-            self.next_batch = tree_map(_to, cpu_batch)
+        for _ in range(n):
+            try:
+                cpu_batch = next(self.it)
+            except StopIteration:
+                return
+
+            s = self.streams[self._rr]
+            self._rr = (self._rr + 1) % self.num_streams
+
+            with torch.cuda.stream(s):
+                def _to(t: FOrHSamples) -> FOrHSamples:
+                    return t.to(self.device, non_blocking=True)
+                dev_batch: FOrHSamples = tree_map(_to, cpu_batch)
+
+            self._buf.append((s, dev_batch))
 
     @property
     def dataset(self) -> Dataset:

@@ -84,6 +84,7 @@ class MainArgs:
     tr_num_samples: Optional[int] = None
     vl_num_samples: Optional[int] = None
     max_length: Optional[int] = None
+    num_streams: int = 0
     num_workers: int = 0
     pin_memory: bool = False
     prefetch_factor: int = 1
@@ -115,6 +116,7 @@ class MainArgumentParser(ArgumentParser):
         self.add_argument("--max_length", type=int, default=MainArgs.max_length)
         self.add_argument("--tr_num_samples", type=int, default=MainArgs.tr_num_samples)
         self.add_argument("--vl_num_samples", type=int, default=MainArgs.vl_num_samples)
+        self.add_argument("--num_streams", type=int, default=MainArgs.num_streams)
         self.add_argument("--num_workers", type=int, default=MainArgs.num_workers)
         self.add_argument("--pin_memory", type=str_to_bool, default=MainArgs.pin_memory)
         self.add_argument("--prefetch_factor", type=int, default=MainArgs.prefetch_factor)
@@ -311,8 +313,7 @@ def main() -> None:
             persistent_workers=None if args.num_workers == 0 else True,
         )
         print(f"dataloader=DataLoader(pin_memory={dataloader.pin_memory})")
-        if args.device.type == "cuda":
-            dataloader = CUDAPrefetcher(dataloader, args.device)
+        dataloader = CUDAPrefetcher(dataloader, args.device, args.num_streams)
         return dataloader
 
     tr_sampler = GroupedLengthBatchSampler.from_lengths(args.tr_batch_size, list(map(os.path.getsize, tr_dataset.files)), first=True, shuffle=True)
