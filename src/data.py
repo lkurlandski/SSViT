@@ -837,7 +837,7 @@ class CollateFn:
         return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, min_length={self.min_length})"
 
     @staticmethod
-    def get_padded_inputs(inputs: list[ByteTensor], min_length, pin_memory: bool, change_dtype_after_pad: bool = True) -> ShortTensor:
+    def get_padded_inputs(inputs: list[ByteTensor], min_length: int, pin_memory: bool, change_dtype_after_pad: bool = True) -> ShortTensor:
         """
         NOTE: some benchmarks indicate that Tensor.to(torch.int16) is a massive bottleneck. change_dtype_after_pad=True might resolve this.
         """
@@ -848,17 +848,17 @@ class CollateFn:
             inputs_ = pad_sequence(inputs, True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
             return inputs_
 
-        lengths = torch.tensor([inp.size(0) for inp in inputs], dtype=torch.int32)
+        lengths = [inp.size(0) for inp in inputs]
 
         inputs_ = pad_sequence(inputs, True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
         inputs_ = inputs_.to(torch.int16)
         for i, l in enumerate(lengths):
-            inputs[i, :l].add_(1)
+            inputs_[i, :l].add_(1)
         # inputs_.add_(1)
         # for i, l in enumerate(lengths):
-        #     inputs[i, l:] = 0
+        #     inputs_[i, l:] = 0
 
-        return inputs
+        return inputs_
 
 
 class CollateFnHierarchical:
