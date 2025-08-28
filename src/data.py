@@ -851,13 +851,17 @@ class CollateFn:
 
         lengths = [inp.size(0) for inp in inputs]
 
-        inputs_ = pad_sequence(inputs, True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
+        inputs_ = pad_sequence(inputs, True, 0, "right", False, PAD_TO_MULTIPLE_OF, min_length)
         inputs_ = inputs_.to(torch.int16)
         for i, l in enumerate(lengths):
             inputs_[i, :l].add_(1)
         # inputs_.add_(1)
         # for i, l in enumerate(lengths):
         #     inputs_[i, l:] = 0
+
+        # Memory pinning must take place after dtype conversion, hence, we used pin_memory=False above.
+        if pin_memory:
+            inputs_ = inputs_.pin_memory()
 
         return inputs_
 
