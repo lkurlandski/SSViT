@@ -339,7 +339,7 @@ class Trainer:
         """
         return self.loss_fn.forward(outputs, batch.label)
 
-    def compute_metrics(self, batch: FOrHSamples, outputs: FTensor) -> dict[str, float]:
+    def compute_metrics(self, batch: FOrHSamples, outputs: FTensor) -> dict[str, Tensor]:
         """
         Compute the validation metrics over a set of examples.
 
@@ -349,15 +349,15 @@ class Trainer:
         labels = batch.label
         preds = torch.argmax(outputs, dim=1)
 
-        tp = ((preds == 1) & (labels == 1)).sum().item()
-        tn = ((preds == 0) & (labels == 0)).sum().item()
-        fp = ((preds == 1) & (labels == 0)).sum().item()
-        fn = ((preds == 0) & (labels == 1)).sum().item()
+        tp = ((preds == 1) & (labels == 1)).sum()
+        tn = ((preds == 0) & (labels == 0)).sum()
+        fp = ((preds == 1) & (labels == 0)).sum()
+        fn = ((preds == 0) & (labels == 1)).sum()
 
-        acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
-        pre = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f_1 = 2 * pre * rec / (pre + rec) if (pre + rec) > 0 else 0.0
+        acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else torch.tensor(0.0)
+        pre = tp / (tp + fp) if (tp + fp) > 0 else torch.tensor(0.0)
+        rec = tp / (tp + fn) if (tp + fn) > 0 else torch.tensor(0.0)
+        f_1 = 2 * pre * rec / (pre + rec) if (pre + rec) > 0 else torch.tensor(0.0)
 
         return {
             "acc": acc,
