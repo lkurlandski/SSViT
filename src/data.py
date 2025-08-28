@@ -825,8 +825,7 @@ class CollateFn:
         file = [s.file for s in batch]
         name = [s.name for s in batch]
         label = torch.stack([s.label for s in batch])
-        inputs = [s.inputs.to(torch.int16) + 1 for s in batch]
-        inputs = pad_sequence(inputs, True, 0, "right", self.pin_memory, PAD_TO_MULTIPLE_OF, self.min_length)
+        inputs = CollateFn.get_padded_inputs([s.inputs for s in batch], self.min_length, self.pin_memory, True)
         guides = [s.guides.compress() if self.bitpack else s.guides for s in batch]
         min_length_ = int(self.min_length / 8) if (self.bitpack or guides[0].is_bitpacked) else self.min_length
         guides = SemanticGuides.from_singles(guides, self.pin_memory, min_length_)
@@ -836,6 +835,30 @@ class CollateFn:
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, min_length={self.min_length})"
+
+    @staticmethod
+    def get_padded_inputs(inputs: list[ByteTensor], min_length, pin_memory: bool, change_dtype_after_pad: bool = True) -> ShortTensor:
+        """
+        NOTE: some benchmarks indicate that Tensor.to(torch.int16) is a massive bottleneck. change_dtype_after_pad=True might resolve this.
+        """
+        if not change_dtype_after_pad:
+            for i in range(len(inputs)):
+                inputs[i] = inputs[i].to(torch.int16)
+                inputs[i].add_(1)
+            inputs_ = pad_sequence(inputs, True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
+            return inputs_
+
+        lengths = torch.tensor([inp.size(0) for inp in inputs], dtype=torch.int32)
+
+        inputs_ = pad_sequence(inputs, True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
+        inputs_ = inputs_.to(torch.int16)
+        for i, l in enumerate(lengths):
+            inputs[i, :l].add_(1)
+        # inputs_.add_(1)
+        # for i, l in enumerate(lengths):
+        #     inputs[i, l:] = 0
+
+        return inputs
 
 
 class CollateFnHierarchical:
@@ -862,9 +885,9 @@ class CollateFnHierarchical:
                 idx = batch[j].structure.index[:, i]
                 x_i_j = batch[j].inputs[idx]
                 g_i_j = batch[j].guides.select(idx)
-                xs.append(x_i_j.to(torch.int16) + 1)
+                xs.append(x_i_j)
                 gs.append(g_i_j.compress() if self.bitpack else g_i_j)
-            xs = pad_sequence(xs, True, 0, "right", self.pin_memory, PAD_TO_MULTIPLE_OF, self.min_lengths[i])
+            xs = CollateFn.get_padded_inputs(xs, self.min_lengths[i], self.pin_memory)
             gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8))
             inputs.append(xs)
             guides.append(gs)
