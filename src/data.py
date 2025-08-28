@@ -918,16 +918,41 @@ class CUDAPrefetcher:
         self._rr = 0
         self._buf: deque[tuple[torch.cuda.Stream, FOrHSamples]] = deque()
         self.it: Optional[Iterator[FOrHSamples]] = None
+        self._primed = False
 
     def __contains__(self, item: object) -> bool:
         return item in self.loader
 
-    def __iter__(self) -> Iterator[FOrHSamples]:
-        self.it = iter(self.loader)
+    def warmup(self, preload_batches: Optional[int] = None) -> None:
+        """
+        Spawn DataLoader workers early and optionally prefetch some batches to device.
+
+        Args:
+            preload_batches: how many batches to prefetch to GPU. If None, uses
+            num_streams (or 0 if num_streams==0). Use 0 to only spawn workers.
+        """
+        if self.it is None:
+            self.it = iter(self.loader)  # spawns worker processes
         self._buf.clear()
         self._rr = 0
-        if self.num_streams > 0:
-            self._preload(self.num_streams)
+
+        if preload_batches is None:
+            preload_batches = self.num_streams if self.num_streams > 0 else 0
+
+        if self.num_streams > 0 and preload_batches > 0:
+            self._preload(preload_batches)
+            self._primed = True
+        else:
+            self._primed = False  # no GPU prefetch, just workers spawned
+
+    def __iter__(self) -> Iterator[FOrHSamples]:
+        if not self._primed:
+            self.it = iter(self.loader)
+            self._buf.clear()
+            self._rr = 0
+            if self.num_streams > 0:
+                self._preload(self.num_streams)
+        self._primed = False
         return self
 
     def __next__(self) -> FOrHSamples:

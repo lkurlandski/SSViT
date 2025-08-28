@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Any
 from typing import Optional
 from typing import Self
@@ -314,6 +315,9 @@ def main() -> None:
         )
         print(f"dataloader=DataLoader(pin_memory={dataloader.pin_memory})")
         dataloader = CUDAPrefetcher(dataloader, args.device, args.num_streams)
+        if dataloader.loader.persistent_workers:
+            dataloader.warmup(0)
+            time.sleep(4)  # Wait for all workers to be ready.
         return dataloader
 
     tr_sampler = GroupedLengthBatchSampler.from_lengths(args.tr_batch_size, list(map(os.path.getsize, tr_dataset.files)), first=True, shuffle=True)
