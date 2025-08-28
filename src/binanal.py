@@ -864,11 +864,53 @@ class StructureParser:
         return []
 
     def get_other(self) -> list[Range]:
-        covered = np.full(self.size, False, dtype=bool)
-        for lo, hi in self.get_headers() + self.get_sections() + self.get_overlay():
-            covered[lo:hi] = True
-        lo, hi = get_ranges_numpy(covered == False)
-        return self._norm([(int(l), int(o)) for l, o in zip(lo, hi, strict=True)])
+
+        def _normalize_and_merge(ranges: Iterable[Range], size: int) -> list[Range]:
+            """Clamp to [0,size), drop empties, sort, and merge overlaps/adjacent."""
+            if size <= 0:
+                return []
+            norm: list[Range] = []
+            for lo, hi in ranges:
+                if hi <= 0 or lo >= size:
+                    continue
+                lo = 0 if lo < 0 else lo
+                hi = size if hi > size else hi
+                if hi > lo:
+                    norm.append((lo, hi))
+            if not norm:
+                return []
+
+            norm.sort()
+            merged: list[Range] = []
+            cur_lo, cur_hi = norm[0]
+            for lo, hi in norm[1:]:
+                if lo <= cur_hi:
+                    if hi > cur_hi:
+                        cur_hi = hi
+                else:
+                    merged.append((cur_lo, cur_hi))
+                    cur_lo, cur_hi = lo, hi
+            merged.append((cur_lo, cur_hi))
+            return merged
+
+        def _complement_of_merged(merged: list[Range], size: int) -> list[Range]:
+            """Complement of a merged, sorted, non-overlapping interval set within [0,size)."""
+            if size <= 0:
+                return []
+            other: list[Range] = []
+            cursor = 0
+            for lo, hi in merged:
+                if cursor < lo:
+                    other.append((cursor, lo))
+                cursor = hi
+            if cursor < size:
+                other.append((cursor, size))
+            return other
+
+        ranges = self.get_headers() + self.get_sections() + self.get_overlay()
+        merged = _normalize_and_merge(ranges, self.size)
+        other = _complement_of_merged(merged, self.size)
+        return self._norm(other)
 
     # ---------- MIDDLE ----------
     def get_code(self) -> list[Range]:
