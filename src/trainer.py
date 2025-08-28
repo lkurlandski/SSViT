@@ -354,10 +354,10 @@ class Trainer:
         fp = ((preds == 1) & (labels == 0)).sum()
         fn = ((preds == 0) & (labels == 1)).sum()
 
-        acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else torch.tensor(0.0)
-        pre = tp / (tp + fp) if (tp + fp) > 0 else torch.tensor(0.0)
-        rec = tp / (tp + fn) if (tp + fn) > 0 else torch.tensor(0.0)
-        f_1 = 2 * pre * rec / (pre + rec) if (pre + rec) > 0 else torch.tensor(0.0)
+        acc = (tp + tn) / (tp + tn + fp + fn).clamp_min_(1)
+        pre = tp / (tp + fp).clamp_min_(1)
+        rec = tp / (tp + fn).clamp_min_(1)
+        f_1 = 2 * pre * rec / (pre + rec).clamp_min_(1)
 
         return {
             "acc": acc,
