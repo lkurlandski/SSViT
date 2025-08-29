@@ -875,6 +875,8 @@ class CollateFnHierarchical:
         self.min_lengths = [0] * num_structures if min_lengths is None else min_lengths
         if any(l % 8 != 0 for l in self.min_lengths):
             raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {self.min_lengths}.")
+        if len(self.min_lengths) != self.num_structures:
+            raise ValueError(f"min_lengths must have length equal to num_structures. Got {self.min_lengths} and {self.num_structures}.")
 
     def __call__(self, batch: Sequence[FSample]) -> HSamples:
         file = [s.file for s in batch]
@@ -1009,7 +1011,7 @@ class CUDAPrefetcher:
         return len(self.loader)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(loader={self.loader}, device={self.device}, num_streams={self.num_streams})"
+        return f"{self.__class__.__name__}(loader={self.loader.__class__.__name__}(...), device={self.device}, num_streams={self.num_streams})"
 
     def _preload(self, n: int) -> None:
         if self.it is None or self.num_streams == 0:
