@@ -15,6 +15,7 @@ from functools import partial
 import gc
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -205,8 +206,6 @@ class Trainer:
     Trainer class for training models.
     """
 
-    PRINTKEYS = ("tr_loss", "tr_gpu_utl", "vl_loss", "vl_acc", "vl_gpu_utl")
-
     def __init__(
         self,
         args: TrainerArgs,
@@ -247,7 +246,7 @@ class Trainer:
         self._update_best(report)
         self._update_save(report)
 
-        pbar = tqdm(list(range(1, self.args.epochs + 1)), "Epochs", disable=self.args.disable_tqdm, ascii=True)
+        pbar = list(range(1, self.args.epochs + 1))
         for epoch in pbar:
             self.monitor.clear()
             tr_report  = self.train()
@@ -392,8 +391,16 @@ class Trainer:
             fp.write(json.dumps(results) + "\n")
 
     def _update_cons(self, results: Mapping[str, int | float]) -> None:
-        d = {k: results[k] for k in self.PRINTKEYS}
-        print(pformat_dict(d))
+        d = {}
+        d["epoch"] = results["epoch"]
+        d["tr_loss"] = round(results["tr_loss"], 3)
+        d["vl_loss"] = round(results["vl_loss"], 3)
+        d["vl_acc"] = round(results["vl_acc"], 3)
+        d["tr_gpu_utl"] = round(results["tr_gpu_utl"], 2)
+        d["vl_gpu_utl"] = round(results["vl_gpu_utl"], 2)
+        d["tr_time"] = int(round(results["tr_time"], 0)) if not math.isnan(results["tr_time"]) else float("nan")
+        d["vl_time"] = int(round(results["vl_time"], 0)) if not math.isnan(results["vl_time"]) else float("nan")
+        print(d)
 
     def _update_best(self, results: Mapping[str, int | float]) -> None:
         if self.args.lower_is_worse and results[self.args.metric] > self.best_metric:
