@@ -3,13 +3,11 @@ Train and validation loops.
 """
 
 from __future__ import annotations
-from argparse import ArgumentParser
 from argparse import Namespace
 from collections import defaultdict
 from collections.abc import Collection
 from collections.abc import Iterable
 from collections.abc import Mapping
-from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
 import gc
@@ -19,7 +17,6 @@ import math
 import os
 from pathlib import Path
 import shutil
-from statistics import mean
 import threading
 import time
 from typing import Any
@@ -45,12 +42,12 @@ from torch import IntTensor
 from torch import LongTensor
 from torch.nn import Module
 from torch.optim import Optimizer
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.utils import str_to_bool
 from src.data import FOrHSamples
 
 
@@ -61,7 +58,6 @@ ITensor = Union[CharTensor | ByteTensor | ShortTensor | IntTensor | LongTensor]
 @dataclass
 class TrainerArgs:
     outdir: Path = Path("./output/tmp")
-    device: torch.device = torch.device("cpu")
     epochs: int = 1
     disable_tqdm: bool = False
     logging_steps: int = -1
@@ -71,13 +67,6 @@ class TrainerArgs:
     gradient_accumulation_steps: int = 1
 
     def __post_init__(self) -> None:
-        if self.device.type == "cuda":
-            if not torch.cuda.is_available():
-                warnings.warn("CUDA device specified but not available, using CPU instead.")
-                self.device = torch.device("cpu")
-            if os.environ.get("CUDA_VISIBLE_DEVICES") is None:
-                warnings.warn("CUDA_VISIBLE_DEVICES is not set, which could result in unexpected behavior if multiple GPUs are available.")
-
         if self.logging_steps > 0:
             warnings.warn(f"Logging every {self.logging_steps} `logging_steps` is enabled, which may slow down training.")
 
@@ -192,7 +181,7 @@ def pformat_dict(d: Mapping[str, int | float]) -> dict[str, str]:
 
 class Trainer:
     """
-    Trainer class for training models.
+    Trainer class for training models with PyTorch.
     """
 
     def __init__(
@@ -202,22 +191,26 @@ class Trainer:
         tr_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
         vl_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
         loss_fn: Module,
-        optimizer: Optimizer,
+        optimizer: Optional[Optimizer] = None,
         scheduler: Optional[LRScheduler] = None,
         stopper: Optional[EarlyStopper] = None,
     ) -> None:
         self.args = args
-        self.model: Module = model.to(args.device)
+        self.model = model
         self.tr_loader = tr_loader
         self.vl_loader = vl_loader
         self.loss_fn = loss_fn
-        self.optimizer = optimizer
+        self.optimizer = optimizer if optimizer is not None else AdamW(model.parameters())
         self.scheduler = scheduler if scheduler is not None else LambdaLR(optimizer, lambda _: 1.0)
         self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
-        self.monitor = Monitor(device=args.device)
+        self.monitor = Monitor(device=self.device)
         self.log: list[Mapping[str, int | float]] = []
         self.best_epoch = -1
         self.best_metric = -float("inf") if args.lower_is_worse else float("inf")
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.model.parameters()).device
 
     def __call__(self) -> Self:
         shutil.rmtree(self.args.outdir, ignore_errors=True)
@@ -267,7 +260,7 @@ class Trainer:
         iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
 
         num_samples = 0
-        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.args.device))
+        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
 
         step = 0
         for mini_step, batch in iterable:
@@ -316,7 +309,7 @@ class Trainer:
         iterable = tqdm(iterable, "Validating...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
 
         num_samples = 0
-        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.args.device))
+        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
 
         with torch.no_grad():
             for mini_step, batch in iterable:
@@ -441,10 +434,12 @@ class Monitor:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._samples: dict[str, list[float]] = {k: [] for k in self.COLLECT}
+        self._cpu_only = device.type == "cpu" if device is not None else False
 
     def start(self) -> Monitor:
-        pynvml.nvmlInit()
-        self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.dindex) if self.dindex is not None else self._get_handle_from_device(self.device)
+        if not self._cpu_only:
+            pynvml.nvmlInit()
+            self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.dindex) if self.dindex is not None else self._get_handle_from_device(self.device)
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -455,7 +450,8 @@ class Monitor:
         if self._thread:
             self._thread.join(timeout=2.0)
         try:
-            pynvml.nvmlShutdown()
+            if not self._cpu_only:
+                pynvml.nvmlShutdown()
         except Exception:
             pass
         return self
@@ -480,6 +476,15 @@ class Monitor:
     def _collect(self) -> dict[str, float]:
         cpu_utl = psutil.cpu_percent(interval=0.0) / 100.0
         cpu_mem = psutil.virtual_memory().used
+        if self._cpu_only:
+            return {
+                "cpu_utl": cpu_utl,
+                "cpu_mem": cpu_mem,
+                "gpu_utl": float("nan"),
+                "gpu_mem": float("nan"),
+                "h_to_d": float("nan"),
+                "d_to_h": float("nan"),
+            }
         gpu_utl = pynvml.nvmlDeviceGetUtilizationRates(self.handle).gpu / 100.0
         gpu_mem = pynvml.nvmlDeviceGetMemoryInfo(self.handle).used
         h_to_d  = pynvml.nvmlDeviceGetPcieThroughput(self.handle, pynvml.NVML_PCIE_UTIL_TX_BYTES) * 1024.0
