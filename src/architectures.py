@@ -31,6 +31,7 @@ from typing import Optional
 import warnings
 
 import torch
+from torch.distributed.fsdp import fully_shard
 from torch.nn import functional as F
 from torch import nn
 from torch import Tensor
@@ -123,7 +124,7 @@ class ClassifificationHead(nn.Module):  # type: ignore[misc]
         """
         check_tensor(x, (None, self.input_size), FLOATS)
 
-        z = self.layers.forward(x)
+        z = self.layers(x)
 
         return z
 
@@ -163,7 +164,7 @@ class FiLM(nn.Module):  # type: ignore[misc]
         check_tensor(x, (None, None, self.embedding_dim), FLOATS)
         check_tensor(g, (x.shape[0], x.shape[1], self.guide_dim), FLOATS)
     
-        film: Tensor = self.mlp.forward(g)  # (B, T, 2E)
+        film: Tensor = self.mlp(g)               # (B, T, 2E)
         gamma, beta = film.chunk(2, dim=-1)      # (B, T, E), (B, T, E)
         z = x * gamma + beta                     # (B, T, E)
 
@@ -297,8 +298,8 @@ class PatchEncoder(nn.Module):  # type: ignore[misc]
         z = self.split_patches(z, P)  # (B,  N, P, E)
         z = z.reshape(B * N, P, E)    # (BN, P, E)
         z = z.permute(0, 2, 1)        # (BN, E, P)
-        z = self.conv.forward(z)      # (BN, C, S)
-        z = self.pool.forward(z)      # (BN, C, 1)
+        z = self.conv(z)              # (BN, C, S)
+        z = self.pool(z)              # (BN, C, 1)
         z = z.squeeze(-1)             # (BN, C)
         z = z.reshape(B, N, C)        # (B,  N, C)
 
@@ -411,15 +412,20 @@ class ViT(nn.Module):  # type: ignore[misc]
         if self.pooling == "cls":  # T <-- T + 1
             t = self.cls_token.expand(x.shape[0], -1, -1)  # (B, 1, E)
             x = torch.cat((t, x), dim=1)  # (B, T, E)
-        z = self.posencoder.forward(x)    # (B, T, E)
-        z = self.proj.forward(z)          # (B, T, D)
-        z = self.transformer.forward(z)   # (B, T, D)
+        z = self.posencoder(x)            # (B, T, E)
+        z = self.proj(z)                  # (B, T, D)
+        z = self.transformer(z)           # (B, T, D)
         if self.pooling == "cls":
             z = z[:, 0, :].unsqueeze(1)   # (B, 1, D)
         z = z.mean(dim=1)                 # (B, D)
 
         check_tensor(z, (x.shape[0], self.d_model), FLOATS)
         return z
+
+    def fully_shard(self, **kwds: Any) -> None:
+        for i in range(0, self.transformer.num_layers, 2):
+            fully_shard(self.transformer.layers[i:i+1], **kwds)
+        fully_shard(self, **kwds)
 
 # -------------------------------------------------------------------------------- #
 # MalConv
@@ -462,11 +468,11 @@ class MalConv(nn.Module):  # type: ignore[misc]
         if x.shape[1] < self.min_length:
             raise RuntimeError(f"Input sequence length {x.shape[1]} is less than the minimum required length {self.min_length}.")
 
-        z = x.transpose(1, 2)                # (B, E, T)
-        c_1 = self.conv_1.forward(z)         # (B, C, S - 1)
-        c_2 = self.conv_2.forward(z)         # (B, C, S - 1)
-        g = c_1 * self.sigmoid.forward(c_2)  # (B, C, S - 1)
-        z = self.pool.forward(g)             # (B, C, 1)
+        z = x.transpose(1, 2)        # (B, E, T)
+        c_1 = self.conv_1(z)         # (B, C, S - 1)
+        c_2 = self.conv_2(z)         # (B, C, S - 1)
+        g = c_1 * self.sigmoid(c_2)  # (B, C, S - 1)
+        z = self.pool(g)             # (B, C, 1)
         z = z.squeeze(-1)                    # (B, C)
 
         check_tensor(z, (x.shape[0], self.channels), FLOATS)
@@ -475,6 +481,9 @@ class MalConv(nn.Module):  # type: ignore[misc]
     @property
     def min_length(self) -> int:
         return self.kernel_size
+
+    def fully_shard(self, **kwds: Any) -> None:
+        fully_shard(self, **kwds)
 
 # -------------------------------------------------------------------------------- #
 # Classifier
@@ -508,14 +517,19 @@ class Classifier(nn.Module):  # type: ignore[misc]
         if g is not None:
             check_tensor(g, (x.shape[0], x.shape[1], None), FLOATS)
 
-        z = self.embedding.forward(x)  # (B, T, E)
-        z = self.filmer.forward(z, g)  # (B, T, E)
-        z = self.patcher.forward(z)    # (B, N, E') or (B, T, E)
-        z = self.backbone.forward(z)   # (B, D)
-        z = self.head.forward(z)       # (B, M)
+        z = self.embedding(x)  # (B, T, E)
+        z = self.filmer(z, g)  # (B, T, E)
+        z = self.patcher(z)    # (B, N, E') or (B, T, E)
+        z = self.backbone(z)   # (B, D)
+        z = self.head(z)       # (B, M)
 
         check_tensor(z, (x.shape[0], self.head.num_classes), FLOATS)
         return z
+
+    def fully_shard(self, **kwds: Any) -> None:
+        fully_shard([self.embedding, self.filmer, self.patcher], **kwds)
+        self.backbone.fully_shard(**kwds)
+        fully_shard(self, **kwds | {"reshard_after_forward": False})
 
 # -------------------------------------------------------------------------------- #
 # Hierarchical Models.
@@ -619,14 +633,14 @@ class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
         for i in range(self.num_structures):
             if x[i] is None:
                 continue
-            z = self.embeddings[i].forward(x[i])  # (B, T, E)
-            z = self.filmers[i].forward(z, g[i])  # (B, T, E)
-            z = self.backbones[i].forward(z)      # (B, C)
+            z = self.embeddings[i](x[i])  # (B, T, E)
+            z = self.filmers[i](z, g[i])  # (B, T, E)
+            z = self.backbones[i](z)      # (B, C)
             zs.append(z)
 
         z = torch.stack(zs, dim=1)  # (B, sum(C))
         z = torch.mean(z, dim=1)    # (B, C)
-        z = self.head.forward(z)    # (B, M)
+        z = self.head(z)            # (B, M)
 
         check_tensor(z, (zs[0].shape[0], self.head.num_classes), FLOATS)
         return z
@@ -649,6 +663,12 @@ class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
     @property
     def max_lengths(self) -> list[int]:
         return [l[1] for l in self._get_min_max_lengths()]
+
+    def fully_shard(self, **kwds: Any) -> None:
+        for i in range(self.num_structures):
+            fully_shard([self.embeddings[i], self.filmers[i]], **kwds)
+            self.backbones[i].fully_shard(**kwds)
+        fully_shard(self, **kwds | {"reshard_after_forward": False})
 
 
 class HierarchicalViTClassifier(nn.Module):  # type: ignore[misc]
@@ -680,18 +700,18 @@ class HierarchicalViTClassifier(nn.Module):  # type: ignore[misc]
         """
         _check_hierarchical_inputs(x, g, self.num_structures)
 
-        zs = []
+        zs: list[Tensor] = []
         for i in range(self.num_structures):
             if x[i] is None:
                 continue
-            z = self.embeddings[i].forward(x[i])  # (B, T, E)
-            z = self.filmers[i].forward(z, g[i])  # (B, T, E)
-            z = self.patchers[i].forward(z)       # (B, N, D)
+            z = self.embeddings[i](x[i])  # (B, T, E)
+            z = self.filmers[i](z, g[i])  # (B, T, E)
+            z = self.patchers[i](z)       # (B, N, D)
             zs.append(z)
 
         z = torch.cat(zs, dim=1)      # (B, sum(N), D)
-        z = self.backbone.forward(z)  # (B, D)
-        z = self.head.forward(z)      # (B, M)
+        z = self.backbone(z)          # (B, D)
+        z = self.head(z)              # (B, M)
 
         check_tensor(z, (zs[0].shape[0], self.head.num_classes), FLOATS)
         return z
@@ -715,3 +735,9 @@ class HierarchicalViTClassifier(nn.Module):  # type: ignore[misc]
     @property
     def max_lengths(self) -> list[int]:
         return [l[1] for l in self._get_min_max_lengths()]
+
+    def fully_shard(self, **kwds: Any) -> None:
+        for i in range(self.num_structures):
+            fully_shard([self.embeddings[i], self.filmers[i], self.patchers[i]], **kwds)
+        self.backbone.fully_shard(**kwds)
+        fully_shard(self, **kwds | {"reshard_after_forward": False})
