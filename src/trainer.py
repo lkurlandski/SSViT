@@ -82,23 +82,12 @@ class TrainerArgs:
             warnings.warn(f"Logging every {self.logging_steps} `logging_steps` is enabled, which may slow down training.")
 
     @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Self:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+    @classmethod
     def from_namespace(cls, namespace: Namespace) -> Self:
-        return cls(**{k: v for k, v in vars(namespace).items() if k in cls.__dataclass_fields__})
-
-
-class TrainerArgumentParser(ArgumentParser):
-
-    def __init__(self, *args: Any, **kwds: Any) -> None:
-        super().__init__(*args, **kwds)
-        self.add_argument("--outdir", type=Path, default=TrainerArgs.outdir)
-        self.add_argument("--device", type=torch.device, default=TrainerArgs.device)
-        self.add_argument("--epochs", type=int, default=TrainerArgs.epochs)
-        self.add_argument("--disable_tqdm", type=str_to_bool, default=TrainerArgs.disable_tqdm)
-        self.add_argument("--logging_steps", type=int, default=TrainerArgs.logging_steps)
-        self.add_argument("--metric", type=str, default=TrainerArgs.metric)
-        self.add_argument("--lower_is_worse", type=str_to_bool, default=TrainerArgs.lower_is_worse)
-        self.add_argument("--max_norm", type=float, default=TrainerArgs.max_norm)
-        self.add_argument("--gradient_accumulation_steps", type=int, default=TrainerArgs.gradient_accumulation_steps)
+        return cls.from_dict(vars(namespace))
 
 
 class EarlyStopper:

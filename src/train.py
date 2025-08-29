@@ -6,15 +6,22 @@ from argparse import ArgumentParser
 from argparse import Namespace
 from collections import Counter
 from dataclasses import dataclass
+from dataclasses import fields
+from dataclasses import Field
 from enum import Enum
 import math
 import os
 from pathlib import Path
+from pprint import pprint
 import sys
 import time
 from typing import Any
 from typing import Optional
 from typing import Self
+from typing import Union
+from typing import get_type_hints
+from typing import get_args
+from typing import get_origin
 import warnings
 
 import lief
@@ -55,7 +62,6 @@ from src.data import CUDAPrefetcher
 from src.data import Preprocessor
 from src.data import GroupedLengthBatchSampler
 from src.trainer import Trainer
-from src.trainer import TrainerArgumentParser
 from src.trainer import TrainerArgs
 from src.trainer import EarlyStopper
 from src.utils import seed_everything
@@ -108,34 +114,163 @@ class MainArgs:
             raise ValueError("If running with torchrun, either --ddp or --fsdp must be set.")
 
     @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Self:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+    @classmethod
     def from_namespace(cls, namespace: Namespace) -> Self:
-        return cls(**{k: v for k, v in vars(namespace).items() if k in cls.__dataclass_fields__})
+        return cls.from_dict(vars(namespace))
 
 
-class MainArgumentParser(ArgumentParser):
+def create_argument_parser_from_dataclass(*objs: type) -> ArgumentParser:
+    """
+    Creates an ArgumentParser from dataclass(es) with unique field names.
+    """
 
-    def __init__(self, *args: Any, **kwds: Any) -> None:
-        super().__init__(*args, **kwds)
-        self.add_argument("--arch", type=Architecture, default=MainArgs.arch)
-        self.add_argument("--size", type=ModelSize, default=MainArgs.size)
-        self.add_argument("--seed", type=int, default=MainArgs.seed)
-        self.add_argument("--do_parser", type=str_to_bool, default=MainArgs.do_parser)
-        self.add_argument("--do_entropy", type=str_to_bool, default=MainArgs.do_entropy)
-        self.add_argument("--do_characteristics", type=str_to_bool, default=MainArgs.do_characteristics)
-        self.add_argument("--level", type=HierarchicalLevel, default=MainArgs.level)
-        self.add_argument("--max_length", type=int, default=MainArgs.max_length)
-        self.add_argument("--tr_num_samples", type=int, default=MainArgs.tr_num_samples)
-        self.add_argument("--vl_num_samples", type=int, default=MainArgs.vl_num_samples)
-        self.add_argument("--num_streams", type=int, default=MainArgs.num_streams)
-        self.add_argument("--num_workers", type=int, default=MainArgs.num_workers)
-        self.add_argument("--pin_memory", type=str_to_bool, default=MainArgs.pin_memory)
-        self.add_argument("--prefetch_factor", type=int, default=MainArgs.prefetch_factor)
-        self.add_argument("--tr_batch_size", type=int, default=MainArgs.tr_batch_size)
-        self.add_argument("--vl_batch_size", type=int, default=MainArgs.vl_batch_size)
-        self.add_argument("--learning_rate", type=float, default=MainArgs.learning_rate)
-        self.add_argument("--weight_decay", type=float, default=MainArgs.weight_decay)
-        self.add_argument("--ddp", type=str_to_bool, default=MainArgs.ddp)
-        self.add_argument("--fsdp", type=str_to_bool, default=MainArgs.fsdp)
+    alltypes: dict[str, Any] = {}
+    allfields: list[Field[Any]] = []
+    allnames: set[str] = set()
+    for obj in objs:
+        fields_ = fields(obj)
+        names = [f.name for f in fields_]
+        if any(n in allnames for n in names):
+            raise ValueError(f"Duplicate field names found: {names} in {allnames}.")
+        allnames.update(names)
+        allfields.extend(list(fields_))
+        # NOTE: this does not correctly extract the types from foreign modules; they are just strings.
+        hints = get_type_hints(obj, globalns=vars(sys.modules[obj.__module__]), include_extras=True)
+        alltypes.update(hints)
+
+    def _unwrap_optional(t: Any) -> tuple[Any, bool]:
+        if get_origin(t) is Union:
+            args = [a for a in get_args(t) if a is not type(None)]
+            if len(args) == 1:
+                return args[0], True
+        return t, False
+
+    parser = ArgumentParser()
+    for f in allfields:
+        # print(f"Adding argument {f.name} of type {f.type} {type(f.type)=} with default {f.default}.")
+        argname = f"--{f.name}"
+        if f.type == bool:
+            parser.add_argument(argname, type=str_to_bool, default=f.default)
+        elif f.type == Optional[bool]:
+            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else str_to_bool(x), default=f.default)
+        elif f.type == Optional[int]:
+            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else int(x), default=f.default)
+        elif f.type == Optional[float]:
+            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else float(x), default=f.default)
+        elif f.type == Optional[str]:
+            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else str(x), default=f.default)
+        elif isinstance(f.type, type) and issubclass(f.type, Enum):
+            parser.add_argument(argname, type=f.type, choices=list(f.type), default=f.default)
+        elif isinstance(f.type, type):
+            parser.add_argument(argname, type=f.type, default=f.default)
+        elif isinstance(f.type, str):
+            type_, _ = _unwrap_optional(alltypes[f.name])
+            parser.add_argument(argname, type=type_, default=f.default)
+        else:
+            raise ValueError(f"Cannot determine type of field {f}.")
+
+    return parser
+
+
+class _FlatDataclassWrapper:
+    """
+    Not intended to be used directly. Use `flatten_dataclasses` instead.
+    """
+
+    def __init__(self, *objs: type) -> None:
+        # Avoid recursion in __setattr__.
+        object.__setattr__(self, "_objs", objs)
+        # Ensure all field names are unique.
+        allnames: set[str] = set()
+        for obj in objs:
+            names = [f.name for f in fields(obj)]
+            if any(n in allnames for n in names):
+                raise ValueError(f"Duplicate field names found: {names} in {allnames}.")
+            allnames.update(names)
+
+    def __getattribute__(self, name: str) -> Any:
+        # Internals
+        if name.startswith("_"):
+            return object.__getattribute__(self, name)
+        # Dataclasses
+        objs = object.__getattribute__(self, "_objs")
+        for obj in objs:
+            if hasattr(obj, name):
+                return getattr(obj, name)
+        # Other
+        return object.__getattribute__(self, name)
+
+    def __getattr__(self, name: str) -> Any:
+        raise AttributeError(f"Could not find {name!r} in any wrapped dataclass.")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Internals
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+        # Dataclasses
+        for obj in object.__getattribute__(self, "_objs"):
+            if hasattr(obj, name):
+                setattr(obj, name, value)
+                return
+        # Other
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        # Internals
+        if name.startswith("_"):
+            object.__delattr__(self, name)
+            return
+        # Dataclasses
+        for obj in object.__getattribute__(self, "_objs"):
+            if hasattr(obj, name):
+                delattr(obj, name)
+                return
+        # Other
+        object.__delattr__(self, name)
+
+    def __dir__(self) -> list[str]:
+        names = set(super().__dir__())
+        for obj in object.__getattribute__(self, "_objs"):
+            names.update(f.name for f in fields(obj))
+        return sorted(names)
+
+    def __repr__(self) -> str:
+        return str(self)
+
+    def __str__(self) -> str:
+        parts = []
+        parts.append(f"{self.__class__.__name__}(")
+        for obj in object.__getattribute__(self, "_objs"):
+            parts.append(f"  {obj.__class__.__name__}(")
+            for f in fields(obj):
+                parts.append(f"    {f.name}={getattr(obj, f.name)!r},")
+            parts.append("  ),")
+        parts.append(")")
+        return "\n".join(parts)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {}
+        for obj in object.__getattribute__(self, "_objs"):
+            d.update({f.name: getattr(obj, f.name) for f in fields(obj)})
+        return d
+
+
+def flatten_dataclasses(*objs: object) -> _FlatDataclassWrapper:
+    """
+    Provides a mypy compatible flattened view over multiple dataclasses with unique field names.
+    """
+    bases: list[type] = [_FlatDataclassWrapper]
+    for obj in objs:
+        if not hasattr(obj, "__dataclass_fields__"):
+            raise TypeError(f"{obj} is not a dataclass.")
+        bases.append(obj.__class__)
+    Args = type("Args", tuple(bases), {})
+    args: _FlatDataclassWrapper = Args(*objs)
+    return args
 
 
 def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool, level: HierarchicalLevel) -> Classifier | HierarchicalMalConvClassifier | HierarchicalViTClassifier:
@@ -273,19 +408,12 @@ def main() -> None:
 
     lief.logging.set_level(lief.logging.LEVEL.OFF)
 
-    Parser = type("Parser", (MainArgumentParser, TrainerArgumentParser), {})
-    parser = Parser(description="Train and validate models.")
-    args = parser.parse_args()
-
-    # TODO: move all these to the dataclasses.
-    if args.tr_batch_size == 1 or args.vl_batch_size == 1:
-        raise NotImplementedError("Batch size of 1 is not supported right now. See https://docs.pytorch.org/docs/stable/data#working-with-collate-fn.")
-    if args.ddp and args.fsdp:
-        raise ValueError("ddp and fsdp cannot both be True.")
-    if ("RANK" in os.environ or "WORLD_SIZE" in os.environ) and not (args.ddp or args.fsdp):
-        raise ValueError("If running with torchrun, either --ddp or --fsdp must be set.")
-    if args.device.type != "cuda":
-        raise NotImplementedError("Training on CPU is not supported right now because the CUDAPrefetcher is responsible for decompressing inputs.")
+    parser = create_argument_parser_from_dataclass(MainArgs, TrainerArgs)
+    namespace = parser.parse_args()
+    margs = MainArgs.from_namespace(namespace)
+    targs = TrainerArgs.from_namespace(namespace)
+    args = flatten_dataclasses(margs, targs)
+    print(f"{args=}")
 
     seed_everything(args.seed)
 
@@ -377,7 +505,7 @@ def main() -> None:
 
     stopper: Optional[EarlyStopper] = None
 
-    trainer = Trainer(TrainerArgs.from_namespace(args), model, tr_loader, vl_loader, loss_fn, optimizer, scheduler, stopper)
+    trainer = Trainer(TrainerArgs.from_dict(args.to_dict()), model, tr_loader, vl_loader, loss_fn, optimizer, scheduler, stopper)
 
     trainer = trainer()
 
