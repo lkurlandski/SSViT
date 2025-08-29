@@ -20,9 +20,11 @@ import warnings
 import lief
 import numpy as np
 import torch
+from torch import distributed as dist
 from torch.nn import Embedding
 from torch.nn import CrossEntropyLoss
 from torch.nn import Module
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import Dataset
@@ -72,7 +74,8 @@ class ModelSize(Enum):
     LG = "lg"
 
 
-# TODO: figure out how to integrate this into the main loop properly (inheritence hacks didn't work).
+# TODO: figure out how to elegantly combine different dataclasses into a new class.
+# TODO: write an ArgumentParser that takes a dataclass and generates arguments.
 @dataclass
 class MainArgs:
     arch: Architecture = Architecture.MALCONV
@@ -93,10 +96,16 @@ class MainArgs:
     vl_batch_size: int = 1
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
+    ddp: bool = False
+    fsdp: bool = False
 
     def __post_init__(self) -> None:
         if self.tr_batch_size == 1 or self.vl_batch_size == 1:
             raise NotImplementedError("Batch size of 1 is not supported right now. See https://docs.pytorch.org/docs/stable/data#working-with-collate-fn.")
+        if self.ddp and self.fsdp:
+            raise ValueError("ddp and fsdp cannot both be True.")
+        if ("RANK" in os.environ or "WORLD_SIZE" in os.environ) and not (self.ddp or self.fsdp):
+            raise ValueError("If running with torchrun, either --ddp or --fsdp must be set.")
 
     @classmethod
     def from_namespace(cls, namespace: Namespace) -> Self:
@@ -125,6 +134,8 @@ class MainArgumentParser(ArgumentParser):
         self.add_argument("--vl_batch_size", type=int, default=MainArgs.vl_batch_size)
         self.add_argument("--learning_rate", type=float, default=MainArgs.learning_rate)
         self.add_argument("--weight_decay", type=float, default=MainArgs.weight_decay)
+        self.add_argument("--ddp", type=str_to_bool, default=MainArgs.ddp)
+        self.add_argument("--fsdp", type=str_to_bool, default=MainArgs.fsdp)
 
 
 def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool, level: HierarchicalLevel) -> Classifier | HierarchicalMalConvClassifier | HierarchicalViTClassifier:
@@ -248,6 +259,7 @@ def count_parameters(model: Module, requires_grad: bool = False) -> int:
     return sum(p.numel() for p in model.parameters() if (not requires_grad or p.requires_grad))
 
 
+# FIXME: account for multiple GPUs.
 def worker_init_fn(worker_id: int) -> None:
     info = torch.utils.data.get_worker_info()
     lief.logging.set_level(lief.logging.LEVEL.OFF)
@@ -265,10 +277,32 @@ def main() -> None:
     parser = Parser(description="Train and validate models.")
     args = parser.parse_args()
 
+    # TODO: move all these to the dataclasses.
+    if args.tr_batch_size == 1 or args.vl_batch_size == 1:
+        raise NotImplementedError("Batch size of 1 is not supported right now. See https://docs.pytorch.org/docs/stable/data#working-with-collate-fn.")
+    if args.ddp and args.fsdp:
+        raise ValueError("ddp and fsdp cannot both be True.")
+    if ("RANK" in os.environ or "WORLD_SIZE" in os.environ) and not (args.ddp or args.fsdp):
+        raise ValueError("If running with torchrun, either --ddp or --fsdp must be set.")
     if args.device.type != "cuda":
         raise NotImplementedError("Training on CPU is not supported right now because the CUDAPrefetcher is responsible for decompressing inputs.")
 
     seed_everything(args.seed)
+
+    if args.ddp:
+        dist.init_process_group("nccl")
+        RANK = dist.get_rank()
+        WORLD_SIZE = dist.get_world_size()
+        args.device = torch.device(RANK % WORLD_SIZE)
+    elif args.fsdp:
+        ...
+    else:
+        RANK = 0
+        WORLD_SIZE = 1
+    print(f"{WORLD_SIZE=} {RANK=} {args.device=}")
+
+    if RANK != 0:
+        args.disable_tqdm = True
 
     preprocessor = Preprocessor(
         args.do_parser,
@@ -278,12 +312,17 @@ def main() -> None:
         max_length=args.max_length,
     )
 
+    # Split the files between distributed workers.
     tr_files, vl_files, tr_labels, vl_labels = get_materials(args.tr_num_samples, args.vl_num_samples)
+    tr_files = tr_files[RANK::WORLD_SIZE]
+    vl_files = vl_files[RANK::WORLD_SIZE]
+    tr_labels = tr_labels[RANK::WORLD_SIZE]
+    vl_labels = vl_labels[RANK::WORLD_SIZE]
 
     tr_dataset = BinaryDataset(tr_files, tr_labels, preprocessor)
     vl_dataset = BinaryDataset(vl_files, vl_labels, preprocessor)
 
-    model = get_model(args.arch, args.size, args.do_characteristics, args.level)
+    model = get_model(args.arch, args.size, args.do_characteristics, args.level).to(args.device)
     print(f"{model=}")
     print(f"num_parameters={count_parameters(model, requires_grad=True)}")
 
@@ -292,6 +331,9 @@ def main() -> None:
     min_lengths = [max(m, min_length) for m in min_lengths]
     print(f"{min_length=}")
     print(f"{min_lengths=}")
+
+    if args.ddp:
+        model = DistributedDataParallel(model, find_unused_parameters=True, static_graph=True)
 
     collate_fn: CollateFn | CollateFnHierarchical
     if args.level == HierarchicalLevel.NONE:
@@ -313,7 +355,7 @@ def main() -> None:
             prefetch_factor=None if args.num_workers == 0 else args.prefetch_factor,
             persistent_workers=None if args.num_workers == 0 else True,
         )
-        print(f"dataloader=DataLoader(pin_memory={dataloader.pin_memory})")
+        print(f"dataloader=DataLoader(pin_memory={dataloader.pin_memory}, num_workers={dataloader.num_workers}, prefetch_factor={dataloader.prefetch_factor})")
         dataloader = CUDAPrefetcher(dataloader, args.device, args.num_streams)
         if dataloader.loader.persistent_workers:
             dataloader.warmup(0)
@@ -339,6 +381,14 @@ def main() -> None:
 
     trainer = trainer()
 
+    if args.ddp:
+        dist.destroy_process_group()
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        raise
