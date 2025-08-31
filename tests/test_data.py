@@ -32,8 +32,8 @@ from src.data import BinaryDataset
 from src.data import GroupedLengthBatchSampler
 from src.data import CollateFn
 from src.data import CollateFnHierarchical
-from src.utils import packbits
-from src.utils import unpackbits
+from src.bitpacking import packbits
+from src.bitpacking import unpackbits
 
 from tests import FILES
 

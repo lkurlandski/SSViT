@@ -43,11 +43,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
 from torch.utils._pytree import tree_map
 
-from src.utils import check_tensor
-from src.utils import packbits
-from src.utils import unpackbits
-from src.utils import pad_sequence
-from src.utils import mask_select_packed
 from src.binanal import _parse_pe_and_get_size
 from src.binanal import _get_size_of_liefparse
 from src.binanal import LiefParse
@@ -61,6 +56,11 @@ from src.binanal import HierarchicalStructureFine
 from src.binanal import HierarchicalStructureMiddle
 from src.binanal import HierarchicalStructureNone
 from src.binentropy import compute_entropy_rolling_numpy
+from src.bitpacking import packbits
+from src.bitpacking import unpackbits
+from src.bitpacking import slice_bitpacked_tensor
+from src.utils import check_tensor
+from src.utils import pad_sequence
 
 
 StrPath = str | os.PathLike[str]
@@ -230,13 +230,13 @@ class _SemanticGuideOrSemanticGuides(ABC):
         if self.parse is not None:
             if idx.shape[self.length_axis] != self.parse.shape[self.length_axis] * 8:
                 raise RuntimeError("Index length does not match unpacked data length.")
-            parse = mask_select_packed(self.parse, idx, self.length_axis)
+            parse = slice_bitpacked_tensor(self.parse, mask=idx, bigchunks=True, axis=self.length_axis)
 
         characteristics = None
         if self.characteristics is not None:
             if idx.shape[self.length_axis] != self.characteristics.shape[self.length_axis] * 8:
                 raise RuntimeError("Index length does not match unpacked data length.")
-            characteristics = mask_select_packed(self.characteristics, idx, self.length_axis)
+            characteristics = slice_bitpacked_tensor(self.characteristics, mask=idx, bigchunks=True, axis=self.length_axis)
 
         return self.__class__(parse, entropy, characteristics)
 
