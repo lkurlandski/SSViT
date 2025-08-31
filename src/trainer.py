@@ -40,7 +40,13 @@ from torch import ByteTensor
 from torch import ShortTensor
 from torch import IntTensor
 from torch import LongTensor
+from torch import distributed as dist
+from torch.distributed import checkpoint as dist_checkpoint
+from torch.distributed.checkpoint.state_dict import get_model_state_dict
+from torch.distributed.checkpoint.state_dict import StateDictOptions
+from torch.distributed.tensor import DTensor
 from torch.nn import Module
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LRScheduler
@@ -49,6 +55,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.data import FOrHSamples
+
+
+def local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", 0))
 
 
 FTensor = Union[BFloat16Tensor | HalfTensor | FloatTensor | DoubleTensor]
@@ -194,6 +204,7 @@ class Trainer:
         optimizer: Optional[Optimizer] = None,
         scheduler: Optional[LRScheduler] = None,
         stopper: Optional[EarlyStopper] = None,
+        device: Optional[torch.device] = None,
     ) -> None:
         self.args = args
         self.model = model
@@ -203,14 +214,29 @@ class Trainer:
         self.optimizer = optimizer if optimizer is not None else AdamW(model.parameters())
         self.scheduler = scheduler if scheduler is not None else LambdaLR(optimizer, lambda _: 1.0)
         self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
+        self.device = device if device is not None else next(self.model.parameters()).device
         self.monitor = Monitor(device=self.device)
         self.log: list[Mapping[str, int | float]] = []
         self.best_epoch = -1
         self.best_metric = -float("inf") if args.lower_is_worse else float("inf")
 
-    @property
-    def device(self) -> torch.device:
-        return next(self.model.parameters()).device
+    def __repr__(self) -> str:
+        return str(self)
+
+    def __str__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(\n"
+            f"  args={self.args.__class__.__name__}(...),\n"
+            f"  model={self.model.__class__.__name__}(...),\n"
+            f"  tr_loader={self.tr_loader.__class__.__name__}(...),\n"
+            f"  vl_loader={self.vl_loader.__class__.__name__}(...),\n"
+            f"  loss_fn={self.loss_fn.__class__.__name__}(...),\n"
+            f"  optimizer={self.optimizer.__class__.__name__}(...),\n"
+            f"  scheduler={self.scheduler.__class__.__name__}(...),\n"
+            f"  stopper={self.stopper.__class__.__name__}(...),\n"
+            f"  device={self.device},\n"
+            f")"
+        )
 
     def __call__(self) -> Self:
         shutil.rmtree(self.args.outdir, ignore_errors=True)
@@ -332,7 +358,7 @@ class Trainer:
         """
         Send a batch of inputs forward through the model.
         """
-        return self.model.forward(batch.inputs, batch.characteristics)
+        return self.model(batch.inputs, batch.characteristics)
 
     def compute_loss(self, batch: FOrHSamples, outputs: FTensor) -> FTensor:
         """
@@ -393,7 +419,25 @@ class Trainer:
             self.best_metric = results[self.args.metric]
 
     def _update_save(self, results: Mapping[str, int | float]) -> None:
-        torch.save(self.model, self.args.outdir / f"model_{results['epoch']}.pth")
+        # TODO: figure out how to save and load properly (FSDP/DDP/GPU/CPU).
+        return
+        if local_rank() == 0:
+            state_dict = {
+                "model": self.model,
+                "optimizer": self.optimizer,
+                "scheduler": self.scheduler,
+            }
+            checkpoint_id = str(self.args.outdir / f"ckpt_{results['epoch']}")
+            print(f"[rank{dist.get_rank()}] Trainer::_update_save: saving to checkpoint.")
+            dist_checkpoint.save(state_dict=state_dict, checkpoint_id=checkpoint_id)
+
+        if dist.is_initialized():
+            print(f"[rank{dist.get_rank()}] Trainer::_update_save: synchronizing workers.")
+            if "nccl" in dist.get_backend():
+                dist.barrier(device_ids=[local_rank()])
+            else:
+                dist.barrier()
+
         checkpoints = sorted(self.args.outdir.glob("model_*.pth"), key=lambda p: int(p.stem.split("_")[1]))
         for checkpoint in checkpoints:
             e = int(checkpoint.stem.split("_")[1])

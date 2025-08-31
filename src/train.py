@@ -28,6 +28,10 @@ import lief
 import numpy as np
 import torch
 from torch import distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.fsdp import OffloadPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy
 from torch.nn import Embedding
 from torch.nn import CrossEntropyLoss
 from torch.nn import Module
@@ -69,6 +73,10 @@ from src.utils import get_optimal_num_worker_threads
 from src.utils import str_to_bool
 
 
+def local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", 0))
+
+
 class Architecture(Enum):
     MALCONV = "malconv"
     VIT     = "vit"
@@ -102,16 +110,22 @@ class MainArgs:
     vl_batch_size: int = 1
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
+    device: torch.device = torch.device("cpu")
     ddp: bool = False
     fsdp: bool = False
+    fsdp_offload: bool = True
 
     def __post_init__(self) -> None:
         if self.tr_batch_size == 1 or self.vl_batch_size == 1:
             raise NotImplementedError("Batch size of 1 is not supported right now. See https://docs.pytorch.org/docs/stable/data#working-with-collate-fn.")
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA device specified but not available.")
         if self.ddp and self.fsdp:
             raise ValueError("ddp and fsdp cannot both be True.")
-        if ("RANK" in os.environ or "WORLD_SIZE" in os.environ) and not (self.ddp or self.fsdp):
+        if "RANK" in os.environ and not (self.ddp or self.fsdp):
             raise ValueError("If running with torchrun, either --ddp or --fsdp must be set.")
+        if "RANK" not in os.environ and (self.ddp or self.fsdp):
+            raise ValueError("If --ddp or --fsdp is set, the script must be launched with torchrun.")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
@@ -257,6 +271,18 @@ class _FlatDataclassWrapper:
         for obj in object.__getattribute__(self, "_objs"):
             d.update({f.name: getattr(obj, f.name) for f in fields(obj)})
         return d
+
+
+class _MTArgs(MainArgs, TrainerArgs):  # type: ignore[misc]
+    """
+    This has gotten so stupid, but I just don't care. Any way, don't create one of these. Ever.
+    """
+
+    def __init__(self, *args: Any, **kwds: Any) -> None:
+        raise NotImplementedError()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {}
 
 
 def flatten_dataclasses(*objs: object) -> _FlatDataclassWrapper:
@@ -412,24 +438,20 @@ def main() -> None:
     namespace = parser.parse_args()
     margs = MainArgs.from_namespace(namespace)
     targs = TrainerArgs.from_namespace(namespace)
-    args = flatten_dataclasses(margs, targs)
+    args: _MTArgs = flatten_dataclasses(margs, targs)  # type: ignore[assignment]
     print(f"{args=}")
 
     seed_everything(args.seed)
 
-    if args.ddp:
-        dist.init_process_group("nccl")
-        RANK = dist.get_rank()
-        WORLD_SIZE = dist.get_world_size()
-        args.device = torch.device(RANK % WORLD_SIZE)
-    elif args.fsdp:
-        ...
-    else:
-        RANK = 0
-        WORLD_SIZE = 1
-    print(f"{WORLD_SIZE=} {RANK=} {args.device=}")
+    if args.ddp or args.fsdp:
+        # A CPU (GLOO) backend is needed to support certain features with CPU offloading.
+        backend = "cpu:gloo,cuda:nccl" if (args.fsdp and args.fsdp_offload) else "cuda:nccl"
+        dist.init_process_group(backend=backend)
+        torch.cuda.set_device(local_rank())
+        args.device = torch.device(local_rank())
+        print(f"Distrubted worker {dist.get_rank()} of {dist.get_world_size()} with local rank {local_rank()}.")
 
-    if RANK != 0:
+    if dist.get_rank() > 0:
         args.disable_tqdm = True
 
     preprocessor = Preprocessor(
@@ -442,15 +464,17 @@ def main() -> None:
 
     # Split the files between distributed workers.
     tr_files, vl_files, tr_labels, vl_labels = get_materials(args.tr_num_samples, args.vl_num_samples)
-    tr_files = tr_files[RANK::WORLD_SIZE]
-    vl_files = vl_files[RANK::WORLD_SIZE]
-    tr_labels = tr_labels[RANK::WORLD_SIZE]
-    vl_labels = vl_labels[RANK::WORLD_SIZE]
+    if dist.get_world_size() > 1:
+        tr_files = tr_files[dist.get_rank()::dist.get_world_size()]
+        vl_files = vl_files[dist.get_rank()::dist.get_world_size()]
+        tr_labels = tr_labels[dist.get_rank()::dist.get_world_size()]
+        vl_labels = vl_labels[dist.get_rank()::dist.get_world_size()]
 
     tr_dataset = BinaryDataset(tr_files, tr_labels, preprocessor)
     vl_dataset = BinaryDataset(vl_files, vl_labels, preprocessor)
 
-    model = get_model(args.arch, args.size, args.do_characteristics, args.level).to(args.device)
+    model = get_model(args.arch, args.size, args.do_characteristics, args.level)
+    model = model.to("cpu")
     print(f"{model=}")
     print(f"num_parameters={count_parameters(model, requires_grad=True)}")
 
@@ -461,7 +485,16 @@ def main() -> None:
     print(f"{min_lengths=}")
 
     if args.ddp:
+        model = model.to(args.device)
         model = DistributedDataParallel(model, find_unused_parameters=True, static_graph=True)
+    elif args.fsdp:
+        mesh = init_device_mesh("cuda", (dist.get_world_size(),))
+        mp_policy = MixedPrecisionPolicy(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, torch.float32)
+        offload_policy = CPUOffloadPolicy() if args.fsdp_offload else OffloadPolicy()
+        model.fully_shard(mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+        # model = model.to(args.device)
+    else:
+        model = model.to(args.device)
 
     collate_fn: CollateFn | CollateFnHierarchical
     if args.level == HierarchicalLevel.NONE:
@@ -505,7 +538,8 @@ def main() -> None:
 
     stopper: Optional[EarlyStopper] = None
 
-    trainer = Trainer(TrainerArgs.from_dict(args.to_dict()), model, tr_loader, vl_loader, loss_fn, optimizer, scheduler, stopper)
+    trainer = Trainer(TrainerArgs.from_dict(args.to_dict()), model, tr_loader, vl_loader, loss_fn, optimizer, scheduler, stopper, args.device)
+    print(f"{trainer=}")
 
     trainer = trainer()
 
