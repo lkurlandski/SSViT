@@ -61,6 +61,18 @@ def local_rank() -> int:
     return int(os.environ.get("LOCAL_RANK", 0))
 
 
+def rank() -> int:
+    if dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def world_size() -> int:
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
 FTensor = Union[BFloat16Tensor | HalfTensor | FloatTensor | DoubleTensor]
 ITensor = Union[CharTensor | ByteTensor | ShortTensor | IntTensor | LongTensor]
 

@@ -68,13 +68,12 @@ from src.data import GroupedLengthBatchSampler
 from src.trainer import Trainer
 from src.trainer import TrainerArgs
 from src.trainer import EarlyStopper
+from src.trainer import local_rank
+from src.trainer import rank
+from src.trainer import world_size
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
 from src.utils import str_to_bool
-
-
-def local_rank() -> int:
-    return int(os.environ.get("LOCAL_RANK", 0))
 
 
 class Architecture(Enum):
@@ -449,9 +448,9 @@ def main() -> None:
         dist.init_process_group(backend=backend)
         torch.cuda.set_device(local_rank())
         args.device = torch.device(local_rank())
-        print(f"Distrubted worker {dist.get_rank()} of {dist.get_world_size()} with local rank {local_rank()}.")
+        print(f"Distrubted worker {rank()} of {world_size()} with local rank {local_rank()}.")
 
-    if dist.get_rank() > 0:
+    if rank() > 0:
         args.disable_tqdm = True
 
     preprocessor = Preprocessor(
@@ -464,11 +463,11 @@ def main() -> None:
 
     # Split the files between distributed workers.
     tr_files, vl_files, tr_labels, vl_labels = get_materials(args.tr_num_samples, args.vl_num_samples)
-    if dist.get_world_size() > 1:
-        tr_files = tr_files[dist.get_rank()::dist.get_world_size()]
-        vl_files = vl_files[dist.get_rank()::dist.get_world_size()]
-        tr_labels = tr_labels[dist.get_rank()::dist.get_world_size()]
-        vl_labels = vl_labels[dist.get_rank()::dist.get_world_size()]
+    if world_size() > 1:
+        tr_files = tr_files[rank()::world_size()]
+        vl_files = vl_files[rank()::world_size()]
+        tr_labels = tr_labels[rank()::world_size()]
+        vl_labels = vl_labels[rank()::world_size()]
 
     tr_dataset = BinaryDataset(tr_files, tr_labels, preprocessor)
     vl_dataset = BinaryDataset(vl_files, vl_labels, preprocessor)
@@ -488,7 +487,7 @@ def main() -> None:
         model = model.to(args.device)
         model = DistributedDataParallel(model, find_unused_parameters=True, static_graph=True)
     elif args.fsdp:
-        mesh = init_device_mesh("cuda", (dist.get_world_size(),))
+        mesh = init_device_mesh("cuda", (world_size(),))
         mp_policy = MixedPrecisionPolicy(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, torch.float32)
         offload_policy = CPUOffloadPolicy() if args.fsdp_offload else OffloadPolicy()
         model.fully_shard(mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
