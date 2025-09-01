@@ -334,16 +334,7 @@ class TestBinaryDataset:
 
     def test_map_binary_dataset(self) -> None:
 
-        class PreprocessorMock(Preprocessor):
-
-            def __call__(self, file: Path, label: int) -> tuple[LongTensor, SemanticGuides, StructureMap]:
-                b = file.read_bytes()
-                inputs = torch.frombuffer(b, dtype=torch.uint8).to(torch.long)
-                guides = SemanticGuides(None, None, None)
-                structure = StructureMap(torch.full((len(b), 1), False), {0: HierarchicalStructureNone.ANY})
-                return FSample(file, file.stem, torch.tensor(label, dtype=torch.int32), inputs, guides, structure)
-
-        preprocessor = PreprocessorMock(False, False, False)
+        preprocessor = Preprocessor(False, False, False)
         with tempfile.TemporaryDirectory() as tmpdir:
             files, buffers = self.populate(Path(tmpdir))
             dataset = BinaryDataset(files, self.labels, preprocessor)
