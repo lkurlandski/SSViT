@@ -16,6 +16,7 @@ from torch import ShortTensor
 from torch import LongTensor
 
 from src.binanal import HierarchicalStructureNone
+from src.binanal import get_ranges_numpy
 from src.data import Name
 from src.data import FSample
 from src.data import FSamples
@@ -61,6 +62,20 @@ class TestSemanticGuider:
         assert bool(sample.characteristics is None) != do_characteristics
 
 
+def indicator_mask_to_ranges(mask: Tensor) -> list[list[tuple[int, int]]]:
+    """
+    Convert a boolean indicator mask to ranges.
+
+    Useful for transitioning between indicator-based and range-based StructureMaps.
+    """
+    ranges: list[list[tuple[int, int]]] = [[] for _ in range(mask.shape[1])]
+    for j in range(mask.shape[1]):
+        lo, hi = get_ranges_numpy(mask[:, j].numpy())
+        index = [(l, h) for l, h in zip(lo.tolist(), hi.tolist())]
+        ranges[j] = index
+    return ranges
+
+
 class TestCollateFn:
 
     @pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 5])
@@ -79,7 +94,10 @@ class TestCollateFn:
             label = torch.randint(0, 2, (1,), dtype=torch.long)[0]
             inputs = torch.randint(0, 256, (seq_length + i,), dtype=torch.uint8)
             guides = SemanticGuide(None, None, None)
-            structure = StructureMap(torch.full((seq_length + i, 1), True), {0: HierarchicalStructureNone.ANY})
+            structure = StructureMap(
+                indicator_mask_to_ranges(torch.full((seq_length + i, 1), True)),
+                {0: HierarchicalStructureNone.ANY},
+            )
             sample = FSample(file, name, label, inputs, guides, structure)
             samples.append(sample)
 
@@ -135,7 +153,10 @@ class TestCollateFn:
             if bitpack_in:
                 characteristics = packbits(characteristics, axis=0)
             guides = SemanticGuide(None, None, characteristics)
-            structure = StructureMap(torch.full((seq_length + i, 1), True), {0: HierarchicalStructureNone.ANY})
+            structure = StructureMap(
+                indicator_mask_to_ranges(torch.full((seq_length + i, 1), True)),
+                {0: HierarchicalStructureNone.ANY},
+            )
             sample = FSample(file, name, label, inputs, guides, structure)
             samples.append(sample)
 
@@ -199,7 +220,7 @@ class TestCollateFnHierarchical:
             inputs = torch.randint(0, 256, (seq_length + i,), dtype=torch.uint8)
             guides = SemanticGuide(None, None, None)
             structure = StructureMap(
-                torch.randint(0, 2, (seq_length + i, num_structures), dtype=torch.bool),
+                indicator_mask_to_ranges(torch.randint(0, 2, (seq_length + i, num_structures), dtype=torch.bool)),
                 {k: HierarchicalStructureNone.ANY for k in range(num_structures)}
             )
             sample = FSample(file, name, label, inputs, guides, structure)
@@ -260,7 +281,7 @@ class TestCollateFnHierarchical:
                 characteristics = packbits(characteristics, axis=0)
             guides = SemanticGuide(None, None, characteristics)
             structure = StructureMap(
-                torch.randint(0, 2, (seq_length + i, num_structures), dtype=torch.bool),
+                indicator_mask_to_ranges(torch.randint(0, 2, (seq_length + i, num_structures), dtype=torch.bool)),
                 {k: HierarchicalStructureNone.ANY for k in range(num_structures)}
             )
             sample = FSample(file, name, label, inputs, guides, structure)

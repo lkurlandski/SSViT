@@ -206,37 +206,48 @@ class _SemanticGuideOrSemanticGuides(ABC):
 
         return self
 
-    def select(self, idx: BoolTensor) -> Self:
-        check_tensor(idx, (None,), torch.bool)
+    def select(self, *, mask: Optional[BoolTensor] = None, idx: Optional[IntTensor] = None, ranges: Optional[list[tuple[int, int]]] = None) -> Self:
+        """
+        Select a subset of the data along the length axis.
 
-        entropy = None
-        if self.entropy is not None:
-            entropy = self.entropy[idx]
+        NOTE: if data is bitpacked, the selectors are assumed to correspond to the unpacked data.
+        """
+
+        def slice_normal_optional_tensor(t: Optional[Tensor]) -> Optional[Tensor]:
+            if t is None:
+                return None
+            if mask is not None:
+                return t[mask]
+            if idx is not None:
+                return t[idx]
+            if ranges is not None:
+                return torch.cat([t[lo:hi] for lo, hi in ranges], dim=self.length_axis)
+            raise RuntimeError("unreachable")
+
+        def slice_bitpacked_optional_tensor(t: Optional[Tensor]) -> Optional[Tensor]:
+            if t is None:
+                return None
+            return slice_bitpacked_tensor(t, mask=mask, idx=idx, ranges=ranges, bigchunks=True, axis=self.length_axis)
+
+
+        selectors = [mask is not None, idx is not None, ranges is not None]
+        if sum(selectors) != 1:
+            raise ValueError("exactly one of mask, idx, or ranges must be provided")
+
+        entropy = slice_normal_optional_tensor(self.entropy)
 
         if not self.is_bitpacked:
-            parse = None
-            if self.parse is not None:
-                parse = self.parse[idx]
-            characteristics = None
-            if self.characteristics is not None:
-                characteristics = self.characteristics[idx]
+            parse = slice_normal_optional_tensor(self.parse)
+            characteristics = slice_normal_optional_tensor(self.characteristics)
             return self.__class__(parse, entropy, characteristics)
 
-        # For bitpacked data, we assume idx corresponds to the unpacked data.
-        if len(idx) % 8 != 0:
-            idx = torch.nn.functional.pad(idx, (0, 8 - (idx.size(0) % 8)), "constant", False)
+        # The bitpacked data may be padded to a multiple of 8, so we may need to pad the mask.
+        # Entropy has already been sliced above, so we need not worry about a length mismatch.
+        if mask is not None and len(mask) % 8 != 0:
+            mask = torch.nn.functional.pad(mask, (0, 8 - (mask.size(0) % 8)), "constant", False)
 
-        parse = None
-        if self.parse is not None:
-            if idx.shape[self.length_axis] != self.parse.shape[self.length_axis] * 8:
-                raise RuntimeError("Index length does not match unpacked data length.")
-            parse = slice_bitpacked_tensor(self.parse, mask=idx, bigchunks=True, axis=self.length_axis)
-
-        characteristics = None
-        if self.characteristics is not None:
-            if idx.shape[self.length_axis] != self.characteristics.shape[self.length_axis] * 8:
-                raise RuntimeError("Index length does not match unpacked data length.")
-            characteristics = slice_bitpacked_tensor(self.characteristics, mask=idx, bigchunks=True, axis=self.length_axis)
+        parse = slice_bitpacked_optional_tensor(self.parse)
+        characteristics = slice_bitpacked_optional_tensor(self.characteristics)
 
         return self.__class__(parse, entropy, characteristics)
 
@@ -320,87 +331,106 @@ class SemanticGuider:
 
 class _StructureMapOrStructureMaps(ABC):
 
-    # NOTE: compression/decompression with bitpacking will implicitly zero pad tensors to a multiple of 8.
-    # NOTE: the boolean tensors are used only for slicing, so its not advisable to compress, pin, or move them.
-
-    index: BoolTensor | CharTensor
+    index: list[list[tuple[int, int]]] | list[list[list[tuple[int, int]]]]
     lexicon: Mapping[int, HierarchicalStructure]
 
-    def __init__(self, index: BoolTensor | CharTensor, lexicon: Mapping[int, HierarchicalStructure]) -> None:
+    def __init__(self, index: list[list[tuple[int, int]]] | list[list[list[tuple[int, int]]]], lexicon: Mapping[int, HierarchicalStructure]) -> None:
         self.index = index
         self.lexicon = lexicon
         self.verify_inputs()
 
-    @property
-    @abstractmethod
-    def length_axis(self) -> int:
-        ...
-
     @abstractmethod
     def verify_inputs(self) -> None:
+        """Verifies that index and lexicon are well-formed and compatible."""
         ...
 
-    @property
-    def is_cuda(self) -> bool:
-        return self.index.is_cuda  # type: ignore[no-any-return]
-
-    def record_stream(self, s: torch.cuda.Stream) -> None:
-        self.index.record_stream(s)
+    @abstractmethod
+    def trim(self, length: Optional[int]) -> Self:
+        """Returns a copy excluding regions outside of length."""
+        ...
 
     def clone(self) -> Self:
-        self.index = self.index.clone()
-        self.lexicon = deepcopy(self.lexicon)
-        return self
-
-    def to(self, device: torch.device, non_blocking: bool = False) -> Self:
-        self.index = self.index.to(device, non_blocking=non_blocking)
-        return self
-
-    def pin_memory(self) -> Self:
-        self.index = self.index.pin_memory()
-        return self
-
-    def compress(self) -> Self:
-        self.index = packbits(self.index, self.length_axis)
-        return self
-
-    def decompress(self) -> Self:
-        self.index = unpackbits(self.index, self.length_axis)
-        return self
-
-    def trim(self, length: Optional[int]) -> Self:
-        if length is None:
-            return self
-        length_ = length
-        if self.index.dtype == torch.uint8:
-            length_ = math.ceil(length / 8)
-        slice_ = [slice(length_) if i == self.length_axis else slice(None) for i in range(self.index.ndim)]
-        self.index = self.index[tuple(slice_)]
-        return self
+        """Return a new, deeply copied instance."""
+        index = deepcopy(self.index)
+        lexicon = deepcopy(self.lexicon)
+        return self.__class__(index, lexicon)
 
 
 class StructureMap(_StructureMapOrStructureMaps):
 
-    @property
-    def length_axis(self) -> int:
-        return 0
+    index: list[list[tuple[int, int]]]  # [STRUCTURE][REGION][LO, HI]
+
+    @staticmethod
+    def verify_index(index: list[list[tuple[int, int]]]) -> bool:
+        if not isinstance(index, list):
+            return False
+        if len(index) > 0:
+            if not isinstance(index[0], list):
+                return False
+            if len(index[0]) > 0:
+                if not isinstance(index[0][0], tuple):
+                    return False
+                if len(index[0][0]) != 2:
+                    return False
+                if not all(isinstance(x, int) for x in index[0][0]):
+                    return False
+        return True
+
+    @staticmethod
+    def verify_lexicon(lexicon: Mapping[int, HierarchicalStructure]) -> bool:
+        if not isinstance(lexicon, Mapping):
+            return False
+        if len(lexicon) > 0:
+            if not all(isinstance(k, int) for k in lexicon.keys()):
+                return False
+            if not all(isinstance(v, HierarchicalStructure) for v in lexicon.values()):
+                return False
+        return True
 
     def verify_inputs(self) -> None:
-        check_tensor(self.index, (None, None), (torch.bool, torch.uint8))
-        if self.index.shape[1] != len(list(self.lexicon.keys())):
-            raise ValueError("StructureMap index does not match lexicon keys.")
+        if not StructureMap.verify_index(self.index):
+            raise TypeError(f"StructureMap index must be list[list[tuple[int, int]]], got {type(self.index)}")
+        if not StructureMap.verify_lexicon(self.lexicon):
+            raise TypeError(f"StructureMap lexicon must be Mapping[int, HierarchicalStructure], got {type(self.lexicon)}")
+        if len(self.index) != len(self.lexicon):
+            raise ValueError(f"StructureMap index and lexicon must have the same length. Got {len(self.index)} and {len(self.lexicon)}.")
+
+    @staticmethod
+    def trim_index(index: list[list[tuple[int, int]]], length: int) -> list[list[tuple[int, int]]]:
+        new: list[list[tuple[int, int]]] = []
+        for i in range(len(index)):
+            new.append([])
+            for j in range(len(index[i])):
+                lo, hi = index[i][j]
+                if lo >= length:
+                    continue
+                if hi > length:
+                    hi = length
+                if lo < hi:
+                    new[i].append((lo, hi))
+        return new
+
+    def trim(self, length: Optional[int]) -> Self:
+        if length is None:
+            return self.clone()
+
+        index = StructureMap.trim_index(self.index, length)
+        lexicon = deepcopy(self.lexicon)
+
+        return self.__class__(index, lexicon)
 
 
 class StructureMaps(_StructureMapOrStructureMaps):
 
-    @property
-    def length_axis(self) -> int:
-        return 1
+    index: list[list[list[tuple[int, int]]]]  # [SAMPLE][STRUCTURE][REGION][LO, HI]
 
     def verify_inputs(self) -> None:
-        check_tensor(self.index, (None, None, None), (torch.bool, torch.uint8))
-        if self.index.shape[2] != len(list(self.lexicon.keys())):
-            raise ValueError("BatchedStructureMap index does not match lexicon keys.")
+        if not isinstance(self.index, list) or (len(self.index) > 0 and not StructureMap.verify_index(self.index[0])):
+            raise TypeError(f"StructureMaps index must be list[list[list[tuple[int, int]]]], got {type(self.index)}")
+        if not StructureMap.verify_lexicon(self.lexicon):
+            raise TypeError(f"StructureMaps lexicon must be Mapping[int, HierarchicalStructure], got {type(self.lexicon)}")
+        if len(self.index) > 0 and len(self.index[0]) != len(self.lexicon):
+            raise ValueError(f"StructureMaps index and lexicon must have the same length. Got {len(self.index[0])} and {len(self.lexicon)}.")
 
     @classmethod
     def from_singles(cls, maps: Sequence[StructureMap], pin_memory: bool = False, min_length: int = 0) -> _StructureMapOrStructureMaps:
@@ -410,10 +440,17 @@ class StructureMaps(_StructureMapOrStructureMaps):
         for m in maps[1:]:
             if m.lexicon != lexicon:
                 raise ValueError("All StructureMaps must have the same lexicon to be batched.")
-        padding_value = False if maps[0].index.dtype == torch.bool else 0.0
-        pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if maps[0].index.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
-        index = pad_sequence([m.index for m in maps], True, padding_value, "right", pin_memory, pad_to_multiple_of, min_length)
+        index = [m.index for m in maps]
         return cls(index, lexicon)
+
+    def trim(self, length: Optional[int]) -> Self:
+        if length is None:
+            return self.clone()
+
+        index = [StructureMap.trim_index(index_, length) for index_ in self.index]
+        lexicon = deepcopy(self.lexicon)
+
+        return self.__class__(index, lexicon)
 
 
 class StructurePartitioner:
@@ -427,7 +464,7 @@ class StructurePartitioner:
     def __call__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> StructureMap:
         if self.level == HierarchicalLevel.NONE:
             size = _get_size_of_liefparse(data) if size is None else size
-            index = torch.full((size, 1), dtype=bool, fill_value=True)
+            index = [[(0, size)]]
             lexicon = {0: HierarchicalStructureNone.ANY}
             return StructureMap(index, lexicon)
 
@@ -447,12 +484,10 @@ class StructurePartitioner:
         else:
             raise TypeError(f"Unknown HierarchicalLevel: {self.level}. Expected one of {list(HierarchicalLevel)}.")
 
-        index = torch.full((parser.size, len(structures)), dtype=bool, fill_value=False)
+        index = [[] for _ in structures]
         lexicon = {}
         for i, s in enumerate(structures):
-            bounds = parser(s)
-            for l, u in bounds:
-                index[l:u, i] = True
+            index[i] = parser(s)
             lexicon[i] = s
         return StructureMap(index, lexicon)
 
@@ -464,10 +499,6 @@ class _FSampleOrSamples(ABC):
     inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
     guides: _SemanticGuideOrSemanticGuides
     structure: _StructureMapOrStructureMaps
-
-    # NOTE: the _StructureMapOrStructureMaps does not need to be involved in GPU operations.
-    # TODO: some of this functionality is redundant or unnecessary, since the original design for the
-        # hierarchical pipeline did not work well and we had to implement the _HSampleOrSamples class.
 
     def __init__(
         self,
@@ -511,11 +542,11 @@ class _FSampleOrSamples(ABC):
 
     @property
     def is_cuda(self) -> bool:
-        if self.label.is_cuda and self.inputs.is_cuda and self.guides.is_cuda and not self.structure.is_cuda:
+        if self.label.is_cuda and self.inputs.is_cuda and self.guides.is_cuda:
             return True
-        if not self.label.is_cuda and not self.inputs.is_cuda and not self.guides.is_cuda and not self.structure.is_cuda:
+        if not self.label.is_cuda and not self.inputs.is_cuda and not self.guides.is_cuda:
             return False
-        raise RuntimeError(f"Unexpected tensor device state: {self.label.is_cuda=}, {self.inputs.is_cuda=}, {self.guides.is_cuda=}, {self.structure.is_cuda=}")
+        raise RuntimeError(f"Unexpected tensor device state: {self.label.is_cuda=}, {self.inputs.is_cuda=}, {self.guides.is_cuda=}")
 
     def record_stream(self, s: torch.cuda.Stream) -> None:
         self.label.record_stream(s)
@@ -889,9 +920,9 @@ class CollateFnHierarchical:
             xs = []
             gs = []
             for j in range(len(batch)):
-                idx = batch[j].structure.index[:, i]
-                x_i_j = batch[j].inputs[idx]
-                g_i_j = batch[j].guides.select(idx)
+                ranges = batch[j].structure.index[i]
+                x_i_j = torch.cat([batch[j].inputs[lo:hi] for lo, hi in ranges] + [torch.tensor([], dtype=batch[j].inputs.dtype)])
+                g_i_j = batch[j].guides.select(ranges=ranges)
                 xs.append(x_i_j)
                 gs.append(g_i_j.compress() if self.bitpack else g_i_j)
             xs = CollateFn.get_padded_inputs(xs, self.min_lengths[i], self.pin_memory)
