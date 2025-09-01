@@ -64,7 +64,7 @@ class TestPatchPEFile:
         assert new_machine == machine
         assert new_subsystem == org_subsystem
         assert new != org
-        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))
+        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))  # type: ignore[no-untyped-call]
         # At most two bytes should differ
         assert np.sum(equal) >= len(equal) - 2, f"{np.sum(equal)} {len(equal)}"
 
@@ -84,7 +84,7 @@ class TestPatchPEFile:
         assert new_machine == org_machine
         assert new_subsystem == subsystem
         assert new != org
-        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))
+        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))  # type: ignore[no-untyped-call]
         # At most one byte should differ
         assert np.sum(equal) >= len(equal) - 1, f"{np.sum(equal)} {len(equal)}"
 
@@ -108,7 +108,7 @@ class TestPatchPEFile:
         assert new_machine == machine
         assert new_subsystem == subsystem
         assert new != org
-        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))
+        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))  # type: ignore[no-untyped-call]
         # At most three bytes should differ
         assert np.sum(equal) >= len(equal) - 3, f"{np.sum(equal)} {len(equal)}"
 
@@ -151,7 +151,7 @@ class TestCharacteristicGuider:
         assert x.ndim == 2
         assert x.shape[0] == os.path.getsize(file)
         assert x.shape[1] == len(CharacteristicGuider.CHARACTERISTICS)
-        assert x.dtype == np.bool_
+        assert np.issubdtype(x.dtype, np.bool_)
 
     @pytest.mark.parametrize("file", FILES)
     @pytest.mark.parametrize("input_type", [str, Path, bytes])
@@ -161,7 +161,7 @@ class TestCharacteristicGuider:
         assert x.ndim == 2
         assert x.shape[0] == math.ceil(os.path.getsize(file) / 8)
         assert x.shape[1] == len(CharacteristicGuider.CHARACTERISTICS)
-        assert x.dtype == np.uint8
+        assert np.issubdtype(x.dtype, np.uint8)
 
     @pytest.mark.parametrize("file", FILES)
     def test_equivalence(self, file: Path, input_type: type[str | Path | bytes] = str) -> None:
