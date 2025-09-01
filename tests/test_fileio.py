@@ -21,20 +21,16 @@ class TestReadFile:
     def get_random_bytes(self, size: int) -> bytes:
         return bytes([i % 256 for i in range(size)])
 
-    def _test_read_file(self, func: Callable[[bytes, Optional[int]], bytes]):
-        with tempfile.NamedTemporaryFile(delete=False, delete_on_close=False) as fp:
+    @pytest.mark.parametrize("func", [read_file, read_file_asynch])
+    def test_read_file(self, func: Callable) -> None:  # type: ignore[type-arg]
+        with tempfile.NamedTemporaryFile() as fp:
             buffer = self.get_random_bytes(1024)
             Path(fp.name).write_bytes(buffer)
             assert func(fp.name) == buffer
             assert func(fp.name, max_length=512) == buffer[:512]
 
-    def test_read_file(self):
-        self._test_read_file(read_file)
-
-    def test_read_file_asynch(self):
-        self._test_read_file(read_file_asynch)
-
-    def _test_read_files(self, func: Callable[[list[PathLike], Optional[int]], list[bytes]]):
+    @pytest.mark.parametrize("func", [read_files, read_files_asynch])
+    def test_read_files(self, func: Callable) -> None:  # type: ignore[type-arg]
         with tempfile.NamedTemporaryFile() as fp1, tempfile.NamedTemporaryFile() as fp2:
             buffer1 = self.get_random_bytes(1024)
             buffer2 = self.get_random_bytes(2048)
@@ -52,13 +48,8 @@ class TestReadFile:
             assert data[1] == buffer2[:512]
             assert len(data) == 2
 
-    def test_read_files(self):
-        self._test_read_files(read_files)
-
-    def test_read_files_asynch(self):
-        self._test_read_files(read_files_asynch)
-
-    def _test_read_files_lazy(self, func: Callable[[Iterable[PathLike], Optional[int]], Generator[bytes, None, None]]):
+    @pytest.mark.parametrize("func", [read_files_lazy, read_files_asynch_lazy])
+    def _test_read_files_lazy(self, func: Callable) -> None:  # type: ignore[type-arg]
         with tempfile.NamedTemporaryFile() as fp1, tempfile.NamedTemporaryFile() as fp2:
             buffer1 = self.get_random_bytes(1024)
             buffer2 = self.get_random_bytes(2048)
@@ -80,9 +71,3 @@ class TestReadFile:
             assert data[0] == buffer1[:512]
             assert data[1] == buffer2[:512]
             assert len(data) == 2
-
-    def test_read_files_lazy(self):
-        self._test_read_files_lazy(read_files_lazy)
-
-    def test_read_files_asynch_lazy(self):
-        self._test_read_files_lazy(read_files_asynch_lazy)
