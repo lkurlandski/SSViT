@@ -202,17 +202,17 @@ class SinusoidalPositionalEncoding(nn.Module):  # type: ignore[misc]
 
     inv_freq: Tensor
 
-    def __init__(self, embedding_dim: int):
+    def __init__(self, embedding_dim: int, fp32: bool = False) -> None:
         super().__init__()
 
         if embedding_dim % 2 != 0 or embedding_dim <= 0:
             raise ValueError(f"The embedding dimension must a positive be even number. Got {embedding_dim} instead.")
 
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, embedding_dim, 2).float() / embedding_dim))
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, embedding_dim, 2, dtype=torch.float32) / embedding_dim))
         self.register_buffer("inv_freq", inv_freq)
-        self.register_buffer("cached_penc", None, persistent=False)
 
         self.embedding_dim = embedding_dim
+        self.fp32 = fp32
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -224,12 +224,16 @@ class SinusoidalPositionalEncoding(nn.Module):  # type: ignore[misc]
         """
         check_tensor(x, (None, None, self.embedding_dim), FLOATS)
 
+        if x.dtype != self.inv_freq.dtype and not self.fp32:
+            self.inv_freq = self.inv_freq.to(x.dtype)
+
         pos = torch.arange(x.shape[1], device=x.device, dtype=self.inv_freq.dtype)  # (T,)
         sin_inp = torch.einsum("i,j->ij", pos, self.inv_freq)                       # (T, E/2)
 
         p = torch.stack((sin_inp.sin(), sin_inp.cos()), dim=-1)                     # (T, E/2, 2)
         p = p.flatten(-2, -1)                                                       # (T, E)
         p = p.repeat(x.shape[0], 1, 1)                                              # (B, T, E)
+        p = p.to(x.dtype)
 
         z = p + x
 
@@ -423,8 +427,8 @@ class ViT(nn.Module):  # type: ignore[misc]
         return z
 
     def fully_shard(self, **kwds: Any) -> None:
-        for i in range(0, self.transformer.num_layers, 2):
-            fully_shard(self.transformer.layers[i:i+1], **kwds)
+        for i in range(0, self.transformer.num_layers):
+            fully_shard(self.transformer.layers[i], **kwds)
         fully_shard(self, **kwds)
 
 # -------------------------------------------------------------------------------- #
