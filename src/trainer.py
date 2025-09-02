@@ -67,6 +67,14 @@ def rank() -> int:
     return 0
 
 
+def local_world_size() -> int:
+    if dist.is_initialized():
+        if "LOCAL_WORLD_SIZE" in os.environ:
+            return int(os.environ["LOCAL_WORLD_SIZE"])
+        return int(torch.cuda.device_count())
+    return 1
+
+
 def world_size() -> int:
     if dist.is_initialized():
         return int(dist.get_world_size())

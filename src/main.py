@@ -68,6 +68,7 @@ from src.trainer import TrainerArgs
 from src.trainer import EarlyStopper
 from src.trainer import local_rank
 from src.trainer import rank
+from src.trainer import local_world_size
 from src.trainer import world_size
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
@@ -205,12 +206,11 @@ def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int]) -> CollateF
     return CollateFnHierarchical(False, False, len(LEVEL_STRUCTURE_MAP[level]), min_lengths)
 
 
-# FIXME: account for multiple GPUs.
 def worker_init_fn(worker_id: int) -> None:
     info = torch.utils.data.get_worker_info()
     lief.logging.set_level(lief.logging.LEVEL.OFF)
     org_num_threads = torch.get_num_threads()
-    new_num_threads = get_optimal_num_worker_threads(info.num_workers)
+    new_num_threads = get_optimal_num_worker_threads(info.num_workers, ngpu=local_world_size())
     torch.set_num_threads(new_num_threads)
     print(f"Worker {worker_id} of {info.num_workers} using {org_num_threads} --> {torch.get_num_threads()} threads.")
 

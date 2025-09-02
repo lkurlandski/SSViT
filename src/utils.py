@@ -44,24 +44,30 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def get_optimal_num_workers(ncpu: int = psutil.cpu_count(logical=False), ngpu: int = torch.cuda.device_count()) -> int:
-    # TODO: its unclear how the CPU check will behave with SLURM and torchrun.
+def num_available_cpus(logical: bool = False) -> int:
+    if "SLURM_CPUS_PER_TASK" in os.environ:
+        raise NotImplementedError("num_available_cpus does not yet support SLURM.")
+    return int(psutil.cpu_count(logical=False))
+
+
+def get_optimal_num_workers(ncpu: int = num_available_cpus(), ngpu: int = 1) -> int:
+    ngpu = max(1, ngpu)
     if ncpu <= 0:
         raise RuntimeError(f"Number of CPU cores ({ncpu}) must be greater than 0.")
     if ngpu > ncpu:
         raise RuntimeError(f"Number of GPUs ({ngpu}) exceeds number of CPU cores ({ncpu}).")
-    return max(0, ncpu // max(1, ngpu) - 1)
+    return max(0, ncpu // ngpu - 1)
 
 
-def get_optimal_num_worker_threads(num_workers: int = 0, ncpu: int = psutil.cpu_count(logical=False)) -> int:
-    # TODO: its unclear how the CPU check will behave with SLURM and torchrun.
+def get_optimal_num_worker_threads(num_workers: int = 0, ncpu: int = num_available_cpus(), ngpu: int = 1) -> int:
+    ngpu = max(1, ngpu)
     if ncpu <= 0:
         raise RuntimeError(f"Number of CPU cores ({ncpu}) must be greater than 0.")
-    if num_workers - 1 > ncpu:
-        raise RuntimeError(f"Number of worker processes ({num_workers} + 1) exceeds number of CPU cores ({ncpu}).")
+    if num_workers + 1 > ncpu // ngpu:
+        raise RuntimeError(f"Number of worker processes ({num_workers} + 1) exceeds number of CPU cores ({ncpu}) in a local world of size {ngpu}.")
     if num_workers == 0:
-        return ncpu
-    return max(1, (ncpu - 1) // num_workers)
+        return ncpu // ngpu
+    return max(1, (ncpu // ngpu - 1) // num_workers)
 
 
 class TensorError(ValueError):
