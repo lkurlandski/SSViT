@@ -221,7 +221,9 @@ class _SemanticGuideOrSemanticGuides(ABC):
             if idx is not None:
                 return t[idx]
             if ranges is not None:
-                return torch.cat([t[lo:hi] for lo, hi in ranges], dim=self.length_axis)
+                if len(ranges) > 0:
+                    return torch.cat([t[lo:hi] for lo, hi in ranges], dim=self.length_axis)
+                return t.new_empty(t.shape[: self.length_axis] + (0,) + t.shape[self.length_axis + 1 :])
             raise RuntimeError("unreachable")
 
         def slice_bitpacked_optional_tensor(t: Optional[Tensor]) -> Optional[Tensor]:
