@@ -341,7 +341,7 @@ def main() -> None:
     stopper: Optional[EarlyStopper] = None
     print(f"{stopper=}")
 
-    trainer = Trainer(TrainerArgs.from_dict(args.to_dict()), model, tr_loader, vl_loader, loss_fn, optimizer, scheduler, stopper, args.device)
+    trainer = Trainer(TrainerArgs.from_dict(args.to_dict()), model, tr_streamer, vl_streamer, loss_fn, optimizer, scheduler, stopper, args.device)
     print(f"{trainer=}")
 
     trainer = trainer()
