@@ -75,6 +75,7 @@ class MainArgs:
         if "RANK" not in os.environ and (self.ddp or self.fsdp):
             raise ValueError("If --ddp or --fsdp is set, the script must be launched with torchrun.")
         self.pin_memory = self.pin_memory and self.device.type == "cuda"
+        self.num_streams = 0 if self.device.type == "cpu" else self.num_streams
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
