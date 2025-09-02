@@ -2,26 +2,15 @@
 Train and validate models.
 """
 
-from argparse import ArgumentParser
-from argparse import Namespace
+from collections.abc import Sequence
 from collections import Counter
-from dataclasses import dataclass
-from dataclasses import fields
-from dataclasses import Field
-from enum import Enum
 import math
 import os
 from pathlib import Path
-from pprint import pprint
 import sys
 import time
-from typing import Any
+from typing import Callable
 from typing import Optional
-from typing import Self
-from typing import Union
-from typing import get_type_hints
-from typing import get_args
-from typing import get_origin
 import warnings
 
 import lief
@@ -65,6 +54,15 @@ from src.data import CollateFnHierarchical
 from src.data import CUDAPrefetcher
 from src.data import Preprocessor
 from src.data import GroupedLengthBatchSampler
+from src.data import FSample
+from src.data import FSamples
+from src.data import HSamples
+from src.helpers import create_argument_parser_from_dataclass
+from src.helpers import flatten_dataclasses
+from src.helpers import _MTArgs
+from src.helpers import Architecture
+from src.helpers import ModelSize
+from src.helpers import MainArgs
 from src.trainer import Trainer
 from src.trainer import TrainerArgs
 from src.trainer import EarlyStopper
@@ -73,232 +71,15 @@ from src.trainer import rank
 from src.trainer import world_size
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
-from src.utils import str_to_bool
+from src.utils import count_parameters
 
 
-class Architecture(Enum):
-    MALCONV = "malconv"
-    VIT     = "vit"
-
-
-class ModelSize(Enum):
-    SM = "sm"
-    MD = "md"
-    LG = "lg"
-
-
-# TODO: figure out how to elegantly combine different dataclasses into a new class.
-# TODO: write an ArgumentParser that takes a dataclass and generates arguments.
-@dataclass
-class MainArgs:
-    arch: Architecture = Architecture.MALCONV
-    size: ModelSize = ModelSize.SM
-    seed: int = 0
-    do_parser: bool = False
-    do_entropy: bool = False
-    do_characteristics: bool = False
-    level: HierarchicalLevel = HierarchicalLevel.NONE
-    tr_num_samples: Optional[int] = None
-    vl_num_samples: Optional[int] = None
-    max_length: Optional[int] = None
-    num_streams: int = 0
-    num_workers: int = 0
-    pin_memory: bool = False
-    prefetch_factor: int = 1
-    tr_batch_size: int = 1
-    vl_batch_size: int = 1
-    learning_rate: float = 1e-3
-    weight_decay: float = 1e-5
-    device: torch.device = torch.device("cpu")
-    ddp: bool = False
-    fsdp: bool = False
-    fsdp_offload: bool = True
-
-    def __post_init__(self) -> None:
-        if self.tr_batch_size == 1 or self.vl_batch_size == 1:
-            raise NotImplementedError("Batch size of 1 is not supported right now. See https://docs.pytorch.org/docs/stable/data#working-with-collate-fn.")
-        if self.device.type == "cuda" and not torch.cuda.is_available():
-            raise ValueError("CUDA device specified but not available.")
-        if self.ddp and self.fsdp:
-            raise ValueError("ddp and fsdp cannot both be True.")
-        if "RANK" in os.environ and not (self.ddp or self.fsdp):
-            raise ValueError("If running with torchrun, either --ddp or --fsdp must be set.")
-        if "RANK" not in os.environ and (self.ddp or self.fsdp):
-            raise ValueError("If --ddp or --fsdp is set, the script must be launched with torchrun.")
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> Self:
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
-
-    @classmethod
-    def from_namespace(cls, namespace: Namespace) -> Self:
-        return cls.from_dict(vars(namespace))
-
-
-def create_argument_parser_from_dataclass(*objs: type) -> ArgumentParser:
-    """
-    Creates an ArgumentParser from dataclass(es) with unique field names.
-    """
-
-    alltypes: dict[str, Any] = {}
-    allfields: list[Field[Any]] = []
-    allnames: set[str] = set()
-    for obj in objs:
-        fields_ = fields(obj)
-        names = [f.name for f in fields_]
-        if any(n in allnames for n in names):
-            raise ValueError(f"Duplicate field names found: {names} in {allnames}.")
-        allnames.update(names)
-        allfields.extend(list(fields_))
-        # NOTE: this does not correctly extract the types from foreign modules; they are just strings.
-        hints = get_type_hints(obj, globalns=vars(sys.modules[obj.__module__]), include_extras=True)
-        alltypes.update(hints)
-
-    def _unwrap_optional(t: Any) -> tuple[Any, bool]:
-        if get_origin(t) is Union:
-            args = [a for a in get_args(t) if a is not type(None)]
-            if len(args) == 1:
-                return args[0], True
-        return t, False
-
-    parser = ArgumentParser()
-    for f in allfields:
-        # print(f"Adding argument {f.name} of type {f.type} {type(f.type)=} with default {f.default}.")
-        argname = f"--{f.name}"
-        if f.type == bool:
-            parser.add_argument(argname, type=str_to_bool, default=f.default)
-        elif f.type == Optional[bool]:
-            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else str_to_bool(x), default=f.default)
-        elif f.type == Optional[int]:
-            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else int(x), default=f.default)
-        elif f.type == Optional[float]:
-            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else float(x), default=f.default)
-        elif f.type == Optional[str]:
-            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else str(x), default=f.default)
-        elif isinstance(f.type, type) and issubclass(f.type, Enum):
-            parser.add_argument(argname, type=f.type, choices=list(f.type), default=f.default)
-        elif isinstance(f.type, type):
-            parser.add_argument(argname, type=f.type, default=f.default)
-        elif isinstance(f.type, str):
-            type_, _ = _unwrap_optional(alltypes[f.name])
-            parser.add_argument(argname, type=type_, default=f.default)
-        else:
-            raise ValueError(f"Cannot determine type of field {f}.")
-
-    return parser
-
-
-class _FlatDataclassWrapper:
-    """
-    Not intended to be used directly. Use `flatten_dataclasses` instead.
-    """
-
-    def __init__(self, *objs: type) -> None:
-        # Avoid recursion in __setattr__.
-        object.__setattr__(self, "_objs", objs)
-        # Ensure all field names are unique.
-        allnames: set[str] = set()
-        for obj in objs:
-            names = [f.name for f in fields(obj)]
-            if any(n in allnames for n in names):
-                raise ValueError(f"Duplicate field names found: {names} in {allnames}.")
-            allnames.update(names)
-
-    def __getattribute__(self, name: str) -> Any:
-        # Internals
-        if name.startswith("_"):
-            return object.__getattribute__(self, name)
-        # Dataclasses
-        objs = object.__getattribute__(self, "_objs")
-        for obj in objs:
-            if hasattr(obj, name):
-                return getattr(obj, name)
-        # Other
-        return object.__getattribute__(self, name)
-
-    def __getattr__(self, name: str) -> Any:
-        raise AttributeError(f"Could not find {name!r} in any wrapped dataclass.")
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        # Internals
-        if name.startswith("_"):
-            object.__setattr__(self, name, value)
-            return
-        # Dataclasses
-        for obj in object.__getattribute__(self, "_objs"):
-            if hasattr(obj, name):
-                setattr(obj, name, value)
-                return
-        # Other
-        object.__setattr__(self, name, value)
-
-    def __delattr__(self, name: str) -> None:
-        # Internals
-        if name.startswith("_"):
-            object.__delattr__(self, name)
-            return
-        # Dataclasses
-        for obj in object.__getattribute__(self, "_objs"):
-            if hasattr(obj, name):
-                delattr(obj, name)
-                return
-        # Other
-        object.__delattr__(self, name)
-
-    def __dir__(self) -> list[str]:
-        names = set(super().__dir__())
-        for obj in object.__getattribute__(self, "_objs"):
-            names.update(f.name for f in fields(obj))
-        return sorted(names)
-
-    def __repr__(self) -> str:
-        return str(self)
-
-    def __str__(self) -> str:
-        parts = []
-        parts.append(f"{self.__class__.__name__}(")
-        for obj in object.__getattribute__(self, "_objs"):
-            parts.append(f"  {obj.__class__.__name__}(")
-            for f in fields(obj):
-                parts.append(f"    {f.name}={getattr(obj, f.name)!r},")
-            parts.append("  ),")
-        parts.append(")")
-        return "\n".join(parts)
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        for obj in object.__getattribute__(self, "_objs"):
-            d.update({f.name: getattr(obj, f.name) for f in fields(obj)})
-        return d
-
-
-class _MTArgs(MainArgs, TrainerArgs):  # type: ignore[misc]
-    """
-    This has gotten so stupid, but I just don't care. Any way, don't create one of these. Ever.
-    """
-
-    def __init__(self, *args: Any, **kwds: Any) -> None:
-        raise NotImplementedError()
-
-    def to_dict(self) -> dict[str, Any]:
-        return {}
-
-
-def flatten_dataclasses(*objs: object) -> _FlatDataclassWrapper:
-    """
-    Provides a mypy compatible flattened view over multiple dataclasses with unique field names.
-    """
-    bases: list[type] = [_FlatDataclassWrapper]
-    for obj in objs:
-        if not hasattr(obj, "__dataclass_fields__"):
-            raise TypeError(f"{obj} is not a dataclass.")
-        bases.append(obj.__class__)
-    Args = type("Args", tuple(bases), {})
-    args: _FlatDataclassWrapper = Args(*objs)
-    return args
-
-
-def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool, level: HierarchicalLevel) -> Classifier | HierarchicalMalConvClassifier | HierarchicalViTClassifier:
+def get_model(
+    arch: Architecture,
+    size: ModelSize,
+    do_characteristics: bool,
+    level: HierarchicalLevel,
+) -> Classifier | HierarchicalMalConvClassifier | HierarchicalViTClassifier:
 
     f = None
     if size == ModelSize.SM:
@@ -374,7 +155,10 @@ def get_model(arch: Architecture, size: ModelSize, do_characteristics: bool, lev
     raise ValueError(f"Invalid combination of {arch=} and {level=}.")
 
 
-def get_materials(tr_num_samples: Optional[int] = None, vl_num_samples: Optional[int] = None) -> tuple[list[Path], list[Path], list[int], list[int]]:
+def get_materials(
+    tr_num_samples: Optional[int] = None,
+    vl_num_samples: Optional[int] = None,
+) -> tuple[list[Path], list[Path], list[int], list[int]]:
     # TODO: define a temporal (not random) train/test split.
     benfiles = list(filter(lambda f: f.is_file(), Path("./data/ass").rglob("*")))
     benlabels = [0] * len(benfiles)
@@ -415,8 +199,10 @@ def get_materials(tr_num_samples: Optional[int] = None, vl_num_samples: Optional
     return tr_files, vl_files, tr_labels, vl_labels
 
 
-def count_parameters(model: Module, requires_grad: bool = False) -> int:
-    return sum(p.numel() for p in model.parameters() if (not requires_grad or p.requires_grad))
+def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int]) -> CollateFn | CollateFnHierarchical:
+    if level == HierarchicalLevel.NONE:
+        return CollateFn(False, False, min_lengths[0])
+    return CollateFnHierarchical(False, False, len(LEVEL_STRUCTURE_MAP[level]), min_lengths)
 
 
 # FIXME: account for multiple GPUs.
@@ -427,6 +213,35 @@ def worker_init_fn(worker_id: int) -> None:
     new_num_threads = get_optimal_num_worker_threads(info.num_workers)
     torch.set_num_threads(new_num_threads)
     print(f"Worker {worker_id} of {info.num_workers} using {org_num_threads} --> {torch.get_num_threads()} threads.")
+
+
+def get_loader(
+    dataset: Dataset,
+    sampler: Sampler,
+    num_workers: int,
+    collate_fn: Callable[[Sequence[FSample]], FSamples | HSamples],
+    pin_memory: bool,
+    prefetch_factor: int,
+) -> DataLoader:
+    return DataLoader(
+        dataset=dataset,
+        batch_sampler=sampler,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=pin_memory,
+        worker_init_fn=None if num_workers == 0 else worker_init_fn,
+        multiprocessing_context=None if num_workers == 0 else "forkserver",
+        prefetch_factor=None if num_workers == 0 else prefetch_factor,
+        persistent_workers=None if num_workers == 0 else True,
+    )
+
+
+def get_streamer(loader: DataLoader, device: torch.device, num_streams: int) -> CUDAPrefetcher:
+    streamer = CUDAPrefetcher(loader, device, num_streams)
+    if loader.persistent_workers:
+        streamer.warmup(0)
+        time.sleep(4)
+    return streamer
 
 
 def main() -> None:
@@ -475,7 +290,9 @@ def main() -> None:
     model = get_model(args.arch, args.size, args.do_characteristics, args.level)
     model = model.to("cpu")
     print(f"{model=}")
-    print(f"num_parameters={count_parameters(model, requires_grad=True)}")
+
+    num_parameters = count_parameters(model, requires_grad=False)
+    print(f"{num_parameters=}")
 
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
     min_lengths = getattr(model, "min_lengths", [min_length])
@@ -491,58 +308,45 @@ def main() -> None:
         mp_policy = MixedPrecisionPolicy(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, torch.float32)
         offload_policy = CPUOffloadPolicy() if args.fsdp_offload else OffloadPolicy()
         model.fully_shard(mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
-        # model = model.to(args.device)
     else:
         model = model.to(args.device)
 
-    collate_fn: CollateFn | CollateFnHierarchical
-    if args.level == HierarchicalLevel.NONE:
-        collate_fn = CollateFn(pin_memory=False, bitpack=False, min_length=min_length)
-    else:
-        collate_fn = CollateFnHierarchical(pin_memory=False, bitpack=False, num_structures=len(LEVEL_STRUCTURE_MAP[args.level]), min_lengths=min_lengths)
+    collate_fn = get_collate_fn(args.level, min_lengths)
     print(f"{collate_fn=}")
-
-    def get_loader(dataset: Dataset, sampler: Sampler) -> DataLoader | CUDAPrefetcher:
-
-        dataloader = DataLoader(
-            dataset=dataset,
-            batch_sampler=sampler,
-            num_workers=args.num_workers,
-            collate_fn=collate_fn,
-            pin_memory=args.pin_memory and args.device.type == "cuda",
-            worker_init_fn=worker_init_fn,
-            multiprocessing_context=None if args.num_workers == 0 else "forkserver",
-            prefetch_factor=None if args.num_workers == 0 else args.prefetch_factor,
-            persistent_workers=None if args.num_workers == 0 else True,
-        )
-        print(f"dataloader=DataLoader(pin_memory={dataloader.pin_memory}, num_workers={dataloader.num_workers}, prefetch_factor={dataloader.prefetch_factor})")
-        dataloader = CUDAPrefetcher(dataloader, args.device, args.num_streams)
-        if dataloader.loader.persistent_workers:
-            dataloader.warmup(0)
-            time.sleep(4)  # Wait for all workers to be ready.
-        return dataloader
 
     tr_sampler = GroupedLengthBatchSampler.from_lengths(args.tr_batch_size, list(map(os.path.getsize, tr_dataset.files)), first=True, shuffle=True)
     vl_sampler = GroupedLengthBatchSampler.from_lengths(args.vl_batch_size, list(map(os.path.getsize, vl_dataset.files)), first=True, shuffle=False)
-    tr_loader = get_loader(tr_dataset, tr_sampler)
-    vl_loader = get_loader(vl_dataset, vl_sampler)
-    print(f"{tr_loader=}")
-    print(f"{vl_loader=}")
+    print(f"{tr_sampler=}")
+    print(f"{vl_sampler=}")
+
+    tr_loader = get_loader(tr_dataset, tr_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    vl_loader = get_loader(tr_dataset, tr_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    print(f"tr_loader=DataLoader(pin_memory={tr_loader.pin_memory}, num_workers={tr_loader.num_workers}, prefetch_factor={tr_loader.prefetch_factor})")
+    print(f"vl_loader=DataLoader(pin_memory={vl_loader.pin_memory}, num_workers={vl_loader.num_workers}, prefetch_factor={vl_loader.prefetch_factor})")
+
+    tr_streamer = get_streamer(tr_loader, args.device, args.num_streams)
+    vl_streamer = get_streamer(vl_loader, args.device, args.num_streams)
+    print(f"{tr_streamer=}")
+    print(f"{vl_streamer=}")
 
     loss_fn = CrossEntropyLoss()
+    print(f"{loss_fn=}")
 
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    print(f"{optimizer=}")
 
     scheduler: Optional[LRScheduler] = None
+    print(f"{scheduler=}")
 
     stopper: Optional[EarlyStopper] = None
+    print(f"{stopper=}")
 
     trainer = Trainer(TrainerArgs.from_dict(args.to_dict()), model, tr_loader, vl_loader, loss_fn, optimizer, scheduler, stopper, args.device)
     print(f"{trainer=}")
 
     trainer = trainer()
 
-    if args.ddp:
+    if dist.is_initialized():
         dist.destroy_process_group()
 
 

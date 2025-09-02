@@ -18,8 +18,13 @@ from torch import Tensor
 from torch import BoolTensor
 from torch import ByteTensor
 from torch import IntTensor
+from torch.nn import Module
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence as _pad_sequence
+
+
+def count_parameters(model: Module, requires_grad: bool = False) -> int:
+    return sum(p.numel() for p in model.parameters() if (not requires_grad or p.requires_grad))
 
 
 def str_to_bool(v: bool | str) -> bool:
