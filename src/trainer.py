@@ -521,7 +521,7 @@ class Monitor:
         return self
 
     def clear(self) -> Monitor:
-        self._samples = defaultdict(list)
+        self._samples = {k: [] for k in self.COLLECT}
         return self
 
     def get_report(self, clear: bool = False) -> dict[str, float]:
