@@ -27,21 +27,23 @@ from src.utils import str_to_bool
 
 
 class Architecture(Enum):
-    MALCONV = "malconv"
-    VIT     = "vit"
+    MCV = "mcv"  # Original MalConv
+    MC2 = "mc2"  # Low-memory MalConv
+    MCG = "mcg"  # Low-memory MalConv with Gating
+    VIT = "vit"  # Vision Transformer
 
 
 class ModelSize(Enum):
-    SM = "sm"
-    MD = "md"
-    LG = "lg"
+    SM = "sm"  # Small
+    MD = "md"  # Medium
+    LG = "lg"  # Large
 
 
 # TODO: figure out how to elegantly combine different dataclasses into a new class.
 # TODO: write an ArgumentParser that takes a dataclass and generates arguments.
 @dataclass
 class MainArgs:
-    arch: Architecture = Architecture.MALCONV
+    arch: Architecture = Architecture.MCV
     size: ModelSize = ModelSize.SM
     seed: int = 0
     do_parser: bool = False
