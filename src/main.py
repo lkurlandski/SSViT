@@ -309,6 +309,8 @@ def main() -> None:
     num_parameters = count_parameters(model, requires_grad=False)
     print(f"{num_parameters=}")
 
+    print(f"mp_dtype={mp_dtype(args.mp16, args.device)}")
+
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
     min_lengths = getattr(model, "min_lengths", [min_length])
     min_lengths = [max(m, min_length) for m in min_lengths]

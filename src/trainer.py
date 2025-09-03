@@ -42,6 +42,7 @@ from torch import ShortTensor
 from torch import IntTensor
 from torch import LongTensor
 from torch import distributed as dist
+from torch.amp import GradScaler
 from torch.distributed import checkpoint as dist_checkpoint
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.distributed.checkpoint.state_dict import StateDictOptions
@@ -220,10 +221,8 @@ def mp_dtype(mp16: bool, device: torch.device) -> torch.dtype:
         if torch.cuda.is_bf16_supported(False):
             return torch.bfloat16
         if torch.cuda.is_bf16_supported(True):
-            warnings.warn("BF16 is not supported only via emulation on this device.")
-            return torch.bfloat16
+            return torch.float16
         if not torch.cuda.is_available(True):
-            warnings.warn("BF16 is not supported on this device and proper loss scaling is not implemented yet.")
             return torch.float16
     raise RuntimeError(f"Unsupported device for mixed precision: {device}.")
 
@@ -319,6 +318,7 @@ class Trainer:
     def train(self) -> dict[str, float]:
         t_0 = time.time()
 
+        self.optimizer.zero_grad()
         self.model.train()
         dataloader = self.tr_loader
         iterable: Iterable[tuple[int, FOrHSamples]] = enumerate(dataloader)
@@ -327,21 +327,26 @@ class Trainer:
         num_samples = 0
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
 
+        scaler = GradScaler(self.device.type, enabled=mp_dtype(self.args.mp16, self.device) == torch.float16)
+
         step = 0
         for mini_step, batch in iterable:
 
             # Compute normalized loss
             outputs = self.forward(batch)
             loss = self.compute_loss(batch, outputs) / self.args.gradient_accumulation_steps
-            loss.backward()
+            scaler.scale(loss).backward()
             results["tr_loss"] += loss.detach() * len(batch)
 
             # Update weights every `gradient_accumulation_steps` `mini_steps`
             condition_1 = (mini_step + 1) % self.args.gradient_accumulation_steps == 0
             condition_2 = (mini_step + 1) == len(dataloader)
             if condition_1 or condition_2:
+                # Unscale gradient then clip; GradScaler.step knows they have already been unscaled
+                scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
-                self.optimizer.step()
+                scaler.step(self.optimizer)
+                scaler.update()
                 self.optimizer.zero_grad()
                 step += 1
 
