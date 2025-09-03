@@ -651,6 +651,9 @@ class MalConvLowMem(nn.Module):  # type: ignore[misc]
     def min_length(self) -> int:
         return self.kernel_size
 
+    def fully_shard(self, **kwds: Any) -> None:
+        fully_shard(self, **kwds)
+
 
 def _eval_max_windows_vectorized_per_batch(
     z: torch.Tensor,
@@ -808,6 +811,9 @@ class MalConvGCG(nn.Module):  # type: ignore[misc]
     @property
     def min_length(self) -> int:
         return self.kernel_size
+
+    def fully_shard(self, **kwds: Any) -> None:
+        fully_shard(self, **kwds)
 
 # -------------------------------------------------------------------------------- #
 # Classifier

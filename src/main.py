@@ -39,6 +39,8 @@ from src.architectures import ClassifificationHead
 from src.architectures import FiLM
 from src.architectures import FiLMNoP
 from src.architectures import MalConv
+from src.architectures import MalConvLowMem
+from src.architectures import MalConvGCG
 from src.architectures import ViT
 from src.architectures import Classifier
 from src.architectures import PatchEncoder
@@ -132,9 +134,18 @@ def get_model(
 
     patcher: list[Optional[PatchEncoder]]
     backbone: list[MalConv | ViT]
-    if arch == Architecture.MALCONV:
+    if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
+        MalConvCls: type[MalConv | MalConvLowMem | MalConvGCG]
+        if arch == Architecture.MCV:
+            MalConvCls = MalConv
+        elif arch == Architecture.MC2:
+            MalConvCls = MalConvLowMem
+        elif arch == Architecture.MCG:
+            MalConvCls = MalConvGCG
+        else:
+            raise NotImplementedError(f"{arch}")
         patcher = [None for _ in range(num_structures)]
-        backbone = [MalConv(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride) for _ in range(num_structures)]
+        backbone = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride) for _ in range(num_structures)]
         clf_input_size = mcnv_channels
     elif arch == Architecture.VIT:
         patcher = [PatchEncoder(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size) for _ in range(num_structures)]
@@ -148,7 +159,7 @@ def get_model(
     if num_structures == 1:
         return Classifier(embedding[0], filmer[0], patcher[0], backbone[0], head)
 
-    if arch == Architecture.MALCONV:
+    if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
         return HierarchicalMalConvClassifier(embedding, filmer, backbone, head)
 
     if arch == Architecture.VIT:
