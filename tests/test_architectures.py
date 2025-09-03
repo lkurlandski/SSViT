@@ -16,6 +16,8 @@ from src.architectures import SinusoidalPositionalEncoding
 from src.architectures import PatchEncoder
 from src.architectures import ViT
 from src.architectures import MalConv
+from src.architectures import MalConvLowMem
+from src.architectures import MalConvGCG
 from src.architectures import HierarchicalMalConvClassifier
 from src.architectures import HierarchicalViTClassifier
 
@@ -192,16 +194,44 @@ class TestFiLM:
         assert z.shape == (batch_size, seq_length, embedding_dim)
 
 
-class TestMalConv:
+class TestMalConvs:
 
+    @pytest.mark.parametrize("arch", ["MalConv", "MalConvLowMem", "MalConvGCG"])
     @pytest.mark.parametrize("batch_size", [1, 2, 3, 5])
     @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
     @pytest.mark.parametrize("embedding_dim", [4, 8, 16])
     @pytest.mark.parametrize("channels", [8, 16, 32])
     @pytest.mark.parametrize("kernel_size", [3, 5])
     @pytest.mark.parametrize("stride", [1, 2])
-    def test_forward(self, batch_size: int, seq_length: int, embedding_dim: int, channels: int, kernel_size: int, stride: int) -> None:
-        net = MalConv(embedding_dim, channels, kernel_size, stride)
+    @pytest.mark.parametrize("chunk_size", [None, 11, 17])
+    @pytest.mark.parametrize("overlap", [None, 3, 5])
+    def test_forward(
+        self,
+        arch: Literal["MalConv", "MalConvLowMem", "MalConvGCG"],
+        batch_size: int,
+        seq_length: int,
+        embedding_dim: int,
+        channels: int,
+        kernel_size: int,
+        stride: int,
+        chunk_size: Optional[int],
+        overlap: Optional[int],
+    ) -> None:
+        if arch == "MalConv":
+            if chunk_size is not None or overlap is not None:
+                return
+            net = MalConv(embedding_dim, channels, kernel_size, stride)
+        elif arch == "MalConvLowMem":
+            if chunk_size is None:
+                return
+            net = MalConvLowMem(embedding_dim, channels, kernel_size, stride, chunk_size=chunk_size, overlap=overlap)
+        elif arch == "MalConvGCG":
+            if chunk_size is None:
+                return
+            net = MalConvGCG(embedding_dim, channels, kernel_size, stride, chunk_size=chunk_size, overlap=overlap)
+        else:
+            raise ValueError(f"Unknown architecture: {arch}")
+
         x = torch.rand((batch_size, seq_length, embedding_dim))
         if seq_length < net.min_length:
             with pytest.raises(RuntimeError):
