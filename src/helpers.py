@@ -133,7 +133,10 @@ def create_argument_parser_from_dataclass(*objs: type) -> ArgumentParser:
         elif isinstance(f.type, type):
             parser.add_argument(argname, type=f.type, default=f.default)
         elif isinstance(f.type, str):
+            # FIXME: this will not handle the special behaviors above!
             type_, _ = _unwrap_optional(alltypes[f.name])
+            if type_ == bool:
+                type_ = str_to_bool
             parser.add_argument(argname, type=type_, default=f.default)
         else:
             raise ValueError(f"Cannot determine type of field {f}.")
