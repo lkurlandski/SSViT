@@ -11,6 +11,7 @@ from enum import Enum
 import os
 import sys
 from typing import Any
+from typing import Literal
 from typing import Optional
 from typing import Self
 from typing import Union
@@ -62,6 +63,7 @@ class MainArgs:
     ddp: bool = False
     fsdp: bool = False
     fsdp_offload: bool = True
+    tf32: bool = False
 
     def __post_init__(self) -> None:
         if self.tr_batch_size == 1 or self.vl_batch_size == 1:

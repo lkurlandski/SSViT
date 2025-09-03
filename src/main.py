@@ -70,6 +70,7 @@ from src.trainer import local_rank
 from src.trainer import rank
 from src.trainer import local_world_size
 from src.trainer import world_size
+from src.trainer import mp_dtype
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
 from src.utils import count_parameters
@@ -265,6 +266,9 @@ def main() -> None:
         args.device = torch.device(local_rank())
         print(f"Distrubted worker {rank()} of {world_size()} with local rank {local_rank()}.")
 
+    if args.tf32:
+        torch.set_float32_matmul_precision("medium")
+
     if rank() > 0:
         args.disable_tqdm = True
 
@@ -302,10 +306,10 @@ def main() -> None:
 
     if args.ddp:
         model = model.to(args.device)
-        model = DistributedDataParallel(model, find_unused_parameters=True, static_graph=True)
+        model = DistributedDataParallel(model, static_graph=True)
     elif args.fsdp:
         mesh = init_device_mesh("cuda", (world_size(),))
-        mp_policy = MixedPrecisionPolicy(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, torch.float32)
+        mp_policy = MixedPrecisionPolicy(mp_dtype(args.mp16, args.device))
         offload_policy = CPUOffloadPolicy() if args.fsdp_offload else OffloadPolicy()
         model.fully_shard(mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
     else:

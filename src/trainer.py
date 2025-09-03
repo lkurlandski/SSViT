@@ -21,6 +21,7 @@ import threading
 import time
 from typing import Any
 from typing import Callable
+from typing import Literal
 from typing import Optional
 from typing import Self
 from typing import Union
@@ -95,6 +96,7 @@ class TrainerArgs:
     lower_is_worse: bool = False
     max_norm: float = 1.0
     gradient_accumulation_steps: int = 1
+    mp16: bool = False
 
     def __post_init__(self) -> None:
         if self.logging_steps > 0:
@@ -207,6 +209,23 @@ def find_executable_batch_size(
 
 def pformat_dict(d: Mapping[str, int | float]) -> dict[str, str]:
     return {k: f"{v:.3f}" if isinstance(v, float) else f"{v}" for k, v in d.items()}
+
+
+def mp_dtype(mp16: bool, device: torch.device) -> torch.dtype:
+    if not mp16:
+        return torch.float32
+    if device.type == "cpu":
+        return torch.bfloat16
+    if device.type == "cuda":
+        if torch.cuda.is_bf16_supported(False):
+            return torch.bfloat16
+        if torch.cuda.is_bf16_supported(True):
+            warnings.warn("BF16 is not supported only via emulation on this device.")
+            return torch.bfloat16
+        if not torch.cuda.is_available(True):
+            warnings.warn("BF16 is not supported on this device and proper loss scaling is not implemented yet.")
+            return torch.float16
+    raise RuntimeError(f"Unsupported device for mixed precision: {device}.")
 
 
 class Trainer:
@@ -378,13 +397,15 @@ class Trainer:
         """
         Send a batch of inputs forward through the model.
         """
-        return self.model(batch.inputs, batch.characteristics)
+        with torch.autocast(self.device.type, dtype=mp_dtype(self.args.mp16, self.device), enabled=self.args.mp16):
+            return self.model(batch.inputs, batch.characteristics)
 
     def compute_loss(self, batch: FOrHSamples, outputs: FTensor) -> FTensor:
         """
         Compute the loss over a batch of examples.
         """
-        return self.loss_fn.forward(outputs, batch.label)
+        with torch.autocast(self.device.type, dtype=mp_dtype(self.args.mp16, self.device), enabled=self.args.mp16):
+            return self.loss_fn.forward(outputs, batch.label)
 
     def compute_metrics(self, batch: FOrHSamples, outputs: FTensor) -> dict[str, Tensor]:
         """
@@ -393,6 +414,7 @@ class Trainer:
         NOTE: This method (summing over batches) may not be ideal for metrics that
             may be more likely to be not-well defined on smaller sets of examples, e.g., F1.
         """
+        outputs = outputs.to(torch.float32)
         labels = batch.label
         preds = torch.argmax(outputs, dim=1)
 
