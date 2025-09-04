@@ -22,12 +22,14 @@ Notations (ViT):
     L: Number of layers
 """
 
+from functools import partial
 import math
 import sys
 from typing import Any
 from typing import Callable
 from typing import Literal
 from typing import Optional
+from typing import Sequence
 import warnings
 
 import torch
@@ -612,14 +614,24 @@ class MalConvLowMem(nn.Module):  # type: ignore[misc]
         self.chunk_size = int(chunk_size)
         self.overlap = int(overlap if overlap is not None else max(kernel_size - 1, 0))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor, recompute: Optional[Callable[[int, Tensor, int], Tensor]] = None) -> Tensor:
+        """
+        Args:
+            x: Input embeddings of shape (B, T, E).
+            recompute: Callable that recomputes the activations on the winning windows.
+        Returns:
+            z: Hidden representation of shape (B, C).
+        """
         check_tensor(x, (None, None, self.embedding_dim), FLOATS)
         if x.shape[1] < self.min_length:
             raise RuntimeError(f"Input sequence length {x.shape[1]} is less than the minimum required length {self.min_length}.")
 
+        if self.training and recompute is None:
+            warnings.warn("`recompute` is None during training; gradients will not flow to previous components.")
+
         z = x.transpose(1, 2)  # (B, E, T)
 
-        # Find per-channel winners (no grad)
+        # Find per-channel winners
         _, max_pos = _lowmem_max_over_time(
             z,
             chunk_size=self.chunk_size,
@@ -628,17 +640,33 @@ class MalConvLowMem(nn.Module):  # type: ignore[misc]
             first_stride=self.stride,
             channels=self.channels,
             activations_fn=self._activations,
-        )
+        )  # (B, C)
 
-        # Recomputation for ONLY unique winning windows
-        z = _eval_max_windows_vectorized(
-            z,
-            rf=self.kernel_size,
-            channels=self.channels,
-            positions=max_pos,
-            activations_fn=self._activations,
-        )
+        # If recompute given, rebuild the winning windows and recompute activations on them
+        # TODO: remove check_tensor calls.
+        if recompute is not None:
+            rf = self.kernel_size
+            z = torch.empty((x.shape[0], self.channels), device=x.device, dtype=x.dtype)
+            for i in range(x.shape[0]):
+                pos = max_pos[i]                             # (C,)        per-channel winning starts
+                posuniq, inv = torch.unique(pos, True, True) # (U,), (C,)  map each channel to its unique start (sorted)
+                z_i = recompute(i, posuniq, rf)              # (U, rf, E)  many windows for THIS sample
+                z_i = z_i.transpose(1, 2)                    # (U, E, rf)  conv expects (B, E, T)
+                z_i = self._activations(z_i)                 # (U, C, 1)   conv per window
+                z_i = z_i.squeeze(-1)                        # (U, C)      remove trailing dim of size 1
+                z_i = z_i[inv, torch.arange(self.channels)]  # (C,)        map each channel to its unique window
+                z[i] = z_i
 
+        # Otherwise, select and pass the winners
+        else:
+            z = _eval_max_windows_vectorized(
+                z,
+                rf=self.kernel_size,
+                channels=self.channels,
+                positions=max_pos,
+                activations_fn=self._activations,
+                stop_grad_input=True,
+            )
         check_tensor(z, (x.shape[0], self.channels), FLOATS)
         return z
 
@@ -653,6 +681,59 @@ class MalConvLowMem(nn.Module):  # type: ignore[misc]
 
     def fully_shard(self, **kwds: Any) -> None:
         fully_shard(self, **kwds)
+
+    @staticmethod
+    def recompute(preprocess: Callable[[Any], Tensor], ts: Sequence[Tensor], b: int, pos: Tensor, rf: int) -> Tensor:
+        """
+        Basic recomputation function that can be passed to `MalConvLowMem.forward`.
+
+        Args:
+            preprocess: Module that computed the hidden representation, `z`, passed to `forward`.
+            ts:     Original input tensor(s) of shape (B, T, *).
+            b:      batch index
+            pos:    (U,) winning start positions
+            rf:     receptive field
+
+        Returns:
+            z:     Output tensor of shape (U, rf, E), which is a subset of the original input to `forward`.
+
+        Usage:
+            >>> embedding = nn.Embedding(...)
+            >>> model = MalConvLowMem(...)
+            >>> x = torch.randint(...)
+            >>> z = embedding(x)
+            >>> model(z)                       # No gradient flow to embedding
+            >>> ...
+            >>> from functools import partial
+            >>> recompute = partial(MalConvLowMem.recompute, embedding, [x])
+            >>> model(z, recompute=recompute)  # Gradients flow to embedding
+        """
+        if not isinstance(ts, Sequence):
+            raise TypeError(f"`ts` must be a sequence of tensors. Got {type(ts)} instead.")
+        if not all(isinstance(t, Tensor) for t in ts):
+            raise TypeError(f"All elements of `ts` must be tensors. Got {[type(t) for t in ts]} instead.")
+        if not all(t.dim() >= 2 for t in ts):
+            raise ValueError(f"All tensors in `ts` must have at least 2 dimensions. Got {[t.dim() for t in ts]} instead.")
+
+        # Build all length-rf windows along time for the whole batch.
+        # Move dimensions to ensure the dimensions larger than 2 are in the correct order.
+        t_unfs = [t.unfold(dimension=1, size=rf, step=1).movedim(-1, 2).contiguous() for t in ts]  # (B, T - rf + 1, rf, *)
+
+        # Handle degenerate case of no winners cleanly.
+        if pos.numel() == 0:
+            wins = [t.new_empty((0, rf) + tuple(t.shape[2:])) for t in ts]
+            z = preprocess(*wins)
+            z = z.contiguous()
+            check_tensor(z, (0, rf, None))
+            return z
+
+        # Select this sample's winning windows and preprocess them.
+        wins = [t_unf[b, pos] for t_unf in t_unfs]   # (U, rf, *)
+        z = preprocess(*wins)                        # (U, rf, None)
+        z = z.contiguous()
+
+        check_tensor(z, (wins[0].shape[0] if len(wins) > 0 else None, rf, None), FLOATS)
+        return z
 
 
 def _eval_max_windows_vectorized_per_batch(
@@ -816,22 +897,61 @@ class MalConvGCG(nn.Module):  # type: ignore[misc]
         fully_shard(self, **kwds)
 
 # -------------------------------------------------------------------------------- #
-# Classifier
+# Classifiers
 # -------------------------------------------------------------------------------- #
 
-class Classifier(nn.Module):  # type: ignore[misc]
+class MalConvClassifier(nn.Module):  # type: ignore[misc]
 
-    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, patcher: Optional[PatchEncoder], backbone: MalConv | ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, backbone: MalConv | MalConvLowMem | MalConvGCG, head: ClassifificationHead) -> None:
         super().__init__()
-
-        if patcher is None and isinstance(backbone, ViT):
-            warnings.warn("ViT backbone is being used without a PatchEncoder.")
-        if patcher is not None and isinstance(backbone, MalConv):
-            warnings.warn("MalConv backbone is being used with a PatchEncoder.")
 
         self.embedding = embedding
         self.filmer = filmer
-        self.patcher = patcher if patcher is not None else nn.Identity()
+        self.backbone = backbone
+        self.head = head
+
+    def forward(self, x: Tensor, g: Optional[Tensor]) -> Tensor:
+        """
+        Args:
+            x: Input tensor of shape (B, T).
+            g: FiLM conditioning vector of shape (B, T, G).
+        Returns:
+            z: Classification logits of shape (B, M).
+        """
+        check_tensor(x, (None, None), INTEGERS)
+        if g is not None:
+            check_tensor(g, (x.shape[0], x.shape[1], None), FLOATS)
+
+        def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
+            z = self.embedding(x)  # (B, T, E)
+            z = self.filmer(z, g)  # (B, T, E)
+            return z
+
+        recompute = None
+        if self.training:
+            recompute = partial(self.backbone.recompute, preprocess, (x, g) if g is not None else (x,))
+
+        z = preprocess(x, g)              # (B, T, E)
+        z = self.backbone(z, recompute)   # (B, D)
+        z = self.head(z)                  # (B, M)
+
+        check_tensor(z, (x.shape[0], self.head.num_classes), FLOATS)
+        return z
+
+    def fully_shard(self, **kwds: Any) -> None:
+        fully_shard([self.embedding, self.filmer, self.patcher], **kwds)
+        self.backbone.fully_shard(**kwds)
+        fully_shard(self, **kwds | {"reshard_after_forward": False})
+
+
+class ViTClassifier(nn.Module):  # type: ignore[misc]
+
+    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, patcher: PatchEncoder, backbone: ViT, head: ClassifificationHead) -> None:
+        super().__init__()
+
+        self.embedding = embedding
+        self.filmer = filmer
+        self.patcher = patcher
         self.backbone = backbone
         self.head = head
 
@@ -849,7 +969,7 @@ class Classifier(nn.Module):  # type: ignore[misc]
 
         z = self.embedding(x)  # (B, T, E)
         z = self.filmer(z, g)  # (B, T, E)
-        z = self.patcher(z)    # (B, N, E') or (B, T, E)
+        z = self.patcher(z)    # (B, N, E')
         z = self.backbone(z)   # (B, D)
         z = self.head(z)       # (B, M)
 
@@ -861,9 +981,6 @@ class Classifier(nn.Module):  # type: ignore[misc]
         self.backbone.fully_shard(**kwds)
         fully_shard(self, **kwds | {"reshard_after_forward": False})
 
-# -------------------------------------------------------------------------------- #
-# Hierarchical Models.
-# -------------------------------------------------------------------------------- #
 
 def _check_hierarchical_inputs(x: list[Optional[Tensor]], g: list[Optional[Tensor]], num_structures: int) -> None:
     if not (len(x) == len(g) == num_structures):
@@ -880,52 +997,6 @@ def _check_hierarchical_inputs(x: list[Optional[Tensor]], g: list[Optional[Tenso
         check_tensor(x[i], (x_ref.shape[0], None), INTEGERS)
         if g[i] is not None:
             check_tensor(g[i], (x_ref.shape[0], x[i].shape[1], None), FLOATS)  # type: ignore[union-attr]
-
-
-def _partition_to_hierarchical_inputs(x: Tensor, g: Optional[Tensor], m: Tensor, min_lengths: Optional[list[int]] = None) -> list[Optional[tuple[Tensor, Optional[Tensor]]]]:
-    """
-    Partitions the input tensor x (and guide tensor g) into multiple structures based on the structure indicator m.
-
-    Args:
-        x: Tensor: Input tensor of shape (B, T).
-        g: Optional[Tensor]: FiLM conditioning vector of shape (B, T, G).
-        m: Tensor: Structure indicator of shape (B, T, R) where R is the number of structures.
-        min_lengths: Optional[list[int]]: Minimum lengths for each structure to pad to.
-            If None, no minimum length padding is applied.
-    """
-    warnings.warn("src::architectures::_partition_to_hierarchical_inputs is depracated.")
-
-    check_tensor(x, (None, None), INTEGERS)
-    if g is not None:
-        check_tensor(g, (x.shape[0], x.shape[1], None), FLOATS)
-    check_tensor(m, (x.shape[0], x.shape[1], None), torch.bool)
-
-    num_structures = m.shape[2]
-    if min_lengths is None:
-        min_lengths = [0] * num_structures
-    if len(min_lengths) != num_structures:
-        raise ValueError(f"Expected {num_structures} min_lengths, got {len(min_lengths)} instead.")
-
-    x_g: list[Optional[tuple[Tensor, Optional[Tensor]]]] = []
-    for i in range(num_structures):
-        xs = []
-        gs = []
-        all_none = True
-        for j in range(x.shape[0]):
-            idx = m[j, :, i]
-            all_none = all_none and not bool(idx.any())
-            x_i_j = x[j, idx]
-            g_i_j = g[j, idx, :] if g is not None else None
-            xs.append(x_i_j)
-            gs.append(g_i_j)
-        if not all_none:
-            xs = pad_sequence(xs, batch_first=True, padding_value=0,   pad_to_multiple_of=8, min_length=min_lengths[i])
-            gs = pad_sequence(gs, batch_first=True, padding_value=0.0, pad_to_multiple_of=8, min_length=min_lengths[i]) if g is not None else None
-            x_g.append((xs, gs))
-        else:
-            x_g.append(None)
-
-    return x_g
 
 
 class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]

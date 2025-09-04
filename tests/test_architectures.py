@@ -2,12 +2,14 @@
 Tests.
 """
 
+from functools import partial
 import math
 from typing import Literal
 from typing import Optional
 
 import pytest
 import torch
+from torch.nn import Embedding
 
 from src.architectures import ClassifificationHead
 from src.architectures import FiLM
@@ -22,7 +24,6 @@ from src.architectures import HierarchicalMalConvClassifier
 from src.architectures import HierarchicalViTClassifier
 
 
-# TODO: clean this up.
 class TestClassificationHead:
     B = 4
 
@@ -194,44 +195,16 @@ class TestFiLM:
         assert z.shape == (batch_size, seq_length, embedding_dim)
 
 
-class TestMalConvs:
+class TestMalConv:
 
-    @pytest.mark.parametrize("arch", ["MalConv", "MalConvLowMem", "MalConvGCG"])
-    @pytest.mark.parametrize("batch_size", [1, 2, 3, 5])
+    @pytest.mark.parametrize("batch_size", [1, 3])
     @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
     @pytest.mark.parametrize("embedding_dim", [4, 8, 16])
     @pytest.mark.parametrize("channels", [8, 16, 32])
     @pytest.mark.parametrize("kernel_size", [3, 5])
     @pytest.mark.parametrize("stride", [1, 2])
-    @pytest.mark.parametrize("chunk_size", [None, 11, 17])
-    @pytest.mark.parametrize("overlap", [None, 3, 5])
-    def test_forward(
-        self,
-        arch: Literal["MalConv", "MalConvLowMem", "MalConvGCG"],
-        batch_size: int,
-        seq_length: int,
-        embedding_dim: int,
-        channels: int,
-        kernel_size: int,
-        stride: int,
-        chunk_size: Optional[int],
-        overlap: Optional[int],
-    ) -> None:
-        if arch == "MalConv":
-            if chunk_size is not None or overlap is not None:
-                return
-            net = MalConv(embedding_dim, channels, kernel_size, stride)
-        elif arch == "MalConvLowMem":
-            if chunk_size is None:
-                return
-            net = MalConvLowMem(embedding_dim, channels, kernel_size, stride, chunk_size=chunk_size, overlap=overlap)
-        elif arch == "MalConvGCG":
-            if chunk_size is None:
-                return
-            net = MalConvGCG(embedding_dim, channels, kernel_size, stride, chunk_size=chunk_size, overlap=overlap)
-        else:
-            raise ValueError(f"Unknown architecture: {arch}")
-
+    def test_forward(self, batch_size: int, seq_length: int, embedding_dim: int, channels: int, kernel_size: int, stride: int) -> None:
+        net = MalConv(embedding_dim, channels, kernel_size, stride)
         x = torch.rand((batch_size, seq_length, embedding_dim))
         if seq_length < net.min_length:
             with pytest.raises(RuntimeError):
@@ -239,6 +212,73 @@ class TestMalConvs:
             return
         z = net.forward(x)
         assert z.shape == (batch_size, channels)
+
+
+class TestMalConvLowMem:
+
+    @pytest.mark.parametrize("batch_size", [1, 3])
+    @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
+    @pytest.mark.parametrize("embedding_dim", [4, 8, 16])
+    @pytest.mark.parametrize("channels", [8, 16, 32])
+    @pytest.mark.parametrize("kernel_size", [3, 5])
+    @pytest.mark.parametrize("stride", [1, 2])
+    @pytest.mark.parametrize("chunk_size", [8, 16, 32])
+    @pytest.mark.parametrize("overlap", [None, 0, 1, 2])
+    def test_forward(self, batch_size: int, seq_length: int, embedding_dim: int, channels: int, kernel_size: int, stride: int, chunk_size: int, overlap: Optional[int]) -> None:
+        net = MalConvLowMem(embedding_dim, channels, kernel_size, stride, chunk_size=chunk_size, overlap=overlap)
+        x = torch.rand((batch_size, seq_length, embedding_dim))
+        if seq_length < net.min_length:
+            with pytest.raises(RuntimeError):
+                net.forward(x)
+            return
+        z = net.forward(x)
+        assert z.shape == (batch_size, channels)
+
+    @pytest.mark.parametrize("guides_are_none", [False, True])
+    @pytest.mark.parametrize("batch_size", [1, 3])
+    @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
+    @pytest.mark.parametrize("embedding_dim", [4, 8, 16])
+    @pytest.mark.parametrize("channels", [8, 16, 32])
+    @pytest.mark.parametrize("kernel_size", [3, 5])
+    @pytest.mark.parametrize("stride", [1, 2])
+    @pytest.mark.parametrize("chunk_size", [8, 16, 32])
+    @pytest.mark.parametrize("overlap", [None, 0, 1, 2])
+    def test_forward_recompute(self, guides_are_none: bool, batch_size: int, seq_length: int, embedding_dim: int, channels: int, kernel_size: int, stride: int, chunk_size: int, overlap: Optional[int]) -> None:
+        torch.manual_seed(0)
+
+        net = MalConvLowMem(embedding_dim, channels, kernel_size, stride, chunk_size=chunk_size, overlap=overlap)
+        if seq_length < net.min_length:
+            pytest.skip("Sequence too short for this configuration.")
+
+        print(f"{batch_size=}, {seq_length=}, {embedding_dim=}, {channels=}, {kernel_size=}, {stride=}, {chunk_size=}, {overlap=} {guides_are_none=}")
+
+        embedding = Embedding(8, embedding_dim)
+        if guides_are_none:
+            filmer = FiLMNoP(guide_dim=3, embedding_dim=embedding_dim, hidden_size=3)
+        else:
+            filmer = FiLM(guide_dim=3, embedding_dim=embedding_dim, hidden_size=3)
+
+        def preprocess(x: torch.Tensor, g: Optional[torch.Tensor] = None) -> torch.Tensor:
+            return filmer(embedding(x), g)
+
+        x = torch.randint(0, 8, (batch_size, seq_length))
+        g = None if guides_are_none else torch.rand((batch_size, seq_length, 3))
+        z = preprocess(x, g)
+
+        net.eval()
+        z1 = net.forward(z, recompute=None)
+        assert z1.shape == (batch_size, channels)
+
+        net.train()
+        with pytest.warns(UserWarning):
+            z2 = net.forward(z, recompute=None)
+        assert z2.shape == (batch_size, channels)
+
+        z3 = net.forward(z, recompute=partial(MalConvLowMem.recompute, preprocess, (x, g) if g is not None else (x,)))
+        assert z3.shape == (batch_size, channels)
+
+        assert torch.allclose(z1, z2), f"Max diff: {torch.max(torch.abs(z1.flatten() - z2.flatten()))}"
+        assert torch.allclose(z1, z3, atol=1e-7), f"Max diff: {torch.max(torch.abs(z1.flatten() - z3.flatten()))}"
 
 
 class TestHierarchicalMalConvClassifier:
