@@ -525,10 +525,6 @@ class MalConvBase(nn.Module, ABC):  # type: ignore[misc]
         if not all(t.dim() >= 2 for t in ts):
             raise ValueError(f"All tensors in `ts` must have at least 2 dimensions. Got {[t.dim() for t in ts]} instead.")
 
-        # Build all length-rf windows along time for the whole batch.
-        # Move dimensions to ensure the dimensions larger than 2 are in the correct order.
-        t_unfs = [t.unfold(dimension=1, size=rf, step=1).movedim(-1, 2).contiguous() for t in ts]  # (B, T - rf + 1, rf, *)
-
         # Handle degenerate case of no winners cleanly.
         if pos.numel() == 0:
             wins = [t.new_empty((0, rf) + tuple(t.shape[2:])) for t in ts]
@@ -538,7 +534,22 @@ class MalConvBase(nn.Module, ABC):  # type: ignore[misc]
             return z
 
         # Select this sample's winning windows and preprocess them.
-        wins = [t_unf[b, pos] for t_unf in t_unfs]   # (U, rf, *)
+        # This needs to be done index-by-index to avoid massive tensor expansion.
+        wins = []
+        for t in ts:
+            if t.shape[1] < rf:
+                raise RuntimeError(f"Sequence too short: T={t.shape[1]} < rf={rf}")
+
+            t_b = t[b]  # (T, *)
+
+            # Build (U, rf) start indices: pos + [0..rf-1]
+            rng = torch.arange(rf, device=pos.device)
+            idx = pos.to(t_b.device).unsqueeze(1) + rng.unsqueeze(0)  # (U, rf)
+
+            # Advanced indexing along the first dim yields (U, rf, *) for any tail
+            w = t_b[idx]
+            wins.append(w.contiguous())
+
         z = preprocess(*wins)                        # (U, rf, None)
         z = z.contiguous()
 
