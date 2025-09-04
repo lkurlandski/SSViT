@@ -22,7 +22,10 @@ Notations (ViT):
     L: Number of layers
 """
 
+from abc import ABC
+from abc import abstractmethod
 from functools import partial
+import inspect
 import math
 import sys
 from typing import Any
@@ -436,12 +439,20 @@ class ViT(nn.Module):  # type: ignore[misc]
 # MalConv
 # -------------------------------------------------------------------------------- #
 
-class MalConv(nn.Module):  # type: ignore[misc]
+class MalConvBase(nn.Module, ABC):  # type: ignore[misc]
     """
-    MalConv backbone.
+    Base class of MalConv backbones.
 
     See: Raff "Malware detection by eating a whole EXE." AICS 2018.
+    See: Raff "Classifying Sequences of Extreme Length with Constant Memory Applied to Malware Detection" AAAI 2021.
     """
+
+    embedding_dim: int
+    channels: int
+    kernel_size: int
+    stride: int
+    chunk_size: int
+    overlap: int
 
     def __init__(
         self,
@@ -449,26 +460,102 @@ class MalConv(nn.Module):  # type: ignore[misc]
         channels: int = 128,
         kernel_size: int = 512,
         stride: int = 512,
+        chunk_size: int = 64_000,
+        overlap: Optional[int] = None,
     ) -> None:
         super().__init__()
-
-        self.conv_1 = nn.Conv1d(embedding_dim, channels, kernel_size, stride)
-        self.conv_2 = nn.Conv1d(embedding_dim, channels, kernel_size, stride)
-        self.sigmoid = nn.Sigmoid()
-        self.pool = nn.AdaptiveMaxPool1d(1)
-
         self.embedding_dim = embedding_dim
         self.channels = channels
         self.kernel_size = kernel_size
         self.stride = stride
+        self.chunk_size = chunk_size
+        self.overlap = kernel_size - stride if overlap is None else overlap
 
-    def forward(self, x: Tensor) -> Tensor:
+    @abstractmethod
+    def forward(self, x: Tensor, recompute: Optional[Callable[[int, Tensor, int], Tensor]] = None) -> Tensor:
         """
+        Construct a dense hidden representation from a long sequence.
+
         Args:
             x: Input embeddings of shape (B, T, E).
+            recompute: Callable that recomputes the activations on the winning windows. See `MalConvBase.recompute`.
+
         Returns:
             z: Hidden representation of shape (B, C).
         """
+        ...
+
+    @property
+    def min_length(self) -> int:
+        return self.kernel_size
+
+    def fully_shard(self, **kwds: Any) -> None:
+        fully_shard(self, **kwds)
+
+    @staticmethod
+    def recompute(preprocess: Callable[[Any], Tensor], ts: Sequence[Tensor], b: int, pos: Tensor, rf: int) -> Tensor:
+        """
+        Basic recomputation function that can be passed to `MalConvLowMem.forward`.
+
+        Args:
+            preprocess: Module that computed the hidden representation, `z`, passed to `forward`.
+            ts:     Original input tensor(s) of shape (B, T, *).
+            b:      batch index
+            pos:    (U,) winning start positions
+            rf:     receptive field
+
+        Returns:
+            z:     Output tensor of shape (U, rf, E), which is a subset of the original input to `forward`.
+
+        Usage:
+            >>> embedding = nn.Embedding(...)
+            >>> model = MalConvLowMem(...)
+            >>> x = torch.randint(...)
+            >>> z = embedding(x)
+            >>> model(z)                       # No gradient flow to embedding
+            >>> ...
+            >>> from functools import partial
+            >>> recompute = partial(MalConvLowMem.recompute, embedding, [x])
+            >>> model(z, recompute=recompute)  # Gradients flow to embedding
+        """
+        if not isinstance(ts, Sequence):
+            raise TypeError(f"`ts` must be a sequence of tensors. Got {type(ts)} instead.")
+        if not all(isinstance(t, Tensor) for t in ts):
+            raise TypeError(f"All elements of `ts` must be tensors. Got {[type(t) for t in ts]} instead.")
+        if not all(t.dim() >= 2 for t in ts):
+            raise ValueError(f"All tensors in `ts` must have at least 2 dimensions. Got {[t.dim() for t in ts]} instead.")
+
+        # Build all length-rf windows along time for the whole batch.
+        # Move dimensions to ensure the dimensions larger than 2 are in the correct order.
+        t_unfs = [t.unfold(dimension=1, size=rf, step=1).movedim(-1, 2).contiguous() for t in ts]  # (B, T - rf + 1, rf, *)
+
+        # Handle degenerate case of no winners cleanly.
+        if pos.numel() == 0:
+            wins = [t.new_empty((0, rf) + tuple(t.shape[2:])) for t in ts]
+            z = preprocess(*wins)
+            z = z.contiguous()
+            check_tensor(z, (0, rf, None))
+            return z
+
+        # Select this sample's winning windows and preprocess them.
+        wins = [t_unf[b, pos] for t_unf in t_unfs]   # (U, rf, *)
+        z = preprocess(*wins)                        # (U, rf, None)
+        z = z.contiguous()
+
+        check_tensor(z, (wins[0].shape[0] if len(wins) > 0 else None, rf, None), FLOATS)
+        return z
+
+
+class MalConv(MalConvBase):
+
+    def __init__(self, *args: Any, **kwds: Any) -> None:
+        super().__init__(*args, **kwds)
+        self.conv_1 = nn.Conv1d(self.embedding_dim, self.channels, self.kernel_size, self.stride)
+        self.conv_2 = nn.Conv1d(self.embedding_dim, self.channels, self.kernel_size, self.stride)
+        self.sigmoid = nn.Sigmoid()
+        self.pool = nn.AdaptiveMaxPool1d(1)
+
+    def forward(self, x: Tensor, recompute: Optional[Callable[[int, Tensor, int], Tensor]] = None) -> Tensor:
         check_tensor(x, (None, None, self.embedding_dim), FLOATS)
         if x.shape[1] < self.min_length:
             raise RuntimeError(f"Input sequence length {x.shape[1]} is less than the minimum required length {self.min_length}.")
@@ -483,15 +570,209 @@ class MalConv(nn.Module):  # type: ignore[misc]
         check_tensor(z, (x.shape[0], self.channels), FLOATS)
         return z
 
-    @property
-    def min_length(self) -> int:
-        return self.kernel_size
 
-    def fully_shard(self, **kwds: Any) -> None:
-        fully_shard(self, **kwds)
+class MalConvLowMem(MalConvBase):
+
+    def __init__(self, *args: Any, **kwds: Any) -> None:
+        super().__init__(*args, **kwds)
+        self.conv_1 = nn.Conv1d(self.embedding_dim, self.channels, self.kernel_size, self.stride)
+        self.conv_2 = nn.Conv1d(self.embedding_dim, self.channels, self.kernel_size, self.stride)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: Tensor, recompute: Optional[Callable[[int, Tensor, int], Tensor]] = None) -> Tensor:
+        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
+        if x.shape[1] < self.min_length:
+            raise RuntimeError(f"Input sequence length {x.shape[1]} is less than the minimum required length {self.min_length}.")
+
+        if self.training and recompute is None:
+            warnings.warn("`recompute` is None during training; gradients will not flow to previous components.")
+
+        z_full = x.transpose(1, 2)  # (B, E, T)
+
+        _, pos = _lowmem_max_over_time(
+            z_full,
+            chunk_size=self.chunk_size,
+            overlap=self.overlap,
+            rf=self.kernel_size,
+            first_stride=self.stride,
+            channels=self.channels,
+            activations_fn=self._activations,
+        )  # (B, C)
+
+        if recompute is not None:
+            wins_cat, meta = _gather_wins_via_recompute(
+                positions=pos,
+                rf=self.kernel_size,
+                embedding_dim=self.embedding_dim,
+                recompute=recompute,
+                to_device=self.conv_1.weight.device,
+                to_dtype=self.conv_1.weight.dtype,
+            )                                                # wins_cat: (sum_U, E, rf)
+
+            g_all = self._activations(wins_cat).squeeze(-1)     # (sum_U, C)
+            z = _scatter_g_to_BC(
+                g_all=g_all,
+                meta=meta,
+                batch_size=x.shape[0],
+                channels=self.channels,
+                to_device=g_all.device,
+                to_dtype=g_all.dtype,
+            )                                                   # (B, C)
+        else:
+            z = _eval_max_windows_vectorized(
+                z_full,
+                rf=self.kernel_size,
+                channels=self.channels,
+                positions=pos,
+                activations_fn=self._activations,
+                stop_grad_input=True,
+            )
+
+        check_tensor(z, (x.shape[0], self.channels), FLOATS)
+        return z
+
+    def _activations(self, z: torch.Tensor) -> torch.Tensor:
+        c1 = self.conv_1(z)
+        c2 = self.conv_2(z)
+        return c1 * self.sigmoid(c2)
+
+
+class MalConvGCG(MalConvBase):
+
+    def __init__(self, *args: Any, **kwds: Any) -> None:
+        super().__init__(*args, **kwds)
+        # Context path (no gating)
+        self.ctx_conv  = nn.Conv1d(self.embedding_dim, 2 * self.channels, self.kernel_size, self.stride)
+        self.ctx_share = nn.Conv1d(self.channels, self.channels, 1)
+        # Main path (with gating)
+        self.conv_1 = nn.Conv1d(self.embedding_dim, 2 * self.channels, self.kernel_size, self.stride)
+        self.conv_2 = nn.Conv1d(self.channels, self.channels, 1)
+        self.gct_proj = nn.Linear(self.channels, self.channels)
+
+    def forward(self, x: Tensor, recompute: Optional[Callable[[int, Tensor, int], Tensor]] = None) -> Tensor:
+        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
+        if x.shape[1] < self.min_length:
+            raise RuntimeError(f"Input sequence length {x.shape[1]} is less than the minimum required length {self.min_length}.")
+        if self.training and recompute is None:
+            warnings.warn("`recompute` is None during training; gradients will not flow to previous components.")
+
+        z_full = x.transpose(1, 2).contiguous()  # (B, E, T)
+
+        # -------- Context path (produces gct: (B, C)) --------
+        _, ctx_pos = _lowmem_max_over_time(
+            z_full,
+            chunk_size=self.chunk_size,
+            overlap=self.overlap,
+            rf=self.kernel_size,
+            first_stride=self.stride,
+            channels=self.channels,
+            activations_fn=self._ctx_activations,
+        )
+
+        if recompute is not None:
+            wins_ctx, meta_ctx = _gather_wins_via_recompute(
+                positions=ctx_pos,
+                rf=self.kernel_size,
+                embedding_dim=self.embedding_dim,
+                recompute=recompute,
+                to_device=self.ctx_conv.weight.device,
+                to_dtype=self.ctx_conv.weight.dtype,
+            )                                              # (sum_Uc, E, rf)
+            g_all_ctx = self._ctx_activations(wins_ctx).squeeze(-1)     # (sum_Uc, C)
+            gct = _scatter_g_to_BC(
+                g_all=g_all_ctx,
+                meta=meta_ctx,
+                batch_size=x.shape[0],
+                channels=self.channels,
+                to_device=g_all_ctx.device,
+                to_dtype=g_all_ctx.dtype,
+            )                                              # (B, C)
+        else:
+            gct = _eval_max_windows_vectorized(
+                z_full,
+                rf=self.kernel_size,
+                channels=self.channels,
+                positions=ctx_pos,
+                activations_fn=self._ctx_activations,
+            )                                              # (B, C)
+
+        # -------- Main path (uses gct) --------
+        _, main_pos = _lowmem_max_over_time(
+            z_full,
+            chunk_size=self.chunk_size,
+            overlap=self.overlap,
+            rf=self.kernel_size,
+            first_stride=self.stride,
+            channels=self.channels,
+            activations_fn=lambda z_chunk: self._main_activations(z_chunk, gct),
+        )
+
+        if recompute is not None:
+            # Gather windows for main, plus a repeated ctx per-window tensor aligned with wins_cat
+            wins_main, meta_main = _gather_wins_via_recompute(
+                positions=main_pos,
+                rf=self.kernel_size,
+                embedding_dim=self.embedding_dim,
+                recompute=recompute,
+                to_device=self.conv_1.weight.device,
+                to_dtype=self.conv_1.weight.dtype,
+            )                                              # (sum_Um, E, rf)
+
+            # Build ctx per-window: concat repeats of gct[b] for each U_b
+            ctx_per_win = []
+            for (start, inv, u_b), b in zip(meta_main, range(x.shape[0])):
+                if u_b == 0:
+                    continue
+                ctx_per_win.append(gct[b].unsqueeze(0).expand(u_b, -1))  # (U_b, C)
+            ctx_cat = torch.cat(ctx_per_win, dim=0) if ctx_per_win else gct.new_empty((0, self.channels))
+
+            g_all_main = self._main_activations(wins_main, ctx_cat).squeeze(-1)  # (sum_Um, C)
+
+            z = _scatter_g_to_BC(
+                g_all=g_all_main,
+                meta=meta_main,
+                batch_size=x.shape[0],
+                channels=self.channels,
+                to_device=g_all_main.device,
+                to_dtype=g_all_main.dtype,
+            )                                              # (B, C)
+        else:
+            z = _eval_max_windows_vectorized_per_batch(
+                z_full,
+                rf=self.kernel_size,
+                channels=self.channels,
+                positions=main_pos,
+                activations_per_batch_fn=lambda wins_b, gct_b: self._main_activations(wins_b, gct_b),
+                ctx=gct,
+            )
+
+        check_tensor(z, (x.shape[0], self.channels), FLOATS)
+        return z
+
+    def _ctx_activations(self, z: Tensor) -> Tensor:
+        """
+        Context subnetwork activations on a chunk.
+        z: (B, E, T_chunk) -> (B, C, T_out)
+        """
+        x = F.glu(self.ctx_conv(z), dim=1)
+        x = F.leaky_relu(self.ctx_share(x))
+        return x
+
+    def _main_activations(self, z: Tensor, gct: Tensor) -> Tensor:
+        """
+        Main subnetwork activations with GCG gating on a chunk.
+        z:   (B, E, T_chunk)
+        gct: (B, C)
+        ->   (B, C, T_out)
+        """
+        h = F.glu(self.conv_1(z), dim=1)
+        h = F.leaky_relu(self.conv_2(h))
+        q = torch.tanh(self.gct_proj(gct))           # (B, C)
+        gate = torch.sigmoid((h * q.unsqueeze(-1)).sum(dim=1, keepdim=True))  # (B, 1, T)
+        return h * gate
 
 # -------------------------------------------------------------------------------- #
-# MalConv2
+# MalConv Helpers
 # -------------------------------------------------------------------------------- #
 
 def _eval_max_windows_vectorized(
@@ -584,156 +865,60 @@ def _lowmem_max_over_time(
     return max_vals, max_pos
 
 
-class MalConvLowMem(nn.Module):  # type: ignore[misc]
+def _gather_wins_via_recompute(
+    *,
+    positions: torch.Tensor,              # (B, C)
+    rf: int,
+    embedding_dim: int,
+    recompute: Callable[[int, torch.Tensor, int], torch.Tensor],
+    to_device: torch.device,
+    to_dtype: torch.dtype,
+) -> tuple[torch.Tensor, list[tuple[int, torch.Tensor, int]]]:
     """
-    MalConv backbone with low-memory global max.
-
-    See: Raff "Classifying Sequences of Extreme Length with Constant Memory Applied to Malware Detection" AAAI 2021.
+    Calls `recompute(b, posuniq, rf)` per sample, validates shapes, casts,
+    permutes to (U_b, E, rf), concatenates all windows, and returns:
+      wins_cat : (sum_U, E, rf)
+      meta     : list of (offset, inv, U_b) for scattering back
     """
+    B = positions.shape[0]
+    wins_list: list[torch.Tensor] = []
+    meta: list[tuple[int, torch.Tensor, int]] = []
+    offset = 0
 
-    def __init__(
-        self,
-        embedding_dim: int = 8,
-        channels: int = 128,
-        kernel_size: int = 512,
-        stride: int = 512,
-        *,
-        chunk_size: int = 64_000,
-        overlap: Optional[int] = None,
-    ) -> None:
-        super().__init__()
-        self.conv_1 = nn.Conv1d(embedding_dim, channels, kernel_size, stride)
-        self.conv_2 = nn.Conv1d(embedding_dim, channels, kernel_size, stride)
-        self.sigmoid = nn.Sigmoid()
+    for b in range(B):
+        pos_b = positions[b]                                                # (C,)
+        posuniq, inv = torch.unique(pos_b, sorted=True, return_inverse=True)  # (U_b,), (C,)
+        z_b = recompute(b, posuniq, rf)                                     # (U_b, rf, E)
+        if z_b.dim() != 3 or z_b.shape[1] != rf or z_b.shape[2] != embedding_dim:
+            raise RuntimeError(f"recompute must return (U_b, rf, E); got {tuple(z_b.shape)}")
+        z_b = z_b.to(device=to_device, dtype=to_dtype).transpose(1, 2).contiguous()  # (U_b, E, rf)
+        wins_list.append(z_b)
+        meta.append((offset, inv, z_b.shape[0]))
+        offset += z_b.shape[0]
 
-        self.embedding_dim = embedding_dim
-        self.channels = channels
-        self.kernel_size = kernel_size
-        self.stride = stride
+    wins_cat = (torch.cat(wins_list, dim=0)
+                if wins_list else
+                torch.empty((0, embedding_dim, rf), device=to_device, dtype=to_dtype))
+    return wins_cat, meta
 
-        self.chunk_size = int(chunk_size)
-        self.overlap = int(overlap if overlap is not None else max(kernel_size - 1, 0))
 
-    def forward(self, x: Tensor, recompute: Optional[Callable[[int, Tensor, int], Tensor]] = None) -> Tensor:
-        """
-        Args:
-            x: Input embeddings of shape (B, T, E).
-            recompute: Callable that recomputes the activations on the winning windows.
-        Returns:
-            z: Hidden representation of shape (B, C).
-        """
-        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
-        if x.shape[1] < self.min_length:
-            raise RuntimeError(f"Input sequence length {x.shape[1]} is less than the minimum required length {self.min_length}.")
-
-        if self.training and recompute is None:
-            warnings.warn("`recompute` is None during training; gradients will not flow to previous components.")
-
-        z = x.transpose(1, 2)  # (B, E, T)
-
-        # Find per-channel winners
-        _, max_pos = _lowmem_max_over_time(
-            z,
-            chunk_size=self.chunk_size,
-            overlap=self.overlap,
-            rf=self.kernel_size,
-            first_stride=self.stride,
-            channels=self.channels,
-            activations_fn=self._activations,
-        )  # (B, C)
-
-        # If recompute given, rebuild the winning windows and recompute activations on them
-        # TODO: remove check_tensor calls.
-        if recompute is not None:
-            rf = self.kernel_size
-            z = torch.empty((x.shape[0], self.channels), device=x.device, dtype=x.dtype)
-            for i in range(x.shape[0]):
-                pos = max_pos[i]                             # (C,)        per-channel winning starts
-                posuniq, inv = torch.unique(pos, True, True) # (U,), (C,)  map each channel to its unique start (sorted)
-                z_i = recompute(i, posuniq, rf)              # (U, rf, E)  many windows for THIS sample
-                z_i = z_i.transpose(1, 2)                    # (U, E, rf)  conv expects (B, E, T)
-                z_i = self._activations(z_i)                 # (U, C, 1)   conv per window
-                z_i = z_i.squeeze(-1)                        # (U, C)      remove trailing dim of size 1
-                z_i = z_i[inv, torch.arange(self.channels)]  # (C,)        map each channel to its unique window
-                z[i] = z_i
-
-        # Otherwise, select and pass the winners
-        else:
-            z = _eval_max_windows_vectorized(
-                z,
-                rf=self.kernel_size,
-                channels=self.channels,
-                positions=max_pos,
-                activations_fn=self._activations,
-                stop_grad_input=True,
-            )
-        check_tensor(z, (x.shape[0], self.channels), FLOATS)
-        return z
-
-    def _activations(self, z: torch.Tensor) -> torch.Tensor:
-        c1 = self.conv_1(z)
-        c2 = self.conv_2(z)
-        return c1 * self.sigmoid(c2)
-
-    @property
-    def min_length(self) -> int:
-        return self.kernel_size
-
-    def fully_shard(self, **kwds: Any) -> None:
-        fully_shard(self, **kwds)
-
-    @staticmethod
-    def recompute(preprocess: Callable[[Any], Tensor], ts: Sequence[Tensor], b: int, pos: Tensor, rf: int) -> Tensor:
-        """
-        Basic recomputation function that can be passed to `MalConvLowMem.forward`.
-
-        Args:
-            preprocess: Module that computed the hidden representation, `z`, passed to `forward`.
-            ts:     Original input tensor(s) of shape (B, T, *).
-            b:      batch index
-            pos:    (U,) winning start positions
-            rf:     receptive field
-
-        Returns:
-            z:     Output tensor of shape (U, rf, E), which is a subset of the original input to `forward`.
-
-        Usage:
-            >>> embedding = nn.Embedding(...)
-            >>> model = MalConvLowMem(...)
-            >>> x = torch.randint(...)
-            >>> z = embedding(x)
-            >>> model(z)                       # No gradient flow to embedding
-            >>> ...
-            >>> from functools import partial
-            >>> recompute = partial(MalConvLowMem.recompute, embedding, [x])
-            >>> model(z, recompute=recompute)  # Gradients flow to embedding
-        """
-        if not isinstance(ts, Sequence):
-            raise TypeError(f"`ts` must be a sequence of tensors. Got {type(ts)} instead.")
-        if not all(isinstance(t, Tensor) for t in ts):
-            raise TypeError(f"All elements of `ts` must be tensors. Got {[type(t) for t in ts]} instead.")
-        if not all(t.dim() >= 2 for t in ts):
-            raise ValueError(f"All tensors in `ts` must have at least 2 dimensions. Got {[t.dim() for t in ts]} instead.")
-
-        # Build all length-rf windows along time for the whole batch.
-        # Move dimensions to ensure the dimensions larger than 2 are in the correct order.
-        t_unfs = [t.unfold(dimension=1, size=rf, step=1).movedim(-1, 2).contiguous() for t in ts]  # (B, T - rf + 1, rf, *)
-
-        # Handle degenerate case of no winners cleanly.
-        if pos.numel() == 0:
-            wins = [t.new_empty((0, rf) + tuple(t.shape[2:])) for t in ts]
-            z = preprocess(*wins)
-            z = z.contiguous()
-            check_tensor(z, (0, rf, None))
-            return z
-
-        # Select this sample's winning windows and preprocess them.
-        wins = [t_unf[b, pos] for t_unf in t_unfs]   # (U, rf, *)
-        z = preprocess(*wins)                        # (U, rf, None)
-        z = z.contiguous()
-
-        check_tensor(z, (wins[0].shape[0] if len(wins) > 0 else None, rf, None), FLOATS)
-        return z
+def _scatter_g_to_BC(
+    *,
+    g_all: torch.Tensor,                                     # (sum_U, C)
+    meta: list[tuple[int, torch.Tensor, int]],
+    batch_size: int,
+    channels: int,
+    to_device: torch.device,
+    to_dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Maps concatenated per-window activations back to (B, C) using meta.
+    """
+    out = torch.empty((batch_size, channels), device=to_device, dtype=to_dtype)
+    for b, (start, inv, u_b) in enumerate(meta):
+        g_b = g_all[start:start + u_b]                       # (U_b, C)
+        out[b] = g_b[inv, torch.arange(channels, device=to_device)]
+    return out
 
 
 def _eval_max_windows_vectorized_per_batch(
@@ -773,143 +958,18 @@ def _eval_max_windows_vectorized_per_batch(
             with torch.no_grad():
                 wins_b = wins_b.clone()                        # detach from z graph
 
-        ctx_b = ctx[b].unsqueeze(0).expand(wins_b.shape[0], -1)  # (U_b, C)
+        ctx_b = ctx[b].unsqueeze(0).expand(wins_b.shape[0], -1)    # (U_b, C)
         g_b = activations_per_batch_fn(wins_b, ctx_b).squeeze(-1)  # (U_b, C)
         out[b] = g_b[inv_b, torch.arange(channels, device=device)]
     return out
-
-
-class MalConvGCG(nn.Module):  # type: ignore[misc]
-    """
-    MalConv backbone with low-memory global max and global channel gating (GCG).
-
-    See: Raff "Classifying Sequences of Extreme Length with Constant Memory Applied to Malware Detection" AAAI 2021.
-    """
-
-    def __init__(
-        self,
-        embedding_dim: int = 8,
-        channels: int = 128,
-        kernel_size: int = 512,
-        stride: int = 512,
-        *,
-        chunk_size: int = 64_000,
-        overlap: Optional[int] = None,
-    ) -> None:
-        super().__init__()
-
-        # Context path (no gating)
-        self.ctx_conv   = nn.Conv1d(embedding_dim, 2 * channels, kernel_size, stride=stride, bias=True)
-        self.ctx_share  = nn.Conv1d(channels, channels, 1, bias=True)
-
-        # Main path (with GCG gating)
-        self.main_conv  = nn.Conv1d(embedding_dim, 2 * channels, kernel_size, stride=stride, bias=True)
-        self.main_share = nn.Conv1d(channels, channels, 1, bias=True)
-        self.gct_proj   = nn.Linear(channels, channels)
-
-        self.embedding_dim = embedding_dim
-        self.channels = channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-
-        self.chunk_size = int(chunk_size)
-        self.overlap = int(overlap if overlap is not None else max(kernel_size - 1, 0))
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: (B, T, E) input embeddings
-        Returns:
-            z: (B, C) feature vector (global max over time)
-        """
-        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
-        if x.shape[1] < self.min_length:
-            raise RuntimeError(
-                f"Input sequence length {x.shape[1]} is less than the minimum required length {self.min_length}."
-            )
-
-        z_full = x.transpose(1, 2)  # (B, E, T)
-
-        _, ctx_pos = _lowmem_max_over_time(
-            z_full,
-            chunk_size=self.chunk_size,
-            overlap=self.overlap,
-            rf=self.kernel_size,
-            first_stride=self.stride,
-            channels=self.channels,
-            activations_fn=self._ctx_activations,
-        )
-        gct = _eval_max_windows_vectorized(
-            z_full,
-            rf=self.kernel_size,
-            channels=self.channels,
-            positions=ctx_pos,
-            activations_fn=self._ctx_activations,
-        )
-        _, main_pos = _lowmem_max_over_time(
-            z_full,
-            chunk_size=self.chunk_size,
-            overlap=self.overlap,
-            rf=self.kernel_size,
-            first_stride=self.stride,
-            channels=self.channels,
-            activations_fn=lambda z_chunk: self._main_activations(z_chunk, gct),
-        )
-        z = _eval_max_windows_vectorized_per_batch(
-            z_full,
-            rf=self.kernel_size,
-            channels=self.channels,
-            positions=main_pos,
-            activations_per_batch_fn=lambda wins_b, gct_b: self._main_activations(wins_b, gct_b),
-            ctx=gct,
-        )
-
-        check_tensor(z, (x.shape[0], self.channels), FLOATS)
-        return z
-
-    def _ctx_activations(self, z: Tensor) -> Tensor:
-        """
-        Context subnetwork activations on a chunk.
-        z: (B, E, T_chunk) -> (B, C, T_out)
-        """
-        x = F.glu(self.ctx_conv(z), dim=1)
-        x = F.leaky_relu(self.ctx_share(x))
-        return x
-
-    def _main_activations(self, z: Tensor, gct: Tensor) -> Tensor:
-        """
-        Main subnetwork activations with GCG gating on a chunk.
-        z:   (B, E, T_chunk)
-        gct: (B, C)
-        ->   (B, C, T_out)
-        """
-        h = F.glu(self.main_conv(z), dim=1)
-        h = F.leaky_relu(self.main_share(h))
-        q = torch.tanh(self.gct_proj(gct))           # (B, C)
-        gate = torch.sigmoid((h * q.unsqueeze(-1)).sum(dim=1, keepdim=True))  # (B, 1, T)
-        return h * gate
-
-    @property
-    def min_length(self) -> int:
-        return self.kernel_size
-
-    def fully_shard(self, **kwds: Any) -> None:
-        fully_shard(self, **kwds)
 
 # -------------------------------------------------------------------------------- #
 # Classifiers
 # -------------------------------------------------------------------------------- #
 
-class MalConvClassifier(nn.Module):  # type: ignore[misc]
+class Classifier(nn.Module, ABC):  # type: ignore[misc]
 
-    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, backbone: MalConv | MalConvLowMem | MalConvGCG, head: ClassifificationHead) -> None:
-        super().__init__()
-
-        self.embedding = embedding
-        self.filmer = filmer
-        self.backbone = backbone
-        self.head = head
-
+    @abstractmethod
     def forward(self, x: Tensor, g: Optional[Tensor]) -> Tensor:
         """
         Args:
@@ -918,9 +978,30 @@ class MalConvClassifier(nn.Module):  # type: ignore[misc]
         Returns:
             z: Classification logits of shape (B, M).
         """
+        ...
+
+    @abstractmethod
+    def fully_shard(self, **kwds: Any) -> None:
+        ...
+
+    def _check_forward_inputs(self, x: Tensor, g: Optional[Tensor]) -> None:
         check_tensor(x, (None, None), INTEGERS)
         if g is not None:
             check_tensor(g, (x.shape[0], x.shape[1], None), FLOATS)
+
+
+class MalConvClassifier(Classifier):
+
+    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, backbone: MalConvBase, head: ClassifificationHead) -> None:
+        super().__init__()
+
+        self.embedding = embedding
+        self.filmer = filmer
+        self.backbone = backbone
+        self.head = head
+
+    def forward(self, x: Tensor, g: Optional[Tensor]) -> Tensor:
+        self._check_forward_inputs(x, g)
 
         def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
             z = self.embedding(x)  # (B, T, E)
@@ -939,12 +1020,12 @@ class MalConvClassifier(nn.Module):  # type: ignore[misc]
         return z
 
     def fully_shard(self, **kwds: Any) -> None:
-        fully_shard([self.embedding, self.filmer, self.patcher], **kwds)
+        fully_shard([self.embedding, self.filmer], **kwds)
         self.backbone.fully_shard(**kwds)
         fully_shard(self, **kwds | {"reshard_after_forward": False})
 
 
-class ViTClassifier(nn.Module):  # type: ignore[misc]
+class ViTClassifier(Classifier):
 
     def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, patcher: PatchEncoder, backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__()
@@ -956,16 +1037,7 @@ class ViTClassifier(nn.Module):  # type: ignore[misc]
         self.head = head
 
     def forward(self, x: Tensor, g: Optional[Tensor]) -> Tensor:
-        """
-        Args:
-            x: Input tensor of shape (B, T).
-            g: FiLM conditioning vector of shape (B, T, G).
-        Returns:
-            z: Classification logits of shape (B, M).
-        """
-        check_tensor(x, (None, None), INTEGERS)
-        if g is not None:
-            check_tensor(g, (x.shape[0], x.shape[1], None), FLOATS)
+        self._check_forward_inputs(x, g)
 
         z = self.embedding(x)  # (B, T, E)
         z = self.filmer(z, g)  # (B, T, E)
@@ -981,42 +1053,21 @@ class ViTClassifier(nn.Module):  # type: ignore[misc]
         self.backbone.fully_shard(**kwds)
         fully_shard(self, **kwds | {"reshard_after_forward": False})
 
+# -------------------------------------------------------------------------------- #
+# Hierarchical Classifiers
+# -------------------------------------------------------------------------------- #
 
-def _check_hierarchical_inputs(x: list[Optional[Tensor]], g: list[Optional[Tensor]], num_structures: int) -> None:
-    if not (len(x) == len(g) == num_structures):
-        raise ValueError(f"Expected {num_structures} structures, got {len(x)=} and {len(g)=} instead.")
+class HierarchicalClassifier(nn.Module, ABC):  # type: ignore[misc]
 
-    if all(x[i] is None for i in range(num_structures)):
-        raise ValueError("At least one structure must have input.")
-
-    x_ref: Tensor = next((x[i] for i in range(num_structures) if x[i] is not None))
-
-    for i in range(num_structures):
-        if x[i] is None:
-            continue
-        check_tensor(x[i], (x_ref.shape[0], None), INTEGERS)
-        if g[i] is not None:
-            check_tensor(g[i], (x_ref.shape[0], x[i].shape[1], None), FLOATS)  # type: ignore[union-attr]
-
-
-class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
-    """
-    Uses disparate MalConv models (Embedding + FiLM + MalConv) to process multiple input structures
-        and averages these hidden representations before feeding them to a classification head.
-    """
-
-    def __init__(self, embeddings: list[nn.Embedding], filmers: list[FiLM | FiLMNoP], backbones: list[MalConv], head: ClassifificationHead) -> None:
+    def __init__(self, num_structures: int) -> None:
         super().__init__()
+        if num_structures < 1:
+            raise ValueError(f"num_structures must be at least 1. Got {num_structures} instead.")
+        if num_structures == 1:
+            warnings.warn("HierarchicalClassifier with num_structures=1 is equivalent to a standard Classifier.")
+        self.num_structures = num_structures
 
-        if not (len(embeddings) == len(filmers) == len(backbones)):
-            raise ValueError("The number of embeddings, filmers, and backbones must be the same.")
-        self.num_structures = len(embeddings)
-
-        self.embeddings = nn.ModuleList(embeddings)
-        self.filmers = nn.ModuleList(filmers)
-        self.backbones = nn.ModuleList(backbones)
-        self.head = head
-
+    @abstractmethod
     def forward(self, x: list[Optional[Tensor]], g: list[Optional[Tensor]]) -> Tensor:
         """
         Args:
@@ -1025,7 +1076,69 @@ class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
         Returns:
             z: Classification logits of shape (B, M).
         """
-        _check_hierarchical_inputs(x, g, self.num_structures)
+        ...
+
+    @abstractmethod
+    def fully_shard(self, **kwds: Any) -> None:
+        ...
+
+    @property
+    @abstractmethod
+    def _trunks(self) -> Sequence[tuple[nn.Module, ...]]:
+        ...
+
+    def _get_min_max_lengths(self) -> list[tuple[int, int]]:
+        lengths = []
+        for i in range(self.num_structures):
+            trunk = self._trunks[i]
+            los, his = zip(*(get_model_input_lengths(m) for m in trunk))
+            lengths.append((max(los), min(his)))
+        return lengths
+
+    @property
+    def min_lengths(self) -> list[int]:
+        return [l[0] for l in self._get_min_max_lengths()]
+
+    @property
+    def max_lengths(self) -> list[int]:
+        return [l[1] for l in self._get_min_max_lengths()]
+
+    def _check_forward_inputs(self, x: list[Optional[Tensor]], g: list[Optional[Tensor]]) -> None:
+        if not (len(x) == len(g) == self.num_structures):
+            raise ValueError(f"Expected {self.num_structures} structures, got {len(x)=} and {len(g)=} instead.")
+
+        if all(x[i] is None for i in range(self.num_structures)):
+            raise ValueError("At least one structure must have input.")
+
+        x_ref: Tensor = next((x[i] for i in range(self.num_structures) if x[i] is not None))
+
+        for i in range(self.num_structures):
+            if x[i] is None:
+                continue
+            check_tensor(x[i], (x_ref.shape[0], None), INTEGERS)
+            if g[i] is not None:
+                check_tensor(g[i], (x_ref.shape[0], x[i].shape[1], None), FLOATS)  # type: ignore[union-attr]
+
+
+class HierarchicalMalConvClassifier(HierarchicalClassifier):
+    """
+    Uses disparate MalConv models (Embedding + FiLM + MalConv) to process multiple input structures
+        and averages these hidden representations before feeding them to a classification head.
+    """
+
+    def __init__(self, embeddings: list[nn.Embedding], filmers: list[FiLM | FiLMNoP], backbones: list[MalConv], head: ClassifificationHead) -> None:
+        super().__init__(len(embeddings))
+
+        if not (len(embeddings) == len(filmers) == len(backbones)):
+            raise ValueError("The number of embeddings, filmers, and backbones must be the same.")
+
+        self.embeddings = nn.ModuleList(embeddings)
+        self.filmers = nn.ModuleList(filmers)
+        self.backbones = nn.ModuleList(backbones)
+        self.head = head
+
+    def forward(self, x: list[Optional[Tensor]], g: list[Optional[Tensor]]) -> Tensor:
+        self._check_forward_inputs(x, g)
 
         zs: list[Tensor] = []
         for i in range(self.num_structures):
@@ -1043,24 +1156,13 @@ class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
         check_tensor(z, (zs[0].shape[0], self.head.num_classes), FLOATS)
         return z
 
-    def _get_min_max_lengths(self) -> list[tuple[int, int]]:
-        lengths = []
+    @property
+    def _trunks(self) -> Sequence[tuple[nn.Module, ...]]:
+        trunks = []
         for i in range(self.num_structures):
-            lo_e, hi_e = get_model_input_lengths(self.embeddings[i])
-            lo_f, hi_f = get_model_input_lengths(self.filmers[i])
-            lo_b, hi_b = get_model_input_lengths(self.backbones[i])
-            lo = max(lo_e, lo_f, lo_b)
-            hi = min(hi_e, hi_f, hi_b)
-            lengths.append((lo, hi))
-        return lengths
-
-    @property
-    def min_lengths(self) -> list[int]:
-        return [l[0] for l in self._get_min_max_lengths()]
-
-    @property
-    def max_lengths(self) -> list[int]:
-        return [l[1] for l in self._get_min_max_lengths()]
+            trunk = (self.embeddings[i], self.filmers[i], self.backbones[i])
+            trunks.append(trunk)
+        return trunks
 
     def fully_shard(self, **kwds: Any) -> None:
         for i in range(self.num_structures):
@@ -1069,18 +1171,17 @@ class HierarchicalMalConvClassifier(nn.Module):  # type: ignore[misc]
         fully_shard(self, **kwds | {"reshard_after_forward": False})
 
 
-class HierarchicalViTClassifier(nn.Module):  # type: ignore[misc]
+class HierarchicalViTClassifier(HierarchicalClassifier):
     """
     Uses disparate ViT trunks (Embedding + FiLM + PatchEncoder) to process multiple input structures
         and feeds the encoded patches to a shared ViT backbone followed by a classification head.
     """
 
     def __init__(self, embeddings: list[nn.Embedding], filmers: list[FiLM | FiLMNoP], patchers: list[PatchEncoder], backbone: ViT, head: ClassifificationHead) -> None:
-        super().__init__()
+        super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(patchers)):
             raise ValueError("The number of embeddings, filmers, and patchers must be the same.")
-        self.num_structures = len(embeddings)
 
         self.embeddings = nn.ModuleList(embeddings)
         self.filmers = nn.ModuleList(filmers)
@@ -1096,7 +1197,7 @@ class HierarchicalViTClassifier(nn.Module):  # type: ignore[misc]
         Returns:
             z: Classification logits of shape (B, M).
         """
-        _check_hierarchical_inputs(x, g, self.num_structures)
+        self._check_forward_inputs(x, g)
 
         zs: list[Tensor] = []
         for i in range(self.num_structures):
@@ -1114,25 +1215,13 @@ class HierarchicalViTClassifier(nn.Module):  # type: ignore[misc]
         check_tensor(z, (zs[0].shape[0], self.head.num_classes), FLOATS)
         return z
 
-    def _get_min_max_lengths(self) -> list[tuple[int, int]]:
-        lengths = []
+    @property
+    def _trunks(self) -> Sequence[tuple[nn.Module, ...]]:
+        trunks = []
         for i in range(self.num_structures):
-            lo_e, hi_e = get_model_input_lengths(self.embeddings[i])
-            lo_f, hi_f = get_model_input_lengths(self.filmers[i])
-            lo_p, hi_p = get_model_input_lengths(self.patchers[i])
-            lo_b, hi_b = get_model_input_lengths(self.backbone)
-            lo = max(lo_e, lo_f, lo_p, lo_b)
-            hi = min(hi_e, hi_f, hi_p, hi_b)
-            lengths.append((lo, hi))
-        return lengths
-
-    @property
-    def min_lengths(self) -> list[int]:
-        return [l[0] for l in self._get_min_max_lengths()]
-
-    @property
-    def max_lengths(self) -> list[int]:
-        return [l[1] for l in self._get_min_max_lengths()]
+            trunk = (self.embeddings[i], self.filmers[i], self.patchers[i])
+            trunks.append(trunk)
+        return trunks
 
     def fully_shard(self, **kwds: Any) -> None:
         for i in range(self.num_structures):
