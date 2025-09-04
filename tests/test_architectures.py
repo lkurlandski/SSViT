@@ -9,6 +9,7 @@ from typing import Optional
 
 import pytest
 import torch
+from torch import nn
 from torch.nn import Embedding
 
 from src.architectures import ClassifificationHead
@@ -22,6 +23,25 @@ from src.architectures import MalConvLowMem
 from src.architectures import MalConvGCG
 from src.architectures import HierarchicalMalConvClassifier
 from src.architectures import HierarchicalViTClassifier
+
+
+def _zero_grads(*modules: nn.Module) -> None:
+    for m in modules:
+        if m is None:
+            continue
+        if isinstance(m, nn.Module):
+            for p in m.parameters(recurse=True):
+                if p is not None and p.grad is not None:
+                    p.grad.detach_()
+                    p.grad.zero_()
+
+
+def _clear_grads(*modules: nn.Module) -> None:
+    for m in modules:
+        if m is None:
+            continue
+        for p in m.parameters(recurse=True):
+            p.grad = None
 
 
 class TestClassificationHead:
@@ -263,22 +283,61 @@ class TestMalConvLowMem:
 
         x = torch.randint(0, 8, (batch_size, seq_length))
         g = None if guides_are_none else torch.rand((batch_size, seq_length, 3))
-        z = preprocess(x, g)
+        z = preprocess(x, g).detach().requires_grad_(True)
 
+        recompute = partial(MalConvLowMem.recompute, preprocess, (x, g) if g is not None else (x,))
+
+        # Case 1: Eval mode without recompute
         net.eval()
+        _clear_grads(net, embedding, filmer)
         z1 = net.forward(z, recompute=None)
+        loss = z1.sum()
+        loss.backward()
         assert z1.shape == (batch_size, channels)
+        assert net.conv_1.weight.grad is not None and net.conv_1.weight.grad.abs().sum() > 0
+        assert embedding.weight.grad is None
+        assert all(p.grad is None for p in filmer.parameters()) if isinstance(filmer, FiLM) else True
+        assert z.grad is None
 
-        net.train()
-        with pytest.warns(UserWarning):
-            z2 = net.forward(z, recompute=None)
+        # Case 2: Eval mode with recompute
+        net.eval()
+        _clear_grads(net, embedding, filmer)
+        z2 = net.forward(z, recompute=recompute)
+        loss = z2.sum()
+        loss.backward()
         assert z2.shape == (batch_size, channels)
+        assert net.conv_1.weight.grad is not None and net.conv_1.weight.grad.abs().sum() > 0
+        assert embedding.weight.grad is not None and embedding.weight.grad.abs().sum() > 0
+        assert all(p.grad is not None for p in filmer.parameters()) if isinstance(filmer, FiLM) else True
+        assert z.grad is None
 
-        z3 = net.forward(z, recompute=partial(MalConvLowMem.recompute, preprocess, (x, g) if g is not None else (x,)))
+        # Case 3: Train mode without recompute
+        net.train()
+        _clear_grads(net, embedding, filmer)
+        z3 = net.forward(z, recompute=None)
+        loss = z3.sum()
+        loss.backward()
         assert z3.shape == (batch_size, channels)
+        assert net.conv_1.weight.grad is not None and net.conv_1.weight.grad.abs().sum() > 0
+        assert embedding.weight.grad is None
+        assert all(p.grad is None for p in filmer.parameters()) if isinstance(filmer, FiLM) else True
+        assert z.grad is None
 
-        assert torch.allclose(z1, z2), f"Max diff: {torch.max(torch.abs(z1.flatten() - z2.flatten()))}"
+        # Case 4: Train mode with recompute
+        net.train()
+        _clear_grads(net, embedding, filmer)
+        z4 = net.forward(z, recompute=recompute)
+        loss = z4.sum()
+        loss.backward()
+        assert z4.shape == (batch_size, channels)
+        assert net.conv_1.weight.grad is not None and net.conv_1.weight.grad.abs().sum() > 0
+        assert embedding.weight.grad is not None and embedding.weight.grad.abs().sum() > 0
+        assert all(p.grad is not None for p in filmer.parameters()) if isinstance(filmer, FiLM) else True
+        assert z.grad is None
+
+        assert torch.allclose(z1, z2, atol=1e-7), f"Max diff: {torch.max(torch.abs(z1.flatten() - z2.flatten()))}"
         assert torch.allclose(z1, z3, atol=1e-7), f"Max diff: {torch.max(torch.abs(z1.flatten() - z3.flatten()))}"
+        assert torch.allclose(z1, z4, atol=1e-7), f"Max diff: {torch.max(torch.abs(z1.flatten() - z2.flatten()))}"
 
 
 class TestHierarchicalMalConvClassifier:
