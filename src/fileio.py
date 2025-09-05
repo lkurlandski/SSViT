@@ -101,7 +101,7 @@ def read_files_asynch_lazy(
     else:
         raise RuntimeError("read_files_asynch_lazy() cannot be called from an async context.")
 
-    agen = _read_files_asynch_lazy(files, max_length, asynch_chunk_size)
+    agen = _read_files_asynch_lazy(files, max_length, asynch_chunk_size, greedy)
     try:
         while True:
             try:
