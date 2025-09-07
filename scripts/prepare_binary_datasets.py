@@ -16,8 +16,10 @@ from io import BytesIO
 import math
 import multiprocessing as mp
 from multiprocessing.context import SpawnProcess
+from multiprocessing.synchronize import Event
 import os
 from pathlib import Path
+import queue
 import sys
 from typing import Any
 from typing import NamedTuple
@@ -86,20 +88,37 @@ def download_file(url: str, outfile: StrPath, chunk_size: int = 4096) -> None:
         print(f"An unexpected error occurred: {e}")
 
 
-_SENTINEL = None
+_SENTINEL = object()
 
 
-def _producer_worker(streamer: DatasetStreamer, names: Iterable[str], out_q: mp.Queue[Optional[Sample]], verbose: bool, worker_idx: int) -> None:
+def _producer_worker(streamer: DatasetStreamer, names: Iterable[str], out_q: mp.Queue[Sample | object], stop_event: Event, worker_idx: int) -> None:
     try:
         for sample in streamer.stream(names):
-            out_q.put(sample)
+            if stop_event.is_set():
+                break
+            # Don't block forever if the consumer stops early (e.g., islice).
+            while not stop_event.is_set():
+                try:
+                    out_q.put(sample, timeout=0.2)
+                    break
+                except queue.Full:
+                    continue
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        if verbose:
-            print(f"[worker {worker_idx}] error: {e!r}")
+        print(f"_producer_worker [worker {worker_idx}] {e}")
     finally:
-        out_q.put(_SENTINEL)
+        # Best effort to notify completion without hanging if the queue is gone.
+        try:
+            out_q.put(_SENTINEL, timeout=0.2)
+        except Exception:
+            pass
+        # Let the child drop its handle promptly to avoid resource_tracker warnings.
+        try:
+            out_q.close()
+            out_q.cancel_join_thread()
+        except Exception:
+            pass
 
 
 class Sample(NamedTuple):
@@ -126,23 +145,26 @@ class DatasetStreamer(ABC):
             return
 
         # Get the list of all available sample names and handle the split across workers.
-        names = list(islice(self.namelist(), 1000))  # FIXME
+        names = list(self.namelist())
         batch_size = math.ceil(len(names) / max(1, self.num_workers))
         batches = list(batched(names, batch_size))
 
         # Create a spawn context for safety (works well across platforms).
         ctx = mp.get_context("spawn")
 
-        # Reasonable queue size to allow some buffering without huge RAM usage.
+        # Bounded queue: small buffer for backpressure. We use timeouts to avoid deadlocks.
         out_q = ctx.Queue(max(2, self.num_workers * 2))
 
-        # Pass a pickleable instance to each worker. This may be funky on anything other than Linux.
+        # Stop flag to tell producers to stop early if the consumer exits (e.g., due to islice).
+        stop_event = ctx.Event()
+
+        # Start workers (non-daemon so they can flush/exit cleanly).
         procs: list[SpawnProcess] = []
         for i, chunk in enumerate(batches):
             p = ctx.Process(
                 target=_producer_worker,
-                args=(self, chunk, out_q, not self.quiet, i),
-                daemon=True,
+                args=(self, chunk, out_q, stop_event, i),
+                daemon=False,
             )
             p.start()
             procs.append(p)
@@ -151,22 +173,54 @@ class DatasetStreamer(ABC):
         try:
             # Greedy single-consumer yields as items arrive and stops after all sentinels.
             while finished < len(procs):
-                item = out_q.get()
+                try:
+                    item = out_q.get(timeout=0.2)  # short timeout lets us react to early shutdown
+                except queue.Empty:
+                    # Periodically loop to notice if workers exited or a stop was requested
+                    continue
+
                 if item is _SENTINEL:
                     finished += 1
                     continue
+
+                # Normal path: yield a sample
                 yield item
+
+        except GeneratorExit:
+            # The upstream consumer stopped (e.g., islice took N items).
+            # Signal producers to stop generating new work.
+            stop_event.set()
+            raise
         finally:
-            # Ensure all workers are terminated and joined.
-            for p in procs:
-                if p.is_alive():
-                    p.terminate()
-            for p in procs:
-                p.join(timeout=5)
+            # Always signal stop (idempotent) and drain any remaining items to unblock puts.
+            stop_event.set()
+            try:
+                while True:
+                    out_q.get_nowait()
+            except queue.Empty:
+                pass
+            except Exception:
+                pass
+
+            # Close and join the queue feeder thread cleanly
             try:
                 out_q.close()
             except Exception:
                 pass
+            try:
+                out_q.join_thread()
+            except Exception:
+                pass
+
+            # Let workers exit on their own; avoid terminate() unless they hang.
+            for p in procs:
+                p.join(timeout=5)
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
+            for p in procs:
+                if p.is_alive():
+                    p.join(timeout=2)
 
     @abstractmethod
     def stream(self, names: Optional[Iterable[str]]) -> Generator[Sample, None, None]:
