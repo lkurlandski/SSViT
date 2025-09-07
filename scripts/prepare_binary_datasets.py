@@ -206,7 +206,7 @@ class AssemblageStreamer(DatasetStreamer):
             for name in tqdm(names, desc="Extracting...", disable=self.disable_tqdm):
                 b = zip_ref.read(name)
                 if not any(b.startswith(m) for m in self.magic):
-                    print(f"Skipping {name} (Unexpected magic {b[0:8].decode()})")
+                    if not self.quiet: print(f"Skipping {name} (Unexpected magic {b[0:8].decode()})")
                     continue
                 sha = hashlib.sha256(b).hexdigest()
                 yield Sample(sha, b, False)
@@ -302,6 +302,8 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--progress", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--shardsize", type=int, default=2**30)
+    parser.add_argument("--hierdepth", type=int, default=2)
     args = parser.parse_args()
 
     kwds = {
@@ -312,35 +314,38 @@ def main() -> None:
     }
 
     streamer: DatasetStreamer
-    stream: Iterable[Sample] = iter(())
+    stream: Iterable[Sample]
+    fullstream: Iterable[Sample] = iter(())
 
     if "ass" in args.dataset:
         streamer = AssemblageStreamer(MAGIC["pe"], archive=Path("./tmp/WindowsBinaries.zip"), **kwds)
-        stream = chain(stream, islice(streamer, args.num_samples))
+        stream = islice(streamer, args.num_samples)
+        stream = tqdm(stream, desc="Processing Assemblage...", disable=not args.progress)
+        fullstream = chain(fullstream, stream)
 
     if "sor" in args.dataset:
         streamer = SorelStreamer(**kwds)
-        stream = chain(stream, islice(streamer, args.num_samples))
-
-    stream = tqdm(stream, disable=not args.progress, desc="Processing...")
+        stream = islice(streamer, args.num_samples)
+        stream = tqdm(stream, desc="Processing Sorel...", disable=not args.progress)
+        fullstream = chain(fullstream, stream)
 
     if args.storage in ("flat", "hier"):
         indexfile = args.root / "index.txt"
         binaries: Path = args.root / "binaries"
         binaries.mkdir(parents=True, exist_ok=True)
         if args.storage == "hier":
-            create_sample_paths(binaries, depth=2)
+            create_sample_paths(binaries, depth=args.hierdepth)
         with open(indexfile, "w") as fp:
-            for sample in stream:
+            for sample in fullstream:
                 outpath = binaries / sample.sha
                 if args.storage == "hier":
-                    outpath = get_sample_path(sample.sha, binaries, depth=2)
+                    outpath = get_sample_path(sample.sha, binaries, depth=args.hierdepth)
                 outpath.write_bytes(sample.data)
                 fp.write(f"{sample.sha} {'1' if sample.malware else '0'}\n")
 
     if args.storage == "pack":
-        creator = CreateSimpleDB(args.root)
-        cstream = (CreateSimpleDBSample(sample.sha, sample.data, sample.malware, -1) for sample in stream)
+        creator = CreateSimpleDB(args.root, shardsize=args.shardsize)
+        cstream = (CreateSimpleDBSample(sample.sha, sample.data, sample.malware, -1) for sample in fullstream)
         creator(cstream)
 
 
