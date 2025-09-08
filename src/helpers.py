@@ -52,13 +52,15 @@ class MainArgs:
     level: HierarchicalLevel = HierarchicalLevel.NONE
     tr_num_samples: Optional[int] = None
     vl_num_samples: Optional[int] = None
+    ts_num_samples: Optional[int] = None
     max_length: Optional[int] = None
     num_streams: int = 0
     num_workers: int = 0
     pin_memory: bool = False
     prefetch_factor: int = 1
     tr_batch_size: int = 1
-    vl_batch_size: int = 1
+    vl_batch_size: Optional[int] = None
+    ts_batch_size: Optional[int] = None
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
     device: torch.device = torch.device("cpu")
@@ -68,8 +70,10 @@ class MainArgs:
     tf32: bool = False
 
     def __post_init__(self) -> None:
-        if self.tr_batch_size == 1 or self.vl_batch_size == 1:
+        if self.tr_batch_size == 1 or self.vl_batch_size == 1 or self.ts_batch_size == 1:
             raise NotImplementedError("Batch size of 1 is not supported right now. See https://docs.pytorch.org/docs/stable/data#working-with-collate-fn.")
+        self.vl_batch_size = self.tr_batch_size if self.vl_batch_size is None else self.vl_batch_size
+        self.ts_batch_size = self.vl_batch_size if self.ts_batch_size is None else self.ts_batch_size
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise ValueError("CUDA device specified but not available.")
         if self.ddp and self.fsdp:
@@ -80,6 +84,7 @@ class MainArgs:
             raise ValueError("If --ddp or --fsdp is set, the script must be launched with torchrun.")
         self.pin_memory = self.pin_memory and self.device.type == "cuda"
         self.num_streams = 0 if self.device.type == "cpu" else self.num_streams
+        self.prefetch_factor = max(1, self.prefetch_factor) if self.num_workers > 0 else 0
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
