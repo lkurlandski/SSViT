@@ -245,7 +245,7 @@ def run_mpsc(
     DATA_DONE = _DataDone()
 
     # Start consumer process
-    consumer_p = ctx.Process(
+    consumer_p = ctx.Process(  # type: ignore[attr-defined]
         target=_consumer_proc,
         args=(data_q, errr_q, consumer_fn, DATA_DONE, stop),
         name="consumer",
@@ -256,7 +256,7 @@ def run_mpsc(
     # Start producer processes
     producers: list[mp.Process] = []
     for i in range(num_producers):
-        p = ctx.Process(
+        p = ctx.Process(  # type: ignore[attr-defined]
             target=_producer_proc,
             args=(work_q, data_q, errr_q, producer_fn, transport, shm_threshold, tempdir, WORK_DONE, DATA_DONE, stop),
             name=f"producer-{i}",
@@ -550,6 +550,6 @@ def _poll_child_error(errr_q: mp.Queue[Any]) -> Optional[tuple[str, str, str, st
         (where, etype, msg, tb) if available, else None.
     """
     try:
-        return errr_q.get_nowait()
+        return errr_q.get_nowait()  # type: ignore[no-any-return]
     except queue.Empty:
         return None
