@@ -4,6 +4,7 @@ Train and validate models.
 
 from collections.abc import Sequence
 from collections import Counter
+from hashlib import md5
 import math
 import os
 from pathlib import Path
@@ -310,6 +311,21 @@ def get_materials(backend: IOBackend, db: Optional[SimpleDB]) -> Materials:
     raise ValueError(f"{backend}")
 
 
+def split_materials(idx: np.ndarray, labels: np.ndarray, timestamps: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return tr_vl_ts_split(
+        idx,
+        tr_size=0.8,
+        vl_size=0.1,
+        ts_size=0.1,
+        labels=labels,
+        ratios=np.array([0.5, 0.5]),
+        timestamps=timestamps,
+        shuffle=True,
+        random_state=seed,
+        temporal_mode="balanced",
+    )
+
+
 def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int]) -> CollateFn | CollateFnHierarchical:
     if level == HierarchicalLevel.NONE:
         return CollateFn(False, False, min_lengths[0])
@@ -396,21 +412,14 @@ def main() -> None:
     print(f"{db=}")
 
     idx, files, labels, timestamps, sizes = get_materials(args.io_backend, db)
-    if np.all(timestamps == -1):
-        warnings.warn("No timestamps found in the database, using random split instead of temporal split.")
-        timestamps = None  # type: ignore[assignment]  # TODO: fix me
-    tr_idx, vl_idx, ts_idx = tr_vl_ts_split(idx,
-        tr_size=0.8, vl_size=0.1, ts_size=0.1,
-        labels=labels, ratios=np.array([0.5, 0.5]), timestamps=timestamps,
-        shuffle=True, random_state=args.seed, temporal_mode="balanced",
-    )
+    tr_idx, vl_idx, ts_idx = split_materials(idx, labels, timestamps, args.seed)
     tr_idx = tr_idx[0:args.tr_num_samples]
     vl_idx = vl_idx[0:args.vl_num_samples]
     ts_idx = ts_idx[0:args.ts_num_samples]
-    print(f"idx    ({len(idx)}):    distribution={np.unique(labels,         return_counts=True)}")  # type: ignore[no-untyped-call]
-    print(f"tr_idx ({len(tr_idx)}): distribution={np.unique(labels[tr_idx], return_counts=True)}")  # type: ignore[no-untyped-call]
-    print(f"vl_idx ({len(vl_idx)}): distribution={np.unique(labels[vl_idx], return_counts=True)}")  # type: ignore[no-untyped-call]
-    print(f"ts_idx ({len(ts_idx)}): distribution={np.unique(labels[ts_idx], return_counts=True)}")  # type: ignore[no-untyped-call]
+    print(f"idx    ({len(idx)}):    distribution={np.unique(labels,         return_counts=True)} hash={md5(idx.tobytes()).hexdigest()}")     # type: ignore[no-untyped-call]
+    print(f"tr_idx ({len(tr_idx)}): distribution={np.unique(labels[tr_idx], return_counts=True)} hash={md5(tr_idx.tobytes()).hexdigest()}")  # type: ignore[no-untyped-call]
+    print(f"vl_idx ({len(vl_idx)}): distribution={np.unique(labels[vl_idx], return_counts=True)} hash={md5(vl_idx.tobytes()).hexdigest()}")  # type: ignore[no-untyped-call]
+    print(f"ts_idx ({len(ts_idx)}): distribution={np.unique(labels[ts_idx], return_counts=True)} hash={md5(ts_idx.tobytes()).hexdigest()}")  # type: ignore[no-untyped-call]
 
     # Split the files between distributed workers.
     if world_size() > 1:
@@ -459,21 +468,26 @@ def main() -> None:
     collate_fn = get_collate_fn(args.level, min_lengths)
     print(f"{collate_fn=}")
 
-    # TODO: Add NoOP ts_sampler and ts_loader
     tr_sampler = GroupedLengthBatchSampler.from_lengths(args.tr_batch_size, sizes[tr_idx], first=True, shuffle=True)
     vl_sampler = GroupedLengthBatchSampler.from_lengths(args.vl_batch_size, sizes[vl_idx], first=True, shuffle=False)
+    ts_sampler = GroupedLengthBatchSampler.from_lengths(args.ts_batch_size, sizes[ts_idx], first=True, shuffle=False)
     print(f"{tr_sampler=}")
     print(f"{vl_sampler=}")
+    print(f"{ts_sampler=}")
 
     tr_loader = get_loader(tr_dataset, tr_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
     vl_loader = get_loader(vl_dataset, vl_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    ts_loader = get_loader(ts_dataset, ts_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
     print(f"tr_loader=DataLoader(pin_memory={tr_loader.pin_memory}, num_workers={tr_loader.num_workers}, prefetch_factor={tr_loader.prefetch_factor})")
     print(f"vl_loader=DataLoader(pin_memory={vl_loader.pin_memory}, num_workers={vl_loader.num_workers}, prefetch_factor={vl_loader.prefetch_factor})")
+    print(f"ts_loader=DataLoader(pin_memory={ts_loader.pin_memory}, num_workers={ts_loader.num_workers}, prefetch_factor={ts_loader.prefetch_factor})")
 
     tr_streamer = get_streamer(tr_loader, args.device, args.num_streams)
     vl_streamer = get_streamer(vl_loader, args.device, args.num_streams)
+    ts_streamer = get_streamer(ts_loader, args.device, args.num_streams)
     print(f"{tr_streamer=}")
     print(f"{vl_streamer=}")
+    print(f"{ts_streamer=}")
 
     loss_fn = CrossEntropyLoss()
     print(f"{loss_fn=}")
