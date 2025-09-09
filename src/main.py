@@ -312,6 +312,12 @@ def get_materials(backend: IOBackend, db: Optional[SimpleDB]) -> Materials:
 
 
 def split_materials(idx: np.ndarray, labels: np.ndarray, timestamps: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    temporal = True
+    if np.all(timestamps == -1):
+        warnings.warn("`timestamps` are all -1, falling back to random splitting.")
+        temporal = False
+    elif np.any(timestamps < 0):
+        raise ValueError("`timestamps` contain negative values and not all of them are -1.")
     return tr_vl_ts_split(
         idx,
         tr_size=0.8,
@@ -319,7 +325,7 @@ def split_materials(idx: np.ndarray, labels: np.ndarray, timestamps: np.ndarray,
         ts_size=0.1,
         labels=labels,
         ratios=np.array([0.5, 0.5]),
-        timestamps=timestamps,
+        timestamps=timestamps if temporal else None,
         shuffle=True,
         random_state=seed,
         temporal_mode="balanced",
@@ -416,7 +422,7 @@ def main() -> None:
     tr_idx = tr_idx[0:args.tr_num_samples]
     vl_idx = vl_idx[0:args.vl_num_samples]
     ts_idx = ts_idx[0:args.ts_num_samples]
-    print(f"idx    ({len(idx)}):    distribution={np.unique(labels,         return_counts=True)} hash={md5(idx.tobytes()).hexdigest()}")     # type: ignore[no-untyped-call]
+    print(f"idx ({len(idx)}): distribution={np.unique(labels,         return_counts=True)} hash={md5(idx.tobytes()).hexdigest()}")     # type: ignore[no-untyped-call]
     print(f"tr_idx ({len(tr_idx)}): distribution={np.unique(labels[tr_idx], return_counts=True)} hash={md5(tr_idx.tobytes()).hexdigest()}")  # type: ignore[no-untyped-call]
     print(f"vl_idx ({len(vl_idx)}): distribution={np.unique(labels[vl_idx], return_counts=True)} hash={md5(vl_idx.tobytes()).hexdigest()}")  # type: ignore[no-untyped-call]
     print(f"ts_idx ({len(ts_idx)}): distribution={np.unique(labels[ts_idx], return_counts=True)} hash={md5(ts_idx.tobytes()).hexdigest()}")  # type: ignore[no-untyped-call]
