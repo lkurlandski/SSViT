@@ -27,6 +27,7 @@ from typing import TypeVar
 import warnings
 
 import lief
+import numpy as np
 import torch
 from torch import Tensor
 from torch import BoolTensor
@@ -59,6 +60,7 @@ from src.binentropy import compute_entropy_rolling_numpy
 from src.bitpacking import packbits
 from src.bitpacking import unpackbits
 from src.bitpacking import slice_bitpacked_tensor
+from src.simpledb import SimpleDB
 from src.utils import check_tensor
 from src.utils import pad_sequence
 
@@ -85,6 +87,7 @@ class _SemanticGuideOrSemanticGuides(ABC):
 
     # NOTE: compression/decompression with bitpacking will implicitly zero pad tensors to a multiple of 8.
     # NOTE: the boolean tensors are converted to floating point internally, to prepare for learning.
+    # FIXME: some of these methods, e.g., `clone`, should return a new instance!
 
     parse: Optional[BoolTensor | ByteTensor | FloatTensor | HalfTensor | DoubleTensor]
     entropy: Optional[HalfTensor | FloatTensor | DoubleTensor]
@@ -116,6 +119,14 @@ class _SemanticGuideOrSemanticGuides(ABC):
             return False
         raise RuntimeError(f"Unexpected tensor dtype state: {is_bitpacked=}")
 
+    def is_contiguous(self) -> bool:
+        is_contiguous = [t.is_contiguous() for t in (self.parse, self.entropy, self.characteristics) if t is not None]
+        if all(is_contiguous):
+            return True
+        if not any(is_contiguous):
+            return False
+        raise RuntimeError(f"Unexpected tensor contiguity state: {is_contiguous=}")
+
     @property
     def is_cuda(self) -> bool:
         is_cuda = [t.is_cuda for t in (self.parse, self.entropy, self.characteristics) if t is not None]
@@ -124,6 +135,15 @@ class _SemanticGuideOrSemanticGuides(ABC):
         if not any(is_cuda):
             return False
         raise RuntimeError(f"Unexpected tensor device state: {is_cuda=}")
+
+    def contiguous(self) -> Self:
+        if self.parse is not None:
+            self.parse = self.parse.contiguous()
+        if self.entropy is not None:
+            self.entropy = self.entropy.contiguous()
+        if self.characteristics is not None:
+            self.characteristics = self.characteristics.contiguous()
+        return self
 
     def record_stream(self, s: torch.cuda.Stream) -> None:
         if self.parse is not None:
@@ -333,6 +353,8 @@ class SemanticGuider:
 
 class _StructureMapOrStructureMaps(ABC):
 
+    # FIXME: some of these methods, e.g., `clone`, should return a new instance!
+
     index: list[list[tuple[int, int]]] | list[list[list[tuple[int, int]]]]
     lexicon: Mapping[int, HierarchicalStructure]
 
@@ -495,6 +517,9 @@ class StructurePartitioner:
 
 
 class _FSampleOrSamples(ABC):
+
+    # FIXME: some of these methods, e.g., `clone`, should return a new instance!
+
     file: StrPath | list[StrPath]
     name: Name | list[Name]
     label: ShortTensor | IntTensor | LongTensor
@@ -630,6 +655,8 @@ class _HSampleOrSamples(Generic[TGuide], ABC):
 
     NOTE: its unclear whether or not the lists of tensors can be moved efficiently across processes,
         i.e., when num_workers > 0 in DataLoader.
+
+    FIXME: some of these methods, e.g., `clone`, should return a new instance!
     """
     file: StrPath | list[StrPath]
     name: Name | list[Name]
@@ -800,10 +827,30 @@ class BinaryDataset(Dataset):  # type: ignore[misc]
         self.preprocessor = preprocessor
 
     def __getitem__(self, i: int) -> FSample:
-        return self.preprocessor(self.files[i], self.labels[i])
+        return self.preprocessor(self.labels[i], file=self.files[i])
 
     def __len__(self) -> int:
         return len(self.files)
+
+
+class SimpleDBDataset(Dataset):  # type: ignore[misc]
+
+    def __init__(self, idx_or_names: Sequence[int | str] | Tensor, db: SimpleDB, preprocessor: Preprocessor) -> None:
+        self.idx_or_names = idx_or_names  # Maps a subset of Dataset indices to SimpleDB indices or names.
+        self.db = db
+        self.preprocessor = preprocessor
+
+    def __getitem__(self, i: int) -> FSample:
+        idx_or_name = self.idx_or_names[i]
+        if not isinstance(idx_or_name, str):
+            idx_or_name = int(idx_or_name)
+        sample = self.db[idx_or_name]
+        label = 1 if sample.malware else 0
+        inputs = sample.data
+        return self.preprocessor(label, name=Name(sample.name), inputs=inputs)
+
+    def __len__(self) -> int:
+        return len(self.idx_or_names)
 
 
 class Preprocessor:
@@ -824,24 +871,62 @@ class Preprocessor:
         self.guider = SemanticGuider(do_parser, do_entropy, do_characteristics)
         self.partitioner = StructurePartitioner(HierarchicalLevel(level))
 
-    def __call__(self, file: StrPath, label: int) -> FSample:
-        name = Name(file)
-        label = torch.tensor(label)
-        inputs = torch.from_file(str(file), shared=False, size=os.path.getsize(file), dtype=torch.uint8)
+    @property
+    def should_lief_parse(self) -> bool:
+        return self.do_parser or self.do_entropy or self.do_characteristics or self.level != HierarchicalLevel.NONE
 
-        if self.do_parser or self.do_entropy or self.do_characteristics or self.level != HierarchicalLevel.NONE:
-            pe, size = _parse_pe_and_get_size(file)
+    def __call__(
+        self,
+        label: int,
+        *,
+        name: Optional[Name] = None,
+        file: Optional[StrPath] = None,
+        inputs: Optional[ByteTensor] = None,
+    ) -> FSample:
+        """
+        Args:
+            label: integer label for the binary.
+            name: name of the binary. If None, `file` must be provided, from which the name is inferred.
+            file: path to the binary file. If None, `inputs` and `name` must be provided.
+            inputs: byte tensor containing the binary data. If None, `file` must be provided, from which the data is read.
+        """
+        if (file is None) == (inputs is None):
+            raise ValueError("Exactly one of file or inputs must be provided.")
+        if file is None and name is None:
+            raise ValueError("If file is None, name must be provided.")
+
+        label = torch.tensor(label)
+        pe = None
+
+        if inputs is not None:
+            if name is None:
+                raise ValueError("If file is None, name must be provided.")
+            size = len(inputs)
+            name = Name(name)
+            if self.should_lief_parse:
+                pe = _parse_pe_and_get_size(memoryview(inputs.numpy()))[0]
+        elif file is not None:
+            size = os.path.getsize(file)
+            name = Name(file)
+            inputs = torch.from_file(str(file), shared=False, size=size, dtype=torch.uint8)
+            if self.should_lief_parse:
+                pe = _parse_pe_and_get_size(file)[0]
         else:
-            pe, size = None, os.path.getsize(file)
+            raise RuntimeError()
 
         guides = self.guider(pe, size, inputs)
         structure = self.partitioner(pe, size)
 
-        # NOTE: this is not meant to be efficient, since its only for debugging.
         if self.max_length is not None:
             inputs = inputs[:self.max_length]
             guides = guides.trim(self.max_length)
             structure = structure.trim(self.max_length)
+            if not inputs.is_contiguous():
+                warnings.warn("`inputs` is not contiguous after trimming. Making it contiguous.")
+                inputs = inputs.contiguous()
+            if not guides.is_contiguous():
+                warnings.warn("`guides` is not contiguous after trimming. Making it contiguous.")
+                guides = guides.contiguous()
 
         return FSample(file, name, label, inputs, guides, structure)
 
