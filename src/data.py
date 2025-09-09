@@ -916,29 +916,30 @@ class Preprocessor:
             file: path to the binary file. If None, `inputs` and `name` must be provided.
             inputs: byte tensor containing the binary data. If None, `file` must be provided, from which the data is read.
         """
-        if (file is None) == (inputs is None):
-            raise ValueError("Exactly one of file or inputs must be provided.")
-        if file is None and name is None:
-            raise ValueError("If file is None, name must be provided.")
-
         label = torch.tensor(label)
-        pe = None
 
-        if inputs is not None:
-            if name is None:
-                raise ValueError("If file is None, name must be provided.")
-            size = len(inputs)
-            name = Name(name)
-            if self.should_lief_parse:
-                pe = _parse_pe_and_get_size(memoryview(inputs.numpy()))[0]
-        elif file is not None:
-            size = os.path.getsize(file)
+        # If `name` is not provided, infer it from the file path.
+        if name is None:
+            if file is None:
+                raise ValueError("If name is None, file must be provided.")
             name = Name(file)
-            inputs = torch.from_file(str(file), shared=False, size=size, dtype=torch.uint8)
-            if self.should_lief_parse:
+
+        # If `inputs` is not provided, read it from the file as a byte tensor.
+        if inputs is None:
+            if file is None:
+                raise ValueError("If inputs is None, file must be provided.")
+            inputs = torch.from_file(str(file), shared=False, size=os.path.getsize(file), dtype=torch.uint8)
+        assert inputs is not None
+
+        # If we need to parse the binary, do so from the file path, if available, as its much faster.
+        if self.should_lief_parse:
+            if file is not None:
                 pe = _parse_pe_and_get_size(file)[0]
+            else:
+                pe = _parse_pe_and_get_size(memoryview(inputs.numpy()))[0]
         else:
-            raise RuntimeError()
+            pe = None
+        size = len(inputs)
 
         guides = self.guider(pe, size, inputs)
         structure = self.partitioner(pe, size)
