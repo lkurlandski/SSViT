@@ -10,11 +10,13 @@ from pathlib import Path
 import sys
 import time
 from typing import Callable
+from typing import NamedTuple
 from typing import Optional
 import warnings
 
 import lief
 import numpy as np
+from numpy import typing as npt
 import torch
 from torch import distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -55,6 +57,7 @@ from src.binanal import CharacteristicGuider
 from src.binanal import LEVEL_STRUCTURE_MAP
 from src.binanal import HierarchicalStructure
 from src.data import BinaryDataset
+from src.data import SimpleDBDataset
 from src.data import CollateFn
 from src.data import CollateFnHierarchical
 from src.data import CUDAPrefetcher
@@ -68,7 +71,10 @@ from src.helpers import flatten_dataclasses
 from src.helpers import _MTArgs
 from src.helpers import Architecture
 from src.helpers import ModelSize
+from src.helpers import IOBackend
 from src.helpers import MainArgs
+from src.simpledb import SimpleDB
+from src.split import tr_vl_ts_split
 from src.trainer import Trainer
 from src.trainer import TrainerArgs
 from src.trainer import EarlyStopper
@@ -232,48 +238,76 @@ def get_model(
 
     raise NotImplementedError(f"{level} {arch}")
 
-def get_materials(
-    tr_num_samples: Optional[int] = None,
-    vl_num_samples: Optional[int] = None,
-) -> tuple[list[Path], list[Path], list[int], list[int]]:
-    # TODO: define a temporal (not random) train/test split.
-    benfiles = list(filter(lambda f: f.is_file(), Path("./data/ass").rglob("*")))
+
+class Materials(NamedTuple):
+    idx: npt.NDArray[np.int64]
+    files: npt.NDArray[np.str_]
+    labels: npt.NDArray[np.int64]
+    timestamps: npt.NDArray[np.int64]
+    sizes: npt.NDArray[np.int64]
+
+
+def _get_materials_backend_file_tmp() -> Materials:
+    root = Path("./data")
+    benfiles = list(map(str, filter(lambda f: f.is_file(), (root / "ass").rglob("*"))))
     benlabels = [0] * len(benfiles)
-    malfiles = list(filter(lambda f: f.is_file(), Path("./data/sor").rglob("*")))
+    malfiles = list(map(str, filter(lambda f: f.is_file(), (root / "sor").rglob("*"))))
     mallabels = [1] * len(malfiles)
-    files = benfiles + malfiles
-    labels = benlabels + mallabels
-    print(f"{len(benfiles)=}")
-    print(f"{len(malfiles)=}")
 
-    idx = np.arange(len(files))
-    tr_idx = np.random.choice(idx, size=int(0.8 * len(files)), replace=False)
-    vl_idx = np.setdiff1d(idx, tr_idx)  # type: ignore[no-untyped-call]
-    vl_idx = np.random.permutation(vl_idx)
+    idx = np.arange(len(benfiles) + len(malfiles), dtype=np.int64)
+    files = np.array(benfiles + malfiles, dtype=np.str_)
+    labels = np.array(benlabels + mallabels, dtype=np.int64)
+    timestamps = np.full(len(files), -1, dtype=np.int64)
+    sizes = np.array(list(map(os.path.getsize, benfiles + malfiles)), dtype=np.int64)
 
-    tr_files  = [files[i] for i in tr_idx]
-    vl_files  = [files[i] for i in vl_idx]
-    tr_labels = [labels[i] for i in tr_idx]
-    vl_labels = [labels[i] for i in vl_idx]
+    return Materials(idx, files, labels, timestamps, sizes)
 
-    if tr_num_samples is not None:
-        if tr_num_samples > len(tr_files):
-            warnings.warn(f"Requested {tr_num_samples} training samples, but only {len(tr_files)} are available.")
-            tr_num_samples = len(tr_files)
-        tr_files = tr_files[0:tr_num_samples]
-        tr_labels = tr_labels[0:tr_num_samples]
 
-    if vl_num_samples is not None:
-        if vl_num_samples > len(vl_files):
-            warnings.warn(f"Requested {vl_num_samples} validation samples, but only {len(vl_files)} are available.")
-            vl_num_samples = len(vl_files)
-        vl_files = vl_files[0:vl_num_samples]
-        vl_labels = vl_labels[0:vl_num_samples]
+def _get_materials_backend_file() -> Materials:
+    root = Path("./data")
+    indexfile = root / "index.txt"
+    binaries = root / "binaries"
 
-    print(f"{len(tr_files)=} {Counter(tr_labels)=}")
-    print(f"{len(vl_files)=} {Counter(vl_labels)=}")
+    files:  list[str]     = []
+    labels: list[int]     = []
+    timestamps: list[int] = []
+    sizes: list[int]      = []
+    with open(indexfile, "r") as fp:
+        for line in fp:
+            line = line.strip()
+            sha, label, timestamp = line.split()
+            file = binaries / sha[0] / sha[1] / sha
+            files.append(str(file))
+            labels.append(int(label))
+            timestamps.append(int(timestamp))
+            sizes.append(os.path.getsize(file))
 
-    return tr_files, vl_files, tr_labels, vl_labels
+    idx = np.arange(len(files), dtype=np.int64)
+    files = np.array(files, dtype=np.str_)
+    labels = np.array(labels, dtype=np.int64)
+    timestamps = np.array(timestamps, dtype=np.int64)
+    sizes = np.array(sizes, dtype=np.int64)
+
+    return Materials(idx, files, labels, timestamps, sizes)
+
+
+def _get_materials_backend_simpledb(db: SimpleDB) -> Materials:
+    idx = db.meta_df["idx"].to_numpy().astype(np.int64)
+    files = db.meta_df["name"].to_numpy().astype(np.str_)
+    labels = db.meta_df["malware"].to_numpy().astype(np.int64)
+    timestamps = db.meta_df["timestamp"].to_numpy().astype(np.int64)
+    sizes = db.size_df["size"].to_numpy().astype(np.int64)
+    return Materials(idx, files, labels, timestamps, sizes)
+
+
+def get_materials(backend: IOBackend, db: Optional[SimpleDB]) -> Materials:
+    if backend == IOBackend.FP:
+        return _get_materials_backend_file_tmp()
+    if backend == IOBackend.DB:
+        if db is None:
+            raise ValueError("db cannot be None if backend is simpledb.")
+        return _get_materials_backend_simpledb(db)
+    raise ValueError(f"{backend}")
 
 
 def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int]) -> CollateFn | CollateFnHierarchical:
@@ -355,8 +389,24 @@ def main() -> None:
         max_length=args.max_length,
     )
 
+    if args.io_backend == IOBackend.FP:
+        db = None
+    elif args.io_backend == IOBackend.DB:
+        db = SimpleDB(Path("./datadb")).open()
+    print(f"{db=}")
+
     # Split the files between distributed workers.
-    tr_files, vl_files, tr_labels, vl_labels = get_materials(args.tr_num_samples, args.vl_num_samples)
+    idx, files, labels, timestamps, sizes = get_materials(args.io_backend, None)
+    # tr_files, vl_files, tr_labels, vl_labels = get_materials(args.tr_num_samples, args.vl_num_samples)
+    tr_idx, vl_idx, ts_idx = tr_vl_ts_split(idx,
+        tr_size=0.8, vl_size=0.1, ts_size=0.1,
+        labels=labels, ratios=np.array([0.5, 0.5]), timestamps=timestamps,
+        shuffle=True, random_state=args.seed, temporal_mode="balanced",
+    )
+    tr_files = files[tr_idx][0:args.tr_num_samples]
+    vl_files = files[vl_idx][0:args.vl_num_samples]
+    tr_labels = labels[tr_idx][0:args.tr_num_samples]
+    vl_labels = labels[vl_idx][0:args.vl_num_samples]
     if world_size() > 1:
         tr_files = tr_files[rank()::world_size()]
         vl_files = vl_files[rank()::world_size()]
