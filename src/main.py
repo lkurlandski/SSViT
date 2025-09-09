@@ -369,10 +369,13 @@ def get_loader(
 
 
 def get_streamer(loader: DataLoader, device: torch.device, num_streams: int) -> CUDAPrefetcher:
+    """Wrap a DataLoader with a CUDAPrefetcher and warmup its workers."""
     streamer = CUDAPrefetcher(loader, device, num_streams)
     if loader.persistent_workers:
         streamer.warmup(0)
         time.sleep(4)
+        if isinstance(loader.dataset, SimpleDBDataset):
+            loader.dataset.open_db()
     return streamer
 
 

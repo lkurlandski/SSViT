@@ -846,6 +846,12 @@ class SimpleDBDataset(Dataset):  # type: ignore[misc]
         self._db = deepcopy(db)
         self._pid = os.getpid()
 
+    def open_db(self) -> None:
+        """
+        Open the underlying SimpleDB instance.
+        """
+        _ = self.db
+
     @property
     def db(self) -> SimpleDB:
         """
