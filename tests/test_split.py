@@ -9,6 +9,10 @@ from typing import Any
 from src.split import tr_vl_ts_split
 
 
+# Extensively typing numpy arrays is a pain the ass.
+# mypy: disable-error-code="type-arg,no-untyped-call"
+
+
 # ---------------- helpers ----------------
 
 def hamilton_counts(n: int, sizes: tuple[float, float, float]) -> tuple[int, int, int, int]:

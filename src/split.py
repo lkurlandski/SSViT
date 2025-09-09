@@ -20,6 +20,10 @@ __all__ = [
 ]
 
 
+# Extensively typing numpy arrays is a pain the ass.
+# mypy: disable-error-code="type-arg,no-untyped-call"
+
+
 def tr_vl_ts_split(
     idx: npt.NDArray[np.integer],
     tr_size: float = 0.0,
