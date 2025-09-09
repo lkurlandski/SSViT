@@ -112,6 +112,10 @@ class SimpleDB:
     def files_meta(self) -> list[Path]:
         return sorted(self.dir_meta.glob("meta-*.csv"), key=lambda p: p.stem.split("-")[-1])
 
+    @property
+    def is_open(self) -> bool:
+        return len(self.storages) > 0
+
     def _get_idx_from_idx_or_name(self, idx_or_name: int | str) -> int:
         if isinstance(idx_or_name, int):
             return idx_or_name
@@ -189,6 +193,8 @@ class SimpleDB:
     def close(self) -> Self:
         """
         Safely closes the pseudo database, releasing all resources.
+
+        This is critical to ensure the database can safely be pickled across processes.
         """
         self.storages.clear()
         self.meta_df = pd.DataFrame()

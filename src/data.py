@@ -835,10 +835,30 @@ class BinaryDataset(Dataset):  # type: ignore[misc]
 
 class SimpleDBDataset(Dataset):  # type: ignore[misc]
 
+    # NOTE: best not to play around with (or even access) the internal state of this class from the outside.
+
     def __init__(self, idx_or_names: Sequence[int | str] | Tensor, db: SimpleDB, preprocessor: Preprocessor) -> None:
+        if db.is_open:  # Ensure the db is closed, so we can pickle it around process boundaries.
+            raise RuntimeError("Expected a closed SimpleDB instance, but the provided instance is already open.")
+
         self.idx_or_names = idx_or_names  # Maps a subset of Dataset indices to SimpleDB indices or names.
-        self.db = db
         self.preprocessor = preprocessor
+        self._db = deepcopy(db)
+        self._pid = os.getpid()
+
+    @property
+    def db(self) -> SimpleDB:
+        """
+        Return an opened process-local SimpleDB instance.
+        """
+        if (pid := os.getpid()) != self._pid:
+            self._db.close()
+            self._pid = pid
+
+        if not self._db.is_open:
+            self._db = self._db.open()
+
+        return self._db
 
     def __getitem__(self, i: int) -> FSample:
         idx_or_name = self.idx_or_names[i]

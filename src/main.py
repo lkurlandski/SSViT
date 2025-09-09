@@ -439,6 +439,7 @@ def main() -> None:
         ts_dataset = BinaryDataset(files[ts_idx], labels[ts_idx], preprocessor)
     elif args.io_backend == IOBackend.DB:
         assert db is not None
+        db = db.close()
         tr_dataset = SimpleDBDataset(tr_idx, db, preprocessor)
         vl_dataset = SimpleDBDataset(vl_idx, db, preprocessor)
         ts_dataset = SimpleDBDataset(ts_idx, db, preprocessor)
