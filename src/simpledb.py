@@ -145,8 +145,12 @@ class SimpleDB:
         family = meta_dict["family"]
 
         storage = self.storages[shard]
-        storage = storage[offset:offset + length]
-        data = torch.tensor(storage, dtype=torch.uint8)
+        # Copy (slow)
+        # storage = storage[offset:offset + length]
+        # data = torch.tensor(storage, dtype=torch.uint8)
+        # No copy (fast)
+        data = torch.empty(0, dtype=torch.uint8)
+        data.set_(storage, storage_offset=offset, size=(length,), stride=(1,))
 
         file = None
         if self.return_an_actual_file:
