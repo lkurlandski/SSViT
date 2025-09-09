@@ -395,26 +395,41 @@ def main() -> None:
         db = SimpleDB(Path("./datadb")).open()
     print(f"{db=}")
 
-    # Split the files between distributed workers.
-    idx, files, labels, timestamps, sizes = get_materials(args.io_backend, None)
-    # tr_files, vl_files, tr_labels, vl_labels = get_materials(args.tr_num_samples, args.vl_num_samples)
+    idx, files, labels, timestamps, sizes = get_materials(args.io_backend, db)
+    if np.all(timestamps == -1):
+        warnings.warn("No timestamps found in the database, using random split instead of temporal split.")
+        timestamps = None  # type: ignore[assignment]  # TODO: fix me
     tr_idx, vl_idx, ts_idx = tr_vl_ts_split(idx,
         tr_size=0.8, vl_size=0.1, ts_size=0.1,
         labels=labels, ratios=np.array([0.5, 0.5]), timestamps=timestamps,
         shuffle=True, random_state=args.seed, temporal_mode="balanced",
     )
-    tr_files = files[tr_idx][0:args.tr_num_samples]
-    vl_files = files[vl_idx][0:args.vl_num_samples]
-    tr_labels = labels[tr_idx][0:args.tr_num_samples]
-    vl_labels = labels[vl_idx][0:args.vl_num_samples]
-    if world_size() > 1:
-        tr_files = tr_files[rank()::world_size()]
-        vl_files = vl_files[rank()::world_size()]
-        tr_labels = tr_labels[rank()::world_size()]
-        vl_labels = vl_labels[rank()::world_size()]
+    tr_idx = tr_idx[0:args.tr_num_samples]
+    vl_idx = vl_idx[0:args.vl_num_samples]
+    ts_idx = ts_idx[0:args.ts_num_samples]
+    print(f"idx    ({len(idx)}):    distribution={np.unique(labels,         return_counts=True)}")  # type: ignore[no-untyped-call]
+    print(f"tr_idx ({len(tr_idx)}): distribution={np.unique(labels[tr_idx], return_counts=True)}")  # type: ignore[no-untyped-call]
+    print(f"vl_idx ({len(vl_idx)}): distribution={np.unique(labels[vl_idx], return_counts=True)}")  # type: ignore[no-untyped-call]
+    print(f"ts_idx ({len(ts_idx)}): distribution={np.unique(labels[ts_idx], return_counts=True)}")  # type: ignore[no-untyped-call]
 
-    tr_dataset = BinaryDataset(tr_files, tr_labels, preprocessor)
-    vl_dataset = BinaryDataset(vl_files, vl_labels, preprocessor)
+    # Split the files between distributed workers.
+    if world_size() > 1:
+        tr_idx = tr_idx[rank()::world_size()]
+        vl_idx = vl_idx[rank()::world_size()]
+        ts_idx = ts_idx[rank()::world_size()]
+
+    if args.io_backend == IOBackend.FP:
+        tr_dataset = BinaryDataset(files[tr_idx], labels[tr_idx], preprocessor)
+        vl_dataset = BinaryDataset(files[vl_idx], labels[vl_idx], preprocessor)
+        ts_dataset = BinaryDataset(files[ts_idx], labels[ts_idx], preprocessor)
+    elif args.io_backend == IOBackend.DB:
+        assert db is not None
+        tr_dataset = SimpleDBDataset(tr_idx, db, preprocessor)
+        vl_dataset = SimpleDBDataset(vl_idx, db, preprocessor)
+        ts_dataset = SimpleDBDataset(ts_idx, db, preprocessor)
+    print(f"{tr_dataset=}")
+    print(f"{vl_dataset=}")
+    print(f"{ts_dataset=}")
 
     model = get_model(args.arch, args.size, args.do_characteristics, args.level)
     model = model.to("cpu")
@@ -422,7 +437,6 @@ def main() -> None:
 
     num_parameters = count_parameters(model, requires_grad=False)
     print(f"{num_parameters=}")
-
     print(f"mp_dtype={mp_dtype(args.mp16, args.device)}")
 
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
@@ -445,8 +459,9 @@ def main() -> None:
     collate_fn = get_collate_fn(args.level, min_lengths)
     print(f"{collate_fn=}")
 
-    tr_sampler = GroupedLengthBatchSampler.from_lengths(args.tr_batch_size, list(map(os.path.getsize, tr_dataset.files)), first=True, shuffle=True)
-    vl_sampler = GroupedLengthBatchSampler.from_lengths(args.vl_batch_size, list(map(os.path.getsize, vl_dataset.files)), first=True, shuffle=False)
+    # TODO: Add NoOP ts_sampler and ts_loader
+    tr_sampler = GroupedLengthBatchSampler.from_lengths(args.tr_batch_size, sizes[tr_idx], first=True, shuffle=True)
+    vl_sampler = GroupedLengthBatchSampler.from_lengths(args.vl_batch_size, sizes[vl_idx], first=True, shuffle=False)
     print(f"{tr_sampler=}")
     print(f"{vl_sampler=}")
 
