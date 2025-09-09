@@ -39,6 +39,11 @@ class ModelSize(Enum):
     LG = "lg"  # Large
 
 
+class IOBackend(Enum):
+    FP = "fp"
+    DB = "db"
+
+
 # TODO: figure out how to elegantly combine different dataclasses into a new class.
 # TODO: write an ArgumentParser that takes a dataclass and generates arguments.
 @dataclass
@@ -59,8 +64,8 @@ class MainArgs:
     pin_memory: bool = False
     prefetch_factor: int = 1
     tr_batch_size: int = 1
-    vl_batch_size: Optional[int] = None
-    ts_batch_size: Optional[int] = None
+    vl_batch_size: int = -1
+    ts_batch_size: int = -1
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
     device: torch.device = torch.device("cpu")
@@ -68,12 +73,13 @@ class MainArgs:
     fsdp: bool = False
     fsdp_offload: bool = True
     tf32: bool = False
+    io_backend: IOBackend = IOBackend.FP
 
     def __post_init__(self) -> None:
         if self.tr_batch_size == 1 or self.vl_batch_size == 1 or self.ts_batch_size == 1:
             raise NotImplementedError("Batch size of 1 is not supported right now. See https://docs.pytorch.org/docs/stable/data#working-with-collate-fn.")
-        self.vl_batch_size = self.tr_batch_size if self.vl_batch_size is None else self.vl_batch_size
-        self.ts_batch_size = self.vl_batch_size if self.ts_batch_size is None else self.ts_batch_size
+        self.vl_batch_size = self.tr_batch_size if self.vl_batch_size < 1 else self.vl_batch_size
+        self.ts_batch_size = self.vl_batch_size if self.ts_batch_size < 1 else self.ts_batch_size
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise ValueError("CUDA device specified but not available.")
         if self.ddp and self.fsdp:
