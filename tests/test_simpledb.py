@@ -7,6 +7,7 @@ import random
 import warnings
 from pathlib import Path
 from typing import Generator
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -48,7 +49,8 @@ def test_roundup_basic() -> None:
     assert roundup(4097, 4096) == 8192
 
 
-def test_build_one_shard_and_read(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reader", ["pread", "torch"])
+def test_build_one_shard_and_read(tmp_path: Path, reader: Literal["pread", "torch"]) -> None:
     root = tmp_path / "db"
     builder = CreateSimpleDB(root, shardsize=2 * 1024 * 1024)  # small-ish shard
     samples = list(_samples(25, min_len=5000, max_len=12000, seed=123))
@@ -65,7 +67,7 @@ def test_build_one_shard_and_read(tmp_path: Path) -> None:
     assert sz % PADDING == 0
 
     # Read back with SimpleDB and verify content & metadata
-    db = SimpleDB(root, allow_name_indexing=True)
+    db = SimpleDB(root, reader=reader, allow_name_indexing=True)
     assert db.files_data == data_files
     assert db.files_size == size_files
     assert db.files_meta == meta_files
@@ -122,10 +124,11 @@ def test_shards_rollover(tmp_path: Path) -> None:
             assert off + ln <= total
 
 
-def test_name_indexing_toggle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reader", ["pread", "torch"])
+def test_name_indexing_toggle(tmp_path: Path, reader: Literal["pread", "torch"]) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([CreateSimpleDBSample("x.exe", b"\x01\x02", True, 42, None)])
-    db = SimpleDB(root, allow_name_indexing=False).open()
+    db = SimpleDB(root, reader=reader, allow_name_indexing=False).open()
     try:
         with pytest.raises(ValueError):
             _ = db["x.exe"]
@@ -133,21 +136,26 @@ def test_name_indexing_toggle(tmp_path: Path) -> None:
         db.close()
 
 
-def test_return_actual_file_not_implemented(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reader", ["pread", "torch"])
+def test_open_slice_as_path(tmp_path: Path, reader: Literal["pread", "torch"]) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([CreateSimpleDBSample("x.exe", b"\x01\x02", True, 42, None)])
-    db = SimpleDB(root, allow_name_indexing=True, return_an_actual_file=True).open()
+    db = SimpleDB(root, reader=reader, allow_name_indexing=True).open()
     try:
-        with pytest.raises(NotImplementedError):
-            _ = db["x.exe"]
+        with db.open_slice_as_path(0) as file:
+            assert isinstance(file, (Path, str))
+            assert os.path.isfile(file)
+            assert os.path.exists(file)
+            assert Path(file).read_bytes() == b"\x01\x02"
     finally:
         db.close()
 
 
-def test_close_is_idempotent_and_clears(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reader", ["pread", "torch"])
+def test_close_is_idempotent_and_clears(tmp_path: Path, reader: Literal["pread", "torch"]) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([CreateSimpleDBSample("x.exe", b"\x00", False, 0, None)])
-    db = SimpleDB(root).open()
+    db = SimpleDB(root, reader=reader).open()
     # Should not raise, and should clear storages
     db.close()
     assert db.storages == []
@@ -155,7 +163,8 @@ def test_close_is_idempotent_and_clears(tmp_path: Path) -> None:
     db.close()
 
 
-def test_oversized_sample_warns_and_is_present(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reader", ["pread", "torch"])
+def test_oversized_sample_warns_and_is_present(tmp_path: Path, reader: Literal["pread", "torch"]) -> None:
     root = tmp_path / "db"
     big = b"\xff" * (256 * 1024)  # 256 KiB
     small = b"\x01\x02"
@@ -169,7 +178,7 @@ def test_oversized_sample_warns_and_is_present(tmp_path: Path) -> None:
         ])
         assert any("larger than the shard size" in str(x.message) for x in w)
 
-    db = SimpleDB(root, allow_name_indexing=True).open()
+    db = SimpleDB(root, reader=reader, allow_name_indexing=True).open()
     try:
         rec = db["big.exe"]
         assert rec.data.numel() == len(big)
@@ -244,7 +253,8 @@ def test_padding_region_is_zeroed(tmp_path: Path) -> None:
     assert all(b == 0 for b in raw[pad_start:])
 
 
-def test_nan_and_empty_metadata_variants(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reader", ["pread", "torch"])
+def test_nan_and_empty_metadata_variants(tmp_path: Path, reader: Literal["pread", "torch"]) -> None:
     root = tmp_path / "db"
     # family=None, empty string, and missing family column worth testing
     CreateSimpleDB(root)([
@@ -257,7 +267,7 @@ def test_nan_and_empty_metadata_variants(tmp_path: Path) -> None:
     df.loc[df["name"] == "n2", "family"] = float("nan")
     df.to_csv(meta_csv, index=False)
 
-    db = SimpleDB(root, allow_name_indexing=True).open()
+    db = SimpleDB(root, reader=reader, allow_name_indexing=True).open()
     try:
         r1 = db["n1"]
         r2 = db["n2"]
@@ -268,7 +278,8 @@ def test_nan_and_empty_metadata_variants(tmp_path: Path) -> None:
         db.close()
 
 
-def test_duplicate_names_behavior(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reader", ["pread", "torch"])
+def test_duplicate_names_behavior(tmp_path: Path, reader: Literal["pread", "torch"]) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([
         CreateSimpleDBSample("dup", b"\x00", True, 1, None),
@@ -278,11 +289,12 @@ def test_duplicate_names_behavior(tmp_path: Path) -> None:
     # Choose a policy — here we assert it raises; if you choose "last wins",
     # change to assert specific content.
     with pytest.raises(RuntimeError):
-        SimpleDB(root, allow_name_indexing=True).open()
-    SimpleDB(root, allow_name_indexing=False).open()
+        SimpleDB(root, reader=reader, allow_name_indexing=True).open()
+    SimpleDB(root, reader=reader, allow_name_indexing=False).open()
 
 
-def test_mismatched_size_and_meta_rows(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reader", ["pread", "torch"])
+def test_mismatched_size_and_meta_rows(tmp_path: Path, reader: Literal["pread", "torch"]) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([
         CreateSimpleDBSample("ok", b"\x00\x01", True, 1, None),
@@ -292,12 +304,13 @@ def test_mismatched_size_and_meta_rows(tmp_path: Path) -> None:
     df = pd.read_csv(meta_csv)
     df = df[df["name"] != "ok"]
     df.to_csv(meta_csv, index=False)
-    db = SimpleDB(root)
+    db = SimpleDB(root, reader=reader)
     with pytest.raises(Exception):
         db.open()
 
 
-def test_corrupted_offset_raises(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reader", ["pread", "torch"])
+def test_corrupted_offset_raises(tmp_path: Path, reader: Literal["pread", "torch"]) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([
         CreateSimpleDBSample("bad", b"\x00\x01\x02", False, 0, None),
@@ -307,7 +320,7 @@ def test_corrupted_offset_raises(tmp_path: Path) -> None:
     df = pd.read_csv(size_csv)
     df.loc[df["name"] == "bad", "offset"] = 10_000_000
     df.to_csv(size_csv, index=False)
-    db = SimpleDB(root, allow_name_indexing=True)
+    db = SimpleDB(root, reader=reader, allow_name_indexing=True)
     try:
         with pytest.raises(Exception):
             db.open()
@@ -315,12 +328,13 @@ def test_corrupted_offset_raises(tmp_path: Path) -> None:
         db.close()
 
 
-def test_zero_length_entry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reader", ["pread", "torch"])
+def test_zero_length_entry(tmp_path: Path, reader: Literal["pread", "torch"]) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([
         CreateSimpleDBSample("empty", b"", True, 0, None),
     ])
-    db = SimpleDB(root, allow_name_indexing=True).open()
+    db = SimpleDB(root, reader=reader, allow_name_indexing=True).open()
     try:
         rec = db["empty"]
         assert isinstance(rec.data, torch.Tensor)
@@ -330,12 +344,13 @@ def test_zero_length_entry(tmp_path: Path) -> None:
         db.close()
 
 
-def test_open_twice_behavior(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reader", ["pread", "torch"])
+def test_open_twice_behavior(tmp_path: Path, reader: Literal["pread", "torch"]) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([
         CreateSimpleDBSample("x", b"\x01", True, 1, None),
     ])
-    db = SimpleDB(root)
+    db = SimpleDB(root, reader=reader)
     db.open()
     # Either support idempotent open() or assert a specific error; this expects idempotency.
     db.open()

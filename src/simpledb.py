@@ -3,15 +3,19 @@ A simple wrapper over millions of file for faster I/O on slow filesystems.
 """
 
 from collections.abc import Iterable
+from collections.abc import Iterator
+import contextlib
 import gc
 from pathlib import Path
 import os
 from typing import Any
+from typing import Literal
 from typing import Optional
 from typing import NamedTuple
 from typing import Self
 import warnings
 
+import numpy as np
 import pandas as pd
 import torch
 from torch import ByteTensor
@@ -28,7 +32,6 @@ class SimpleDBSample(NamedTuple):
     malware: bool
     timestamp: int
     family: Optional[str] = None
-    file: Optional[str] = None
 
 
 class SimpleDB:
@@ -57,7 +60,7 @@ class SimpleDB:
     data-*.bin
     -------------
     This is a simple binary file containing concatenated binary blobs of each entry.
-    It is padded to a multiple of `PADDING` bytes for paging efficiency.
+    Each sample is padded to a multiple of `PADDING` bytes for paging efficiency.
 
     size-*.csv
     -------------
@@ -66,7 +69,7 @@ class SimpleDB:
     It has the following columns:
         - idx (int): the unique integer ID of the entry.
         - name (str): the name of the entry.
-        - shard (int): the shard number (coresponding to the '****'). This is redundant but useful.
+        - shard (int): the shard number (coresponding to the '*'). This is redundant but useful.
         - offset (int): the offset of the entry in the data-****.bin file.
         - size (int): the size of the entry in bytes.
 
@@ -77,7 +80,7 @@ class SimpleDB:
     It has the following columns:
         - idx (int): the unique integer ID of the entry.
         - name (str): the name of the entry.
-        - shard (int): the shard number (coresponding to the '****'). This is redundant but useful.
+        - shard (int): the shard number (coresponding to the '*'). This is redundant but useful.
         - timestamp (int): the UNIX timestamp of the entry (as a UNIX timestamp). If not available, is -1.
         - malware (int): whether the entry is malware (1) or not (0). If not available, is -1.
         - family (str): the malware family of the entry. If not available, is empty string.
@@ -86,19 +89,22 @@ class SimpleDB:
     of the pseudo database, while meta is not.
     """
 
-    def __init__(self, dir_root: Path, allow_name_indexing: bool = False, return_an_actual_file: bool = False) -> None:
+    def __init__(self, dir_root: Path, reader: Literal["pread", "torch"] = "torch", allow_name_indexing: bool = False) -> None:
         self.dir_root = dir_root
         self.dir_data = dir_root / "data"
         self.dir_size = dir_root / "size"
         self.dir_meta = dir_root / "meta"
         self.storages: list[UntypedStorage] = []
+        self.handles: list[int] = []
         self.size_df: pd.DataFrame = pd.DataFrame()
         self.meta_df: pd.DataFrame = pd.DataFrame()
         self.name_map: dict[str, int] = {}
+        self.reader = reader
         self.allow_name_indexing = allow_name_indexing
-        self.return_an_actual_file = return_an_actual_file
         if not (len(self.files_data) == len(self.files_size) == len(self.files_meta)):
             raise RuntimeError("Number of data, size, and meta files do not match.")
+        if self.reader not in ("pread", "torch"):
+            raise ValueError("Reader must be 'pread' or 'torch'.")
 
     @property
     def files_data(self) -> list[Path]:
@@ -127,6 +133,25 @@ class SimpleDB:
 
         raise TypeError("Index must be an integer or string.")
 
+    def _read_as_tensor_torch(self, shard: int, offset: int, length: int) -> ByteTensor:
+        storage = self.storages[shard]
+        data = torch.empty(0, dtype=torch.uint8)
+        data.set_(storage, storage_offset=offset, size=(length,), stride=(1,))
+        return data
+
+    def _read_as_tensor_pread(self, shard: int, offset: int, length: int) -> ByteTensor:
+        fd = self.handles[shard]
+        data = torch.empty(length, dtype=torch.uint8)
+        mv = memoryview(data.numpy()).cast("B")
+        got, off = 0, offset
+        while got < length:
+            n = os.preadv(fd, [mv[got:]], off)
+            if n == 0:
+                raise EOFError(f"EOF at shard={shard} off={off}, need {length-got} more")
+            got += n
+            off += n
+        return data
+
     def __getitem__(self, idx_or_name: int | str) -> SimpleDBSample:
         idx = self._get_idx_from_idx_or_name(idx_or_name)
 
@@ -144,17 +169,10 @@ class SimpleDB:
         timestamp = meta_dict["timestamp"]
         family = meta_dict["family"]
 
-        storage = self.storages[shard]
-        # Copy (slow)
-        # storage = storage[offset:offset + length]
-        # data = torch.tensor(storage, dtype=torch.uint8)
-        # No copy (fast)
-        data = torch.empty(0, dtype=torch.uint8)
-        data.set_(storage, storage_offset=offset, size=(length,), stride=(1,))
-
-        file = None
-        if self.return_an_actual_file:
-            raise NotImplementedError("Returning an actual file is not implemented yet.")
+        if self.reader == "torch":
+            data = self._read_as_tensor_torch(shard, offset, length)
+        elif self.reader == "pread":
+            data = self._read_as_tensor_pread(shard, offset, length)
 
         return SimpleDBSample(
             name=name,
@@ -162,24 +180,28 @@ class SimpleDB:
             malware=malware,
             timestamp=timestamp,
             family=family,
-            file=file,
         )
 
     def open(self) -> Self:
         """
         Prepares the pseudo database for operations and conducts basic integrity checks.
         """
-        self.storages = [UntypedStorage.from_file(str(f), shared=False, nbytes=os.path.getsize(f)) for f in self.files_data]
+        if self.reader == "torch":
+            self.storages = [UntypedStorage.from_file(str(f), shared=False, nbytes=os.path.getsize(f)) for f in self.files_data]
+        elif self.reader == "pread":
+            self.handles = [os.open(str(p), os.O_RDONLY | os.O_CLOEXEC) for p in self.files_data]
 
         size_dfs = [pd.read_csv(f) for f in self.files_size]
-        for st, df in zip(self.storages, size_dfs):
-            if (df["offset"] + df["size"]).max() > len(st):
+        for i in range(len(size_dfs)):
+            df = size_dfs[i]
+            l = len(self.storages[i]) if self.reader == "torch" else os.path.getsize(self.files_data[i])
+            if (df["offset"] + df["size"]).max() > l:
                 raise RuntimeError(f"Size file contains an entry that exceeds the size its data file.")
         self.size_df = pd.concat(size_dfs, ignore_index=True)
         self.size_df = self.size_df.sort_values(by="idx").set_index("idx", drop=False)
 
         meta_dfs = [pd.read_csv(f, converters={"family": lambda s: s if s else ""}) for f in self.files_meta]
-        if len(meta_dfs) != len(self.storages):
+        if len(meta_dfs) != len(self.storages) and len(meta_dfs) != len(self.handles):
             raise RuntimeError(f"Number of meta files ({len(meta_dfs)}) does not match number of data files ({len(self.storages)}).")
         self.meta_df = pd.concat(meta_dfs, ignore_index=True)
         self.meta_df = self.meta_df.sort_values(by="idx").set_index("idx", drop=False)
@@ -201,10 +223,65 @@ class SimpleDB:
         This is critical to ensure the database can safely be pickled across processes.
         """
         self.storages.clear()
+        for h in self.handles:
+            os.close(h)
+        self.handles.clear()
         self.meta_df = pd.DataFrame()
         self.size_df = pd.DataFrame()
         gc.collect()
         return self
+
+    @contextlib.contextmanager
+    def open_slice_as_path(self, idx_or_name: int | str) -> Iterator[str]:
+        idx = self._get_idx_from_idx_or_name(idx_or_name)
+
+        shard  = int(self.size_df.loc[idx, "shard"])
+        offset = int(self.size_df.loc[idx, "offset"])
+        length = int(self.size_df.loc[idx, "size"])
+        src    = self.files_data[shard]
+
+        use_cfr = True
+        chunksz = 2 ** 20
+
+        src_fd = os.open(src, os.O_RDONLY)
+        try:
+            memfd = os.memfd_create(f"simpledb-{shard}-{offset}", flags=os.MFD_CLOEXEC)
+            try:
+                remaining = length
+                off_in    = offset
+                off_out   = 0
+
+                while remaining:
+                    nreq = min(chunksz, remaining)
+                    n = 0
+
+                    if use_cfr:
+                        try:
+                            n = os.copy_file_range(src_fd, memfd, nreq, offset_src=off_in, offset_dst=off_out)
+                            if n == 0:
+                                warnings.warn("`copy_file_range` returned 0 bytes copied. Falling back to userspace copy.")
+                                use_cfr = False
+                                continue
+                        except OSError as err:
+                            warnings.warn(f"`copy_file_range` failed with {str(err)}. Falling back to userspace copy.")
+                            use_cfr = False
+                            continue
+
+                    if (not use_cfr) and (n == 0):
+                        chunk = os.pread(src_fd, nreq, off_in)
+                        if not chunk:
+                            break
+                        n = os.pwrite(memfd, chunk, off_out)
+
+                    remaining -= n
+                    off_in    += n
+                    off_out   += n
+
+                yield f"/proc/self/fd/{memfd}"
+            finally:
+                os.close(memfd)
+        finally:
+            os.close(src_fd)
 
 
 class CreateSimpleDBSample(NamedTuple):
@@ -223,6 +300,8 @@ def roundup(x: int, to: int) -> int:
 class CreateSimpleDB:
     """
     Create a SimpleDB from files and metadata.
+
+    TODO: pad each individual sample to a multiple of PADDING for better paging performance.
     """
 
     def __init__(self, root: Path, shardsize: int = 2 ** 30) -> None:
