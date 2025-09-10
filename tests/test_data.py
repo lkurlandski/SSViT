@@ -2,6 +2,8 @@
 Tests.
 """
 
+from collections.abc import Iterable
+import itertools
 import math
 import os
 import random
@@ -31,6 +33,7 @@ from src.data import StructurePartitioner
 from src.data import Preprocessor
 from src.data import BinaryDataset
 from src.data import GroupedLengthBatchSampler
+from src.data import ShardAwareBatchSampler
 from src.data import CollateFn
 from src.data import CollateFnHierarchical
 from src.bitpacking import packbits
@@ -435,3 +438,389 @@ class TestGroupedLengthBatchSampler:
             longest = max(lengths[i] for i in batch)
             shortest = min(lengths[i] for i in batch)
             assert longest - shortest < batch_size, "Batch should contain similar lengths."
+
+
+class TestShardAwareBatchSampler:
+
+    # ---------- helpers ----------
+
+    @staticmethod
+    def _build_mappings(
+        shard_sizes: list[list[int]],
+        *,
+        offset_gap: int = 10,
+    ) -> tuple[Tensor, Tensor, Tensor, dict[int, list[int]], dict[int, list[int]]]:
+        """
+        Create mapping tensors for a synthetic dataset.
+        shard_sizes: list per shard, each inner list is the sample 'size' in bytes for that shard.
+        Offsets are increasing within each shard; different shards separated in offset space.
+        Returns:
+            sample_idx_to_shard_idx, sample_idx_to_sample_size, sample_idx_to_sample_offset,
+            per_shard_indices (by global sample idx), per_shard_offsets (parallel to indices)
+        """
+        shard_to_idxs: dict[int, list[int]] = {}
+        shard_to_offsets: dict[int, list[int]] = {}
+
+        shard_ids: list[int] = []
+        sizes: list[int] = []
+        offsets: list[int] = []
+
+        idx = 0
+        for sh, sizes_list in enumerate(shard_sizes):
+            shard_to_idxs[sh] = []
+            shard_to_offsets[sh] = []
+            off = (sh + 1) * 1_000_000  # keep shards far apart in offset space
+            for s in sizes_list:
+                shard_ids.append(sh)
+                sizes.append(s)
+                offsets.append(off)
+                shard_to_idxs[sh].append(idx)
+                shard_to_offsets[sh].append(off)
+                idx += 1
+                off += offset_gap  # strictly increasing within shard
+
+        t_shard = torch.tensor(shard_ids, dtype=torch.int64)
+        t_size = torch.tensor(sizes, dtype=torch.int64)
+        t_off = torch.tensor(offsets, dtype=torch.int64)
+        return t_shard, t_size, t_off, shard_to_idxs, shard_to_offsets
+
+    @staticmethod
+    def _flatten(batches: Iterable[list[int]]) -> list[int]:
+        return list(itertools.chain.from_iterable(batches))
+
+    @staticmethod
+    def _count_full_batches(shard_sizes: list[list[int]], batch_size: int) -> int:
+        return sum(len(lst) // batch_size for lst in shard_sizes)
+
+    @staticmethod
+    def _leftover_blocks(per_shard_indices: dict[int, list[int]], batch_size: int) -> list[list[int]]:
+        blocks: list[list[int]] = []
+        for _, idxs in per_shard_indices.items():
+            r = len(idxs) % batch_size
+            if r:
+                blocks.append(idxs[-r:])
+        return blocks
+
+    @staticmethod
+    def _batch_sums_bytes(batches: list[list[int]], size_tensor: Tensor) -> list[int]:
+        return [int(size_tensor[b].sum().item()) for b in batches]
+
+    # ---------- tests ----------
+
+    def test_single_shard_contiguous_full_batches(self) -> None:
+        # One shard, N multiple of B → purely contiguous batches in offset order
+        B = 3
+        shard_sizes = [[10, 20, 30, 40, 50, 60]]  # 6 samples => 2 batches
+        t_shard, t_size, t_off, per_shard_idxs, _ = self._build_mappings(shard_sizes)
+
+        sampler = ShardAwareBatchSampler(
+            batch_size=B,
+            sample_idx_to_shard_idx=t_shard,
+            sample_idx_to_sample_size=t_size,
+            sample_idx_to_sample_offset=t_off,
+            contiguous=True,
+            first=False,
+            shuffle=False,
+            drop_last=False,
+            seed=123,
+        )
+
+        batches = list(iter(sampler))
+        assert len(batches) == 2
+        # Validate exact batches are contiguous slices of the single shard
+        expected = [per_shard_idxs[0][0:3], per_shard_idxs[0][3:6]]
+        assert batches == expected
+
+    def test_multi_shard_full_and_leftover_combination(self) -> None:
+        # Two shards, each with leftovers. Leftovers should be kept together per shard
+        # and combined at the tail without splitting a block.
+        B = 4
+        shard_sizes = [
+            [10, 10, 10, 10, 10],      # 5 -> 1 full + leftover of 1
+            [7, 7, 7, 7, 7, 7, 7],     # 7 -> 1 full + leftover of 3
+        ]
+        t_shard, t_size, t_off, per_shard_idxs, _ = self._build_mappings(shard_sizes)
+
+        sampler = ShardAwareBatchSampler(
+            batch_size=B,
+            sample_idx_to_shard_idx=t_shard,
+            sample_idx_to_sample_size=t_size,
+            sample_idx_to_sample_offset=t_off,
+            contiguous=True,
+            first=False,
+            shuffle=False,
+            drop_last=False,
+            seed=0,
+        )
+
+        batches = list(iter(sampler))
+        # 2 full batches (one per shard) + 1 leftover batch combining (1 + 3)
+        assert len(batches) == 3
+
+        # First two must be full, single-shard, size B
+        assert len(batches[0]) == B and len(batches[1]) == B
+        # last is leftover (size B here due to 1+3)
+        assert len(batches[2]) == B
+
+        # Check that full batches are exactly contiguous slices from shards
+        s0 = per_shard_idxs[0]
+        s1 = per_shard_idxs[1]
+        full_candidates = [s0[0:4], s1[0:4]]
+        assert sorted(map(tuple, batches[:2])) == sorted(map(tuple, full_candidates))  # type: ignore[arg-type]
+
+        # Check leftover blocks are not split across batches
+        blocks = self._leftover_blocks(per_shard_idxs, B)  # [[last_of_shard0], [last3_of_shard1]]
+        leftover_batches = batches[2:]
+        flat_left = self._flatten(leftover_batches)
+        for block in blocks:
+            # block must appear fully in leftover concatenation
+            for i in block:
+                assert i in flat_left
+            # and must be fully contained in exactly one batch (not split)
+            found_in = [i for i, b in enumerate(leftover_batches) if set(block).issubset(set(b))]
+            assert len(found_in) == 1, "Leftover block should be inside exactly one batch"
+
+    def test_drop_last_removes_short_leftovers(self) -> None:
+        B = 4
+        shard_sizes = [
+            [1, 1, 1, 1, 1],  # 5 -> 1 full + 1 leftover
+            [1, 1, 1, 1, 1],  # 5 -> 1 full + 1 leftover
+        ]
+        t_shard, t_size, t_off, _, _ = self._build_mappings(shard_sizes)
+
+        sampler = ShardAwareBatchSampler(
+            batch_size=B,
+            sample_idx_to_shard_idx=t_shard,
+            sample_idx_to_sample_size=t_size,
+            sample_idx_to_sample_offset=t_off,
+            contiguous=True,
+            first=False,
+            shuffle=False,
+            drop_last=True,   # drop last short batch
+            seed=0,
+        )
+
+        batches = list(iter(sampler))
+        # There are exactly 2 full batches total and the leftover (size 2) is dropped.
+        assert len(batches) == 2
+        assert all(len(b) == B for b in batches)
+
+    def test_first_places_largest_full_batch_first(self) -> None:
+        # Construct two full batches with distinct total byte sums.
+        B = 4
+        shard_sizes = [
+            [100, 100, 100, 100],  # sum 400
+            [200, 1, 1, 1],        # sum 203
+        ]
+        t_shard, t_size, t_off, per_shard_idxs, _ = self._build_mappings(shard_sizes)
+
+        sampler = ShardAwareBatchSampler(
+            batch_size=B,
+            sample_idx_to_shard_idx=t_shard,
+            sample_idx_to_sample_size=t_size,
+            sample_idx_to_sample_offset=t_off,
+            contiguous=True,
+            first=True,       # ensure largest-by-bytes goes first
+            shuffle=True,     # allow shuffle; first should still be largest
+            drop_last=False,
+            seed=42,
+        )
+        # Keep epoch deterministic
+        sampler.set_epoch(0)
+
+        batches = list(iter(sampler))
+        assert len(batches) == 2
+        sums = self._batch_sums_bytes(batches, t_size)
+        assert sums[0] == max(sums), "First batch should have the largest total bytes"
+
+        # Also verify each is single-shard full batch
+        # (order may be swapped by 'first', but composition is as expected)
+        expected_batches = [per_shard_idxs[0], per_shard_idxs[1]]
+        assert sorted(map(tuple, batches)) == sorted(map(tuple, expected_batches))  # type: ignore[arg-type]
+
+    def test_shuffle_and_epoch_control(self) -> None:
+        # With shuffle=True and set_epoch controlling RNG, epoch 0 should be reproducible;
+        # epoch 1 should differ (typically).
+        B = 3
+        shard_sizes = [
+            list(range(1, 10)),  # 9 samples => 3 full batches
+            list(range(1, 7)),   # 6 samples => 2 full batches
+        ]
+        t_shard, t_size, t_off, _, _ = self._build_mappings(shard_sizes)
+
+        sampler = ShardAwareBatchSampler(
+            batch_size=B,
+            sample_idx_to_shard_idx=t_shard,
+            sample_idx_to_sample_size=t_size,
+            sample_idx_to_sample_offset=t_off,
+            contiguous=False,
+            first=False,
+            shuffle=True,
+            drop_last=False,
+            seed=1234,
+        )
+
+        sampler.set_epoch(0)
+        batches_e0_a = list(iter(sampler))
+        sampler.set_epoch(0)
+        batches_e0_b = list(iter(sampler))
+        sampler.set_epoch(1)
+        batches_e1 = list(iter(sampler))
+
+        # Same epoch → identical sequence
+        assert batches_e0_a == batches_e0_b
+
+        # Different epoch → likely different sequence (not guaranteed by math, but very likely)
+        # Instead of strict inequality, test that composition is identical (a permutation)
+        flat_e0 = self._flatten(batches_e0_a)
+        flat_e1 = self._flatten(batches_e1)
+        assert sorted(flat_e0) == sorted(flat_e1), "Different epochs must yield same sample multiset"
+        # And very likely order differs:
+        assert batches_e0_a != batches_e1
+
+    def test_local_shuffle_window_preserves_locality(self) -> None:
+        # Use windowed local shuffle with window == batch_size so each full batch
+        # should come from one offset-window per shard.
+        B = 4
+        shard_sizes = [
+            [1] * 16,  # 4 full batches
+            [1] * 8,   # 2 full batches
+        ]
+        t_shard, t_size, t_off, per_shard_idxs, _ = self._build_mappings(shard_sizes)
+
+        sampler = ShardAwareBatchSampler(
+            batch_size=B,
+            sample_idx_to_shard_idx=t_shard,
+            sample_idx_to_sample_size=t_size,
+            sample_idx_to_sample_offset=t_off,
+            contiguous=False,
+            first=False,
+            shuffle=True,
+            drop_last=False,
+            local_shuffle_window=B,  # align window with batch size
+            seed=2025,
+        )
+        sampler.set_epoch(0)
+        batches = list(iter(sampler))
+
+        # Compute mapping from idx -> ordinal position within its shard (offset-sorted)
+        pos_in_shard: dict[int, dict[int, int]] = {}
+        for sh, idxs in per_shard_idxs.items():
+            pos_in_shard[sh] = {i: p for p, i in enumerate(idxs)}
+
+        # First N_full batches must be single shard full batches
+        n_full_expected = self._count_full_batches(shard_sizes, B)
+        full_batches = batches[:n_full_expected]
+        assert all(len(b) == B for b in full_batches)
+
+        # For each full batch, check all indices belong to the same shard
+        # and their positions are within a small window (<= B).
+        for b in full_batches:
+            shards = {int(t_shard[i].item()) for i in b}
+            assert len(shards) == 1
+            sh = next(iter(shards))
+            positions = sorted(pos_in_shard[sh][i] for i in b)
+            assert positions[-1] - positions[0] < B, "Batch should fit within one shuffled offset window"
+
+    def test_len_matches_formula(self) -> None:
+        shard_sizes = [
+            [1] * 10,  # 10
+            [1] * 7,   # 7
+            [1] * 5,   # 5
+        ]
+        B = 4
+        t_shard, t_size, t_off, _, _ = self._build_mappings(shard_sizes)
+
+        sampler_keep = ShardAwareBatchSampler(
+            batch_size=B,
+            sample_idx_to_shard_idx=t_shard,
+            sample_idx_to_sample_size=t_size,
+            sample_idx_to_sample_offset=t_off,
+            contiguous=True,
+            first=False,
+            shuffle=False,
+            drop_last=False,
+            seed=0,
+        )
+        sampler_drop = ShardAwareBatchSampler(
+            batch_size=B,
+            sample_idx_to_shard_idx=t_shard,
+            sample_idx_to_sample_size=t_size,
+            sample_idx_to_sample_offset=t_off,
+            contiguous=True,
+            first=False,
+            shuffle=False,
+            drop_last=True,
+            seed=0,
+        )
+
+        # Manual expectation
+        full = sum(len(lst) // B for lst in shard_sizes)
+        leftover = sum(len(lst) % B for lst in shard_sizes)
+        expected_keep = full + math.ceil(leftover / B)
+        expected_drop = full + math.floor(leftover / B)
+
+        assert len(sampler_keep) == expected_keep
+        assert len(sampler_drop) == expected_drop
+
+    def test_contiguous_true_uses_offset_order(self) -> None:
+        # Ensure that with contiguous=True the batches correspond to contiguous
+        # slices in offset order for each shard (though batch order may be shuffled=False here)
+        B = 3
+        shard_sizes = [
+            [5, 6, 7, 8, 9, 10],  # two batches
+            [1, 2, 3, 4],         # one batch
+        ]
+        t_shard, t_size, t_off, per_shard_idxs, _ = self._build_mappings(shard_sizes)
+
+        sampler = ShardAwareBatchSampler(
+            batch_size=B,
+            sample_idx_to_shard_idx=t_shard,
+            sample_idx_to_sample_size=t_size,
+            sample_idx_to_sample_offset=t_off,
+            contiguous=True,
+            first=False,
+            shuffle=False,
+            drop_last=False,
+            seed=7,
+        )
+
+        batches = list(iter(sampler))
+        # Expected full batches are contiguous slices per shard
+        expected_full = [
+            per_shard_idxs[0][0:3], per_shard_idxs[0][3:6],
+            per_shard_idxs[1][0:3],
+        ]
+        # The last leftover batch (size 1) should contain the leftover from shard 1
+        expected_leftover = [per_shard_idxs[1][3:4]]
+        assert batches[:3] == expected_full
+        assert batches[3:] == expected_leftover
+
+    def test_invalid_inputs_raise(self) -> None:
+        B = 4
+        # Mismatched lengths
+        with pytest.raises(ValueError):
+            ShardAwareBatchSampler(
+                batch_size=B,
+                sample_idx_to_shard_idx=torch.tensor([0, 0, 1]),
+                sample_idx_to_sample_size=torch.tensor([1, 2]),  # shorter
+                sample_idx_to_sample_offset=torch.tensor([0, 10, 20]),
+                contiguous=True,
+                first=False,
+                shuffle=False,
+                drop_last=False,
+            )
+
+        # Non-1D tensors
+        with pytest.raises(ValueError):
+            ShardAwareBatchSampler(
+                batch_size=B,
+                sample_idx_to_shard_idx=torch.tensor([[0, 0], [1, 1]]),
+                sample_idx_to_sample_size=torch.tensor([1, 2, 3, 4]),
+                sample_idx_to_sample_offset=torch.tensor([0, 10, 20, 30]),
+                contiguous=True,
+                first=False,
+                shuffle=False,
+                drop_last=False,
+            )
+
