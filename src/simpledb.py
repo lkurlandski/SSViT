@@ -91,20 +91,22 @@ class SimpleDB:
 
     def __init__(self, dir_root: Path, reader: Literal["pread", "torch"] = "torch", allow_name_indexing: bool = False) -> None:
         self.dir_root = dir_root
+        self.reader = reader
+        self.allow_name_indexing = allow_name_indexing
         self.dir_data = dir_root / "data"
         self.dir_size = dir_root / "size"
         self.dir_meta = dir_root / "meta"
         self.storages: list[UntypedStorage] = []
         self.handles: list[int] = []
-        self.size_df: pd.DataFrame = pd.DataFrame()
-        self.meta_df: pd.DataFrame = pd.DataFrame()
-        self.name_map: dict[str, int] = {}
-        self.reader = reader
-        self.allow_name_indexing = allow_name_indexing
+        self.size_df: pd.DataFrame = self.get_size_df()
+        self.meta_df: pd.DataFrame = self.get_meta_df()
+        self.name_map: dict[str, int] = self.get_name_map()
         if not (len(self.files_data) == len(self.files_size) == len(self.files_meta)):
             raise RuntimeError("Number of data, size, and meta files do not match.")
         if self.reader not in ("pread", "torch"):
             raise ValueError("Reader must be 'pread' or 'torch'.")
+        if len(self.size_df) != len(self.meta_df):
+            raise RuntimeError(f"Size and meta data have different number of rows ({len(self.size_df)} vs {len(self.meta_df)}).")
 
     @property
     def files_data(self) -> list[Path]:
@@ -120,7 +122,7 @@ class SimpleDB:
 
     @property
     def is_open(self) -> bool:
-        return len(self.storages) > 0
+        return len(self.storages) > 0 or len(self.handles) > 0
 
     def _get_idx_from_idx_or_name(self, idx_or_name: int | str) -> int:
         if isinstance(idx_or_name, int):
@@ -182,37 +184,43 @@ class SimpleDB:
             family=family,
         )
 
+    def get_size_df(self) -> pd.DataFrame:
+        size_dfs = [pd.read_csv(f) for f in self.files_size]
+        for f, df in zip(self.files_data, size_dfs):
+            if (df["offset"] + df["size"]).max() > os.path.getsize(f):
+                raise RuntimeError("Size file contains an entry that exceeds the size its data file.")
+        size_df = pd.concat(size_dfs, ignore_index=True)
+        size_df = size_df.sort_values(by="idx").set_index("idx", drop=False)
+        return size_df
+
+    def get_meta_df(self) -> pd.DataFrame:
+        meta_dfs = [pd.read_csv(f, converters={"family": lambda s: s if s else ""}) for f in self.files_meta]
+        meta_df = pd.concat(meta_dfs, ignore_index=True)
+        meta_df = meta_df.sort_values(by="idx").set_index("idx", drop=False)
+        return meta_df
+
+    def get_name_map(self) -> dict[str, int]:
+        if not self.allow_name_indexing:
+            return {}
+        if not self.meta_df["name"].is_unique:
+            raise RuntimeError("Names are not unique, so name indexing is not possible.")
+        name_map = {str(row["name"]): int(row["idx"]) for _, row in self.meta_df.iterrows()}
+        return name_map
+
     def open(self) -> Self:
         """
         Prepares the pseudo database for operations and conducts basic integrity checks.
         """
+        if self.is_open:
+            self.close()
+
+        # NOTE: it is critical that storages and handles refer to the same list.
         if self.reader == "torch":
-            self.storages = [UntypedStorage.from_file(str(f), shared=False, nbytes=os.path.getsize(f)) for f in self.files_data]
+            for f in self.files_data:
+                self.storages.append(UntypedStorage.from_file(str(f), shared=False, nbytes=os.path.getsize(f)))
         elif self.reader == "pread":
-            self.handles = [os.open(str(p), os.O_RDONLY | os.O_CLOEXEC) for p in self.files_data]
-
-        size_dfs = [pd.read_csv(f) for f in self.files_size]
-        for i in range(len(size_dfs)):
-            df = size_dfs[i]
-            l = len(self.storages[i]) if self.reader == "torch" else os.path.getsize(self.files_data[i])
-            if (df["offset"] + df["size"]).max() > l:
-                raise RuntimeError(f"Size file contains an entry that exceeds the size its data file.")
-        self.size_df = pd.concat(size_dfs, ignore_index=True)
-        self.size_df = self.size_df.sort_values(by="idx").set_index("idx", drop=False)
-
-        meta_dfs = [pd.read_csv(f, converters={"family": lambda s: s if s else ""}) for f in self.files_meta]
-        if len(meta_dfs) != len(self.storages) and len(meta_dfs) != len(self.handles):
-            raise RuntimeError(f"Number of meta files ({len(meta_dfs)}) does not match number of data files ({len(self.storages)}).")
-        self.meta_df = pd.concat(meta_dfs, ignore_index=True)
-        self.meta_df = self.meta_df.sort_values(by="idx").set_index("idx", drop=False)
-
-        if len(self.size_df) != len(self.meta_df):
-            raise RuntimeError(f"Size and meta data have different number of rows ({len(self.size_df)} vs {len(self.meta_df)}).")
-
-        if self.allow_name_indexing:
-            if not self.meta_df["name"].is_unique:
-                raise RuntimeError("Names are not unique, so name indexing is not possible.")
-            self.name_map = {row["name"]: row["idx"] for _, row in self.meta_df.iterrows()}
+            for f in self.files_data:
+                self.handles.append(os.open(str(f), os.O_RDONLY | os.O_CLOEXEC))
 
         return self
 
@@ -226,8 +234,6 @@ class SimpleDB:
         for h in self.handles:
             os.close(h)
         self.handles.clear()
-        self.meta_df = pd.DataFrame()
-        self.size_df = pd.DataFrame()
         gc.collect()
         return self
 

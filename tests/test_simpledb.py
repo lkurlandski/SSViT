@@ -304,9 +304,8 @@ def test_mismatched_size_and_meta_rows(tmp_path: Path, reader: Literal["pread", 
     df = pd.read_csv(meta_csv)
     df = df[df["name"] != "ok"]
     df.to_csv(meta_csv, index=False)
-    db = SimpleDB(root, reader=reader)
-    with pytest.raises(Exception):
-        db.open()
+    with pytest.raises(RuntimeError, match="Size and meta data have different number of rows"):
+        SimpleDB(root, reader=reader)
 
 
 @pytest.mark.parametrize("reader", ["pread", "torch"])
@@ -320,12 +319,8 @@ def test_corrupted_offset_raises(tmp_path: Path, reader: Literal["pread", "torch
     df = pd.read_csv(size_csv)
     df.loc[df["name"] == "bad", "offset"] = 10_000_000
     df.to_csv(size_csv, index=False)
-    db = SimpleDB(root, reader=reader, allow_name_indexing=True)
-    try:
-        with pytest.raises(Exception):
-            db.open()
-    finally:
-        db.close()
+    with pytest.raises(RuntimeError, match="Size file contains an entry that exceeds the size its data file."):
+        SimpleDB(root, reader=reader, allow_name_indexing=True)
 
 
 @pytest.mark.parametrize("reader", ["pread", "torch"])
