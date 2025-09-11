@@ -1,32 +1,27 @@
 """
-A simple wrapper over millions of file for faster I/O on slow filesystems.
+A simple wrapper over millions of files for faster I/O on slow filesystems.
 """
 
 from collections.abc import Iterable
 from collections.abc import Iterator
 import ctypes
 import ctypes.util
-import contextlib
-from dataclasses import dataclass
+from enum import Enum
 import gc
 from pathlib import Path
 import os
 from typing import Any
-from typing import Literal
 from typing import Optional
 from typing import NamedTuple
 from typing import Self
 import warnings
 
-import numpy as np
 import pandas as pd
 import torch
 from torch import ByteTensor
-from torch import UntypedStorage
 
 
-PAGE    = 4096
-PADDING = PAGE
+PAGESIZE = 4096
 
 
 _LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
@@ -36,6 +31,12 @@ _POSIX_FADV_SEQUENTIAL = 2
 _POSIX_FADV_WILLNEED   = 3
 _HAS_FADVICE   = hasattr(_LIBC, "posix_fadvise")
 _HAS_READAHEAD = hasattr(_LIBC, "readahead")
+
+
+class FADViseMode(Enum):
+    SEQ = "seq"  # SEQUENTIAL
+    RND = "rnd"  # RANDOM
+    OFF = "off"  # NORMAL
 
 
 def _posix_fadvise(fd: int, offset: int, length: int, advice: int) -> None:
@@ -52,29 +53,48 @@ def _readahead(fd: int, offset: int, length: int) -> None:
     _ = _LIBC.readahead(ctypes.c_int(fd), ctypes.c_long(offset), ctypes.c_size_t(length))
 
 
-@dataclass
-class _ShardWindow:
-    base: int            # file offset of start (block-aligned)
-    nbytes: int          # window length
-    buf: torch.Tensor    # uint8 CPU tensor (pinned if enabled)
-
+def _pread_into_tensor(fd: int, offset: int, nbytes: int, *, pin: bool = False) -> torch.Tensor:
+    """
+    Read exactly `nbytes` from `fd` at `offset` into a fresh 1-D uint8 tensor.
+    """
+    buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=pin)
+    mv = memoryview(buf.numpy()).cast("B")
+    got, off = 0, offset
+    while got < nbytes:
+        n = os.preadv(fd, [mv[got:]], off)
+        if n == 0:
+            raise EOFError(f"EOF: need {nbytes - got} more bytes at off={off}")
+        got += n
+        off += n
+    return buf
 
 def _align_down(x: int, a: int) -> int:
     return (x // a) * a
 
 
 class SimpleDBSample(NamedTuple):
-    """A subset of information returned by the SimpleDB when indexed."""
+    """
+    Information returned from the SimpleDB for each sample.
+    """
     name: str
     data: ByteTensor
+    bview: memoryview
     malware: bool
     timestamp: int
-    family: Optional[str] = None
+    family: str
 
 
 class SimpleDB:
     """
-    A simple database that provides fast, random access to packed files.
+    A simple database that provides fast(-ish) access to a large number of files.
+
+    Currently, the database can handle a maximum of 10^8 shard files, each of which can contain
+    an arbitrary number of individual entries. Balancing the size of the shard vs the number of
+    samples within each shard is a tradeoff between system performance and shuffling granularity.    
+
+    At the moment, the database opens every shard file simulateously, so the maximum number of
+    shards is limited by the maximum number of open file descriptors. Use `ulimit -n` to check
+    and set this limit.
 
     Structure:
         root
@@ -95,23 +115,23 @@ class SimpleDB:
     Each size-*.csv file contains the size of each entry, essential for indexing.
     Each meta-*.csv file contains non-essential metadata for each entry.
 
-    data-*.bin
+    data-*******.bin
     -------------
     This is a simple binary file containing concatenated binary blobs of each entry.
-    Each sample is padded to a multiple of `PADDING` bytes for paging efficiency.
+    Each sample is padded to a multiple of `PAGESIZE` bytes for paging efficiency.
 
-    size-*.csv
+    size-*******.csv
     -------------
-    This is a CSV file containing the offset and size of each entry in the corresponding data-****.bin file.
+    This is a CSV file containing the offset and size of each entry in the corresponding data-*******.bin file.
     It is absolutely critical to the operation of the pseudo database and should not be modified.
     It has the following columns:
         - idx (int): the unique integer ID of the entry.
         - name (str): the name of the entry.
-        - shard (int): the shard number (coresponding to the '*'). This is redundant but useful.
-        - offset (int): the offset of the entry in the data-****.bin file.
+        - shard (int): the shard number (coresponding to the '*******'). This is redundant but useful.
+        - offset (int): the offset of the entry in the data-*******.bin file.
         - size (int): the size of the entry in bytes.
 
-    meta-*.csv
+    meta-*******.csv
     -------------
     This is a CSV file containing non-essential metadata for each entry.
     Its less critical to the operation of the pseudo database and can be modified as needed.
@@ -122,53 +142,20 @@ class SimpleDB:
         - timestamp (int): the UNIX timestamp of the entry (as a UNIX timestamp). If not available, is -1.
         - malware (int): whether the entry is malware (1) or not (0). If not available, is -1.
         - family (str): the malware family of the entry. If not available, is empty string.
-
-    The size-*.csv and meta-*.csv files are separated because size is critical to the operation
-    of the pseudo database, while meta is not.
     """
 
-    def __init__(
-        self,
-        dir_root: Path,
-        reader: Literal["pread", "torch"] = "torch",
-        allow_name_indexing: bool = False,
-        *,
-        pread_cache: bool = True,
-        pread_block_bytes: int = 2 ** 24,
-        pread_pin_memory: bool = True,
-        pread_prefetch_next: bool = True,
-        fadvise_mode: Literal["sequential", "random", "off"] = "sequential",
-        use_readahead: bool = False,
-    ) -> None:
+    def __init__(self, dir_root: Path) -> None:
         self.dir_root = dir_root
-        self.reader = reader
-        self.allow_name_indexing = allow_name_indexing
         self.dir_data = dir_root / "data"
         self.dir_size = dir_root / "size"
         self.dir_meta = dir_root / "meta"
-        self.storages: list[UntypedStorage] = []
         self.handles: list[int] = []
         self.size_df: pd.DataFrame = self.get_size_df()
         self.meta_df: pd.DataFrame = self.get_meta_df()
-        self.name_map: dict[str, int] = self.get_name_map()
         if not (len(self.files_data) == len(self.files_size) == len(self.files_meta)):
             raise RuntimeError("Number of data, size, and meta files do not match.")
-        if self.reader not in ("pread", "torch"):
-            raise ValueError("Reader must be 'pread' or 'torch'.")
         if len(self.size_df) != len(self.meta_df):
             raise RuntimeError(f"Size and meta data have different number of rows ({len(self.size_df)} vs {len(self.meta_df)}).")
-        if fadvise_mode not in ("sequential", "random", "off"):
-            raise ValueError("fadvise_mode must be 'sequential', 'random', or 'off'.")
-        self.pread_cache = pread_cache
-        self.pread_block_bytes = pread_block_bytes
-        self.pread_pin_memory = pread_pin_memory
-        self.pread_prefetch_next = pread_prefetch_next
-        self.fadvise_mode = fadvise_mode
-        self.use_readahead = use_readahead
-        self._file_sizes = [os.path.getsize(f) for f in self.files_data]
-        self._win: dict[int, _ShardWindow] = {}
-        self._pread_hits   = 0
-        self._pread_misses = 0
 
     @property
     def files_data(self) -> list[Path]:
@@ -184,9 +171,102 @@ class SimpleDB:
 
     @property
     def is_open(self) -> bool:
-        return len(self.storages) > 0 or len(self.handles) > 0
+        return len(self.handles) > 0
 
-    def _get_idx_from_idx_or_name(self, idx_or_name: int | str) -> int:
+    @property
+    def is_closed(self) -> bool:
+        return not self.is_open
+
+    def get_size_df(self) -> pd.DataFrame:
+        size_dfs = [pd.read_csv(f) for f in self.files_size]
+        for f, df in zip(self.files_data, size_dfs):
+            if (df["offset"] + df["size"]).max() > os.path.getsize(f):
+                raise RuntimeError("Size file contains an entry that exceeds the size its data file.")
+        size_df = pd.concat(size_dfs, ignore_index=True)
+        size_df = size_df.sort_values(by="idx").set_index("idx", drop=False)
+        size_df.index.name = None
+        return size_df
+
+    def get_meta_df(self) -> pd.DataFrame:
+        meta_dfs = [pd.read_csv(f, converters={"family": lambda s: s if s else ""}) for f in self.files_meta]
+        meta_df = pd.concat(meta_dfs, ignore_index=True)
+        meta_df = meta_df.sort_values(by="idx").set_index("idx", drop=False)
+        meta_df.index.name = None
+        return meta_df
+
+    def open(self) -> Self:
+        """
+        Prepares the pseudo database for operation.
+        """
+        if self.is_open:
+            raise RuntimeError("Calling open() on an open database.")
+        return self
+
+    def close(self) -> Self:
+        """
+        Safely closes the pseudo database, releasing all resources, ensuring safe pickling across processes.
+        """
+        if not self.is_open:
+            raise RuntimeError("Calling close() on a closed database.")
+        for h in self.handles:
+            os.close(h)
+        self.handles.clear()
+        gc.collect()
+        return self
+
+
+class MappingSimpleDB(SimpleDB):
+    """
+    SimpleDB optimized for random accesses.
+    """
+
+    def __init__(self, dir_root: Path, *, allow_name_indexing: bool = False, random_within_shard: bool = False) -> None:
+        """
+        Args:
+            dir_root (Path): The root directory of the SimpleDB.
+            allow_name_indexing (bool): Whether to allow indexing by name.
+            random_within_shard (bool): Whether to assume random accesses are scheduled on a shard-by-shard basis.
+        """
+        super().__init__(dir_root)
+        self.allow_name_indexing = allow_name_indexing
+        self.random_within_shard = random_within_shard
+        self.name_map: dict[str, int] = self.get_name_map()
+        self.willneed = -1
+
+    def __getitem__(self, idx_or_name: int | str) -> SimpleDBSample:
+        if not self.is_open:
+            raise RuntimeError("Database is not open. Call open() before indexing.")
+
+        idx = self.get_idx_from_idx_or_name(idx_or_name)
+
+        size_dict: dict[str, Any] = self.size_df.loc[idx].to_dict()
+        meta_dict: dict[str, Any] = self.meta_df.loc[idx].to_dict()
+
+        shard = size_dict["shard"]
+        offset = size_dict["offset"]
+        length = size_dict["size"]
+
+        fd = self.handles[shard]
+        if self.random_within_shard and self.willneed != shard:
+            if self.willneed != -1:
+                prev_fd = self.handles[self.willneed]
+                _posix_fadvise(prev_fd, 0, 0, _POSIX_FADV_NORMAL)
+            _posix_fadvise(fd, 0, 0, _POSIX_FADV_WILLNEED)
+            self.willneed = shard
+
+        data = _pread_into_tensor(fd, offset, length, pin=False)
+        bview = memoryview(data.numpy()).cast("B")
+
+        return SimpleDBSample(
+            name=size_dict["name"],
+            data=data,
+            bview=bview,
+            malware=meta_dict["malware"] == 1,
+            timestamp=meta_dict["timestamp"],
+            family=meta_dict["family"],
+        )
+
+    def get_idx_from_idx_or_name(self, idx_or_name: int | str) -> int:
         if isinstance(idx_or_name, int):
             return idx_or_name
 
@@ -197,128 +277,6 @@ class SimpleDB:
 
         raise TypeError("Index must be an integer or string.")
 
-    def _read_as_tensor_torch(self, shard: int, offset: int, length: int) -> ByteTensor:
-        storage = self.storages[shard]
-        data = torch.empty(0, dtype=torch.uint8)
-        data.set_(storage, storage_offset=offset, size=(length,), stride=(1,))
-        return data
-
-    def _read_as_tensor_pread(self, shard: int, offset: int, length: int) -> ByteTensor:
-        fd = self.handles[shard]
-
-        if not self.pread_cache:
-            data = torch.empty(length, dtype=torch.uint8)
-            mv = memoryview(data.numpy()).cast("B")
-            got, off = 0, offset
-            while got < length:
-                n = os.preadv(fd, [mv[got:]], off)
-                if n == 0:
-                    raise EOFError(f"EOF at shard={shard} off={off}, need {length-got} more")
-                got += n
-                off += n
-            return data
-
-        end = offset + length
-        bsz = self.pread_block_bytes
-        fsz = self._file_sizes[shard]
-
-        # Current rolling window for this shard?
-        win = self._win.get(shard)
-
-        # Fast-path hit: entirely inside current window
-        if win is not None and offset >= win.base and end <= win.base + win.nbytes:
-            self._pread_hits += 1
-            start = offset - win.base
-            return win.buf.narrow(0, start, length)
-
-        self._pread_misses += 1
-
-        # Compute new window covering this request, block-aligned
-        base = _align_down(offset, bsz)
-        need = end - base
-        nbytes = max(bsz, need)                     # at least one full block
-        # stay within file
-        if base + nbytes > fsz:
-            nbytes = fsz - base
-            if nbytes <= 0:
-                raise EOFError(f"Invalid window shard={shard} offset={offset} length={length}")
-
-        # Hint kernel we will need this region soon
-        _posix_fadvise(fd, base, nbytes, _POSIX_FADV_WILLNEED)
-
-        # Optional: prefetch NEXT window (non-blocking)
-        if self.pread_prefetch_next:
-            nb_base = base + nbytes
-            if nb_base < fsz:
-                nb_len = min(nbytes, fsz - nb_base)
-                _posix_fadvise(fd, nb_base, nb_len, _POSIX_FADV_WILLNEED)
-                if self.use_readahead:
-                    _readahead(fd, nb_base, nb_len)
-
-        # Allocate pinned CPU buffer and read the window in one go
-        buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=self.pread_pin_memory)
-        mv = memoryview(buf.numpy()).cast("B")
-        got, off = 0, base
-        while got < nbytes:
-            n = os.preadv(fd, [mv[got:]], off)
-            if n == 0:
-                raise EOFError(f"EOF at shard={shard} off={off}, need {nbytes-got} more")
-            got += n
-            off += n
-
-        # Install/advance rolling window (we never need to go backwards in contiguous mode)
-        self._win[shard] = _ShardWindow(base=base, nbytes=nbytes, buf=buf)
-
-        start = offset - base
-        return buf.narrow(0, start, length)
-
-    def __getitem__(self, idx_or_name: int | str) -> SimpleDBSample:
-        if not self.is_open:
-            raise RuntimeError("Database is not open. Call open() before indexing.")
-        idx = self._get_idx_from_idx_or_name(idx_or_name)
-
-        size_dict: dict[str, Any] = self.size_df.loc[idx].to_dict()
-        meta_dict: dict[str, Any] = self.meta_df.loc[idx].to_dict()
-
-        if any(size_dict[key] != meta_dict[key] for key in ("idx", "name", "shard")):
-            raise RuntimeError(f"Size and meta data mismatch for idx {idx}.")
-
-        name = size_dict["name"]
-        shard = size_dict["shard"]
-        offset = size_dict["offset"]
-        length = size_dict["size"]
-        malware = meta_dict["malware"] == 1
-        timestamp = meta_dict["timestamp"]
-        family = meta_dict["family"]
-
-        if self.reader == "torch":
-            data = self._read_as_tensor_torch(shard, offset, length)
-        elif self.reader == "pread":
-            data = self._read_as_tensor_pread(shard, offset, length)
-
-        return SimpleDBSample(
-            name=name,
-            data=data,
-            malware=malware,
-            timestamp=timestamp,
-            family=family,
-        )
-
-    def get_size_df(self) -> pd.DataFrame:
-        size_dfs = [pd.read_csv(f) for f in self.files_size]
-        for f, df in zip(self.files_data, size_dfs):
-            if (df["offset"] + df["size"]).max() > os.path.getsize(f):
-                raise RuntimeError("Size file contains an entry that exceeds the size its data file.")
-        size_df = pd.concat(size_dfs, ignore_index=True)
-        size_df = size_df.sort_values(by="idx").set_index("idx", drop=False)
-        return size_df
-
-    def get_meta_df(self) -> pd.DataFrame:
-        meta_dfs = [pd.read_csv(f, converters={"family": lambda s: s if s else ""}) for f in self.files_meta]
-        meta_df = pd.concat(meta_dfs, ignore_index=True)
-        meta_df = meta_df.sort_values(by="idx").set_index("idx", drop=False)
-        return meta_df
-
     def get_name_map(self) -> dict[str, int]:
         if not self.allow_name_indexing:
             return {}
@@ -328,94 +286,135 @@ class SimpleDB:
         return name_map
 
     def open(self) -> Self:
-        """
-        Prepares the pseudo database for operations and conducts basic integrity checks.
-        """
-        if self.is_open:
-            self.close()
-
-        # NOTE: it is critical that storages and handles refer to the same list.
-        if self.reader == "torch":
-            for f in self.files_data:
-                self.storages.append(UntypedStorage.from_file(str(f), shared=False, nbytes=os.path.getsize(f)))
-        elif self.reader == "pread":
-            for f in self.files_data:
-                self.handles.append(os.open(str(f), os.O_RDONLY | os.O_CLOEXEC))
-            if self.fadvise_mode == "sequential":
-                for fd in self.handles:
-                    _posix_fadvise(fd, 0, 0, _POSIX_FADV_SEQUENTIAL)
-            elif self.fadvise_mode == "random":
-                for fd in self.handles:
-                    _posix_fadvise(fd, 0, 0, _POSIX_FADV_RANDOM)
-
+        super().open()
+        for f in self.files_data:
+            fd = os.open(str(f), os.O_RDONLY | os.O_CLOEXEC)
+            _posix_fadvise(fd, 0, 0, _POSIX_FADV_RANDOM)
+            self.handles.append(fd)
         return self
 
-    def close(self) -> Self:
-        """
-        Safely closes the pseudo database, releasing all resources.
 
-        This is critical to ensure the database can safely be pickled across processes.
-        """
-        self.storages.clear()
-        for h in self.handles:
-            os.close(h)
-        self.handles.clear()
-        self.handles.clear()
-        self._win.clear()
-        gc.collect()
-        return self
+class IterableSimpleDB(SimpleDB):
+    """
+    SimpleDB optimized for sequential accesses.
+    """
 
-    @contextlib.contextmanager
-    def open_slice_as_path(self, idx_or_name: int | str) -> Iterator[str]:
-        idx = self._get_idx_from_idx_or_name(idx_or_name)
+    def __init__(
+        self,
+        dir_root: Path,
+        *,
+        pread_block_bytes: int = 64 * 2 ** 20,
+        merge_slack_bytes: int = 0,
+        prefetch_next_window: bool = True,
+        use_readahead: bool = False,
+    ) -> None:
+        super().__init__(dir_root)
+        self.block_bytes = pread_block_bytes
+        self.merge_slack = merge_slack_bytes
+        self.prefetch_next_window = prefetch_next_window
+        self.use_readahead = use_readahead
 
-        shard  = int(self.size_df.loc[idx, "shard"])
-        offset = int(self.size_df.loc[idx, "offset"])
-        length = int(self.size_df.loc[idx, "size"])
-        src    = self.files_data[shard]
+    def __iter__(self) -> Iterator[SimpleDBSample]:
+        for f in self.files_data:
+            shard_idx = int(f.stem.split("-")[-1])
+            yield from self.iter_one_shard(shard_idx)
 
-        use_cfr = True
-        chunksz = 2 ** 20
+    def iter_one_shard(self, shard_idx_or_name: str | int) -> Iterator[SimpleDBSample]:
+        if not self.is_open:
+            raise RuntimeError("Database is not open. Call open() before iterating.")
 
-        src_fd = os.open(src, os.O_RDONLY)
-        try:
-            memfd = os.memfd_create(f"simpledb-{shard}-{offset}", flags=os.MFD_CLOEXEC)
+        if isinstance(shard_idx_or_name, str):
             try:
-                remaining = length
-                off_in    = offset
-                off_out   = 0
+                shard_idx = int(shard_idx_or_name)
+            except ValueError:
+                raise ValueError(f"Shard identifier must be int-like, got {shard_idx_or_name!r}")
+        else:
+            shard_idx = int(shard_idx_or_name)
 
-                while remaining:
-                    nreq = min(chunksz, remaining)
-                    n = 0
+        sub_df = self.size_df[self.size_df["shard"] == shard_idx][["idx", "name", "shard", "offset", "size"]]
+        rows = sub_df.sort_values(["offset", "idx"]).reset_index(drop=True)
+        if rows.empty:
+            return
+        fd = self.handles[shard_idx]
+        file_path = self.files_data[shard_idx]
+        fsz = os.path.getsize(file_path)
 
-                    if use_cfr:
+        block = int(self.block_bytes)
+        slack = int(self.merge_slack)
+
+        i = 0
+        while i < len(rows):
+            r0 = rows.iloc[i]
+            first_off  = int(r0["offset"])
+            first_size = int(r0["size"])
+            # Window start aligned to block; ensure at least one full block or the whole sample
+            base = _align_down(first_off, block)
+            end  = base + max(block, (first_off + first_size) - base)
+
+            # Greedily extend while consecutive samples fit within [base, end] + slack
+            j = i + 1
+            while j < len(rows):
+                rj = rows.iloc[j]
+                o  = int(rj["offset"]); s = int(rj["size"])
+                if o + s <= end + slack and end < fsz:
+                    end = max(end, o + s)
+                    j += 1
+                else:
+                    break
+
+            if end > fsz:
+                end = fsz
+            nbytes = end - base
+            if nbytes <= 0:
+                break
+
+            # Hint current and (optionally) next window
+            _posix_fadvise(fd, base, nbytes, _POSIX_FADV_WILLNEED)
+            if self.prefetch_next_window:
+                nb_base = end
+                if nb_base < fsz:
+                    nb_len = min(nbytes, fsz - nb_base)
+                    _posix_fadvise(fd, nb_base, nb_len, _POSIX_FADV_WILLNEED)
+                    if self.use_readahead and _HAS_READAHEAD:
                         try:
-                            n = os.copy_file_range(src_fd, memfd, nreq, offset_src=off_in, offset_dst=off_out)
-                            if n == 0:
-                                warnings.warn("`copy_file_range` returned 0 bytes copied. Falling back to userspace copy.")
-                                use_cfr = False
-                                continue
-                        except OSError as err:
-                            warnings.warn(f"`copy_file_range` failed with {str(err)}. Falling back to userspace copy.")
-                            use_cfr = False
-                            continue
+                            _readahead(fd, nb_base, nb_len)
+                        except Exception:
+                            pass
 
-                    if (not use_cfr) and (n == 0):
-                        chunk = os.pread(src_fd, nreq, off_in)
-                        if not chunk:
-                            break
-                        n = os.pwrite(memfd, chunk, off_out)
+            # Read the whole window in one preadv loop
+            win = _pread_into_tensor(fd, base, nbytes, pin=False)
 
-                    remaining -= n
-                    off_in    += n
-                    off_out   += n
+            # Views/slices per row i..j-1
+            base_mv = memoryview(win.numpy()).cast("B")
+            for k in range(i, j):
+                rk = rows.iloc[k]
+                idx = int(rk["idx"])
+                name = str(rk["name"])
+                off = int(rk["offset"]); sz = int(rk["size"])
+                start = off - base
 
-                yield f"/proc/self/fd/{memfd}"
-            finally:
-                os.close(memfd)
-        finally:
-            os.close(src_fd)
+                tview = win.narrow(0, start, sz)
+                bview = base_mv[start:start + sz]
+
+                mrow = self.meta_df.loc[idx]
+                yield SimpleDBSample(
+                    name=name,
+                    data=tview,
+                    bview=bview,
+                    malware=bool(int(mrow["malware"]) == 1),
+                    timestamp=int(mrow["timestamp"]),
+                    family=str(mrow["family"]),
+                )
+
+            i = j  # advance to first not-yet-emitted row
+
+    def open(self) -> Self:
+        super().open()
+        for f in self.files_data:
+            fd = os.open(str(f), os.O_RDONLY | os.O_CLOEXEC)
+            _posix_fadvise(fd, 0, 0, _POSIX_FADV_SEQUENTIAL)
+            self.handles.append(fd)
+        return self
 
 
 class CreateSimpleDBSample(NamedTuple):
@@ -434,8 +433,6 @@ def roundup(x: int, to: int) -> int:
 class CreateSimpleDB:
     """
     Create a SimpleDB from files and metadata.
-
-    TODO: pad each individual sample to a multiple of PADDING for better paging performance.
     """
 
     def __init__(self, root: Path, shardsize: int = 2 ** 30) -> None:
@@ -496,8 +493,11 @@ class CreateSimpleDB:
                 "malware": [1 if sample.malware else 0],
                 "family": [sample.family if sample.family is not None else ""],
             })
-            # Append the data for this sample to the current shard.
+            # Append the data and padding bytes for this sample to the current shard.
+            npad = roundup(len(data_), PAGESIZE) - len(data_)
+            bpad = b"\x00" * npad
             data.extend(data_)
+            data.extend(bpad)
             size_df = pd.concat([size_df, size_df_], ignore_index=True)
             meta_df = pd.concat([meta_df, meta_df_], ignore_index=True)
             # Increment counters.
@@ -525,11 +525,11 @@ class CreateSimpleDB:
         if len(sample.data) > self.shardsize:
             warnings.warn(
                 f"Sample {sample.name} is larger than the shard size {self.shardsize}. "
-                f"It will be stored in its own shard of size {roundup(len(sample.data), PADDING)}."
+                f"It will be stored in its own shard of size {roundup(len(sample.data), PAGESIZE)}."
             )
             return True
         # Dump if adding the current sample would exceed the shard size.
-        if roundup(len(data) + len(sample.data), PADDING) > self.shardsize:
+        if roundup(len(data) + len(sample.data), PAGESIZE) > self.shardsize:
             return True
         # Otherwise, do not dump.
         return False
@@ -542,10 +542,7 @@ class CreateSimpleDB:
         if shard_idx >= 10 ** len('*******'):
             raise RuntimeError(f"Exceeded maximum number of shards ({10 ** len('*******')}).")
         prefix = f"{(len('*******') - len(str(shard_idx))) * '0'}{shard_idx}"
-        # Pad the binary data to a multiple of PADDING.
-        padding = roundup(len(data), PADDING) - len(data)
-        data.extend(b"\x00" * padding)
+        # Write the data, size, and meta files for this shard.
         Path(self.dir_data / f"data-{prefix}.bin").write_bytes(data)
-        # Save the size and meta dataframes.
         size_df.to_csv(self.dir_size / f"size-{prefix}.csv", index=False)
         meta_df.to_csv(self.dir_meta / f"meta-{prefix}.csv", index=False)
