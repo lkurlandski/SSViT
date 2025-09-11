@@ -4,7 +4,10 @@ A simple wrapper over millions of file for faster I/O on slow filesystems.
 
 from collections.abc import Iterable
 from collections.abc import Iterator
+import ctypes
+import ctypes.util
 import contextlib
+from dataclasses import dataclass
 import gc
 from pathlib import Path
 import os
@@ -22,7 +25,42 @@ from torch import ByteTensor
 from torch import UntypedStorage
 
 
-PADDING = 4096
+PAGE    = 4096
+PADDING = PAGE
+
+
+_LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+_POSIX_FADV_NORMAL     = 0
+_POSIX_FADV_RANDOM     = 1
+_POSIX_FADV_SEQUENTIAL = 2
+_POSIX_FADV_WILLNEED   = 3
+_HAS_FADVICE   = hasattr(_LIBC, "posix_fadvise")
+_HAS_READAHEAD = hasattr(_LIBC, "readahead")
+
+
+def _posix_fadvise(fd: int, offset: int, length: int, advice: int) -> None:
+    if not _HAS_FADVICE:
+        warnings.warn("posix_fadvise called but not available on this system.")
+        return
+    _ = _LIBC.posix_fadvise(ctypes.c_int(fd), ctypes.c_long(offset), ctypes.c_long(length), ctypes.c_int(advice))
+
+
+def _readahead(fd: int, offset: int, length: int) -> None:
+    if not _HAS_READAHEAD:
+        warnings.warn("readahead called but not available on this system.")
+        return
+    _ = _LIBC.readahead(ctypes.c_int(fd), ctypes.c_long(offset), ctypes.c_size_t(length))
+
+
+@dataclass
+class _ShardWindow:
+    base: int            # file offset of start (block-aligned)
+    nbytes: int          # window length
+    buf: torch.Tensor    # uint8 CPU tensor (pinned if enabled)
+
+
+def _align_down(x: int, a: int) -> int:
+    return (x // a) * a
 
 
 class SimpleDBSample(NamedTuple):
@@ -89,7 +127,19 @@ class SimpleDB:
     of the pseudo database, while meta is not.
     """
 
-    def __init__(self, dir_root: Path, reader: Literal["pread", "torch"] = "torch", allow_name_indexing: bool = False) -> None:
+    def __init__(
+        self,
+        dir_root: Path,
+        reader: Literal["pread", "torch"] = "torch",
+        allow_name_indexing: bool = False,
+        *,
+        pread_cache: bool = True,
+        pread_block_bytes: int = 2 ** 24,
+        pread_pin_memory: bool = True,
+        pread_prefetch_next: bool = True,
+        fadvise_mode: Literal["sequential", "random", "off"] = "sequential",
+        use_readahead: bool = False,
+    ) -> None:
         self.dir_root = dir_root
         self.reader = reader
         self.allow_name_indexing = allow_name_indexing
@@ -107,6 +157,18 @@ class SimpleDB:
             raise ValueError("Reader must be 'pread' or 'torch'.")
         if len(self.size_df) != len(self.meta_df):
             raise RuntimeError(f"Size and meta data have different number of rows ({len(self.size_df)} vs {len(self.meta_df)}).")
+        if fadvise_mode not in ("sequential", "random", "off"):
+            raise ValueError("fadvise_mode must be 'sequential', 'random', or 'off'.")
+        self.pread_cache = pread_cache
+        self.pread_block_bytes = pread_block_bytes
+        self.pread_pin_memory = pread_pin_memory
+        self.pread_prefetch_next = pread_prefetch_next
+        self.fadvise_mode = fadvise_mode
+        self.use_readahead = use_readahead
+        self._file_sizes = [os.path.getsize(f) for f in self.files_data]
+        self._win: dict[int, _ShardWindow] = {}
+        self._pread_hits   = 0
+        self._pread_misses = 0
 
     @property
     def files_data(self) -> list[Path]:
@@ -143,18 +205,76 @@ class SimpleDB:
 
     def _read_as_tensor_pread(self, shard: int, offset: int, length: int) -> ByteTensor:
         fd = self.handles[shard]
-        data = torch.empty(length, dtype=torch.uint8)
-        mv = memoryview(data.numpy()).cast("B")
-        got, off = 0, offset
-        while got < length:
+
+        if not self.pread_cache:
+            data = torch.empty(length, dtype=torch.uint8)
+            mv = memoryview(data.numpy()).cast("B")
+            got, off = 0, offset
+            while got < length:
+                n = os.preadv(fd, [mv[got:]], off)
+                if n == 0:
+                    raise EOFError(f"EOF at shard={shard} off={off}, need {length-got} more")
+                got += n
+                off += n
+            return data
+
+        end = offset + length
+        bsz = self.pread_block_bytes
+        fsz = self._file_sizes[shard]
+
+        # Current rolling window for this shard?
+        win = self._win.get(shard)
+
+        # Fast-path hit: entirely inside current window
+        if win is not None and offset >= win.base and end <= win.base + win.nbytes:
+            self._pread_hits += 1
+            start = offset - win.base
+            return win.buf.narrow(0, start, length)
+
+        self._pread_misses += 1
+
+        # Compute new window covering this request, block-aligned
+        base = _align_down(offset, bsz)
+        need = end - base
+        nbytes = max(bsz, need)                     # at least one full block
+        # stay within file
+        if base + nbytes > fsz:
+            nbytes = fsz - base
+            if nbytes <= 0:
+                raise EOFError(f"Invalid window shard={shard} offset={offset} length={length}")
+
+        # Hint kernel we will need this region soon
+        _posix_fadvise(fd, base, nbytes, _POSIX_FADV_WILLNEED)
+
+        # Optional: prefetch NEXT window (non-blocking)
+        if self.pread_prefetch_next:
+            nb_base = base + nbytes
+            if nb_base < fsz:
+                nb_len = min(nbytes, fsz - nb_base)
+                _posix_fadvise(fd, nb_base, nb_len, _POSIX_FADV_WILLNEED)
+                if self.use_readahead:
+                    _readahead(fd, nb_base, nb_len)
+
+        # Allocate pinned CPU buffer and read the window in one go
+        buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=self.pread_pin_memory)
+        mv = memoryview(buf.numpy()).cast("B")
+        got, off = 0, base
+        while got < nbytes:
             n = os.preadv(fd, [mv[got:]], off)
             if n == 0:
-                raise EOFError(f"EOF at shard={shard} off={off}, need {length-got} more")
+                raise EOFError(f"EOF at shard={shard} off={off}, need {nbytes-got} more")
             got += n
             off += n
-        return data
+
+        # Install/advance rolling window (we never need to go backwards in contiguous mode)
+        self._win[shard] = _ShardWindow(base=base, nbytes=nbytes, buf=buf)
+
+        start = offset - base
+        return buf.narrow(0, start, length)
 
     def __getitem__(self, idx_or_name: int | str) -> SimpleDBSample:
+        if not self.is_open:
+            raise RuntimeError("Database is not open. Call open() before indexing.")
         idx = self._get_idx_from_idx_or_name(idx_or_name)
 
         size_dict: dict[str, Any] = self.size_df.loc[idx].to_dict()
@@ -221,6 +341,12 @@ class SimpleDB:
         elif self.reader == "pread":
             for f in self.files_data:
                 self.handles.append(os.open(str(f), os.O_RDONLY | os.O_CLOEXEC))
+            if self.fadvise_mode == "sequential":
+                for fd in self.handles:
+                    _posix_fadvise(fd, 0, 0, _POSIX_FADV_SEQUENTIAL)
+            elif self.fadvise_mode == "random":
+                for fd in self.handles:
+                    _posix_fadvise(fd, 0, 0, _POSIX_FADV_RANDOM)
 
         return self
 
@@ -234,6 +360,8 @@ class SimpleDB:
         for h in self.handles:
             os.close(h)
         self.handles.clear()
+        self.handles.clear()
+        self._win.clear()
         gc.collect()
         return self
 
