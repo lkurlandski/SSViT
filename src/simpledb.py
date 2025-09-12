@@ -208,6 +208,35 @@ class SimpleDB:
     def files_meta(self) -> list[Path]:
         return sorted(self.dir_meta.glob("meta-*.csv"), key=lambda p: p.stem.split("-")[-1])
 
+    def compute_shardwise_stats(self) -> pd.DataFrame:
+        """
+        Computes a DataFrame with the distribution of malware and families per shard.
+
+        Returns:
+            pd.DataFrame: A DataFrame with the following columns:
+                - shard (int): The shard number.
+                - num_samples (int): The number of samples in the shard.
+                - num_malware (int): The number of malware samples in the shard.
+                - num_benign (int): The number of benign samples in the shard.
+                - malware_fraction (float): The fraction of malware samples in the shard.
+        """
+        stats = []
+        for f in self.files_meta:
+            df = pd.read_csv(f, converters={"family": lambda s: s if s else ""})
+            shard_idx = int(f.stem.split("-")[-1])
+            num_samples = len(df)
+            num_malware = int((df["malware"] == 1).sum())
+            num_benign = int((df["malware"] == 0).sum())
+            malware_fraction = num_malware / num_samples if num_samples > 0 else 0.0
+            stats.append({
+                "shard": shard_idx,
+                "num_samples": num_samples,
+                "num_malware": num_malware,
+                "num_benign": num_benign,
+                "malware_fraction": malware_fraction,
+            })
+        return pd.DataFrame(stats).sort_values("shard").reset_index(drop=True)
+
     def get_size_df(self) -> pd.DataFrame:
         size_dfs = [pd.read_csv(f) for f in self.files_size]
         for f, df in zip(self.files_data, size_dfs):
@@ -550,12 +579,6 @@ class CreateSimpleDB:
     """
 
     def __init__(self, root: Path, shardsize: int = 2 ** 30) -> None:
-        """
-        Args:
-            root (Path): The root directory of the SimpleDB.
-            shardsize (int): The maximum size of each shard in bytes.
-                Default is 1 GiB, which can hold about 1PB of binary data.
-        """
         self.root = root
         self.dir_data = root / "data"
         self.dir_size = root / "size"
@@ -566,97 +589,108 @@ class CreateSimpleDB:
         self.dir_meta.mkdir()
         self.shardsize = shardsize
 
+        # ---- internal state for incremental use ----
+        self._cur_data: bytearray | None = None
+        self._cur_size_df: pd.DataFrame | None = None
+        self._cur_meta_df: pd.DataFrame | None = None
+        self._cur_count: int = 0
+        self._shard_idx: int = 0
+        self._sample_idx: int = 0
+        self._closed: bool = False
+
     @property
     def max_capacity(self) -> int:
         return self.shardsize * int(10 ** len('*******'))
 
-    def __call__(self, samples: Iterable[CreateSimpleDBSample]) -> Self:
-        """
-        Create the SimpleDB from an iterable of samples.
-
-        Args:
-            samples (Iterable[CreateSimpleDBSample]): An iterable of samples to add to the SimpleDB.
-        """
-        # Data for the current shard.
-        data, size_df, meta_df, num_samples = self._initialize_shard_containers()
-
-        # Global counters for all shards
-        shard_idx = 0
-        sample_idx = 0
-
-        for sample in samples:
-            # If we should dump the current shard, do so, and reset the containers for this shard.
-            if self._should_dump_shard_containers(data, size_df, meta_df, num_samples, sample):
-                self._dump_shard_containers(data, size_df, meta_df, num_samples, shard_idx)
-                data, size_df, meta_df, num_samples = self._initialize_shard_containers()
-                shard_idx += 1
-            # Get the data for this sample.
-            data_ = bytearray(sample.data)
-            size_df_ = pd.DataFrame({
-                "idx": [sample_idx],
-                "name": [sample.name],
-                "shard": [shard_idx],
-                "offset": [len(data)],
-                "size": [len(data_)],
-            })
-            meta_df_ = pd.DataFrame({
-                "idx": [sample_idx],
-                "name": [sample.name],
-                "shard": [shard_idx],
-                "timestamp": [sample.timestamp],
-                "malware": [1 if sample.malware else 0],
-                "family": [sample.family if sample.family is not None else ""],
-            })
-            # Append the data and padding bytes for this sample to the current shard.
-            npad = roundup(len(data_), PAGESIZE) - len(data_)
-            bpad = b"\x00" * npad
-            data.extend(data_)
-            data.extend(bpad)
-            size_df = pd.concat([size_df, size_df_], ignore_index=True)
-            meta_df = pd.concat([meta_df, meta_df_], ignore_index=True)
-            # Increment counters.
-            sample_idx += 1
-            num_samples += 1
-
-        # Dump any remaining data.
-        if num_samples > 0:
-            self._dump_shard_containers(data, size_df, meta_df, num_samples, shard_idx)
-
+    # ---------- Batch Build API ----------
+    def __call__(self, samples: Iterable["CreateSimpleDBSample"]) -> "CreateSimpleDB":
+        for s in samples:
+            self.add(s)
+        self.close()
         return self
 
-    def _initialize_shard_containers(self) -> tuple[bytearray, pd.DataFrame, pd.DataFrame, int]:
-        data = bytearray()
-        size_df = pd.DataFrame(columns=["idx", "name", "shard", "offset", "size"])
-        meta_df = pd.DataFrame(columns=["idx", "name", "shard", "timestamp", "malware", "family"])
-        num_samples = 0
-        return data, size_df, meta_df, num_samples
+    # ---------- Incremental Build API ----------
+    def _ensure_containers(self) -> None:
+        if self._cur_data is None:
+            self._cur_data = bytearray()
+            self._cur_size_df = pd.DataFrame(columns=["idx", "name", "shard", "offset", "size"])
+            self._cur_meta_df = pd.DataFrame(columns=["idx", "name", "shard", "timestamp", "malware", "family"])
+            self._cur_count = 0
 
-    def _should_dump_shard_containers(self, data: bytearray, size_df: pd.DataFrame, meta_df: pd.DataFrame, num_samples: int, sample: CreateSimpleDBSample) -> bool:
-        # Never dump if we have no samples.
+    def add(self, sample: CreateSimpleDBSample) -> None:
+        if self._closed:
+            raise RuntimeError("CreateSimpleDB is already closed.")
+        self._ensure_containers()
+
+        # If adding this sample would overflow current shard, dump current shard first.
+        assert self._cur_data is not None and self._cur_size_df is not None and self._cur_meta_df is not None
+        if self._should_dump_shard_containers(self._cur_data, self._cur_size_df, self._cur_meta_df, self._cur_count, sample):
+            self._dump_shard_containers(self._cur_data, self._cur_size_df, self._cur_meta_df, self._cur_count, self._shard_idx)
+            # reset containers and advance shard id
+            self._cur_data = bytearray()
+            self._cur_size_df = pd.DataFrame(columns=["idx", "name", "shard", "offset", "size"])
+            self._cur_meta_df = pd.DataFrame(columns=["idx", "name", "shard", "timestamp", "malware", "family"])
+            self._cur_count = 0
+            self._shard_idx += 1
+
+        # Append sample to current shard
+        data_bytes = bytearray(sample.data)
+        size_df_ = pd.DataFrame({
+            "idx": [self._sample_idx],
+            "name": [sample.name],
+            "shard": [self._shard_idx],
+            "offset": [len(self._cur_data)],
+            "size": [len(data_bytes)],
+        })
+        meta_df_ = pd.DataFrame({
+            "idx": [self._sample_idx],
+            "name": [sample.name],
+            "shard": [self._shard_idx],
+            "timestamp": [sample.timestamp],
+            "malware": [1 if sample.malware else 0],
+            "family": [sample.family if sample.family is not None else ""],
+        })
+
+        # pad + append
+        npad = roundup(len(data_bytes), PAGESIZE) - len(data_bytes)
+        self._cur_data.extend(data_bytes)
+        if npad:
+            self._cur_data.extend(b"\x00" * npad)
+
+        self._cur_size_df = pd.concat([self._cur_size_df, size_df_], ignore_index=True)
+        self._cur_meta_df = pd.concat([self._cur_meta_df, meta_df_], ignore_index=True)
+
+        self._cur_count += 1
+        self._sample_idx += 1
+
+    def close(self) -> CreateSimpleDB:
+        if self._closed:
+            return self
+        if self._cur_count > 0:
+            assert self._cur_data is not None and self._cur_size_df is not None and self._cur_meta_df is not None
+            self._dump_shard_containers(self._cur_data, self._cur_size_df, self._cur_meta_df, self._cur_count, self._shard_idx)
+        self._closed = True
+        return self
+
+    def _should_dump_shard_containers(self, data: bytearray, size_df: pd.DataFrame, meta_df: pd.DataFrame, num_samples: int, sample: "CreateSimpleDBSample") -> bool:
         if num_samples == 0:
             return False
-        # Dump if the current sample is larger than the shard size.
         if len(sample.data) > self.shardsize:
             warnings.warn(
                 f"Sample {sample.name} is larger than the shard size {self.shardsize}. "
                 f"It will be stored in its own shard of size {roundup(len(sample.data), PAGESIZE)}."
             )
             return True
-        # Dump if adding the current sample would exceed the shard size.
         if roundup(len(data) + len(sample.data), PAGESIZE) > self.shardsize:
             return True
-        # Otherwise, do not dump.
         return False
 
     def _dump_shard_containers(self, data: bytearray, size_df: pd.DataFrame, meta_df: pd.DataFrame, num_samples: int, shard_idx: int) -> None:
-        # Never dump if we have no samples.
         if num_samples == 0:
             return
-        # Get the prefix for the shard.
         if shard_idx >= 10 ** len('*******'):
             raise RuntimeError(f"Exceeded maximum number of shards ({10 ** len('*******')}).")
         prefix = f"{(len('*******') - len(str(shard_idx))) * '0'}{shard_idx}"
-        # Write the data, size, and meta files for this shard.
         Path(self.dir_data / f"data-{prefix}.bin").write_bytes(data)
         size_df.to_csv(self.dir_size / f"size-{prefix}.csv", index=False)
         meta_df.to_csv(self.dir_meta / f"meta-{prefix}.csv", index=False)
@@ -667,27 +701,82 @@ def split_simple_db(
     dirs_out: list[Path],
     indices: list[Sequence[int] | npt.NDArray[np.integer[Any]] | torch.Tensor],
     shardsize: int = 2 ** 30,
+    *,
+    shuffle: bool = True,
+    poolsize: int = 16384,
+    seed: Optional[int] = None,
 ) -> None:
     """
     Split a SimpleDB into multiple SimpleDBs.
+
+    NOTE: This algorithm's randomization capabalities are somewhat limited across shards unless
+    poolsize is large relative to the shardsize of the source database. Recommend you use SimpleDB's
+    `compute_shardwise_stats` method to examind each shard's data distribution before and after splitting.
     """
     if len(dirs_out) != len(indices):
         raise ValueError("dirs_out and indices must have the same length.")
-    db = IterableSimpleDB(dir_root)
 
-    for dir_out, idx in zip(dirs_out, indices):
-        idxset: set[int] = set(idx.tolist()) if isinstance(idx, (np.ndarray, torch.Tensor)) else set(idx)
-        creator = CreateSimpleDB(dir_out, shardsize=shardsize)
-        def stream() -> Generator[CreateSimpleDBSample, None, None]:
-            with db as opened_db:
-                for i, sample in enumerate(opened_db):
-                    if i not in idxset:
+    rng = random.Random(seed)
+
+    # For each output, convert indices to a set for fast lookup.
+    idxsets: list[set[int]] = []
+    for idx in indices:
+        if isinstance(idx, (np.ndarray, torch.Tensor)):
+            idx = idx.tolist()
+        idxsets.append(set(idx))
+
+    builders = [CreateSimpleDB(out_dir, shardsize=shardsize) for out_dir in dirs_out]
+    pools: list[list[CreateSimpleDBSample]] = [[] for _ in dirs_out]
+
+    src = IterableSimpleDB(dir_root)
+    shard_ids = [int(p.stem.split("-")[-1]) for p in src.files_data]
+    if shuffle:
+        rng.shuffle(shard_ids)
+
+    try:
+        src.open()
+        for shard in tqdm(shard_ids, desc="Processing shards", unit="shard"):
+            # Build the "rows" view to recover idx order used by iter_one_shard.
+            sub_df = src.size_df[src.size_df["shard"] == shard][["idx", "offset"]]
+            rows = sub_df.sort_values(["offset", "idx"]).reset_index(drop=True)
+            idx_in_order = rows["idx"].astype(int).tolist()
+
+            # Stream samples for this shard and zip with the true idxs.
+            for idx_val, sample in zip(idx_in_order, src.iter_one_shard(shard)):
+                # Add sample to each new database that wants it.
+                for out_j, idxset in enumerate(idxsets):
+                    if idx_val not in idxset:
                         continue
-                    yield CreateSimpleDBSample(
+                    # Create the Sample to add.
+                    rec = CreateSimpleDBSample(
                         name=sample.name,
                         data=bytes(sample.bview),
-                        malware=sample.malware,
-                        timestamp=sample.timestamp,
-                        family=sample.family if sample.family else None,
+                        malware=bool(sample.malware),
+                        timestamp=int(sample.timestamp),
+                        family=(sample.family if sample.family else None),
                     )
-        creator(tqdm(stream(), total=len(idx), desc=f"Creating SimpleDB at {dir_out}"))
+                    # If not shuffling, add directly to builder.
+                    if not shuffle:
+                        builders[out_j].add(rec)
+                        continue
+                    # Add to reservoir pool or randomly evict from the pool to builder.
+                    pool = pools[out_j]
+                    if len(pool) < poolsize:
+                        pool.append(rec)
+                    else:
+                        j = rng.randrange(len(pool))
+                        builders[out_j].add(pool[j])
+                        pool[j] = rec
+
+        # Drain all pools in randomized order.
+        for out_j, pool in enumerate(pools):
+            while pool:
+                j = rng.randrange(len(pool))
+                builders[out_j].add(pool.pop(j))
+    finally:
+        src.close()
+        for b in builders:
+            try:
+                b.close()
+            except Exception:
+                pass
