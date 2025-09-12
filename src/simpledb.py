@@ -436,24 +436,29 @@ class IterableSimpleDB(SimpleDB):
         dir_root: Path,
         *,
         allow_name_indexing: bool = False,
-        pread_block_bytes: int = 64 * 2 ** 20,
+        pread_block_bytes: int = 32 * 2 ** 20,
         merge_slack_bytes: int = 0,
         prefetch_next_window: bool = True,
         use_readahead: bool = False,
     ) -> None:
         """
         Args:
-            pread_block_bytes (int): The block size to use for pread. Larger blocks
-                can improve performance, but increase memory usage. Default is 64 MiB.
-            merge_slack_bytes (int): The maximum number of bytes to extend a read window
-                beyond the current block to include additional samples. This can reduce
-                the number of read calls, but increases memory usage. Default is 0.
-            prefetch_next_window (bool): Whether to prefetch the next window of data.
-                This can improve performance when reading sequentially, but increases
-                memory usage. Default is True.
-            use_readahead (bool): Whether to use readahead to prefetch the next window
-                of data. This can improve performance when reading sequentially, but
-                increases memory usage. Default is False.
+            pread_block_bytes (int):
+                Target size of each contiguous window read from a shard with a single pread.
+                Larger windows reduce syscall overhead and improve throughput, at the cost of
+                higher peak RAM per worker and more page-cache churn with many workers.
+            merge_slack_bytes (int):
+                Allowance to extend a window past its nominal end to include the next sample
+                if it would otherwise straddle the boundary. Reduces the number of small tail
+                reads near block boundaries. Typical values 0-4 MiB.
+            prefetch_next_window (bool):
+                If True, issue posix_fadvise(WILLNEED) on the next window so the kernel can
+                start pulling it into the page cache while you process the current window.
+                Cheap and usually beneficial; default True.
+            use_readahead (bool):
+                If True, additionally call readahead(fd, next_base, next_len).
+                This actively queues IO (stronger than a hint). Often unnecessary on NVMe/SSD,
+                but can help on spinning disks or network filesystems. Default False.
         """
         super().__init__(dir_root, allow_name_indexing=allow_name_indexing)
         self.block_bytes = pread_block_bytes
