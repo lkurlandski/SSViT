@@ -4,6 +4,7 @@ Tests.
 
 from collections.abc import Generator
 from pathlib import Path
+from typing import Literal
 from typing import Optional
 
 import os
@@ -20,7 +21,8 @@ from src.simpledb import (
     roundup,
     CreateSimpleDB,
     CreateSimpleDBSample,
-    MappingSimpleDB,
+    RandomMappingSimpleDB,
+    ChunkedMappingSimpleDB,
     IterableSimpleDB,
 )
 
@@ -56,9 +58,12 @@ def test_roundup_basic() -> None:
     assert roundup(PAGESIZE, PAGESIZE) == PAGESIZE
     assert roundup(PAGESIZE + 1, PAGESIZE) == 2 * PAGESIZE
 
-# ---------- building and reading (mapping) ----------
+# ---------- building and reading (random mapping) ----------
 
-def test_build_one_shard_and_read_mapping(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backend", ["mmap", "pread"])
+def test_build_one_shard_and_read_random_mapping(tmp_path: Path, backend: Literal["mmap", "pread"]) -> None:
+    if backend == "pread" and not hasattr(os, "preadv"):
+        pytest.skip("preadv not available on this platform")
     root = tmp_path / "db"
     builder = CreateSimpleDB(root, shardsize=2 * 1024 * 1024)
     samples = list(_samples(25, min_len=5000, max_len=12_000, seed=123))
@@ -73,7 +78,7 @@ def test_build_one_shard_and_read_mapping(tmp_path: Path) -> None:
     sz = os.path.getsize(data_files[0])
     assert sz % PAGESIZE == 0
 
-    db = MappingSimpleDB(root, allow_name_indexing=True).open()
+    db = RandomMappingSimpleDB(root, allow_name_indexing=True, backend=backend, num_open=1).open()
     try:
         for idx, s in enumerate(samples):
             rec = db[idx]
@@ -84,6 +89,7 @@ def test_build_one_shard_and_read_mapping(tmp_path: Path) -> None:
             assert rec.data.dtype == torch.uint8
             assert rec.data.numel() == len(s.data)
             # zero-copy memoryview matches tensor bytes
+            assert isinstance(rec.bview, memoryview)
             assert bytes(rec.bview) == bytes(rec.data.tolist()) == s.data
             # meta
             assert rec.malware == s.malware
@@ -96,6 +102,33 @@ def test_build_one_shard_and_read_mapping(tmp_path: Path) -> None:
             # name indexing
             by_name = db[s.name]
             assert bytes(by_name.bview) == s.data
+    finally:
+        db.close()
+
+def test_chunked_mapping_within_shard(tmp_path: Path) -> None:
+    root = tmp_path / "db"
+    # build enough entries to span multiple shards and then hit same shard repeatedly
+    builder = CreateSimpleDB(root, shardsize=512 * 1024)
+    samples = list(_samples(100, min_len=1024, max_len=4096, seed=42))
+    builder(samples)
+
+    # Build a per-shard index list (by offset) so we can query multiple from same shard
+    size_csv = sorted((root / "size").glob("size-*.csv"))[0]
+    df = pd.read_csv(size_csv).sort_values(["shard", "offset", "idx"])
+    per_shard: dict[int, list[tuple[int, int, int]]] = {}
+    for _, r in df.iterrows():
+        per_shard.setdefault(int(r["shard"]), []).append((int(r["idx"]), int(r["offset"]), int(r["size"])))
+
+    db = ChunkedMappingSimpleDB(root, allow_name_indexing=True).open()
+    try:
+        # take first shard, fetch first 10 entries; ensure bytes match reconstructed bytes from shard file
+        shard0 = min(per_shard.keys())
+        items = per_shard[shard0][:10]
+        data_path = sorted((root / "data").glob("data-*.bin"))[shard0]
+        raw = data_path.read_bytes()
+        for idx, off, ln in items:
+            rec = db[idx]
+            assert bytes(rec.bview) == raw[off:off+ln]
     finally:
         db.close()
 
@@ -129,38 +162,31 @@ def test_build_and_stream_iterable(tmp_path: Path) -> None:
     for key in list(expected.keys())[:10]:
         assert produced[key] == expected[key]
 
-
 def test_iterable_streams_in_offset_order_within_shard(tmp_path: Path) -> None:
     root = tmp_path / "db"
     builder = CreateSimpleDB(root, shardsize=128 * 1024)
     s_list = list(_samples(80, min_len=512, max_len=4096, seed=99))
     builder(s_list)
 
-    # for each shard, collect offsets in stream order and verify non-decreasing
-    # we derive offsets from CSV since iterator doesn't expose them
-    size_csvs = sorted((root / "size").glob("size-*.csv"))
-    per_shard_offsets = {int(p.stem.split("-")[-1]): pd.read_csv(p)[["offset", "idx"]]
-                         for p in size_csvs}
+    # Build name -> (shard, offset) lookup from all size csvs
+    name_to_shard_offset: dict[str, tuple[int, int]] = {}
+    for size_csv in sorted((root / "size").glob("size-*.csv")):
+        df = pd.read_csv(size_csv)
+        for _, r in df.iterrows():
+            name_to_shard_offset[str(r["name"])] = (int(r["shard"]), int(r["offset"]))
 
     db = IterableSimpleDB(root).open()
     try:
-        current_shard = None
-        last_offset = None
-        shard_to_offset_map = {}
-        for p in size_csvs:
-            df = pd.read_csv(p)
-            shard_id = int(p.stem.split("-")[-1])
-            shard_to_offset_map[shard_id] = df.set_index("idx")["offset"].to_dict()
-
+        last_by_shard: dict[int, int] = {}
         for rec in db:
-            shard = int(rec.name.split("-")[0].replace("file", "0")) if False else None  # not used
-            # we can't parse shard from name; use size tables
-            # Look up offset via idx by reverse-mapping the name -> idx
-            # Build a quick name->idx map once
-            pass
+            sh, off = name_to_shard_offset[rec.name]
+            last = last_by_shard.get(sh, -1)
+            assert off >= last, f"Offsets must be non-decreasing within shard {sh}"
+            last_by_shard[sh] = off
     finally:
         db.close()
 
+# ---------- rollover & consistency ----------
 
 def test_shards_rollover(tmp_path: Path) -> None:
     root = tmp_path / "db"
@@ -185,20 +211,26 @@ def test_shards_rollover(tmp_path: Path) -> None:
             assert 0 <= off
             assert off + ln <= total
 
+# ---------- lifecycle contracts ----------
 
-def test_open_and_close_contracts(tmp_path: Path) -> None:
+def test_open_close_idempotent_and_context_manager(tmp_path: Path) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([CreateSimpleDBSample("x.exe", b"\x00", False, 0, None)])
 
-    # open twice should raise; close twice should raise (per current API)
-    db = MappingSimpleDB(root)
+    # idempotent open/close
+    db = RandomMappingSimpleDB(root)
     db.open()
-    with pytest.raises(RuntimeError):
-        db.open()
+    db.open()   # should NOT raise per new API
     db.close()
-    with pytest.raises(RuntimeError):
-        db.close()
+    db.close()  # should NOT raise
 
+    # context manager opens and closes
+    with RandomMappingSimpleDB(root, allow_name_indexing=True, backend="mmap") as db_cm:
+        assert db_cm.is_open
+        _ = db_cm["x.exe"]
+    assert not db_cm.is_open
+
+# ---------- edge cases ----------
 
 def test_oversized_sample_warns_and_is_present(tmp_path: Path) -> None:
     root = tmp_path / "db"
@@ -214,7 +246,7 @@ def test_oversized_sample_warns_and_is_present(tmp_path: Path) -> None:
         ])
         assert any("larger than the shard size" in str(x.message) for x in w)
 
-    db = MappingSimpleDB(root, allow_name_indexing=True).open()
+    db = RandomMappingSimpleDB(root, allow_name_indexing=True).open()
     try:
         rec = db["big.exe"]
         assert rec.data.numel() == len(big)
@@ -223,11 +255,11 @@ def test_oversized_sample_warns_and_is_present(tmp_path: Path) -> None:
     finally:
         db.close()
 
-
 def test_padding_region_is_zeroed(tmp_path: Path) -> None:
     root = tmp_path / "db"
     e1 = _mk_bytes(1000, 1)
     e2 = _mk_bytes(2000, 2)
+    # 2 * PAGESIZE ensures both entries (each padded to PAGESIZE) fit in one shard
     CreateSimpleDB(root, shardsize=PAGESIZE * 2)([
         CreateSimpleDBSample("x", e1, True, 0),
         CreateSimpleDBSample("y", e2, False, 0),
@@ -242,19 +274,19 @@ def test_padding_region_is_zeroed(tmp_path: Path) -> None:
     pad_start = int(last["offset"]) + int(last["size"])
     assert all(b == 0 for b in raw[pad_start:])
 
-
-def test_nan_and_empty_metadata_variants_mapping(tmp_path: Path) -> None:
+def test_nan_and_empty_metadata_variants_random_mapping(tmp_path: Path) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([
         CreateSimpleDBSample("n1", b"\x00\x01", True, 123, None),
         CreateSimpleDBSample("n2", b"\x02\x03", False, 456, ""),
     ])
+    # Inject NaN in family for one row
     meta_csv = sorted((root / "meta").glob("meta-*.csv"))[0]
     df = pd.read_csv(meta_csv)
     df.loc[df["name"] == "n2", "family"] = float("nan")
     df.to_csv(meta_csv, index=False)
 
-    db = MappingSimpleDB(root, allow_name_indexing=True).open()
+    db = RandomMappingSimpleDB(root, allow_name_indexing=True).open()
     try:
         r1 = db["n1"]
         r2 = db["n2"]
@@ -263,8 +295,7 @@ def test_nan_and_empty_metadata_variants_mapping(tmp_path: Path) -> None:
     finally:
         db.close()
 
-
-def test_duplicate_names_behavior_mapping(tmp_path: Path) -> None:
+def test_duplicate_names_behavior_random_mapping(tmp_path: Path) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([
         CreateSimpleDBSample("dup", b"\x00", True, 1, None),
@@ -272,10 +303,9 @@ def test_duplicate_names_behavior_mapping(tmp_path: Path) -> None:
     ])
     # Name indexing builds map in __init__, so duplicate names raise there.
     with pytest.raises(RuntimeError):
-        MappingSimpleDB(root, allow_name_indexing=True)
+        RandomMappingSimpleDB(root, allow_name_indexing=True)
 
-
-def test_mismatched_size_and_meta_rows_on_init(tmp_path: Path) -> None:
+def test_mismatched_size_and_meta_rows_on_init_random_mapping(tmp_path: Path) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([CreateSimpleDBSample("ok", b"\x00\x01", True, 1, None)])
     # Remove the meta row so idxs don't match
@@ -284,10 +314,9 @@ def test_mismatched_size_and_meta_rows_on_init(tmp_path: Path) -> None:
     df = df[df["name"] != "ok"]
     df.to_csv(meta_csv, index=False)
     with pytest.raises(RuntimeError, match="different number of rows"):
-        MappingSimpleDB(root)
+        RandomMappingSimpleDB(root)
 
-
-def test_corrupted_offset_raises_on_init(tmp_path: Path) -> None:
+def test_corrupted_offset_raises_on_init_random_mapping(tmp_path: Path) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([CreateSimpleDBSample("bad", b"\x00\x01\x02", False, 0, None)])
     size_csv = sorted((root / "size").glob("size-*.csv"))[0]
@@ -295,13 +324,12 @@ def test_corrupted_offset_raises_on_init(tmp_path: Path) -> None:
     df.loc[df["name"] == "bad", "offset"] = 10_000_000
     df.to_csv(size_csv, index=False)
     with pytest.raises(RuntimeError, match="exceeds the size"):
-        MappingSimpleDB(root)
+        RandomMappingSimpleDB(root)
 
-
-def test_zero_length_entry_mapping(tmp_path: Path) -> None:
+def test_zero_length_entry_random_mapping(tmp_path: Path) -> None:
     root = tmp_path / "db"
     CreateSimpleDB(root)([CreateSimpleDBSample("empty", b"", True, 0, None)])
-    db = MappingSimpleDB(root, allow_name_indexing=True).open()
+    db = RandomMappingSimpleDB(root, allow_name_indexing=True).open()
     try:
         rec = db["empty"]
         assert isinstance(rec.data, torch.Tensor)

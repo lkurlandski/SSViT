@@ -2,23 +2,28 @@
 A simple wrapper over millions of files for faster I/O on slow filesystems.
 """
 
+from __future__ import annotations
 from collections.abc import Iterable
 from collections.abc import Iterator
 import ctypes
 import ctypes.util
 from enum import Enum
 import gc
-from pathlib import Path
 import os
+from pathlib import Path
+import random
 from typing import Any
-from typing import Optional
+from typing import Literal
 from typing import NamedTuple
+from typing import Optional
 from typing import Self
+from types import TracebackType
 import warnings
 
 import pandas as pd
 import torch
 from torch import ByteTensor
+from torch import UntypedStorage
 
 
 PAGESIZE = 4096
@@ -88,6 +93,14 @@ class SimpleDB:
     """
     A simple database that provides fast(-ish) access to a large number of files.
 
+    Usage:
+        >>> db = SimpleDB(Path("/path/to/db"))
+        >>> db.is_open
+        False
+        >>> with db.open() as openeddb:
+        ...     openeddb.is_open
+        True
+
     Currently, the database can handle a maximum of 10^8 shard files, each of which can contain
     an arbitrary number of individual entries. Balancing the size of the shard vs the number of
     samples within each shard is a tradeoff between system performance and shuffling granularity.    
@@ -144,18 +157,39 @@ class SimpleDB:
         - family (str): the malware family of the entry. If not available, is empty string.
     """
 
-    def __init__(self, dir_root: Path) -> None:
+    def __init__(self, dir_root: Path, *, allow_name_indexing: bool) -> None:
+        """
+        Args:
+            dir_root (Path): The root directory of the SimpleDB.
+            allow_name_indexing (bool): Whether to allow indexing by name, as opposed to index.
+        """
         self.dir_root = dir_root
+        self.allow_name_indexing = allow_name_indexing
         self.dir_data = dir_root / "data"
         self.dir_size = dir_root / "size"
         self.dir_meta = dir_root / "meta"
-        self.handles: list[int] = []
         self.size_df: pd.DataFrame = self.get_size_df()
         self.meta_df: pd.DataFrame = self.get_meta_df()
+        self.name_map: dict[str, int] = self.get_name_map()
         if not (len(self.files_data) == len(self.files_size) == len(self.files_meta)):
             raise RuntimeError("Number of data, size, and meta files do not match.")
         if len(self.size_df) != len(self.meta_df):
             raise RuntimeError(f"Size and meta data have different number of rows ({len(self.size_df)} vs {len(self.meta_df)}).")
+        self._is_open = False
+
+    def __enter__(self) -> Self:
+        return self.open()
+
+    def __exit__(self, exc_type: type[Exception], exc: Exception, tb: TracebackType) -> Literal[False]:
+        try:
+            self.close()
+        except Exception:
+            pass
+        return False
+
+    @property
+    def is_open(self) -> bool:
+        return self._is_open
 
     @property
     def files_data(self) -> list[Path]:
@@ -168,14 +202,6 @@ class SimpleDB:
     @property
     def files_meta(self) -> list[Path]:
         return sorted(self.dir_meta.glob("meta-*.csv"), key=lambda p: p.stem.split("-")[-1])
-
-    @property
-    def is_open(self) -> bool:
-        return len(self.handles) > 0
-
-    @property
-    def is_closed(self) -> bool:
-        return not self.is_open
 
     def get_size_df(self) -> pd.DataFrame:
         size_dfs = [pd.read_csv(f) for f in self.files_size]
@@ -194,87 +220,13 @@ class SimpleDB:
         meta_df.index.name = None
         return meta_df
 
-    def open(self) -> Self:
-        """
-        Prepares the pseudo database for operation.
-        """
-        if self.is_open:
-            raise RuntimeError("Calling open() on an open database.")
-        return self
-
-    def close(self) -> Self:
-        """
-        Safely closes the pseudo database, releasing all resources, ensuring safe pickling across processes.
-        """
-        if not self.is_open:
-            raise RuntimeError("Calling close() on a closed database.")
-        for h in self.handles:
-            os.close(h)
-        self.handles.clear()
-        gc.collect()
-        return self
-
-
-class MappingSimpleDB(SimpleDB):
-    """
-    SimpleDB optimized for random accesses.
-    """
-
-    def __init__(self, dir_root: Path, *, allow_name_indexing: bool = False, random_within_shard: bool = False) -> None:
-        """
-        Args:
-            dir_root (Path): The root directory of the SimpleDB.
-            allow_name_indexing (bool): Whether to allow indexing by name.
-            random_within_shard (bool): Whether to assume random accesses are scheduled on a shard-by-shard basis.
-        """
-        super().__init__(dir_root)
-        self.allow_name_indexing = allow_name_indexing
-        self.random_within_shard = random_within_shard
-        self.name_map: dict[str, int] = self.get_name_map()
-        self.willneed = -1
-
-    def __getitem__(self, idx_or_name: int | str) -> SimpleDBSample:
-        if not self.is_open:
-            raise RuntimeError("Database is not open. Call open() before indexing.")
-
-        idx = self.get_idx_from_idx_or_name(idx_or_name)
-
-        size_dict: dict[str, Any] = self.size_df.loc[idx].to_dict()
-        meta_dict: dict[str, Any] = self.meta_df.loc[idx].to_dict()
-
-        shard = size_dict["shard"]
-        offset = size_dict["offset"]
-        length = size_dict["size"]
-
-        fd = self.handles[shard]
-        if self.random_within_shard and self.willneed != shard:
-            if self.willneed != -1:
-                prev_fd = self.handles[self.willneed]
-                _posix_fadvise(prev_fd, 0, 0, _POSIX_FADV_NORMAL)
-            _posix_fadvise(fd, 0, 0, _POSIX_FADV_WILLNEED)
-            self.willneed = shard
-
-        data = _pread_into_tensor(fd, offset, length, pin=False)
-        bview = memoryview(data.numpy()).cast("B")
-
-        return SimpleDBSample(
-            name=size_dict["name"],
-            data=data,
-            bview=bview,
-            malware=meta_dict["malware"] == 1,
-            timestamp=meta_dict["timestamp"],
-            family=meta_dict["family"],
-        )
-
     def get_idx_from_idx_or_name(self, idx_or_name: int | str) -> int:
         if isinstance(idx_or_name, int):
             return idx_or_name
-
         if isinstance(idx_or_name, str):
             if not self.allow_name_indexing:
                 raise ValueError("Name indexing is not allowed. Set allow_name_indexing=True to enable it.")
             return self.name_map[idx_or_name]
-
         raise TypeError("Index must be an integer or string.")
 
     def get_name_map(self) -> dict[str, int]:
@@ -286,11 +238,157 @@ class MappingSimpleDB(SimpleDB):
         return name_map
 
     def open(self) -> Self:
+        """
+        Perform any initialization required to open the database.
+        """
+        self._is_open = True
+        return self
+
+    def close(self) -> Self:
+        """
+        Perform any cleanup required to close the database.
+        """
+        self._is_open = False
+        return self
+
+
+class RandomMappingSimpleDB(SimpleDB):
+    """
+    SimpleDB optimized for random accesses across shards.
+    """
+
+    def __init__(self, dir_root: Path, *, allow_name_indexing: bool = False, num_open: int = 1, backend: Literal["mmap", "pread"] = "mmap") -> None:
+        """
+        Args:
+            num_open (int): The maximum number of shard files to keep open at once.
+            backend (str): The backend to use for reading data. Either "mmap" or "pread".
+        """
+        super().__init__(dir_root, allow_name_indexing=allow_name_indexing)
+        self.num_open = min(num_open, len(self.files_data))
+        if num_open < 1:
+            raise ValueError("num_open must be at least 1.")
+        self.backend = backend
+        if backend not in ("mmap", "pread"):
+            raise ValueError("backend must be either 'mmap' or 'pread'.")
+        self._storages: list[Optional[UntypedStorage]] = [None for _ in self.files_data]
+        self._fds: list[Optional[int]] = [None for _ in self.files_data]
+
+    def __getitem__(self, idx_or_name: int | str) -> SimpleDBSample:
+        if not self.is_open:
+            raise RuntimeError("Database is not open. Call open() before accessing data.")
+
+        idx = self.get_idx_from_idx_or_name(idx_or_name)
+
+        size_dict: dict[str, Any] = self.size_df.loc[idx].to_dict()
+        meta_dict: dict[str, Any] = self.meta_df.loc[idx].to_dict()
+
+        shard = size_dict["shard"]
+        offset = size_dict["offset"]
+        length = size_dict["size"]
+        shardfile = str(self.files_data[shard])
+
+        if self.backend == "mmap":
+            if self._storages[shard] is None:
+                opened = [i for i, s in enumerate(self._storages) if s is not None]
+                assert len(opened) == self.num_open, "There should always be `num_open` storages open."
+                i = random.choice(opened)
+                self._storages[i] = None
+                self._storages[shard] = UntypedStorage.from_file(shardfile, shared=False, nbytes=os.path.getsize(shardfile))
+            data = torch.empty(0, dtype=torch.uint8)
+            data.set_(self._storages[shard], storage_offset=offset, size=(length,), stride=(1,))
+
+        elif self.backend == "pread":
+            if self._fds[shard] is None:
+                opened = [i for i, s in enumerate(self._fds) if s is not None]
+                assert len(opened) == self.num_open, "There should always be `num_open` storages open."
+                i = random.choice(opened)
+                os.close(self._fds[i])  # type: ignore[arg-type]
+                self._fds[i] = None
+                self._fds[shard] = os.open(shardfile, os.O_RDONLY | os.O_CLOEXEC)
+                _posix_fadvise(self._fds[shard], 0, 0, _POSIX_FADV_RANDOM)
+            data = _pread_into_tensor(self._fds[shard], offset, length, pin=False)
+
+        bview = memoryview(data.numpy()).cast("B")
+
+        return SimpleDBSample(
+            name=size_dict["name"],
+            data=data,
+            bview=bview,
+            malware=meta_dict["malware"] == 1,
+            timestamp=meta_dict["timestamp"],
+            family=meta_dict["family"],
+        )
+
+    def open(self) -> Self:
         super().open()
-        for f in self.files_data:
-            fd = os.open(str(f), os.O_RDONLY | os.O_CLOEXEC)
-            _posix_fadvise(fd, 0, 0, _POSIX_FADV_RANDOM)
-            self.handles.append(fd)
+        if self.backend == "mmap":
+            for i, f in enumerate(self.files_data[0:self.num_open]):
+                self._storages[i] = UntypedStorage.from_file(str(f), shared=False, nbytes=os.path.getsize(f))
+        elif self.backend == "pread":
+            for i, f in enumerate(self.files_data[0:self.num_open]):
+                fd = os.open(str(f), os.O_RDONLY | os.O_CLOEXEC)
+                _posix_fadvise(fd, 0, 0, _POSIX_FADV_RANDOM)
+                self._fds[i] = fd
+        return self
+
+    def close(self) -> Self:
+        super().close()
+        if self.backend == "mmap":
+            for i in range(len(self._storages)):
+                self._storages[i] = None
+        elif self.backend == "pread":
+            for i in range(len(self._fds)):
+                if self._fds[i] is not None:
+                    os.close(self._fds[i])  # type: ignore[arg-type]
+                self._fds[i] = None
+        return self
+
+
+class ChunkedMappingSimpleDB(SimpleDB):
+    """
+    SimpleDB optimized for random accesses within a shard.
+    """
+
+    def __init__(self, dir_root: Path, *, allow_name_indexing: bool = False) -> None:
+        super().__init__(dir_root, allow_name_indexing=allow_name_indexing)
+        self._curshard = -1
+        self._storage: Optional[UntypedStorage] = None
+
+    def __getitem__(self, idx_or_name: int | str) -> SimpleDBSample:
+        if not self.is_open:
+            raise RuntimeError("Database is not open. Call open() before accessing data.")
+
+        idx = self.get_idx_from_idx_or_name(idx_or_name)
+
+        size_dict: dict[str, Any] = self.size_df.loc[idx].to_dict()
+        meta_dict: dict[str, Any] = self.meta_df.loc[idx].to_dict()
+
+        shard = size_dict["shard"]
+        offset = size_dict["offset"]
+        length = size_dict["size"]
+        shardfile = str(self.files_data[shard])
+
+        if self._curshard != shard:
+            self._curshard = shard
+            self._storage = UntypedStorage.from_file(shardfile, shared=False, nbytes=os.path.getsize(shardfile))
+
+        data = torch.empty(0, dtype=torch.uint8)
+        data.set_(self._storage, storage_offset=offset, size=(length,), stride=(1,))
+        bview = memoryview(data.numpy()).cast("B")
+
+        return SimpleDBSample(
+            name=size_dict["name"],
+            data=data,
+            bview=bview,
+            malware=meta_dict["malware"] == 1,
+            timestamp=meta_dict["timestamp"],
+            family=meta_dict["family"],
+        )
+
+    def close(self) -> Self:
+        super().close()
+        self._curshard = -1
+        self._storage = None
         return self
 
 
@@ -303,41 +401,50 @@ class IterableSimpleDB(SimpleDB):
         self,
         dir_root: Path,
         *,
+        allow_name_indexing: bool = False,
         pread_block_bytes: int = 64 * 2 ** 20,
         merge_slack_bytes: int = 0,
         prefetch_next_window: bool = True,
         use_readahead: bool = False,
     ) -> None:
-        super().__init__(dir_root)
+        """
+        Args:
+            pread_block_bytes (int): The block size to use for pread. Larger blocks
+                can improve performance, but increase memory usage. Default is 64 MiB.
+            merge_slack_bytes (int): The maximum number of bytes to extend a read window
+                beyond the current block to include additional samples. This can reduce
+                the number of read calls, but increases memory usage. Default is 0.
+            prefetch_next_window (bool): Whether to prefetch the next window of data.
+                This can improve performance when reading sequentially, but increases
+                memory usage. Default is True.
+            use_readahead (bool): Whether to use readahead to prefetch the next window
+                of data. This can improve performance when reading sequentially, but
+                increases memory usage. Default is False.
+        """
+        super().__init__(dir_root, allow_name_indexing=allow_name_indexing)
         self.block_bytes = pread_block_bytes
         self.merge_slack = merge_slack_bytes
         self.prefetch_next_window = prefetch_next_window
         self.use_readahead = use_readahead
+        self._fd = -1
 
     def __iter__(self) -> Iterator[SimpleDBSample]:
         for f in self.files_data:
             shard_idx = int(f.stem.split("-")[-1])
             yield from self.iter_one_shard(shard_idx)
 
-    def iter_one_shard(self, shard_idx_or_name: str | int) -> Iterator[SimpleDBSample]:
+    def iter_one_shard(self, shard_idx: int) -> Iterator[SimpleDBSample]:
         if not self.is_open:
-            raise RuntimeError("Database is not open. Call open() before iterating.")
-
-        if isinstance(shard_idx_or_name, str):
-            try:
-                shard_idx = int(shard_idx_or_name)
-            except ValueError:
-                raise ValueError(f"Shard identifier must be int-like, got {shard_idx_or_name!r}")
-        else:
-            shard_idx = int(shard_idx_or_name)
-
+            raise RuntimeError("Database is not open. Call open() before accessing data.")
         sub_df = self.size_df[self.size_df["shard"] == shard_idx][["idx", "name", "shard", "offset", "size"]]
         rows = sub_df.sort_values(["offset", "idx"]).reset_index(drop=True)
         if rows.empty:
             return
-        fd = self.handles[shard_idx]
-        file_path = self.files_data[shard_idx]
-        fsz = os.path.getsize(file_path)
+
+        shardfile = str(self.files_data[shard_idx])
+        self._fd = os.open(shardfile, os.O_RDONLY | os.O_CLOEXEC)
+        _posix_fadvise(self._fd, 0, 0, _POSIX_FADV_SEQUENTIAL)
+        fsz = os.path.getsize(shardfile)
 
         block = int(self.block_bytes)
         slack = int(self.merge_slack)
@@ -369,20 +476,20 @@ class IterableSimpleDB(SimpleDB):
                 break
 
             # Hint current and (optionally) next window
-            _posix_fadvise(fd, base, nbytes, _POSIX_FADV_WILLNEED)
+            _posix_fadvise(self._fd, base, nbytes, _POSIX_FADV_WILLNEED)
             if self.prefetch_next_window:
                 nb_base = end
                 if nb_base < fsz:
                     nb_len = min(nbytes, fsz - nb_base)
-                    _posix_fadvise(fd, nb_base, nb_len, _POSIX_FADV_WILLNEED)
+                    _posix_fadvise(self._fd, nb_base, nb_len, _POSIX_FADV_WILLNEED)
                     if self.use_readahead and _HAS_READAHEAD:
                         try:
-                            _readahead(fd, nb_base, nb_len)
+                            _readahead(self._fd, nb_base, nb_len)
                         except Exception:
                             pass
 
             # Read the whole window in one preadv loop
-            win = _pread_into_tensor(fd, base, nbytes, pin=False)
+            win = _pread_into_tensor(self._fd, base, nbytes, pin=False)
 
             # Views/slices per row i..j-1
             base_mv = memoryview(win.numpy()).cast("B")
@@ -408,12 +515,14 @@ class IterableSimpleDB(SimpleDB):
 
             i = j  # advance to first not-yet-emitted row
 
-    def open(self) -> Self:
-        super().open()
-        for f in self.files_data:
-            fd = os.open(str(f), os.O_RDONLY | os.O_CLOEXEC)
-            _posix_fadvise(fd, 0, 0, _POSIX_FADV_SEQUENTIAL)
-            self.handles.append(fd)
+        os.close(self._fd)
+        self._fd = -1
+
+    def close(self) -> Self:
+        super().close()
+        if self._fd != -1:
+            os.close(self._fd)
+            self._fd = -1
         return self
 
 
