@@ -5,6 +5,7 @@ Manage data and datasets.
 from __future__ import annotations
 from abc import ABC
 from abc import abstractmethod
+import atexit
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
@@ -15,11 +16,13 @@ from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import replace
+from itertools import batched
 import math
 import os
 from pathlib import Path
 import random
 import sys
+from typing import Any
 from typing import Literal
 from typing import Generic
 from typing import Optional
@@ -41,8 +44,10 @@ from torch import ShortTensor
 from torch import IntTensor
 from torch import LongTensor
 from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
+from torch.utils.data import get_worker_info
 from torch.utils._pytree import tree_map
 
 from src.binanal import _parse_pe_and_get_size
@@ -62,6 +67,10 @@ from src.bitpacking import packbits
 from src.bitpacking import unpackbits
 from src.bitpacking import slice_bitpacked_tensor
 from src.simpledb import SimpleDB
+from src.simpledb import RandomMappingSimpleDB
+from src.simpledb import ChunkedMappingSimpleDB
+from src.simpledb import IterableSimpleDB
+from src.simpledb import SimpleDBSample
 from src.utils import check_tensor
 from src.utils import pad_sequence
 
@@ -821,6 +830,7 @@ FOrHSamples = FSamples | HSamples
 
 
 class BinaryDataset(Dataset):  # type: ignore[misc]
+    """Map-style dataset for files on disk."""
 
     def __init__(self, files: Sequence[StrPath], labels: Sequence[int], preprocessor: Preprocessor) -> None:
         self.files = files
@@ -834,50 +844,124 @@ class BinaryDataset(Dataset):  # type: ignore[misc]
         return len(self.files)
 
 
-class SimpleDBDataset(Dataset):  # type: ignore[misc]
+class BaseSimpleDBBinaryDataset(ABC):
+    """
+    Base class for SimpleDB-backed datasets.
 
-    # NOTE: best not to play around with (or even access) the internal state of this class from the outside.
+    Usage:
+        >>> db = SimpleDB(...).close()
+        >>> preprocessor = Preprocessor(...)
+        >>> dataset = SimpleDBBinaryDataset(db, preprocessor)
+        >>> dataset.worker_open_and_register_finalizer()
+        >>> sample = dataset[0]
+    """
 
-    def __init__(self, idx_or_names: Sequence[int | str] | Tensor, db: SimpleDB, preprocessor: Preprocessor) -> None:
-        if db.is_open:  # Ensure the db is closed, so we can pickle it around process boundaries.
-            raise RuntimeError("Expected a closed SimpleDB instance, but the provided instance is already open.")
+    db: SimpleDB
 
-        self.idx_or_names = idx_or_names  # Maps a subset of Dataset indices to SimpleDB indices or names.
+    def __init__(self, db: SimpleDB, preprocessor: Preprocessor) -> None:
+        self.db = db.close()
         self.preprocessor = preprocessor
-        self._db = deepcopy(db)
-        self._pid = os.getpid()
+        self._finalizer_registered = False
 
-    def open_db(self) -> None:
-        """
-        Open the underlying SimpleDB instance.
-        """
-        _ = self.db
-
-    @property
-    def db(self) -> SimpleDB:
-        """
-        Return an opened process-local SimpleDB instance.
-        """
-        if (pid := os.getpid()) != self._pid:
-            self._db.close()
-            self._pid = pid
-
-        if not self._db.is_open:
-            self._db = self._db.open()
-
-        return self._db
-
-    def __getitem__(self, i: int) -> FSample:
-        idx_or_name = self.idx_or_names[i]
-        if not isinstance(idx_or_name, str):
-            idx_or_name = int(idx_or_name)
-        sample = self.db[idx_or_name]
-        label = 1 if sample.malware else 0
-        inputs = sample.data
-        return self.preprocessor(label, name=Name(sample.name), inputs=inputs)
+    def __getstate__(self) -> dict[str, Any]:
+        """Ensure DB is closed before pickling and clear worker-only flags."""
+        state = self.__dict__.copy()
+        self.db.close()
+        state["_finalizer_registered"] = False
+        return state
 
     def __len__(self) -> int:
-        return len(self.idx_or_names)
+        """Return the number of samples in the underlying database."""
+        return len(self.db.meta_df.index)
+
+    def safe_close_db(self) -> None:
+        """Close the DB connection if it is open."""
+        try:
+            self.db.close()
+        except Exception:
+            pass
+
+    def preprocess(self, sample: SimpleDBSample) -> FSample:
+        """Preprocess a SimpleDBSample into an FSample using the preprocessor."""
+        label = 1 if sample.malware else 0
+        name = Name(sample.name)
+        inputs = sample.data
+        bview = sample.bview
+        return self.preprocessor(label=label, name=name, inputs=inputs, liefblob=bview)
+
+    def worker_open_and_register_finalizer(self) -> None:
+        """Open the DB connection and register a finalizer to close it at exit."""
+        self.db.open()
+        if not self._finalizer_registered:
+            atexit.register(self.safe_close_db)
+            self._finalizer_registered = True
+
+
+class MappingSimpleDBBinaryDataset(BaseSimpleDBBinaryDataset, Dataset):  # type: ignore[misc]
+    """Map-style dataset for SimpleDB databases."""
+
+    db: RandomMappingSimpleDB | ChunkedMappingSimpleDB
+
+    def __init__(self, db: RandomMappingSimpleDB | ChunkedMappingSimpleDB, preprocessor: Preprocessor) -> None:
+        super().__init__(db, preprocessor)
+
+    def __getitem__(self, i: int) -> FSample:
+        if not self.db.is_open:
+            raise RuntimeError("SimpleDB is not open. Ensure that `worker_open_and_register_finalizer` is called.")
+        sample = self.db[i]
+        return self.preprocess(sample)
+
+
+class IterableSimpleDBDataset(BaseSimpleDBBinaryDataset, IterableDataset):  # type: ignore[misc]
+    """Iterable-style dataset for SimpleDB databases."""
+
+    db: IterableSimpleDB
+
+    def __init__(self, db: IterableSimpleDB, preprocessor: Preprocessor, shuffle: bool = False, poolsize: int = 64) -> None:
+        super().__init__(db, preprocessor)
+        self.shards = [int(f.stem.split("-")[-1]) for f in self.db.files_data]
+        self.shuffle = shuffle
+        self.poolsize = poolsize
+
+    def __iter__(self) -> Iterable[FSample]:
+        if not self.db.is_open:
+            raise RuntimeError("SimpleDB is not open. Ensure that `worker_open_and_register_finalizer` is called.")
+
+        # Determine which shards this worker will process.
+        shards = deepcopy(self.shards)
+        if (worker_info := get_worker_info()) is not None:
+            per_worker = math.ceil(len(self.shards) / worker_info.num_workers)
+            shards = list(batched(self.shards, per_worker))[worker_info.id]
+
+        # If not shuffling, just yield samples in order.
+        if not self.shuffle:
+            for shard in shards:
+                for sample in self.db.iter_one_shard(shard):
+                    yield self.preprocess(sample)
+            return
+
+        # Otherwise, randomize the order of the shards deterministically.
+        seed = worker_info.seed if worker_info is not None and hasattr(worker_info, "seed") else torch.initial_seed()
+        rng = random.Random(int(seed))
+        if self.shuffle:
+            rng.shuffle(shards)
+
+        # Yield samples in random order using a reservoir sampling-like algorithm.
+        pool: list[SimpleDBSample] = []
+        for shard in shards:
+            for sample in self.db.iter_one_shard(shard):
+                if len(pool) < self.poolsize:
+                    pool.append(sample)
+                    continue
+                i = random.randint(0, len(pool) - 1)
+                yield self.preprocess(pool[i])
+                pool[i] = sample
+
+        # Yield the remaining samples in the pool.
+        while len(pool) > 0:
+            i = random.randint(0, len(pool) - 1)
+            yield self.preprocess(pool[i])
+            pool.pop(i)
 
 
 class Preprocessor:
@@ -909,6 +993,7 @@ class Preprocessor:
         name: Optional[Name] = None,
         file: Optional[StrPath] = None,
         inputs: Optional[ByteTensor] = None,
+        liefblob: Optional[LiefParse] = None,
     ) -> FSample:
         """
         Args:
@@ -916,6 +1001,7 @@ class Preprocessor:
             name: name of the binary. If None, `file` must be provided, from which the name is inferred.
             file: path to the binary file. If None, `inputs` and `name` must be provided.
             inputs: byte tensor containing the binary data. If None, `file` must be provided, from which the data is read.
+            liefblob: datablob to pass to `_parse_pe_and_get_size` if custom behavior is desired.
         """
         label = torch.tensor(label)
 
@@ -932,12 +1018,14 @@ class Preprocessor:
             inputs = torch.from_file(str(file), shared=False, size=os.path.getsize(file), dtype=torch.uint8)
         assert inputs is not None
 
-        # If we need to parse the binary, do so from the file path, if available, as its much faster.
+        # If we need to parse the binary, do so from `liefblob`, then `file`, then `inputs`.
         if self.should_lief_parse:
-            if file is not None:
+            if liefblob is not None:
+                pe = _parse_pe_and_get_size(liefblob)[0]
+            elif file is not None:
                 pe = _parse_pe_and_get_size(file)[0]
             else:
-                pe = _parse_pe_and_get_size(memoryview(inputs.numpy()))[0]
+                pe = _parse_pe_and_get_size(memoryview(inputs.numpy()).cast("B"))[0]
         else:
             pe = None
         size = len(inputs)
