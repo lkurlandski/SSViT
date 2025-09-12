@@ -844,7 +844,7 @@ class BinaryDataset(Dataset):  # type: ignore[misc]
         return len(self.files)
 
 
-class BaseSimpleDBBinaryDataset(ABC):
+class BaseSimpleDBDataset(ABC):
     """
     Base class for SimpleDB-backed datasets.
 
@@ -897,7 +897,7 @@ class BaseSimpleDBBinaryDataset(ABC):
             self._finalizer_registered = True
 
 
-class MappingSimpleDBBinaryDataset(BaseSimpleDBBinaryDataset, Dataset):  # type: ignore[misc]
+class MappingSimpleDBDataset(BaseSimpleDBDataset, Dataset):  # type: ignore[misc]
     """Map-style dataset for SimpleDB databases."""
 
     db: RandomMappingSimpleDB | ChunkedMappingSimpleDB
@@ -912,14 +912,14 @@ class MappingSimpleDBBinaryDataset(BaseSimpleDBBinaryDataset, Dataset):  # type:
         return self.preprocess(sample)
 
 
-class IterableSimpleDBDataset(BaseSimpleDBBinaryDataset, IterableDataset):  # type: ignore[misc]
+class IterableSimpleDBDataset(BaseSimpleDBDataset, IterableDataset):  # type: ignore[misc]
     """Iterable-style dataset for SimpleDB databases."""
 
     db: IterableSimpleDB
 
-    def __init__(self, db: IterableSimpleDB, preprocessor: Preprocessor, shuffle: bool = False, poolsize: int = 64) -> None:
+    def __init__(self, db: IterableSimpleDB, preprocessor: Preprocessor, shuffle: bool = False, poolsize: int = 16, shards: Optional[list[int]] = None) -> None:
         super().__init__(db, preprocessor)
-        self.shards = [int(f.stem.split("-")[-1]) for f in self.db.files_data]
+        self.shards = [int(f.stem.split("-")[-1]) for f in self.db.files_data] if shards is None else shards
         self.shuffle = shuffle
         self.poolsize = poolsize
 
