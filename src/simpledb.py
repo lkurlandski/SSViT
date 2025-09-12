@@ -39,6 +39,7 @@ _POSIX_FADV_NORMAL     = 0
 _POSIX_FADV_RANDOM     = 1
 _POSIX_FADV_SEQUENTIAL = 2
 _POSIX_FADV_WILLNEED   = 3
+_POSIX_FADV_DONTNEED   = 4
 _HAS_FADVICE   = hasattr(_LIBC, "posix_fadvise")
 _HAS_READAHEAD = hasattr(_LIBC, "readahead")
 
@@ -439,6 +440,7 @@ class IterableSimpleDB(SimpleDB):
         pread_block_bytes: int = 32 * 2 ** 20,
         merge_slack_bytes: int = 0,
         prefetch_next_window: bool = True,
+        prefetch_max_bytes: int = 1 * 2 ** 20,
         use_readahead: bool = False,
     ) -> None:
         """
@@ -464,6 +466,7 @@ class IterableSimpleDB(SimpleDB):
         self.block_bytes = pread_block_bytes
         self.merge_slack = merge_slack_bytes
         self.prefetch_next_window = prefetch_next_window
+        self.prefetch_max_bytes = prefetch_max_bytes
         self.use_readahead = use_readahead
         self._fd = -1
 
@@ -519,13 +522,10 @@ class IterableSimpleDB(SimpleDB):
             if self.prefetch_next_window:
                 nb_base = end
                 if nb_base < fsz:
-                    nb_len = min(nbytes, fsz - nb_base)
+                    nb_len = min(nbytes, fsz - nb_base, self.prefetch_max_bytes)
                     _posix_fadvise(self._fd, nb_base, nb_len, _POSIX_FADV_WILLNEED)
-                    if self.use_readahead and _HAS_READAHEAD:
-                        try:
-                            _readahead(self._fd, nb_base, nb_len)
-                        except Exception:
-                            pass
+                    if self.use_readahead:
+                        _readahead(self._fd, nb_base, nb_len)
 
             # Read the whole window in one preadv loop
             win = _pread_into_tensor(self._fd, base, nbytes, pin=False)
@@ -553,6 +553,7 @@ class IterableSimpleDB(SimpleDB):
                 )
 
             i = j  # advance to first not-yet-emitted row
+            _posix_fadvise(self._fd, base, nbytes, _POSIX_FADV_DONTNEED)
 
         os.close(self._fd)
         self._fd = -1
