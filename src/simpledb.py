@@ -5,6 +5,7 @@ A simple wrapper over millions of files for faster I/O on slow filesystems.
 from __future__ import annotations
 from collections.abc import Iterable
 from collections.abc import Iterator
+from collections.abc import Sequence
 import ctypes
 import ctypes.util
 from enum import Enum
@@ -13,6 +14,7 @@ import os
 from pathlib import Path
 import random
 from typing import Any
+from typing import Generator
 from typing import Literal
 from typing import NamedTuple
 from typing import Optional
@@ -20,10 +22,13 @@ from typing import Self
 from types import TracebackType
 import warnings
 
+import numpy as np
+from numpy import typing as npt
 import pandas as pd
 import torch
 from torch import ByteTensor
 from torch import UntypedStorage
+from tqdm import tqdm
 
 
 PAGESIZE = 4096
@@ -157,7 +162,7 @@ class SimpleDB:
         - family (str): the malware family of the entry. If not available, is empty string.
     """
 
-    def __init__(self, dir_root: Path, *, allow_name_indexing: bool) -> None:
+    def __init__(self, dir_root: Path, *, allow_name_indexing: bool = False) -> None:
         """
         Args:
             dir_root (Path): The root directory of the SimpleDB.
@@ -655,3 +660,34 @@ class CreateSimpleDB:
         Path(self.dir_data / f"data-{prefix}.bin").write_bytes(data)
         size_df.to_csv(self.dir_size / f"size-{prefix}.csv", index=False)
         meta_df.to_csv(self.dir_meta / f"meta-{prefix}.csv", index=False)
+
+
+def split_simple_db(
+    dir_root: Path,
+    dirs_out: list[Path],
+    indices: list[Sequence[int] | npt.NDArray[np.integer[Any]] | torch.Tensor],
+    shardsize: int = 2 ** 30,
+) -> None:
+    """
+    Split a SimpleDB into multiple SimpleDBs.
+    """
+    if len(dirs_out) != len(indices):
+        raise ValueError("dirs_out and indices must have the same length.")
+    db = IterableSimpleDB(dir_root)
+
+    for dir_out, idx in zip(dirs_out, indices):
+        idxset: set[int] = set(idx.tolist()) if isinstance(idx, (np.ndarray, torch.Tensor)) else set(idx)
+        creator = CreateSimpleDB(dir_out, shardsize=shardsize)
+        def stream() -> Generator[CreateSimpleDBSample, None, None]:
+            with db as opened_db:
+                for i, sample in enumerate(opened_db):
+                    if i not in idxset:
+                        continue
+                    yield CreateSimpleDBSample(
+                        name=sample.name,
+                        data=bytes(sample.bview),
+                        malware=sample.malware,
+                        timestamp=sample.timestamp,
+                        family=sample.family if sample.family else None,
+                    )
+        creator(tqdm(stream(), total=len(idx), desc=f"Creating SimpleDB at {dir_out}"))
