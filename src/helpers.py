@@ -39,9 +39,10 @@ class ModelSize(Enum):
     LG = "lg"  # Large
 
 
-class IOBackend(Enum):
-    FP = "fp"
-    DB = "db"
+class DBType(Enum):
+    RND = "rnd"
+    CHK = "chk"
+    ITR = "itr"
 
 
 # TODO: figure out how to elegantly combine different dataclasses into a new class.
@@ -73,7 +74,7 @@ class MainArgs:
     fsdp: bool = False
     fsdp_offload: bool = True
     tf32: bool = False
-    io_backend: IOBackend = IOBackend.FP
+    db_type: DBType = DBType.ITR
 
     def __post_init__(self) -> None:
         if self.tr_batch_size == 1 or self.vl_batch_size == 1 or self.ts_batch_size == 1:

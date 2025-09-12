@@ -8,8 +8,10 @@ from hashlib import md5
 import math
 import os
 from pathlib import Path
+import resource
 import sys
 import time
+from typing import Any
 from typing import Callable
 from typing import NamedTuple
 from typing import Optional
@@ -58,12 +60,15 @@ from src.binanal import CharacteristicGuider
 from src.binanal import LEVEL_STRUCTURE_MAP
 from src.binanal import HierarchicalStructure
 from src.data import BinaryDataset
-from src.data import SimpleDBDataset
+from src.data import BaseSimpleDBDataset
+from src.data import MappingSimpleDBDataset
+from src.data import IterableSimpleDBDataset
 from src.data import CollateFn
 from src.data import CollateFnHierarchical
 from src.data import CUDAPrefetcher
 from src.data import Preprocessor
 from src.data import GroupedLengthBatchSampler
+from src.data import ShardAwareBatchSampler
 from src.data import FSample
 from src.data import FSamples
 from src.data import HSamples
@@ -72,9 +77,14 @@ from src.helpers import flatten_dataclasses
 from src.helpers import _MTArgs
 from src.helpers import Architecture
 from src.helpers import ModelSize
-from src.helpers import IOBackend
+from src.helpers import DBType
 from src.helpers import MainArgs
 from src.simpledb import SimpleDB
+from src.simpledb import RandomMappingSimpleDB
+from src.simpledb import ChunkedMappingSimpleDB
+from src.simpledb import IterableSimpleDB
+from src.simpledb import SimpleDBSample
+from src.simpledb import split_simple_db
 from src.split import tr_vl_ts_split
 from src.trainer import Trainer
 from src.trainer import TrainerArgs
@@ -240,98 +250,6 @@ def get_model(
     raise NotImplementedError(f"{level} {arch}")
 
 
-class Materials(NamedTuple):
-    idx: npt.NDArray[np.int64]
-    files: npt.NDArray[np.str_]
-    labels: npt.NDArray[np.int64]
-    timestamps: npt.NDArray[np.int64]
-    sizes: npt.NDArray[np.int64]
-
-
-def _get_materials_backend_file_tmp() -> Materials:
-    root = Path("./data")
-    benfiles = list(map(str, filter(lambda f: f.is_file(), (root / "ass").rglob("*"))))
-    benlabels = [0] * len(benfiles)
-    malfiles = list(map(str, filter(lambda f: f.is_file(), (root / "sor").rglob("*"))))
-    mallabels = [1] * len(malfiles)
-
-    idx = np.arange(len(benfiles) + len(malfiles), dtype=np.int64)
-    files = np.array(benfiles + malfiles, dtype=np.str_)
-    labels = np.array(benlabels + mallabels, dtype=np.int64)
-    timestamps = np.full(len(files), -1, dtype=np.int64)
-    sizes = np.array(list(map(os.path.getsize, benfiles + malfiles)), dtype=np.int64)
-
-    return Materials(idx, files, labels, timestamps, sizes)
-
-
-def _get_materials_backend_file() -> Materials:
-    root = Path("./data")
-    indexfile = root / "index.txt"
-    binaries = root / "binaries"
-
-    files:  list[str]     = []
-    labels: list[int]     = []
-    timestamps: list[int] = []
-    sizes: list[int]      = []
-    with open(indexfile, "r") as fp:
-        for line in fp:
-            line = line.strip()
-            sha, label, timestamp = line.split()
-            file = binaries / sha[0] / sha[1] / sha
-            files.append(str(file))
-            labels.append(int(label))
-            timestamps.append(int(timestamp))
-            sizes.append(os.path.getsize(file))
-
-    idx = np.arange(len(files), dtype=np.int64)
-    files = np.array(files, dtype=np.str_)
-    labels = np.array(labels, dtype=np.int64)
-    timestamps = np.array(timestamps, dtype=np.int64)
-    sizes = np.array(sizes, dtype=np.int64)
-
-    return Materials(idx, files, labels, timestamps, sizes)
-
-
-def _get_materials_backend_simpledb(db: SimpleDB) -> Materials:
-    idx = db.meta_df["idx"].to_numpy().astype(np.int64)
-    files = db.meta_df["name"].to_numpy().astype(np.str_)
-    labels = db.meta_df["malware"].to_numpy().astype(np.int64)
-    timestamps = db.meta_df["timestamp"].to_numpy().astype(np.int64)
-    sizes = db.size_df["size"].to_numpy().astype(np.int64)
-    return Materials(idx, files, labels, timestamps, sizes)
-
-
-def get_materials(backend: IOBackend, db: Optional[SimpleDB]) -> Materials:
-    if backend == IOBackend.FP:
-        return _get_materials_backend_file_tmp()
-    if backend == IOBackend.DB:
-        if db is None:
-            raise ValueError("db cannot be None if backend is simpledb.")
-        return _get_materials_backend_simpledb(db)
-    raise ValueError(f"{backend}")
-
-
-def split_materials(idx: np.ndarray, labels: np.ndarray, timestamps: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    temporal = True
-    if np.all(timestamps == -1):
-        warnings.warn("`timestamps` are all -1, falling back to random splitting.")
-        temporal = False
-    elif np.any(timestamps < 0):
-        raise ValueError("`timestamps` contain negative values and not all of them are -1.")
-    return tr_vl_ts_split(
-        idx,
-        tr_size=0.8,
-        vl_size=0.1,
-        ts_size=0.1,
-        labels=labels,
-        ratios=np.array([0.5, 0.5]),
-        timestamps=timestamps if temporal else None,
-        shuffle=True,
-        random_state=seed,
-        temporal_mode="balanced",
-    )
-
-
 def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int]) -> CollateFn | CollateFnHierarchical:
     if level == HierarchicalLevel.NONE:
         return CollateFn(False, False, min_lengths[0])
@@ -344,12 +262,15 @@ def worker_init_fn(worker_id: int) -> None:
     org_num_threads = torch.get_num_threads()
     new_num_threads = get_optimal_num_worker_threads(info.num_workers, ngpu=local_world_size())
     torch.set_num_threads(new_num_threads)
+    if isinstance(info.dataset, BaseSimpleDBDataset):
+        info.dataset.worker_open_and_register_finalizer()
     print(f"Worker {worker_id} of {info.num_workers} using {org_num_threads} --> {torch.get_num_threads()} threads.")
 
 
 def get_loader(
     dataset: Dataset,
     sampler: Sampler,
+    shuffle: Optional[bool],
     num_workers: int,
     collate_fn: Callable[[Sequence[FSample]], FSamples | HSamples],
     pin_memory: bool,
@@ -358,6 +279,7 @@ def get_loader(
     return DataLoader(
         dataset=dataset,
         batch_sampler=sampler,
+        shuffle=shuffle,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
@@ -374,8 +296,8 @@ def get_streamer(loader: DataLoader, device: torch.device, num_streams: int) -> 
     if loader.persistent_workers:
         streamer.warmup(0)
         time.sleep(4)
-        if isinstance(loader.dataset, SimpleDBDataset):
-            loader.dataset.open_db()
+    if loader.num_workers == 0 and isinstance(loader.dataset, BaseSimpleDBDataset):
+        loader.dataset.worker_open_and_register_finalizer()
     return streamer
 
 
@@ -406,6 +328,28 @@ def main() -> None:
     if rank() > 0:
         args.disable_tqdm = True
 
+    mpdtype = mp_dtype(args.mp16, args.device)
+    print(f"{mpdtype=}")
+
+    model = get_model(args.arch, args.size, args.do_characteristics, args.level).to("cpu")
+    num_parameters = count_parameters(model, requires_grad=False)
+    min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
+    min_lengths = [max(m, min_length) for m in getattr(model, "min_lengths", [min_length])]
+    print(f"{model=}")
+    print(f"{num_parameters=}")
+    print(f"{min_length=}")
+    print(f"{min_lengths=}")
+    if args.ddp:
+        model = model.to(args.device)
+        model = DistributedDataParallel(model, static_graph=True)
+    elif args.fsdp:
+        mesh = init_device_mesh("cuda", (world_size(),))
+        mp_policy = MixedPrecisionPolicy(mpdtype)
+        offload_policy = CPUOffloadPolicy() if args.fsdp_offload else OffloadPolicy()
+        model.fully_shard(mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+    else:
+        model = model.to(args.device)
+
     preprocessor = Preprocessor(
         args.do_parser,
         args.do_entropy,
@@ -413,81 +357,142 @@ def main() -> None:
         args.level,
         max_length=args.max_length,
     )
+    print(f"{preprocessor=}")
 
-    if args.io_backend == IOBackend.FP:
-        db = None
-    elif args.io_backend == IOBackend.DB:
-        db = SimpleDB(Path("./datadb")).open()
-    print(f"{db=}")
+    tr_db_root = Path("./datadb_tr")
+    vl_db_root = Path("./datadb_vl")
+    ts_db_root = Path("./datadb_ts")
+    print(f"{tr_db_root=}")
+    print(f"{vl_db_root=}")
+    print(f"{ts_db_root=}")
 
-    idx, files, labels, timestamps, sizes = get_materials(args.io_backend, db)
-    tr_idx, vl_idx, ts_idx = split_materials(idx, labels, timestamps, args.seed)
-    tr_idx = tr_idx[0:args.tr_num_samples]
-    vl_idx = vl_idx[0:args.vl_num_samples]
-    ts_idx = ts_idx[0:args.ts_num_samples]
-    print(f"idx ({len(idx)}): distribution={np.unique(labels,         return_counts=True)} hash={md5(idx.tobytes()).hexdigest()}")     # type: ignore[no-untyped-call]
-    print(f"tr_idx ({len(tr_idx)}): distribution={np.unique(labels[tr_idx], return_counts=True)} hash={md5(tr_idx.tobytes()).hexdigest()}")  # type: ignore[no-untyped-call]
-    print(f"vl_idx ({len(vl_idx)}): distribution={np.unique(labels[vl_idx], return_counts=True)} hash={md5(vl_idx.tobytes()).hexdigest()}")  # type: ignore[no-untyped-call]
-    print(f"ts_idx ({len(ts_idx)}): distribution={np.unique(labels[ts_idx], return_counts=True)} hash={md5(ts_idx.tobytes()).hexdigest()}")  # type: ignore[no-untyped-call]
+    tr_db: SimpleDB
+    vl_db: SimpleDB
+    ts_db: SimpleDB
+    if args.db_type == DBType.ITR:
+        tr_db = IterableSimpleDB(tr_db_root, pread_block_bytes=8 * 2**20, merge_slack_bytes=1 * 2**20)
+        vl_db = IterableSimpleDB(vl_db_root, pread_block_bytes=8 * 2**20, merge_slack_bytes=1 * 2**20)
+        ts_db = IterableSimpleDB(ts_db_root, pread_block_bytes=8 * 2**20, merge_slack_bytes=1 * 2**20)
+    if args.db_type == DBType.RND:
+        ulimit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        tr_db = RandomMappingSimpleDB(tr_db_root, num_open=ulimit // 2, backend="mmap")
+        vl_db = RandomMappingSimpleDB(vl_db_root, num_open=ulimit // 8, backend="mmap")
+        ts_db = RandomMappingSimpleDB(ts_db_root, num_open=ulimit // 8, backend="mmap")
+    if args.db_type == DBType.CHK:
+        tr_db = ChunkedMappingSimpleDB(tr_db_root)
+        vl_db = ChunkedMappingSimpleDB(vl_db_root)
+        ts_db = ChunkedMappingSimpleDB(ts_db_root)
+    print(f"{tr_db=}")
+    print(f"{vl_db=}")
+    print(f"{ts_db=}")
 
-    # Split the files between distributed workers.
+    tr_max_shard = len(tr_db.files_data) - 1 if args.tr_num_samples is None else tr_db.meta_df["shard"].iloc[args.tr_num_samples]
+    vl_max_shard = len(vl_db.files_data) - 1 if args.vl_num_samples is None else vl_db.meta_df["shard"].iloc[args.vl_num_samples]
+    ts_max_shard = len(ts_db.files_data) - 1 if args.ts_num_samples is None else ts_db.meta_df["shard"].iloc[args.ts_num_samples]
+    print(f"{tr_max_shard=}")
+    print(f"{vl_max_shard=}")
+    print(f"{ts_max_shard=}")
+
+    tr_shards = list(range(len(tr_db.files_data)))[0: tr_max_shard + 1]
+    vl_shards = list(range(len(vl_db.files_data)))[0: vl_max_shard + 1]
+    ts_shards = list(range(len(ts_db.files_data)))[0: ts_max_shard + 1]
+    print(f"tr_shards=[0, ..., {tr_max_shard}]")
+    print(f"vl_shards=[0, ..., {vl_max_shard}]")
+    print(f"ts_shards=[0, ..., {ts_max_shard}]")
+
+    tr_idx = tr_db.meta_df[tr_db.meta_df["shard"] <= tr_max_shard]["idx"].to_numpy(np.int64)
+    vl_idx = vl_db.meta_df[vl_db.meta_df["shard"] <= vl_max_shard]["idx"].to_numpy(np.int64)
+    ts_idx = ts_db.meta_df[ts_db.meta_df["shard"] <= ts_max_shard]["idx"].to_numpy(np.int64)
+    tr_labels = tr_db.meta_df["malware"].to_numpy(np.int64)[tr_idx]
+    vl_labels = vl_db.meta_df["malware"].to_numpy(np.int64)[vl_idx]
+    ts_labels = ts_db.meta_df["malware"].to_numpy(np.int64)[ts_idx]
+    print(f"tr_idx ({len(tr_idx)}): distribution={np.unique(tr_labels, return_counts=True)}")  # type: ignore[no-untyped-call]
+    print(f"vl_idx ({len(vl_idx)}): distribution={np.unique(vl_labels, return_counts=True)}")  # type: ignore[no-untyped-call]
+    print(f"ts_idx ({len(ts_idx)}): distribution={np.unique(ts_labels, return_counts=True)}")  # type: ignore[no-untyped-call]
+
+    # Split the shards or idx between distributed workers.
     if world_size() > 1:
-        tr_idx = tr_idx[rank()::world_size()]
-        vl_idx = vl_idx[rank()::world_size()]
-        ts_idx = ts_idx[rank()::world_size()]
+        if args.db_type == DBType.ITR:
+            tr_shards = tr_shards[rank()::world_size()]
+            vl_shards = vl_shards[rank()::world_size()]
+            ts_shards = ts_shards[rank()::world_size()]
+        if args.db_type == DBType.RND:
+            tr_idx = tr_idx[rank()::world_size()]
+            vl_idx = vl_idx[rank()::world_size()]
+            ts_idx = ts_idx[rank()::world_size()]
+        if args.db_type == DBType.CHK:
+            tr_idx = tr_idx[rank()::world_size()]
+            vl_idx = vl_idx[rank()::world_size()]
+            ts_idx = ts_idx[rank()::world_size()]
 
-    if args.io_backend == IOBackend.FP:
-        tr_dataset = BinaryDataset(files[tr_idx], labels[tr_idx], preprocessor)
-        vl_dataset = BinaryDataset(files[vl_idx], labels[vl_idx], preprocessor)
-        ts_dataset = BinaryDataset(files[ts_idx], labels[ts_idx], preprocessor)
-    elif args.io_backend == IOBackend.DB:
-        assert db is not None
-        db = db.close()
-        tr_dataset = SimpleDBDataset(tr_idx, db, preprocessor)
-        vl_dataset = SimpleDBDataset(vl_idx, db, preprocessor)
-        ts_dataset = SimpleDBDataset(ts_idx, db, preprocessor)
+    if args.db_type == DBType.ITR:
+        tr_dataset = IterableSimpleDBDataset(tr_db, preprocessor, shuffle=True,  shards=tr_shards)  # type: ignore[arg-type]
+        vl_dataset = IterableSimpleDBDataset(vl_db, preprocessor, shuffle=False, shards=vl_shards)  # type: ignore[arg-type]
+        ts_dataset = IterableSimpleDBDataset(ts_db, preprocessor, shuffle=False, shards=ts_shards)  # type: ignore[arg-type]
+    if args.db_type == DBType.RND:
+        tr_dataset = MappingSimpleDBDataset(tr_db, preprocessor)  # type: ignore[arg-type]
+        vl_dataset = MappingSimpleDBDataset(vl_db, preprocessor)  # type: ignore[arg-type]
+        ts_dataset = MappingSimpleDBDataset(ts_db, preprocessor)  # type: ignore[arg-type]
+    if args.db_type == DBType.CHK:
+        tr_dataset = MappingSimpleDBDataset(tr_db, preprocessor)  # type: ignore[arg-type]
+        vl_dataset = MappingSimpleDBDataset(vl_db, preprocessor)  # type: ignore[arg-type]
+        ts_dataset = MappingSimpleDBDataset(ts_db, preprocessor)  # type: ignore[arg-type]
     print(f"{tr_dataset=}")
     print(f"{vl_dataset=}")
     print(f"{ts_dataset=}")
 
-    model = get_model(args.arch, args.size, args.do_characteristics, args.level)
-    model = model.to("cpu")
-    print(f"{model=}")
-
-    num_parameters = count_parameters(model, requires_grad=False)
-    print(f"{num_parameters=}")
-    print(f"mp_dtype={mp_dtype(args.mp16, args.device)}")
-
-    min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
-    min_lengths = getattr(model, "min_lengths", [min_length])
-    min_lengths = [max(m, min_length) for m in min_lengths]
-    print(f"{min_length=}")
-    print(f"{min_lengths=}")
-
-    if args.ddp:
-        model = model.to(args.device)
-        model = DistributedDataParallel(model, static_graph=True)
-    elif args.fsdp:
-        mesh = init_device_mesh("cuda", (world_size(),))
-        mp_policy = MixedPrecisionPolicy(mp_dtype(args.mp16, args.device))
-        offload_policy = CPUOffloadPolicy() if args.fsdp_offload else OffloadPolicy()
-        model.fully_shard(mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
-    else:
-        model = model.to(args.device)
-
     collate_fn = get_collate_fn(args.level, min_lengths)
     print(f"{collate_fn=}")
 
-    tr_sampler = GroupedLengthBatchSampler.from_lengths(args.tr_batch_size, sizes[tr_idx], first=True, shuffle=True)
-    vl_sampler = GroupedLengthBatchSampler.from_lengths(args.vl_batch_size, sizes[vl_idx], first=True, shuffle=False)
-    ts_sampler = GroupedLengthBatchSampler.from_lengths(args.ts_batch_size, sizes[ts_idx], first=True, shuffle=False)
+    if args.db_type == DBType.ITR:
+        tr_sampler = None
+        vl_sampler = None
+        ts_sampler = None
+    if args.db_type == DBType.RND:
+        tr_sampler = None
+        vl_sampler = None
+        ts_sampler = None
+    if args.db_type == DBType.CHK:
+        def func(db: SimpleDB, idx: npt.NDArray[np.integer[Any]], batch_size: int, shuffle: bool) -> ShardAwareBatchSampler:
+            df = db.size_df.iloc[idx]
+            return ShardAwareBatchSampler(
+                batch_size,
+                torch.from_numpy(df["shard"].to_numpy()),
+                torch.from_numpy(df["size"].to_numpy()),
+                torch.from_numpy(df["offset"].to_numpy()),
+                shuffle=shuffle,
+                seed=args.seed,
+                contiguous=False,
+                first=False,
+                drop_last=False,
+                local_shuffle_window=None,
+            )
+        tr_sampler = func(tr_db, tr_idx, args.tr_batch_size, shuffle=True)
+        vl_sampler = func(vl_db, vl_idx, args.vl_batch_size, shuffle=False)
+        ts_sampler = func(ts_db, ts_idx, args.ts_batch_size, shuffle=False)
     print(f"{tr_sampler=}")
     print(f"{vl_sampler=}")
     print(f"{ts_sampler=}")
 
-    tr_loader = get_loader(tr_dataset, tr_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
-    vl_loader = get_loader(vl_dataset, vl_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
-    ts_loader = get_loader(ts_dataset, ts_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    if args.db_type == DBType.ITR:
+        tr_shuffle = None
+        vl_shuffle = None
+        ts_shuffle = None
+    if args.db_type == DBType.RND:
+        tr_shuffle = True
+        vl_shuffle = False
+        ts_shuffle = False
+    if args.db_type == DBType.CHK:
+        tr_shuffle = None
+        vl_shuffle = None
+        ts_shuffle = None
+    print(f"{tr_shuffle=}")
+    print(f"{vl_shuffle=}")
+    print(f"{ts_shuffle=}")
+
+    tr_loader = get_loader(tr_dataset, tr_sampler, tr_shuffle, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    vl_loader = get_loader(vl_dataset, vl_sampler, vl_shuffle, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    ts_loader = get_loader(ts_dataset, ts_sampler, ts_shuffle, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
     print(f"tr_loader=DataLoader(pin_memory={tr_loader.pin_memory}, num_workers={tr_loader.num_workers}, prefetch_factor={tr_loader.prefetch_factor})")
     print(f"vl_loader=DataLoader(pin_memory={vl_loader.pin_memory}, num_workers={vl_loader.num_workers}, prefetch_factor={vl_loader.prefetch_factor})")
     print(f"ts_loader=DataLoader(pin_memory={ts_loader.pin_memory}, num_workers={ts_loader.num_workers}, prefetch_factor={ts_loader.prefetch_factor})")
@@ -514,16 +519,13 @@ def main() -> None:
     trainer = Trainer(TrainerArgs.from_dict(args.to_dict()), model, tr_streamer, vl_streamer, loss_fn, optimizer, scheduler, stopper, args.device)
     print(f"{trainer=}")
 
-    trainer = trainer()
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    # trainer()
+    trainer.evaluate()
 
 
 if __name__ == "__main__":
     try:
         main()
-    except BaseException:
+    finally:
         if dist.is_initialized():
             dist.destroy_process_group()
-        raise
