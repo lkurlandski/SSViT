@@ -72,7 +72,7 @@ def test_bytes_transport_basic() -> None:
         run_mpsc(
             items,
             producer_fn=produced,
-            consumer_fn=collecting_consumer(seen),
+            consumer_fn=collecting_consumer(seen),  # type: ignore[arg-type]
             num_producers=4,
             data_queue_size=8,
             transport="bytes",
@@ -164,7 +164,7 @@ def test_backpressure_with_slow_consumer() -> None:
         run_mpsc(
             items,
             producer_fn=produced,
-            consumer_fn=slow_collecting_consumer(seen, delay_sec=0.01),
+            consumer_fn=slow_collecting_consumer(seen, delay_sec=0.01),  # type: ignore[arg-type]
             num_producers=4,
             data_queue_size=2,   # tiny queue to exercise backpressure
             transport="bytes",

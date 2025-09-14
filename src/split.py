@@ -154,7 +154,7 @@ def _align_feature(
     if arr.shape[0] == n:
         return arr
     try:
-        return arr[idx]
+        return arr[idx]  # type: ignore[no-any-return]
     except Exception as e:
         raise ValueError(
             f"{name} must either be length len(idx) or indexable by idx. "
@@ -194,7 +194,7 @@ def _shuffle_inplace(rng: np.random.Generator, a: npt.NDArray, *, enable: bool) 
 
 def _time_order(timestamps: npt.NDArray[np.number]) -> npt.NDArray[np.int64]:
     n = timestamps.shape[0]
-    return np.lexsort((np.arange(n, dtype=np.int64), timestamps)).astype(np.int64)
+    return np.lexsort((np.arange(n, dtype=np.int64), timestamps)).astype(np.int64)  # type: ignore[no-any-return]
 
 
 def _empirical_ratios(y: npt.NDArray, classes: npt.NDArray) -> npt.NDArray[np.floating]:
@@ -240,7 +240,7 @@ def _prepare_desired_ratios(
     r = np.asarray(ratios, dtype=float)
     if r.ndim != 1 or r.size != classes.size or (r < 0).any() or r.sum() <= 0:
         raise ValueError("ratios must be 1D, non-negative, and match number of classes.")
-    return r / r.sum()
+    return r / r.sum()  # type: ignore[no-any-return]
 
 
 def _ratio_error(dists: Sequence[npt.NDArray[np.floating]], target: Optional[npt.NDArray[np.floating]]) -> float:
@@ -523,7 +523,7 @@ def _stratified_split(
             return np.empty(0, dtype=work.dtype)
         out = np.concatenate(chosen, axis=0)
         _shuffle_inplace(rng, out, enable=shuffle)
-        return out
+        return out  # type: ignore[no-any-return]
 
     tr = take(tr_n)
     vl = take(vl_n)

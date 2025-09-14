@@ -35,7 +35,7 @@ def hamilton_counts(n: int, sizes: tuple[float, float, float]) -> tuple[int, int
 def class_dist(y: np.ndarray, classes: np.ndarray) -> np.ndarray:
     counts = np.array([(y == c).sum() for c in classes], dtype=float)
     s = counts.sum()
-    return counts / s if s > 0 else np.ones_like(counts) / counts.size
+    return counts / s if s > 0 else np.ones_like(counts) / counts.size  # type: ignore[no-any-return]
 
 
 def pairwise_max_abs_diff(dists: list[np.ndarray]) -> float:
@@ -51,7 +51,7 @@ def make_temporal_drift(n: int = 1000) -> tuple[np.ndarray, np.ndarray, np.ndarr
     timestamps = np.arange(n, dtype=np.int64)
     labels = np.empty(n, dtype=int)
 
-    def fill(a, b, zeros_ratio):
+    def fill(a: int, b: int, zeros_ratio: float) -> None:
         block = b - a
         k = int(round(5 * zeros_ratio))
         pattern = np.array([0] * k + [1] * (5 - k), dtype=int)
