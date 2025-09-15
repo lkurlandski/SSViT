@@ -449,10 +449,14 @@ def main() -> None:
         vl_sampler = None
         ts_sampler = None
     if args.db_type == DBType.RND:
+        # TODO: design a sampler that only selects from the subset of idx, not the entire db; adjust the __len__ of the dataset accordingly.
+        warnings.warn(f"Properly sample selection for {args.db_type} is not implemented yet.")
         tr_sampler = None
         vl_sampler = None
         ts_sampler = None
     if args.db_type == DBType.CHK:
+        # TODO: design a sampler that only selects from the subset of idx, not the entire db; adjust the __len__ of the dataset accordingly.
+        warnings.warn(f"Properly sample selection for {args.db_type} is not implemented yet.")
         tr_sampler = ShardAwareBatchSampler(args.tr_batch_size, tr_db.size_df["shard"], tr_db.size_df["size"], tr_db.size_df["offset"], shuffle=True, seed=args.seed)
         vl_sampler = ShardAwareBatchSampler(args.vl_batch_size, vl_db.size_df["shard"], vl_db.size_df["size"], vl_db.size_df["offset"], shuffle=False, seed=args.seed)
         ts_sampler = ShardAwareBatchSampler(args.ts_batch_size, ts_db.size_df["shard"], ts_db.size_df["size"], ts_db.size_df["offset"], shuffle=False, seed=args.seed)
