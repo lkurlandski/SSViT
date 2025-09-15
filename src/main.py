@@ -453,23 +453,9 @@ def main() -> None:
         vl_sampler = None
         ts_sampler = None
     if args.db_type == DBType.CHK:
-        def func(db: SimpleDB, idx: npt.NDArray[np.integer[Any]], batch_size: int, shuffle: bool) -> ShardAwareBatchSampler:
-            df = db.size_df.iloc[idx]
-            return ShardAwareBatchSampler(
-                batch_size,
-                torch.from_numpy(df["shard"].to_numpy()),
-                torch.from_numpy(df["size"].to_numpy()),
-                torch.from_numpy(df["offset"].to_numpy()),
-                shuffle=shuffle,
-                seed=args.seed,
-                contiguous=False,
-                first=False,
-                drop_last=False,
-                local_shuffle_window=None,
-            )
-        tr_sampler = func(tr_db, tr_idx, args.tr_batch_size, shuffle=True)
-        vl_sampler = func(vl_db, vl_idx, args.vl_batch_size, shuffle=False)
-        ts_sampler = func(ts_db, ts_idx, args.ts_batch_size, shuffle=False)
+        tr_sampler = ShardAwareBatchSampler(args.tr_batch_size, tr_db.size_df["shard"], tr_db.size_df["size"], tr_db.size_df["offset"], shuffle=True, seed=args.seed)
+        vl_sampler = ShardAwareBatchSampler(args.vl_batch_size, vl_db.size_df["shard"], vl_db.size_df["size"], vl_db.size_df["offset"], shuffle=False, seed=args.seed)
+        ts_sampler = ShardAwareBatchSampler(args.ts_batch_size, ts_db.size_df["shard"], ts_db.size_df["size"], ts_db.size_df["offset"], shuffle=False, seed=args.seed)
     print(f"{tr_sampler=}")
     print(f"{vl_sampler=}")
     print(f"{ts_sampler=}")
@@ -519,8 +505,7 @@ def main() -> None:
     trainer = Trainer(TrainerArgs.from_dict(args.to_dict()), model, tr_streamer, vl_streamer, loss_fn, optimizer, scheduler, stopper, args.device)
     print(f"{trainer=}")
 
-    # trainer()
-    trainer.evaluate()
+    trainer()
 
 
 if __name__ == "__main__":

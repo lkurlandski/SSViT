@@ -1357,10 +1357,10 @@ class ShardAwareBatchSampler(Sampler[list[int]]):  # type: ignore[misc]
         sample_idx_to_shard_idx: Tensor,
         sample_idx_to_sample_size: Tensor,
         sample_idx_to_sample_offset: Tensor,
-        contiguous: bool,
-        first: bool,
-        shuffle: bool,
-        drop_last: bool,
+        contiguous: bool = False,
+        first: bool = False,
+        shuffle: bool = False,
+        drop_last: bool = False,
         *,
         local_shuffle_window: Optional[int] = None,
         seed: Optional[int] = None,
@@ -1382,6 +1382,10 @@ class ShardAwareBatchSampler(Sampler[list[int]]):  # type: ignore[misc]
         """
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
+
+        sample_idx_to_shard_idx = torch.tensor(sample_idx_to_shard_idx, copy=False)
+        sample_idx_to_sample_size = torch.tensor(sample_idx_to_sample_size, copy=False)
+        sample_idx_to_sample_offset = torch.tensor(sample_idx_to_sample_offset, copy=False)
 
         # Normalize & validate inputs
         for name, t in [
