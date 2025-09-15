@@ -238,6 +238,12 @@ class SimpleDB:
             })
         return pd.DataFrame(stats).sort_values("shard").reset_index(drop=True)
 
+    def number_of_samples_in_shards(self) -> npt.NDArray[np.int64]:
+        """
+        Returns an array whose i-th element is the number of samples in the i-th shard.
+        """
+        return self.size_df.groupby("shard").size().to_numpy().astype(np.int64)  # type: ignore[no-any-return]
+
     def get_size_df(self) -> pd.DataFrame:
         size_dfs = [pd.read_csv(f) for f in self.files_size]
         for f, df in zip(self.files_data, size_dfs):
