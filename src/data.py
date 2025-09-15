@@ -911,6 +911,10 @@ class MappingSimpleDBDataset(BaseSimpleDBDataset, Dataset):  # type: ignore[misc
         sample = self.db[i]
         return self.preprocess(sample)
 
+    def __len__(self) -> int:
+        warnings.warn("MappingSimpleDBDataset.__len__ is not implemented properly to account for sharding or sample selection.")
+        return super().__len__()
+
 
 class IterableSimpleDBDataset(BaseSimpleDBDataset, IterableDataset):  # type: ignore[misc]
     """Iterable-style dataset for SimpleDB databases."""
@@ -922,20 +926,22 @@ class IterableSimpleDBDataset(BaseSimpleDBDataset, IterableDataset):  # type: ig
         self.shards = [int(f.stem.split("-")[-1]) for f in self.db.files_data] if shards is None else shards
         self.shuffle = shuffle
         self.poolsize = poolsize
+        self._local_shards = deepcopy(self.shards)
 
     def __iter__(self) -> Iterable[FSample]:
         if not self.db.is_open:
             raise RuntimeError("SimpleDB is not open. Ensure that `worker_open_and_register_finalizer` is called.")
 
         # Determine which shards this worker will process.
-        shards = deepcopy(self.shards)
         if (worker_info := get_worker_info()) is not None:
+            if len(self.shards) < worker_info.num_workers:
+                raise ValueError(f"Number of shards ({len(self.shards)}) is less than number of workers ({worker_info.num_workers}).")
             per_worker = math.ceil(len(self.shards) / worker_info.num_workers)
-            shards = list(batched(self.shards, per_worker))[worker_info.id]
+            self._local_shards = list(list(batched(self.shards, per_worker))[worker_info.id])
 
         # If not shuffling, just yield samples in order.
         if not self.shuffle:
-            for shard in shards:
+            for shard in self._local_shards:
                 for sample in self.db.iter_one_shard(shard):
                     yield self.preprocess(sample)
             return
@@ -944,11 +950,11 @@ class IterableSimpleDBDataset(BaseSimpleDBDataset, IterableDataset):  # type: ig
         seed = worker_info.seed if worker_info is not None and hasattr(worker_info, "seed") else torch.initial_seed()
         rng = random.Random(int(seed))
         if self.shuffle:
-            rng.shuffle(shards)
+            rng.shuffle(self._local_shards)
 
         # Yield samples in random order using a reservoir sampling-like algorithm.
         pool: list[SimpleDBSample] = []
-        for shard in shards:
+        for shard in self._local_shards:
             for sample in self.db.iter_one_shard(shard):
                 if len(pool) < self.poolsize:
                     pool.append(sample)
@@ -962,6 +968,10 @@ class IterableSimpleDBDataset(BaseSimpleDBDataset, IterableDataset):  # type: ig
             i = random.randint(0, len(pool) - 1)
             yield self.preprocess(pool[i])
             pool.pop(i)
+
+    def __len__(self) -> int:
+        a = self.db.number_of_samples_in_shards()
+        return int(a[self._local_shards].sum())
 
 
 class Preprocessor:
@@ -1383,9 +1393,9 @@ class ShardAwareBatchSampler(Sampler[list[int]]):  # type: ignore[misc]
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
 
-        sample_idx_to_shard_idx = torch.tensor(sample_idx_to_shard_idx, copy=False)
-        sample_idx_to_sample_size = torch.tensor(sample_idx_to_sample_size, copy=False)
-        sample_idx_to_sample_offset = torch.tensor(sample_idx_to_sample_offset, copy=False)
+        sample_idx_to_shard_idx = torch.tensor(sample_idx_to_shard_idx)
+        sample_idx_to_sample_size = torch.tensor(sample_idx_to_sample_size)
+        sample_idx_to_sample_offset = torch.tensor(sample_idx_to_sample_offset)
 
         # Normalize & validate inputs
         for name, t in [
