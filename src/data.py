@@ -631,7 +631,7 @@ class _FSampleOrSamples(ABC):
         label = self.label.clone()
         guides = self.guides.clone()
         structure = self.structure.clone()
-        return self.__class__(file, name, inputs, label, guides, structure)
+        return self.__class__(file, name, label, inputs, guides, structure)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> Self:
         file = deepcopy(self.file)
