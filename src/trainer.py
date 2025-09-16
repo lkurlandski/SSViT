@@ -8,7 +8,9 @@ from collections import defaultdict
 from collections.abc import Collection
 from collections.abc import Iterable
 from collections.abc import Mapping
+import contextlib
 from dataclasses import dataclass
+import datetime
 from functools import partial
 import gc
 import inspect
@@ -21,6 +23,7 @@ import threading
 import time
 from typing import Any
 from typing import Callable
+from typing import ContextManager
 from typing import Literal
 from typing import Optional
 from typing import Self
@@ -44,8 +47,11 @@ from torch import LongTensor
 from torch import distributed as dist
 from torch.amp import GradScaler
 from torch.distributed import checkpoint as dist_checkpoint
+from torch.distributed.algorithms.join import Join
+from torch.distributed.algorithms.join import Joinable
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.distributed.checkpoint.state_dict import StateDictOptions
+from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.distributed.tensor import DTensor
 from torch.nn import Module
 from torch.nn.parallel import DistributedDataParallel
@@ -59,20 +65,25 @@ from tqdm import tqdm
 from src.data import FOrHSamples
 
 
+def is_dist() -> bool:
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+
 def local_rank() -> int:
     return int(os.environ.get("LOCAL_RANK", 0))
 
 
 def rank() -> int:
-    if dist.is_initialized():
+    if is_dist():
         return int(dist.get_rank())
     return 0
 
 
 def local_world_size() -> int:
     if "LOCAL_WORLD_SIZE" in os.environ:
+        # Works when checking within subprocesses.
         return int(os.environ["LOCAL_WORLD_SIZE"])
-    if dist.is_initialized():
+    if is_dist():
         return int(torch.cuda.device_count())
     return 1
 
@@ -81,6 +92,75 @@ def world_size() -> int:
     if dist.is_initialized():
         return int(dist.get_world_size())
     return 1
+
+
+def maybe_join(model: Module, join: bool = True) -> ContextManager[None]:
+    """
+    Returns a Join context if in distributed the model is Joinable, else a no-op context.
+
+    This is particularily helpful for distributed workers processing different amounts of data.
+    """
+    if join and is_dist() and isinstance(model, Joinable):
+        return Join([model])
+    return contextlib.nullcontext()
+
+
+def maybe_no_sync(model: Module, sync_now: bool) -> ContextManager[None]:
+    """
+    Returns a no_sync context if in distributed and the model has a no_sync method, else a no-op context.
+    """
+    no_sync = getattr(model, "no_sync", None)
+    if (not is_dist()) or sync_now or (no_sync is None):
+        return contextlib.nullcontext()
+    return no_sync()
+
+
+def cpu_rendezvous() -> None:
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        t = torch.ones(1, dtype=torch.int64)   # CPU tensor ⇒ Gloo on composable backends
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)  # acts as a barrier/rendezvous
+
+
+_METRICS_PG = None
+def metrics_group():
+    global _METRICS_PG
+    if _METRICS_PG is None and torch.distributed.is_initialized():
+        # Create a small, CPU-only comms group for scalars/metrics
+        _METRICS_PG = torch.distributed.new_group(backend="gloo")
+    return _METRICS_PG
+
+
+@contextlib.contextmanager
+def unwrapped_model(model: Module) -> Iterable[Module]:
+    """
+    Yields a model without DDP/FSDP interference.
+    """
+    if isinstance(model, DistributedDataParallel):
+        yield model.module
+        return
+
+    if isinstance(model, FullyShardedDataParallel):
+        print(f"[Worker {rank()}] unwrapping FSDP model...")  # FIXME: remove
+        with FullyShardedDataParallel.summon_full_params(model, recurse=True):
+            yield model
+        return
+
+    if hasattr(model, "unshard") and hasattr(model, "reshard"):
+        print(f"[Worker {rank()}] unwrapping sharded model...")  # FIXME: remove
+        try:
+            for mod in model.modules():
+                if hasattr(mod, "unshard"):
+                    print(f"[Worker {rank()}] unwrapping {mod}...")  # FIXME: remove
+                    mod.unshard()
+            yield model
+        finally:
+            for mod in model.modules():
+                if hasattr(mod, "reshard"):
+                    print(f"[Worker {rank()}] resharing {mod}...")  # FIXME: remove
+                    mod.reshard()
+        return
+
+    yield model
 
 
 FTensor = Union[BFloat16Tensor | HalfTensor | FloatTensor | DoubleTensor]
@@ -330,37 +410,41 @@ class Trainer:
         scaler = GradScaler(self.device.type, enabled=mp_dtype(self.args.mp16, self.device) == torch.float16)
 
         step = 0
-        for mini_step, batch in iterable:
+        mini_step = -1
+        with maybe_join(self.model):
+            for mini_step, batch in iterable:
+                print(f"[Worker {rank()}] Trainer::train {mini_step=}")  # FIXME: remove
+                sync_gradients = (mini_step + 1) % self.args.gradient_accumulation_steps == 0
 
-            # Compute normalized loss
-            outputs = self.forward(batch)
-            loss = self.compute_loss(batch, outputs) / self.args.gradient_accumulation_steps
-            scaler.scale(loss).backward()
-            results["tr_loss"] += loss.detach() * len(batch)
+                # Compute normalized loss
+                with maybe_no_sync(self.model, sync_gradients):
+                    outputs = self.forward(batch)
+                    loss = self.compute_loss(batch, outputs) / self.args.gradient_accumulation_steps
+                    scaler.scale(loss).backward()
+                    results["tr_loss"] += loss.detach() * len(batch)
 
-            # Update weights every `gradient_accumulation_steps` `mini_steps`
-            condition_1 = (mini_step + 1) % self.args.gradient_accumulation_steps == 0
-            condition_2 = (mini_step + 1) == len(dataloader)
-            if condition_1 or condition_2:
-                # Unscale gradient then clip; GradScaler.step knows they have already been unscaled
-                scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
-                scaler.step(self.optimizer)
-                scaler.update()
-                self.optimizer.zero_grad()
-                step += 1
+                # Update model weights
+                if sync_gradients:
+                    scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                    self.optimizer.zero_grad()
+                    step += 1
 
-            # Perform logging every `logging_steps` `steps`
-            condition_1 = self.args.logging_steps > 0
-            condition_2 = step > 0
-            condition_3 = step % self.args.logging_steps == 0
-            if condition_1 and condition_2 and condition_3:
-                d = {"step": step}
-                for k in results:
-                    d[k] = results[k].item() / num_samples
-                print(pformat_dict(d))
+                num_samples += len(batch)
 
-            num_samples += len(batch)
+        if mini_step < 0:
+            warnings.warn("No training mini-steps were taken, the training dataset may be empty.")
+            num_samples = max(num_samples, 1)
+
+        # Update weights if there are remaining gradients
+        if mini_step > 0 and (mini_step + 1) % self.args.gradient_accumulation_steps != 0:
+            scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
+            scaler.step(self.optimizer)
+            scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
 
         # Average statistics over epoch
         report = {}
@@ -371,6 +455,15 @@ class Trainer:
         return report
 
     def evaluate(self) -> dict[str, float]:
+        """
+        NOTE: Due to using dataloaders with variable numbers of batches (I think), this method
+        is extremely prone to hanging or deadlocking when used with DDP or FSDP. After many hours
+        of debugging, the only solution I found was to unwrap the model from DDP/FSDP before evaluating.
+        For DDP, this is fine and straightforward, but for FSDP this means that the model is fully materialized
+        on each GPU, which may be infeasible for large models. In the future, I would like to try to
+        synthetically augment the shorter dataloaders with empty batches, then ignore their metrics, instead.
+        # FIXME: This does not work with FSDP as previously thought.
+        """
         t_0 = time.time()
 
         self.model.eval()
@@ -379,10 +472,12 @@ class Trainer:
         iterable = tqdm(iterable, "Validating...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
 
         num_samples = 0
+        mini_step = -1
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
 
-        with torch.no_grad():
+        with torch.no_grad(), self.unwrapped_model():
             for mini_step, batch in iterable:
+                print(f"[Worker {rank()}] Trainer::evaluate {mini_step=}")  # FIXME: remove
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 metrics = self.compute_metrics(batch, outputs)
@@ -391,6 +486,29 @@ class Trainer:
                     results[f"vl_{k}"] += metrics[k] * len(batch)
                 num_samples += len(batch)
 
+        if mini_step < 0:
+            warnings.warn("No validation mini-steps were taken, the training dataset may be empty.")
+
+        print(f"[Worker {rank()}] Trainer::evaluate synchronizing...")  # FIXME: remove
+        if is_dist():
+            vals = torch.empty((len(results) + 1,), dtype=torch.float64, device="cpu")
+            vals[0] = num_samples
+            keys = sorted(results.keys())
+            for i, k in enumerate(keys, start=1):
+                vals[i] = results[k].detach()
+            print(f"[Worker {rank()}] Trainer::evaluate checking")  # FIXME: remove
+            sizes = [None] * torch.distributed.get_world_size()
+            dist.all_gather_object(sizes, 1 + len(keys), group=metrics_group())
+            assert len(set(sizes)) == 1
+            print(f"[Worker {rank()}] Trainer::evaluate reducing")  # FIXME: remove
+            dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=metrics_group())
+            num_samples = int(vals[0].item())
+            for i, k in enumerate(keys, start=1):
+                results[k] = vals[i]
+        print(f"[Worker {rank()}] Trainer::evaluate normalizing...")  # FIXME: remove
+
+        # Normalize metrics by number of samples
+        num_samples = max(num_samples, 1)
         report = {}
         for k in results:
             report[k] = results[k].item() / num_samples
@@ -439,6 +557,14 @@ class Trainer:
             "rec": rec,
             "f-1": f_1,
         }
+
+    @contextlib.contextmanager
+    def unwrapped_model(self) -> contextlib.ContextManager[Module]:
+        model = self.model
+        with unwrapped_model(model) as unwrapped:
+            self.model = unwrapped
+            yield
+        self.model = model
 
     def _update_logs(self, results: Mapping[str, int | float]) -> None:
         self.log.append(results)
