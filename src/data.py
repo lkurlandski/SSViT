@@ -1374,6 +1374,7 @@ class StreamlessCUDAPrefetcher:
     def __init__(self, loader: DataLoader, device: torch.device) -> None:
         self.loader = loader
         self.device = device
+        self.it: Optional[Iterator[FOrHSamples]] = None
 
     def __contains__(self, item: object) -> bool:
         return item in self.loader
