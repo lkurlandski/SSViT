@@ -1366,6 +1366,53 @@ class CUDAPrefetcher:
         return self.loader.dataset
 
 
+class StreamlessCUDAPrefetcher:
+    """
+    A simpler prefetcher that does not use multiple streams, useful for debugging.
+    """
+
+    def __init__(self, loader: DataLoader, device: torch.device) -> None:
+        self.loader = loader
+        self.device = device
+
+    def __contains__(self, item: object) -> bool:
+        return item in self.loader
+
+    def warmup(self, preload_batches: Optional[int] = None) -> None:
+        """
+        Spawn DataLoader workers early.
+        """
+        if preload_batches is not None:
+            warnings.warn(f"{self.__class__.__name__}.warmup does not support preloading batches. Ignoring preload_batches={preload_batches}.")
+        if self.it is None:
+            self.it = iter(self.loader)
+
+    def __iter__(self) -> Iterator[FOrHSamples]:
+        self.it = iter(self.loader)
+        return self
+
+    def __next__(self) -> FOrHSamples:
+        if self.it is None:
+            raise StopIteration
+
+        try:
+            cpu_batch: FOrHSamples = next(self.it)
+        except StopIteration:
+            raise StopIteration
+
+        return cpu_batch.to(self.device).decompress()
+
+    def __len__(self) -> int:
+        return len(self.loader)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(loader={self.loader.__class__.__name__}(...), device={self.device})"
+
+    @property
+    def dataset(self) -> Dataset:
+        return self.loader.dataset
+
+
 class GroupedLengthBatchSampler(Sampler[list[int]]):  # type: ignore[misc]
 
     def __init__(self, chunks: Sequence[IntTensor | list[int]], first: bool, shuffle: bool, drop_last: bool) -> None:
