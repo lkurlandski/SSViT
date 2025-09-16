@@ -66,7 +66,7 @@ from src.data import FOrHSamples
 
 
 def is_dist() -> bool:
-    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    return bool(dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1)
 
 
 def local_rank() -> int:
@@ -94,7 +94,7 @@ def world_size() -> int:
     return 1
 
 
-def maybe_join(model: Module, join: bool = True) -> ContextManager[None]:
+def maybe_join(model: Module, join: bool = True) -> ContextManager[None] | Join:
     """
     Returns a Join context if in distributed the model is Joinable, else a no-op context.
 
@@ -109,10 +109,9 @@ def maybe_no_sync(model: Module, sync_now: bool) -> ContextManager[None]:
     """
     Returns a no_sync context if in distributed and the model has a no_sync method, else a no-op context.
     """
-    no_sync = getattr(model, "no_sync", None)
-    if (not is_dist()) or sync_now or (no_sync is None):
+    if not is_dist() or sync_now or not hasattr(model, "no_sync"):
         return contextlib.nullcontext()
-    return no_sync()
+    return model.no_sync()  # type: ignore[no-any-return]
 
 
 def cpu_rendezvous() -> None:
@@ -121,46 +120,16 @@ def cpu_rendezvous() -> None:
         dist.all_reduce(t, op=dist.ReduceOp.SUM)  # acts as a barrier/rendezvous
 
 
-_METRICS_PG = None
-def metrics_group():
+_METRICS_PG: Optional[dist.ProcessGroup] = None
+def init_metrics_group() -> None:
+    """Create a small, CPU-only comms group for scalars/metrics."""
     global _METRICS_PG
-    if _METRICS_PG is None and torch.distributed.is_initialized():
-        # Create a small, CPU-only comms group for scalars/metrics
-        _METRICS_PG = torch.distributed.new_group(backend="gloo")
-    return _METRICS_PG
-
-
-@contextlib.contextmanager
-def unwrapped_model(model: Module) -> Iterable[Module]:
-    """
-    Yields a model without DDP/FSDP interference.
-    """
-    if isinstance(model, DistributedDataParallel):
-        yield model.module
+    if _METRICS_PG is not None:
+        raise RuntimeError("Metrics process group is already initialized.")
+    if not is_dist():
         return
-
-    if isinstance(model, FullyShardedDataParallel):
-        print(f"[Worker {rank()}] unwrapping FSDP model...")  # FIXME: remove
-        with FullyShardedDataParallel.summon_full_params(model, recurse=True):
-            yield model
-        return
-
-    if hasattr(model, "unshard") and hasattr(model, "reshard"):
-        print(f"[Worker {rank()}] unwrapping sharded model...")  # FIXME: remove
-        try:
-            for mod in model.modules():
-                if hasattr(mod, "unshard"):
-                    print(f"[Worker {rank()}] unwrapping {mod}...")  # FIXME: remove
-                    mod.unshard()
-            yield model
-        finally:
-            for mod in model.modules():
-                if hasattr(mod, "reshard"):
-                    print(f"[Worker {rank()}] resharing {mod}...")  # FIXME: remove
-                    mod.reshard()
-        return
-
-    yield model
+    _METRICS_PG = dist.new_group(ranks=list(range(world_size())), backend="gloo")
+    dist.barrier(group=_METRICS_PG)
 
 
 FTensor = Union[BFloat16Tensor | HalfTensor | FloatTensor | DoubleTensor]
@@ -323,6 +292,7 @@ class Trainer:
         scheduler: Optional[LRScheduler] = None,
         stopper: Optional[EarlyStopper] = None,
         device: Optional[torch.device] = None,
+        padbatch: Optional[FOrHSamples] = None,
     ) -> None:
         self.args = args
         self.model = model
@@ -333,6 +303,7 @@ class Trainer:
         self.scheduler = scheduler if scheduler is not None else LambdaLR(optimizer, lambda _: 1.0)
         self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
         self.device = device if device is not None else next(self.model.parameters()).device
+        self.padbatch = padbatch.clone().to(self.device) if padbatch is not None else None
         self.monitor = Monitor(device=self.device)
         self.log: list[Mapping[str, int | float]] = []
         self.best_epoch = -1
@@ -455,36 +426,55 @@ class Trainer:
         return report
 
     def evaluate(self) -> dict[str, float]:
-        """
-        NOTE: Due to using dataloaders with variable numbers of batches (I think), this method
-        is extremely prone to hanging or deadlocking when used with DDP or FSDP. After many hours
-        of debugging, the only solution I found was to unwrap the model from DDP/FSDP before evaluating.
-        For DDP, this is fine and straightforward, but for FSDP this means that the model is fully materialized
-        on each GPU, which may be infeasible for large models. In the future, I would like to try to
-        synthetically augment the shorter dataloaders with empty batches, then ignore their metrics, instead.
-        # FIXME: This does not work with FSDP as previously thought.
-        """
         t_0 = time.time()
 
         self.model.eval()
         dataloader = self.vl_loader
         iterable: Iterable[tuple[int, FOrHSamples]] = enumerate(dataloader)
         iterable = tqdm(iterable, "Validating...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
+        iterable = iter(iterable)
 
         num_samples = 0
         mini_step = -1
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
 
-        with torch.no_grad(), self.unwrapped_model():
-            for mini_step, batch in iterable:
-                print(f"[Worker {rank()}] Trainer::evaluate {mini_step=}")  # FIXME: remove
+        batch: FOrHSamples
+        padbatch = self.padbatch
+
+        with torch.no_grad():
+            while True:
+                # Get the next batch of data or padbatch if this rank is out of data.
+                try:
+                    mini_step, batch = next(iterable)
+                    has_local = torch.tensor([1], dtype=torch.int32, device="cpu")
+                    padbatch = batch.clone() if mini_step == 0 and padbatch is None else padbatch
+                    real = 1.0
+                except StopIteration:
+                    if padbatch is None:
+                        raise RuntimeError("This rank has no data and we could not create a dummy batch.")
+                    mini_step, batch = mini_step + 1, padbatch
+                    has_local = torch.tensor([0], dtype=torch.int32, device="cpu")
+                    real = 0.0
+                print(f"[Worker {rank()}] Trainer::evaluate {mini_step=} {real=}")  # FIXME: remove
+                # If all ranks are out of data, all ranks should stop.
+                if world_size() > 1:
+                    has_any = has_local.clone()
+                    dist.all_reduce(has_any, op=dist.ReduceOp.SUM, group=_METRICS_PG)
+                    if int(has_any[0].item()) == 0:
+                        break
+                # Run the inputs through the model, but only count the metrics if this rank has real data.
+                hb = torch.tensor(1, device="cpu")
+                torch.distributed.all_reduce(hb, group=_METRICS_PG)
+                print(f"[Worker {rank()}] Trainer::evaluate hb passed")  # FIXME: remove
                 outputs = self.forward(batch)
+                torch.distributed.all_reduce(hb, group=_METRICS_PG)
+                print(f"[Worker {rank()}] Trainer::evaluate hb returned")  # FIXME: remove
                 loss = self.compute_loss(batch, outputs)
                 metrics = self.compute_metrics(batch, outputs)
-                results["vl_loss"] += loss * len(batch)
+                results["vl_loss"] += loss * len(batch) * real
                 for k in metrics:
-                    results[f"vl_{k}"] += metrics[k] * len(batch)
-                num_samples += len(batch)
+                    results[f"vl_{k}"] += metrics[k] * len(batch) * real
+                num_samples += len(batch) * int(real)
 
         if mini_step < 0:
             warnings.warn("No validation mini-steps were taken, the training dataset may be empty.")
@@ -498,10 +488,10 @@ class Trainer:
                 vals[i] = results[k].detach()
             print(f"[Worker {rank()}] Trainer::evaluate checking")  # FIXME: remove
             sizes = [None] * torch.distributed.get_world_size()
-            dist.all_gather_object(sizes, 1 + len(keys), group=metrics_group())
+            dist.all_gather_object(sizes, 1 + len(keys), group=_METRICS_PG)
             assert len(set(sizes)) == 1
             print(f"[Worker {rank()}] Trainer::evaluate reducing")  # FIXME: remove
-            dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=metrics_group())
+            dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=_METRICS_PG)
             num_samples = int(vals[0].item())
             for i, k in enumerate(keys, start=1):
                 results[k] = vals[i]
@@ -557,14 +547,6 @@ class Trainer:
             "rec": rec,
             "f-1": f_1,
         }
-
-    @contextlib.contextmanager
-    def unwrapped_model(self) -> contextlib.ContextManager[Module]:
-        model = self.model
-        with unwrapped_model(model) as unwrapped:
-            self.model = unwrapped
-            yield
-        self.model = model
 
     def _update_logs(self, results: Mapping[str, int | float]) -> None:
         self.log.append(results)
