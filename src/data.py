@@ -97,7 +97,6 @@ class _SemanticGuideOrSemanticGuides(ABC):
 
     # NOTE: compression/decompression with bitpacking will implicitly zero pad tensors to a multiple of 8.
     # NOTE: the boolean tensors are converted to floating point internally, to prepare for learning.
-    # FIXME: some of these methods, e.g., `clone`, should return a new instance!
 
     parse: Optional[BoolTensor | ByteTensor | FloatTensor | HalfTensor | DoubleTensor]
     entropy: Optional[HalfTensor | FloatTensor | DoubleTensor]
@@ -138,8 +137,10 @@ class _SemanticGuideOrSemanticGuides(ABC):
         raise RuntimeError(f"Unexpected tensor contiguity state: {is_contiguous=}")
 
     @property
-    def is_cuda(self) -> bool:
+    def is_cuda(self) -> Optional[bool]:
         is_cuda = [t.is_cuda for t in (self.parse, self.entropy, self.characteristics) if t is not None]
+        if len(is_cuda) == 0:
+            return None
         if all(is_cuda):
             return True
         if not any(is_cuda):
@@ -147,13 +148,24 @@ class _SemanticGuideOrSemanticGuides(ABC):
         raise RuntimeError(f"Unexpected tensor device state: {is_cuda=}")
 
     def contiguous(self) -> Self:
-        if self.parse is not None:
-            self.parse = self.parse.contiguous()
-        if self.entropy is not None:
-            self.entropy = self.entropy.contiguous()
-        if self.characteristics is not None:
-            self.characteristics = self.characteristics.contiguous()
-        return self
+        parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
+        if parse is not None:
+            parse = parse.contiguous()
+        if entropy is not None:
+            entropy = entropy.contiguous()
+        if characteristics is not None:
+            characteristics = characteristics.contiguous()
+        return self.__class__(parse, entropy, characteristics)
+
+    def detach(self) -> Self:
+        parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
+        if parse is not None:
+            parse = parse.detach()
+        if entropy is not None:
+            entropy = entropy.detach()
+        if characteristics is not None:
+            characteristics = characteristics.detach()
+        return self.__class__(parse, entropy, characteristics)
 
     def record_stream(self, s: torch.cuda.Stream) -> None:
         if self.parse is not None:
@@ -164,77 +176,90 @@ class _SemanticGuideOrSemanticGuides(ABC):
             self.characteristics.record_stream(s)
 
     def clone(self) -> Self:
-        if self.parse is not None:
-            self.parse = self.parse.clone()
-        if self.entropy is not None:
-            self.entropy = self.entropy.clone()
-        if self.characteristics is not None:
-            self.characteristics = self.characteristics.clone()
-        return self
+        parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
+        if parse is not None:
+            parse = parse.clone()
+        if entropy is not None:
+            entropy = entropy.clone()
+        if characteristics is not None:
+            characteristics = characteristics.clone()
+        return self.__class__(parse, entropy, characteristics)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> Self:
-        if self.parse is not None:
-            self.parse = self.parse.to(device, non_blocking=non_blocking)
-        if self.entropy is not None:
-            self.entropy = self.entropy.to(device, non_blocking=non_blocking)
-        if self.characteristics is not None:
-            self.characteristics = self.characteristics.to(device, non_blocking=non_blocking)
-        return self
+        parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
+        if parse is not None:
+            parse = parse.to(device, non_blocking=non_blocking)
+        if entropy is not None:
+            entropy = entropy.to(device, non_blocking=non_blocking)
+        if characteristics is not None:
+            characteristics = characteristics.to(device, non_blocking=non_blocking)
+        return self.__class__(parse, entropy, characteristics)
 
     def pin_memory(self) -> Self:
-        if self.parse is not None:
-            self.parse = self.parse.pin_memory()
-        if self.entropy is not None:
-            self.entropy = self.entropy.pin_memory()
-        if self.characteristics is not None:
-            self.characteristics = self.characteristics.pin_memory()
-        return self
+        parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
+        if parse is not None:
+            if parse.is_cuda:
+                raise RuntimeError("Cannot pin memory of a CUDA tensor.")
+            parse = parse.pin_memory()
+        if entropy is not None:
+            if entropy.is_cuda:
+                raise RuntimeError("Cannot pin memory of a CUDA tensor.")
+            entropy = entropy.pin_memory()
+        if characteristics is not None:
+            if characteristics.is_cuda:
+                raise RuntimeError("Cannot pin memory of a CUDA tensor.")
+            characteristics = characteristics.pin_memory()
+        return self.__class__(parse, entropy, characteristics)
 
     def compress(self) -> Self:
-        if self.parse is not None and self.parse.dtype == torch.bool:
-            self.parse = packbits(self.parse, axis=self.length_axis)
-        if self.entropy is not None and self.entropy.dtype != torch.float16:
-            self.entropy = self.entropy.to(torch.float16)
-        if self.characteristics is not None and self.characteristics.dtype == torch.bool:
-            self.characteristics = packbits(self.characteristics, axis=self.length_axis)
-        return self
+        parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
+        if parse is not None and parse.dtype == torch.bool:
+            parse = packbits(parse, axis=self.length_axis)
+        if entropy is not None and entropy.dtype != torch.float16:
+            entropy = entropy.to(torch.float16)
+        if characteristics is not None and characteristics.dtype == torch.bool:
+            characteristics = packbits(characteristics, axis=self.length_axis)
+        return self.__class__(parse, entropy, characteristics)
 
     def decompress(self) -> Self:
-        if self.parse is not None:
-            if self.parse.dtype == torch.uint8:
-                self.parse = unpackbits(self.parse, axis=self.length_axis)
-            self.parse = self.parse.to(torch.float32)
-        if self.entropy is not None and self.entropy.dtype != torch.float32:
-            self.entropy = self.entropy.to(torch.float32)
-        if self.characteristics is not None:
-            if self.characteristics.dtype == torch.uint8:
-                self.characteristics = unpackbits(self.characteristics, axis=self.length_axis)
-            self.characteristics = self.characteristics.to(torch.float32)
-        return self
+        parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
+        if parse is not None:
+            if parse.dtype == torch.uint8:
+                parse = unpackbits(parse, axis=self.length_axis)
+            parse = parse.to(torch.float32)
+        if entropy is not None and entropy.dtype != torch.float32:
+            entropy = entropy.to(torch.float32)
+        if characteristics is not None:
+            if characteristics.dtype == torch.uint8:
+                characteristics = unpackbits(characteristics, axis=self.length_axis)
+            characteristics = characteristics.to(torch.float32)
+        return self.__class__(parse, entropy, characteristics)
 
     def trim(self, length: Optional[int]) -> Self:
+        parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
+
         if length is None:
-            return self
+            return self.__class__(parse, entropy, characteristics)
 
-        if self.parse is not None:
+        if parse is not None:
             length_ = length
-            if self.parse.dtype == torch.uint8:
+            if parse.dtype == torch.uint8:
                 length_ = math.ceil(length / 8)
-            slice_ = [slice(length_) if i == self.length_axis else slice(None) for i in range(self.parse.ndim)]
-            self.parse = self.parse[tuple(slice_)]
+            slice_ = [slice(length_) if i == self.length_axis else slice(None) for i in range(parse.ndim)]
+            parse = parse[tuple(slice_)]
 
-        if self.entropy is not None:
-            slice_ = [slice(length) if i == self.length_axis else slice(None) for i in range(self.parse.ndim)]
-            self.parse = self.parse[tuple(slice_)]
+        if entropy is not None:
+            slice_ = [slice(length) if i == self.length_axis else slice(None) for i in range(entropy.ndim)]
+            parse = entropy[tuple(slice_)]
 
-        if self.characteristics is not None:
+        if characteristics is not None:
             length_ = length
-            if self.characteristics.dtype == torch.uint8:
+            if characteristics.dtype == torch.uint8:
                 length_ = math.ceil(length / 8)
-            slice_ = [slice(length_) if i == self.length_axis else slice(None) for i in range(self.characteristics.ndim)]
-            self.characteristics = self.characteristics[tuple(slice_)]
+            slice_ = [slice(length_) if i == self.length_axis else slice(None) for i in range(characteristics.ndim)]
+            characteristics = characteristics[tuple(slice_)]
 
-        return self
+        return self.__class__(parse, entropy, characteristics)
 
     def select(self, *, mask: Optional[BoolTensor] = None, idx: Optional[IntTensor] = None, ranges: Optional[list[tuple[int, int]]] = None) -> Self:
         """
@@ -579,9 +604,9 @@ class _FSampleOrSamples(ABC):
 
     @property
     def is_cuda(self) -> bool:
-        if self.label.is_cuda and self.inputs.is_cuda and self.guides.is_cuda:
+        if self.label.is_cuda and self.inputs.is_cuda and (self.guides.is_cuda is True or self.guides.is_cuda is None):
             return True
-        if not self.label.is_cuda and not self.inputs.is_cuda and not self.guides.is_cuda:
+        if not self.label.is_cuda and not self.inputs.is_cuda and (self.guides.is_cuda is False or self.guides.is_cuda is None):
             return False
         raise RuntimeError(f"Unexpected tensor device state: {self.label.is_cuda=}, {self.inputs.is_cuda=}, {self.guides.is_cuda=}")
 
@@ -590,38 +615,61 @@ class _FSampleOrSamples(ABC):
         self.inputs.record_stream(s)
         self.guides.record_stream(s)
 
+    def detach(self) -> Self:
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.detach()
+        inputs = self.inputs.detach()
+        guides = self.guides.detach()
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
+
     def clone(self) -> Self:
-        self.file = deepcopy(self.file)
-        self.name = deepcopy(self.name)
-        self.inputs = self.inputs.clone()
-        self.label = self.label.clone()
-        self.guides = self.guides.clone()
-        self.structure = self.structure.clone()
-        return self
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        inputs = self.inputs.clone()
+        label = self.label.clone()
+        guides = self.guides.clone()
+        structure = self.structure.clone()
+        return self.__class__(file, name, inputs, label, guides, structure)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> Self:
-        self.label = self.label.to(device, non_blocking=non_blocking)
-        self.inputs = self.inputs.to(device, non_blocking=non_blocking)
-        self.guides = self.guides.to(device, non_blocking=non_blocking)
-        return self
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.to(device, non_blocking=non_blocking)
+        inputs = self.inputs.to(device, non_blocking=non_blocking)
+        guides = self.guides.to(device, non_blocking=non_blocking)
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
 
     def pin_memory(self) -> Self:
-        self.label = self.label.pin_memory()
-        self.inputs = self.inputs.pin_memory()
-        self.guides = self.guides.pin_memory()
-        return self
+        if self.label.is_cuda or self.inputs.is_cuda or self.guides.is_cuda:
+            raise RuntimeError("Cannot pin memory of a CUDA tensor.")
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.pin_memory()
+        inputs = self.inputs.pin_memory()
+        guides = self.guides.pin_memory()
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
 
     def compress(self) -> Self:
-        self.label = self.label.to(torch.int16)
-        self.inputs = self.inputs.to(torch.int16)
-        self.guides = self.guides.compress()
-        return self
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.to(torch.int16)
+        inputs = self.inputs.to(torch.int16)
+        guides = self.guides.compress()
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
 
     def decompress(self) -> Self:
-        self.label = self.label.to(torch.int64)
-        self.inputs = self.inputs.to(torch.int32)
-        self.guides = self.guides.decompress()
-        return self
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.to(torch.int64)
+        inputs = self.inputs.to(torch.int32)
+        guides = self.guides.decompress()
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
 
 
 class FSample(_FSampleOrSamples):
@@ -727,7 +775,7 @@ class _HSampleOrSamples(Generic[TGuide], ABC):
     @property
     def is_cuda(self) -> bool:
         for i in range(self.num_structures):
-            if self.inputs[i].is_cuda and self.guides[i].is_cuda:
+            if self.inputs[i].is_cuda and (self.guides[i].is_cuda is True or self.guides[i].is_cuda is None):
                 continue
             break
         else:
@@ -735,7 +783,7 @@ class _HSampleOrSamples(Generic[TGuide], ABC):
                 return True
 
         for i in range(self.num_structures):
-            if not self.inputs[i].is_cuda and not self.guides[i].is_cuda:
+            if not self.inputs[i].is_cuda and (self.guides[i].is_cuda is False or self.guides[i].is_cuda is None):
                 continue
             break
         else:
@@ -750,43 +798,79 @@ class _HSampleOrSamples(Generic[TGuide], ABC):
             self.inputs[i].record_stream(s)
             self.guides[i].record_stream(s)
 
-    def clone(self) -> Self:
-        self.file = deepcopy(self.file)
-        self.name = deepcopy(self.name)
-        self.label = self.label.clone()
+    def detach(self) -> Self:
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.detach()
+        inputs = []
+        guides = []
         for i in range(self.num_structures):
-            self.inputs[i] = self.inputs[i].clone()
-            self.guides[i] = self.guides[i].clone()
-        self.structure = self.structure.clone()
-        return self
+            inputs.append(self.inputs[i].detach())
+            guides.append(self.guides[i].detach())
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
+
+    def clone(self) -> Self:
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.clone()
+        inputs = []
+        guides = []
+        for i in range(self.num_structures):
+            inputs.append(self.inputs[i].clone())
+            guides.append(self.guides[i].clone())
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> Self:
-        self.label = self.label.to(device, non_blocking=non_blocking)
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.to(device, non_blocking=non_blocking)
+        inputs = []
+        guides = []
         for i in range(self.num_structures):
-            self.inputs[i] = self.inputs[i].to(device, non_blocking=non_blocking)
-            self.guides[i] = self.guides[i].to(device, non_blocking=non_blocking)
-        return self
+            inputs.append(self.inputs[i].to(device, non_blocking=non_blocking))
+            guides.append(self.guides[i].to(device, non_blocking=non_blocking))
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
 
     def pin_memory(self) -> Self:
-        self.label = self.label.pin_memory()
+        if self.label.is_cuda or any(inp.is_cuda for inp in self.inputs) or any(guide.is_cuda for guide in self.guides):
+            raise RuntimeError("Cannot pin memory of a CUDA tensor.")
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.pin_memory()
+        inputs = []
+        guides = []
         for i in range(self.num_structures):
-            self.inputs[i] = self.inputs[i].pin_memory()
-            self.guides[i] = self.guides[i].pin_memory()
-        return self
+            inputs.append(self.inputs[i].pin_memory())
+            guides.append(self.guides[i].pin_memory())
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
 
     def compress(self) -> Self:
-        self.label = self.label.to(torch.int16)
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.to(torch.int16)
+        inputs = []
+        guides = []
         for i in range(self.num_structures):
-            self.inputs[i] = self.inputs[i].to(torch.int16)
-            self.guides[i] = self.guides[i].compress()
-        return self
+            inputs.append(self.inputs[i].to(torch.int16))
+            guides.append(self.guides[i].compress())
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
 
     def decompress(self) -> Self:
-        self.label = self.label.to(torch.int64)
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.to(torch.int64)
+        inputs = []
+        guides = []
         for i in range(self.num_structures):
-            self.inputs[i] = self.inputs[i].to(torch.int32)
-            self.guides[i] = self.guides[i].decompress()
-        return self
+            inputs.append(self.inputs[i].to(torch.int32))
+            guides.append(self.guides[i].decompress())
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
 
 
 class HSample(_HSampleOrSamples[SemanticGuide]):
