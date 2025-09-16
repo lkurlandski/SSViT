@@ -441,34 +441,32 @@ class Trainer:
         batch: FOrHSamples
         padbatch = self.padbatch
 
+        procdev = self.device   # "cpu"
+        procgrp = None          # _METRICS_PG
+
         with torch.no_grad():
             while True:
                 # Get the next batch of data or padbatch if this rank is out of data.
                 try:
                     mini_step, batch = next(iterable)
-                    has_local = torch.tensor([1], dtype=torch.int32, device="cpu")
+                    has_local = torch.tensor([1], dtype=torch.int32, device=procdev)
                     padbatch = batch.clone() if mini_step == 0 and padbatch is None else padbatch
                     real = 1.0
                 except StopIteration:
                     if padbatch is None:
                         raise RuntimeError("This rank has no data and we could not create a dummy batch.")
                     mini_step, batch = mini_step + 1, padbatch
-                    has_local = torch.tensor([0], dtype=torch.int32, device="cpu")
+                    has_local = torch.tensor([0], dtype=torch.int32, device=procdev)
                     real = 0.0
                 print(f"[Worker {rank()}] Trainer::evaluate {mini_step=} {real=}")  # FIXME: remove
                 # If all ranks are out of data, all ranks should stop.
                 if world_size() > 1:
                     has_any = has_local.clone()
-                    dist.all_reduce(has_any, op=dist.ReduceOp.SUM, group=_METRICS_PG)
+                    dist.all_reduce(has_any, op=dist.ReduceOp.SUM, group=procgrp)
                     if int(has_any[0].item()) == 0:
                         break
                 # Run the inputs through the model, but only count the metrics if this rank has real data.
-                hb = torch.tensor(1, device="cpu")
-                torch.distributed.all_reduce(hb, group=_METRICS_PG)
-                print(f"[Worker {rank()}] Trainer::evaluate hb passed")  # FIXME: remove
                 outputs = self.forward(batch)
-                torch.distributed.all_reduce(hb, group=_METRICS_PG)
-                print(f"[Worker {rank()}] Trainer::evaluate hb returned")  # FIXME: remove
                 loss = self.compute_loss(batch, outputs)
                 metrics = self.compute_metrics(batch, outputs)
                 results["vl_loss"] += loss * len(batch) * real
@@ -481,17 +479,17 @@ class Trainer:
 
         print(f"[Worker {rank()}] Trainer::evaluate synchronizing...")  # FIXME: remove
         if is_dist():
-            vals = torch.empty((len(results) + 1,), dtype=torch.float64, device="cpu")
+            vals = torch.empty((len(results) + 1,), dtype=torch.float64, device=procdev)
             vals[0] = num_samples
             keys = sorted(results.keys())
             for i, k in enumerate(keys, start=1):
                 vals[i] = results[k].detach()
             print(f"[Worker {rank()}] Trainer::evaluate checking")  # FIXME: remove
             sizes = [None] * torch.distributed.get_world_size()
-            dist.all_gather_object(sizes, 1 + len(keys), group=_METRICS_PG)
+            dist.all_gather_object(sizes, 1 + len(keys), group=procgrp)
             assert len(set(sizes)) == 1
             print(f"[Worker {rank()}] Trainer::evaluate reducing")  # FIXME: remove
-            dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=_METRICS_PG)
+            dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=procgrp)
             num_samples = int(vals[0].item())
             for i, k in enumerate(keys, start=1):
                 results[k] = vals[i]
