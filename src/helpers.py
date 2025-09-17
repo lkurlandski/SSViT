@@ -18,6 +18,7 @@ from typing import Union
 from typing import get_type_hints
 from typing import get_args
 from typing import get_origin
+import warnings
 
 import torch
 
@@ -92,6 +93,8 @@ class MainArgs:
         self.pin_memory = self.pin_memory and self.device.type == "cuda"
         self.num_streams = 0 if self.device.type == "cpu" else self.num_streams
         self.prefetch_factor = max(1, self.prefetch_factor) if self.num_workers > 0 else 0
+        if self.fsdp:
+            warnings.warn("The Trainer::evaluate method currently hangs with FSDP modules.")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:

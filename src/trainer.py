@@ -303,7 +303,7 @@ class Trainer:
         self.scheduler = scheduler if scheduler is not None else LambdaLR(optimizer, lambda _: 1.0)
         self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
         self.device = device if device is not None else next(self.model.parameters()).device
-        self.padbatch = padbatch.clone().to(self.device) if padbatch is not None else None
+        self.padbatch = padbatch.to(self.device) if padbatch is not None else None
         self.monitor = Monitor(device=self.device)
         self.log: list[Mapping[str, int | float]] = []
         self.best_epoch = -1
@@ -384,7 +384,6 @@ class Trainer:
         mini_step = -1
         with maybe_join(self.model):
             for mini_step, batch in iterable:
-                print(f"[Worker {rank()}] Trainer::train {mini_step=}")  # FIXME: remove
                 sync_gradients = (mini_step + 1) % self.args.gradient_accumulation_steps == 0
 
                 # Compute normalized loss
@@ -426,6 +425,18 @@ class Trainer:
         return report
 
     def evaluate(self) -> dict[str, float]:
+        """
+        Evaluate the model.
+
+        NOTE: this does not work with FSDP models and will deadlock/hang.
+
+        We use a padding-batch approach to keep every distributed worker occupied for the same
+        number of batches, even if some workers have less validation data than others. This helps
+        prevent deadlocks under certain distributed conditions. For DDP, the much simpler approach is
+        to simply extract the model from the DDP wrapper and use that to conduct validation. This doesn't
+        really work for FSDP, however, so this padding-batch approach was deviced. Unfortunately, it
+        still doesn't work for FSDP and FSDP models will hang/deadlock when communicating across workers.
+        """
         t_0 = time.time()
 
         self.model.eval()
@@ -441,8 +452,8 @@ class Trainer:
         batch: FOrHSamples
         padbatch = self.padbatch
 
-        procdev = self.device   # "cpu"
-        procgrp = None          # _METRICS_PG
+        procdev = torch.device("cpu")
+        procgrp = _METRICS_PG
 
         with torch.no_grad():
             while True:
@@ -458,7 +469,6 @@ class Trainer:
                     mini_step, batch = mini_step + 1, padbatch
                     has_local = torch.tensor([0], dtype=torch.int32, device=procdev)
                     real = 0.0
-                print(f"[Worker {rank()}] Trainer::evaluate {mini_step=} {real=}")  # FIXME: remove
                 # If all ranks are out of data, all ranks should stop.
                 if world_size() > 1:
                     has_any = has_local.clone()
@@ -474,26 +484,23 @@ class Trainer:
                     results[f"vl_{k}"] += metrics[k] * len(batch) * real
                 num_samples += len(batch) * int(real)
 
-        if mini_step < 0:
-            warnings.warn("No validation mini-steps were taken, the training dataset may be empty.")
-
-        print(f"[Worker {rank()}] Trainer::evaluate synchronizing...")  # FIXME: remove
+        # Aggregate results across workers
         if is_dist():
+            # Values to aggregate
             vals = torch.empty((len(results) + 1,), dtype=torch.float64, device=procdev)
             vals[0] = num_samples
             keys = sorted(results.keys())
             for i, k in enumerate(keys, start=1):
                 vals[i] = results[k].detach()
-            print(f"[Worker {rank()}] Trainer::evaluate checking")  # FIXME: remove
+            # Verify all ranks have the same keys
             sizes = [None] * torch.distributed.get_world_size()
             dist.all_gather_object(sizes, 1 + len(keys), group=procgrp)
             assert len(set(sizes)) == 1
-            print(f"[Worker {rank()}] Trainer::evaluate reducing")  # FIXME: remove
+            # Sum-reduce values
             dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=procgrp)
             num_samples = int(vals[0].item())
             for i, k in enumerate(keys, start=1):
                 results[k] = vals[i]
-        print(f"[Worker {rank()}] Trainer::evaluate normalizing...")  # FIXME: remove
 
         # Normalize metrics by number of samples
         num_samples = max(num_samples, 1)

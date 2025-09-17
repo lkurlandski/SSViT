@@ -4,6 +4,7 @@ Train and validate models.
 
 from collections.abc import Sequence
 from collections import Counter
+from copy import deepcopy
 from hashlib import md5
 import math
 import os
@@ -59,6 +60,9 @@ from src.binanal import HierarchicalLevel
 from src.binanal import CharacteristicGuider
 from src.binanal import LEVEL_STRUCTURE_MAP
 from src.binanal import HierarchicalStructure
+from src.binanal import CharacteristicGuider
+from src.data import SemanticGuides
+from src.data import StructureMaps
 from src.data import BinaryDataset
 from src.data import BaseSimpleDBDataset
 from src.data import MappingSimpleDBDataset
@@ -94,6 +98,7 @@ from src.trainer import rank
 from src.trainer import local_world_size
 from src.trainer import world_size
 from src.trainer import mp_dtype
+from src.trainer import init_metrics_group
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
 from src.utils import count_parameters
@@ -301,6 +306,43 @@ def get_streamer(loader: DataLoader, device: torch.device, num_streams: int) -> 
     return streamer
 
 
+def get_padbatch(level: HierarchicalLevel, do_parse: bool,do_entropy: bool, do_characteristics: bool, min_lengths: list[int], batch_size: int) -> FSamples | HSamples:
+    """Return a short batch of purely padding samples."""
+    from src.data import Name
+    file = ["./" + "0" * 64] * batch_size
+    name = [Name("0" * 64)] * batch_size
+    label = torch.zeros(batch_size, dtype=torch.int64)
+
+    def get_inputs(length: int) -> torch.Tensor:
+        return torch.zeros((batch_size, length), dtype=torch.int32)
+
+    def get_guides(length: int) -> SemanticGuides:
+        parse = torch.zeros((batch_size, length), dtype=torch.float32) if do_parse else None
+        entropy = torch.zeros((batch_size, length), dtype=torch.float32) if do_entropy else None
+        characteristics = torch.zeros((batch_size, length, CharacteristicGuider.CHARACTERISTICS), dtype=torch.float32) if do_characteristics else None
+        return SemanticGuides(parse, entropy, characteristics)
+
+    def get_structure() -> StructureMaps:
+        index: list[list[tuple[int, int]]] = [[] for _ in LEVEL_STRUCTURE_MAP[level]]
+        lexicon = {}
+        for i, s in enumerate(LEVEL_STRUCTURE_MAP[level]):
+            index[i] = [(0, min_lengths[i])]
+            lexicon[i] = s
+        index = [deepcopy(index) for _ in range(batch_size)]
+        return StructureMaps(index, lexicon)
+
+    structure = get_structure()
+
+    if level == HierarchicalLevel.NONE:
+        inputs = get_inputs(min_lengths[0])
+        guides = get_guides(min_lengths[0])
+        return FSamples(file, name, label, inputs, guides, structure)  # type: ignore[arg-type]
+
+    inputs_ = [get_inputs(l) for l in min_lengths]
+    guides_ = [get_guides(l) for l in min_lengths]
+    return HSamples(file, name, label, inputs_, guides_, structure)  # type: ignore[arg-type]
+
+
 def main() -> None:
 
     lief.logging.set_level(lief.logging.LEVEL.OFF)
@@ -320,6 +362,7 @@ def main() -> None:
         dist.init_process_group(backend=backend)
         torch.cuda.set_device(local_rank())
         args.device = torch.device(local_rank())
+        init_metrics_group()
         print(f"Distrubted worker {rank()} of {world_size()} with local rank {local_rank()}.")
 
     if args.tf32:
@@ -506,7 +549,10 @@ def main() -> None:
     stopper: Optional[EarlyStopper] = None
     print(f"{stopper=}")
 
-    trainer = Trainer(TrainerArgs.from_dict(args.to_dict()), model, tr_streamer, vl_streamer, loss_fn, optimizer, scheduler, stopper, args.device)
+    padbatch = get_padbatch(args.level, args.do_parser, args.do_entropy, args.do_characteristics, min_lengths, args.vl_batch_size)
+    print(f"{padbatch=}")
+
+    trainer = Trainer(TrainerArgs.from_dict(args.to_dict()), model, tr_streamer, vl_streamer, loss_fn, optimizer, scheduler, stopper, args.device, padbatch)
     print(f"{trainer=}")
 
     trainer()
@@ -517,4 +563,6 @@ if __name__ == "__main__":
         main()
     finally:
         if dist.is_initialized():
+            print(f"[rank {rank()}] Destroying process group")
             dist.destroy_process_group()
+            print(f"[rank {rank()}] Process group destroyed")
