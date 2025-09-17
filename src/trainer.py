@@ -224,6 +224,7 @@ class Trainer:
         self.log: list[Mapping[str, int | float]] = []
         self.best_epoch = -1
         self.best_metric = -float("inf") if args.lower_is_worse else float("inf")
+        self.glbl_step = -1
 
     def __repr__(self) -> str:
         return str(self)
@@ -247,6 +248,7 @@ class Trainer:
         shutil.rmtree(self.args.outdir, ignore_errors=True)
         self.args.outdir.mkdir(parents=True, exist_ok=True)
         self.monitor.start()
+        self.glbl_step = 0
 
         tr_report  = {"tr_loss": float("nan"), "tr_time": float("nan")}
         tr_report |= {f"tr_{k}": float("nan") for k, _ in self.monitor.get_report(clear=True).items()}
@@ -283,23 +285,36 @@ class Trainer:
         return self
 
     def train(self) -> dict[str, float]:
+        """
+        Train the model for one epoch.
+        """
         t_0 = time.time()
 
         self.optimizer.zero_grad()
         self.model.train()
+        scaler = GradScaler(self.device.type, enabled=mp_dtype(self.args.mp16, self.device) == torch.float16)
+
         dataloader = self.tr_loader
         iterable: Iterable[tuple[int, FOrHSamples]] = enumerate(dataloader)
         iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
-
-        num_samples = 0
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
 
-        scaler = GradScaler(self.device.type, enabled=mp_dtype(self.args.mp16, self.device) == torch.float16)
+        locl_step = 0   # local step within this epoch
+        mini_step = -1  # mini-step within this epoch
+        def step() -> None:
+            """Update the model parameters."""
+            nonlocal locl_step
+            scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
+            scaler.step(self.optimizer)
+            scaler.update()
+            self.optimizer.zero_grad()
+            locl_step += 1
+            self.glbl_step += 1
 
-        step = 0
-        mini_step = -1
         with maybe_join(self.model):
             for mini_step, batch in iterable:
+                results["num_samples"] += len(batch)
                 sync_gradients = (mini_step + 1) % self.args.gradient_accumulation_steps == 0
 
                 # Compute normalized loss
@@ -311,28 +326,23 @@ class Trainer:
 
                 # Update model weights
                 if sync_gradients:
-                    scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
-                    scaler.step(self.optimizer)
-                    scaler.update()
-                    self.optimizer.zero_grad()
-                    step += 1
-
-                num_samples += len(batch)
+                    step()
 
         if mini_step < 0:
-            warnings.warn("No training mini-steps were taken, the training dataset may be empty.")
-            num_samples = max(num_samples, 1)
+            raise RuntimeError(f"[rank {rank()}] empty dataloader.")
 
         # Update weights if there are remaining gradients
         if mini_step > 0 and (mini_step + 1) % self.args.gradient_accumulation_steps != 0:
-            scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
-            scaler.step(self.optimizer)
-            scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
+            step()
 
-        # Average statistics over epoch
+        # Aggregate results across workers and/or move to CPU
+        if is_dist():
+            results = self.reduce_results(results)
+        else:
+            results = {k: results[k].detach().to("cpu") for k in results}
+        num_samples = int(results.pop("num_samples").item())
+
+        # Average statistics over total number of samples
         report = {}
         for k in results:
             report[k] = results[k].item() / num_samples
@@ -342,26 +352,20 @@ class Trainer:
 
     def evaluate(self) -> dict[str, float]:
         """
-        Evaluate the model.
+        Evaluate the model on the validation set.
 
-        NOTE: this does not work with FSDP models and will deadlock/hang.
-
-        We use a padding-batch approach to keep every distributed worker occupied for the same
-        number of batches, even if some workers have less validation data than others. This helps
-        prevent deadlocks under certain distributed conditions. For DDP, the much simpler approach is
-        to simply extract the model from the DDP wrapper and use that to conduct validation. This doesn't
-        really work for FSDP, however, so this padding-batch approach was deviced. Unfortunately, it
-        still doesn't work for FSDP and FSDP models will hang/deadlock when communicating across workers.
+        NOTE: We use a padding-batch strategy so each worker performs the same number of forward passes.
+        This helps prevent deadlocks and hanging. Unfortunately, this still does not work with FSDP models.
         """
         t_0 = time.time()
 
         self.model.eval()
+
         dataloader = self.vl_loader
         iterable: Iterable[tuple[int, FOrHSamples]] = enumerate(dataloader)
         iterable = tqdm(iterable, "Validating...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
         iterable = iter(iterable)
 
-        num_samples = 0
         mini_step = -1
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
 
@@ -392,34 +396,25 @@ class Trainer:
                     if int(has_any[0].item()) == 0:
                         break
                 # Run the inputs through the model, but only count the metrics if this rank has real data.
+                results["num_samples"] += len(batch) * int(real)
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 metrics = self.compute_metrics(batch, outputs)
                 results["vl_loss"] += loss * len(batch) * real
                 for k in metrics:
                     results[f"vl_{k}"] += metrics[k] * len(batch) * real
-                num_samples += len(batch) * int(real)
 
-        # Aggregate results across workers
+        if mini_step < 0:
+            raise RuntimeError(f"[rank {rank()}] empty dataloader.")
+
+        # Aggregate results across workers and/or move to CPU
         if is_dist():
-            # Values to aggregate
-            vals = torch.empty((len(results) + 1,), dtype=torch.float64, device=procdev)
-            vals[0] = num_samples
-            keys = sorted(results.keys())
-            for i, k in enumerate(keys, start=1):
-                vals[i] = results[k].detach()
-            # Verify all ranks have the same keys
-            sizes = [None] * torch.distributed.get_world_size()
-            dist.all_gather_object(sizes, 1 + len(keys), group=procgrp)
-            assert len(set(sizes)) == 1
-            # Sum-reduce values
-            dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=procgrp)
-            num_samples = int(vals[0].item())
-            for i, k in enumerate(keys, start=1):
-                results[k] = vals[i]
+            results = self.reduce_results(results)
+        else:
+            results = {k: results[k].detach().to("cpu") for k in results}
+        num_samples = int(results.pop("num_samples").item())
 
-        # Normalize metrics by number of samples
-        num_samples = max(num_samples, 1)
+        # Average statistics over total number of samples
         report = {}
         for k in results:
             report[k] = results[k].item() / num_samples
@@ -439,7 +434,25 @@ class Trainer:
         Compute the loss over a batch of examples.
         """
         with torch.autocast(self.device.type, dtype=mp_dtype(self.args.mp16, self.device), enabled=self.args.mp16):
-            return self.loss_fn.forward(outputs, batch.label)
+            return self.loss_fn(outputs, batch.label)
+
+    def reduce_results(self, results: dict[str, Tensor], check: bool = True) -> dict[str, Tensor]:
+        """
+        Reduce the results dictionary across all distributed ranks using a separate CPU process group.
+        """
+        # Verify all ranks have the same keys
+        keys = sorted(results.keys())
+        if check:
+            sizes = [None] * world_size()
+            dist.all_gather_object(sizes, len(keys), group=_METRICS_PG)
+            if len(set(sizes)) != 1:
+                raise RuntimeError(f"Metrics keys do not match across ranks. Detected key sets with sizes: {sizes}.")
+        # Sum-reduce values across workers
+        vals = torch.empty((len(results)), dtype=torch.float64, device="cpu")
+        for i, k in enumerate(keys):
+            vals[i] = results[k].detach()
+        dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=_METRICS_PG)
+        return {k: vals[i] for i, k in enumerate(keys)}
 
     def compute_metrics(self, batch: FOrHSamples, outputs: Tensor) -> dict[str, Tensor]:
         """
