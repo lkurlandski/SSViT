@@ -66,20 +66,24 @@ from src.data import FOrHSamples
 
 
 def is_dist() -> bool:
+    """Return True if in a distributed training environment else False."""
     return bool(dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1)
 
 
 def local_rank() -> int:
+    """Return the node-local rank of the current process."""
     return int(os.environ.get("LOCAL_RANK", 0))
 
 
 def rank() -> int:
+    """Return the global rank of the current process."""
     if is_dist():
         return int(dist.get_rank())
     return 0
 
 
 def local_world_size() -> int:
+    """Return the node-local world size."""
     if "LOCAL_WORLD_SIZE" in os.environ:
         # Works when checking within subprocesses.
         return int(os.environ["LOCAL_WORLD_SIZE"])
@@ -89,35 +93,24 @@ def local_world_size() -> int:
 
 
 def world_size() -> int:
+    """Return the global world size."""
     if dist.is_initialized():
         return int(dist.get_world_size())
     return 1
 
 
 def maybe_join(model: Module, join: bool = True) -> ContextManager[None] | Join:
-    """
-    Returns a Join context if in distributed the model is Joinable, else a no-op context.
-
-    This is particularily helpful for distributed workers processing different amounts of data.
-    """
+    """Return a Join context if in distributed the model is Joinable, else a no-op context."""
     if join and is_dist() and isinstance(model, Joinable):
         return Join([model])
     return contextlib.nullcontext()
 
 
 def maybe_no_sync(model: Module, sync_now: bool) -> ContextManager[None]:
-    """
-    Returns a no_sync context if in distributed and the model has a no_sync method, else a no-op context.
-    """
+    """Return a no_sync context if in distributed and the model has a no_sync method, else a no-op context."""
     if not is_dist() or sync_now or not hasattr(model, "no_sync"):
         return contextlib.nullcontext()
     return model.no_sync()  # type: ignore[no-any-return]
-
-
-def cpu_rendezvous() -> None:
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        t = torch.ones(1, dtype=torch.int64)   # CPU tensor ⇒ Gloo on composable backends
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)  # acts as a barrier/rendezvous
 
 
 _METRICS_PG: Optional[dist.ProcessGroup] = None
@@ -130,10 +123,6 @@ def init_metrics_group() -> None:
         return
     _METRICS_PG = dist.new_group(ranks=list(range(world_size())), backend="gloo")
     dist.barrier(group=_METRICS_PG)
-
-
-FTensor = Union[BFloat16Tensor | HalfTensor | FloatTensor | DoubleTensor]
-ITensor = Union[CharTensor | ByteTensor | ShortTensor | IntTensor | LongTensor]
 
 
 @dataclass
@@ -187,78 +176,6 @@ class EarlyStopper:
             return False
         self.count += 1
         return self.count >= self.patience
-
-
-def find_executable_batch_size(
-    function: Optional[Callable[[int, int], Any]] = None,
-    starting_batch_size: int = -1,
-    starting_gradient_accumulation_steps: int = 1,
-) -> Callable[[int, int], Any]:
-    """Rerun a function with a smaller mini batch size if an OOM error is encountered.
-    """
-
-    if function is None:
-        return partial(
-            find_executable_batch_size,
-            starting_batch_size=starting_batch_size,
-            starting_gradient_accumulation_steps=starting_gradient_accumulation_steps,
-        )
-
-    batch_size = starting_batch_size
-    gradient_accumulation_steps = starting_gradient_accumulation_steps
-
-
-    def should_reduce_batch_size(exception: Exception) -> bool:
-        statements = [
-            "CUDA out of memory.",
-            "cuDNN error: CUDNN_STATUS_NOT_SUPPORTED.",
-            "DefaultCPUAllocator: can't allocate memory",
-            "CUDA error: an illegal memory access was encountered",
-            "Triton Error [CUDA]: an illegal memory access was encountered",
-            "CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`",
-        ]
-        if isinstance(exception, RuntimeError) and len(exception.args) == 1:
-            return any(err in exception.args[0] for err in statements)
-        return False
-
-
-    def decorator(*args: Any, **kwds: Any) -> Any:
-        nonlocal batch_size, gradient_accumulation_steps
-
-        function: Callable[[int, int], Any]
-
-        gc.collect()
-        torch.cuda.empty_cache()
-        params = list(inspect.signature(function).parameters.keys())
-
-        # Guard against user error
-        if len(params) < (len(args) + 1):
-            arg_str = ", ".join([f"{arg}={value}" for arg, value in zip(params[1:], args[1:])])
-            raise TypeError(
-                f"Batch size was passed into `{function.__name__}` as the first argument when called."
-                f"Remove this as the decorator already does so: `{function.__name__}({arg_str})`"
-            )
-
-        while True:
-            if batch_size == 0:
-                raise RuntimeError("No executable batch size found, reached zero.")
-
-            try:
-                return function(batch_size, gradient_accumulation_steps, *args, **kwds)
-            except Exception as e:
-                if should_reduce_batch_size(e):
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    batch_size //= 2
-                    gradient_accumulation_steps *= 2
-                else:
-                    raise
-
-    return decorator
-
-
-def pformat_dict(d: Mapping[str, int | float]) -> dict[str, str]:
-    return {k: f"{v:.3f}" if isinstance(v, float) else f"{v}" for k, v in d.items()}
 
 
 def mp_dtype(mp16: bool, device: torch.device) -> torch.dtype:
@@ -511,21 +428,21 @@ class Trainer:
 
         return report
 
-    def forward(self, batch: FOrHSamples) -> FTensor:
+    def forward(self, batch: FOrHSamples) -> Tensor:
         """
         Send a batch of inputs forward through the model.
         """
         with torch.autocast(self.device.type, dtype=mp_dtype(self.args.mp16, self.device), enabled=self.args.mp16):
             return self.model(batch.inputs, batch.characteristics)
 
-    def compute_loss(self, batch: FOrHSamples, outputs: FTensor) -> FTensor:
+    def compute_loss(self, batch: FOrHSamples, outputs: Tensor) -> Tensor:
         """
         Compute the loss over a batch of examples.
         """
         with torch.autocast(self.device.type, dtype=mp_dtype(self.args.mp16, self.device), enabled=self.args.mp16):
             return self.loss_fn.forward(outputs, batch.label)
 
-    def compute_metrics(self, batch: FOrHSamples, outputs: FTensor) -> dict[str, Tensor]:
+    def compute_metrics(self, batch: FOrHSamples, outputs: Tensor) -> dict[str, Tensor]:
         """
         Compute the validation metrics over a set of examples.
 
