@@ -1236,10 +1236,15 @@ class CollateFnHierarchical:
 
 
 class CUDAPrefetcher:
+    """
+    A DataLoader wrapper that prefetches batches to a CUDA device using multiple streams.
+    """
 
     def __init__(self, loader: DataLoader, device: torch.device, num_streams: int) -> None:
         if num_streams > 0 and (device.type != "cuda" or not torch.cuda.is_available()):
             raise ValueError(f"{self.__class__.__name__} with num_streams > 0 requires a CUDA device.")
+        if os.environ.get("TORCH_NCCL_BLOCKING_WAIT") == "1":
+            warnings.warn("TORCH_NCCL_BLOCKING_WAIT=1 may cause unexpected crashes with CUDAPrefetcher. Consider unsetting it.")
 
         self.loader = loader
         self.device = device
