@@ -85,7 +85,6 @@ def rank() -> int:
 def local_world_size() -> int:
     """Return the node-local world size."""
     if "LOCAL_WORLD_SIZE" in os.environ:
-        # Works when checking within subprocesses.
         return int(os.environ["LOCAL_WORLD_SIZE"])
     if is_dist():
         return int(torch.cuda.device_count())
@@ -217,7 +216,7 @@ class Trainer:
         self.vl_loader = vl_loader
         self.loss_fn = loss_fn
         self.optimizer = optimizer if optimizer is not None else AdamW(model.parameters())
-        self.scheduler = scheduler if scheduler is not None else LambdaLR(optimizer, lambda _: 1.0)
+        self.scheduler = scheduler if scheduler is not None else LambdaLR(self.optimizer, lambda _: 1.0)
         self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
         self.device = device if device is not None else next(self.model.parameters()).device
         self.padbatch = padbatch.to(self.device) if padbatch is not None else None
@@ -496,30 +495,7 @@ class Trainer:
             self.best_metric = results[self.args.metric]
 
     def _update_save(self, results: Mapping[str, int | float]) -> None:
-        # TODO: figure out how to save and load properly (FSDP/DDP/GPU/CPU).
-        return
-        if local_rank() == 0:
-            state_dict = {
-                "model": self.model,
-                "optimizer": self.optimizer,
-                "scheduler": self.scheduler,
-            }
-            checkpoint_id = str(self.args.outdir / f"ckpt_{results['epoch']}")
-            print(f"[rank{dist.get_rank()}] Trainer::_update_save: saving to checkpoint.")
-            dist_checkpoint.save(state_dict=state_dict, checkpoint_id=checkpoint_id)
-
-        if dist.is_initialized():
-            print(f"[rank{dist.get_rank()}] Trainer::_update_save: synchronizing workers.")
-            if "nccl" in dist.get_backend():
-                dist.barrier(device_ids=[local_rank()])
-            else:
-                dist.barrier()
-
-        checkpoints = sorted(self.args.outdir.glob("model_*.pth"), key=lambda p: int(p.stem.split("_")[1]))
-        for checkpoint in checkpoints:
-            e = int(checkpoint.stem.split("_")[1])
-            if e not in (self.best_epoch, results["epoch"]):
-                checkpoint.unlink()
+        ...
 
 
 class Monitor:
