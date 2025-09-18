@@ -94,22 +94,24 @@ class Name(str):
 
 
 class _SemanticGuideOrSemanticGuides(ABC):
+    """
+    Semantic guides to acompany a byte stream.
 
-    # NOTE: compression/decompression with bitpacking will implicitly zero pad tensors to a multiple of 8.
-    # NOTE: the boolean tensors are converted to floating point internally, to prepare for learning.
+    Both `parse` and `characteristics` are boolean tensors, where True indicates the presence of a feature
+    and False indicates its absence. For compression and data transfer purposes, these can be stored as bitpacked
+    uint8 Tensors. If uint8, these are treated internally very differently for a variety of operations. For
+    learning, these are typically going to be converted to floating point Tensors, where False -> 0.0 and True -> 1.0.
 
-    parse: Optional[BoolTensor | ByteTensor | FloatTensor | HalfTensor | DoubleTensor]
-    entropy: Optional[HalfTensor | FloatTensor | DoubleTensor]
-    characteristics: Optional[BoolTensor | ByteTensor | HalfTensor | FloatTensor | DoubleTensor]
+    NOTE: compression/decompression with bitpacking will implicitly zero pad tensors to a multiple of 8.
+
+    `entropy` is a floating point Tensor, typically float16 for compression and data transfer, and float32 for learning.
+    """
+
+    parse: Optional[Tensor]
+    entropy: Optional[Tensor]
+    characteristics: Optional[Tensor]
 
     def __init__(self, parse: Optional[Tensor], entropy: Optional[Tensor], characteristics: Optional[Tensor]) -> None:
-        if parse is not None and parse.dtype not in (torch.bool, torch.uint8):
-            raise TypeError(f"Expected parse to be bool or uint8, got {parse.dtype}")
-        if entropy is not None and entropy.dtype not in (torch.float16, torch.float32, torch.float64):
-            raise TypeError(f"Expected entropy to be float16, float32, or float64, got {entropy.dtype}")
-        if characteristics is not None and characteristics.dtype not in (torch.bool, torch.uint8):
-            raise TypeError(f"Expected characteristics to be bool or uint8, got {characteristics.dtype}")
-
         self.parse = parse
         self.entropy = entropy
         self.characteristics = characteristics
