@@ -5,6 +5,7 @@ Train and validate models.
 from collections.abc import Sequence
 from collections import Counter
 from copy import deepcopy
+from functools import partial
 from hashlib import md5
 import math
 import os
@@ -70,6 +71,7 @@ from src.data import IterableSimpleDBDataset
 from src.data import CollateFn
 from src.data import CollateFnHierarchical
 from src.data import CUDAPrefetcher
+from src.data import Name
 from src.data import Preprocessor
 from src.data import GroupedLengthBatchSampler
 from src.data import ShardAwareBatchSampler
@@ -255,6 +257,25 @@ def get_model(
     raise NotImplementedError(f"{level} {arch}")
 
 
+def wrap_model_base(model: Module, device: torch.device) -> Module:
+    model = model.to(device)
+    return model
+
+
+def wrap_model_ddp(model: Module, device: torch.device, static_graph: bool) -> Module:
+    model = model.to(device)
+    model = DistributedDataParallel(model, static_graph=static_graph)
+    return model
+
+
+def wrap_model_fsdp(model: Module, mpdtype: torch.dtype, fsdp_offload: bool) -> Module:
+    mesh = init_device_mesh("cuda", (world_size(),))
+    mp_policy = MixedPrecisionPolicy(mpdtype)
+    offload_policy = CPUOffloadPolicy() if fsdp_offload else OffloadPolicy()
+    model.fully_shard(mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+    return model
+
+
 def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int]) -> CollateFn | CollateFnHierarchical:
     if level == HierarchicalLevel.NONE:
         return CollateFn(False, False, min_lengths[0])
@@ -308,7 +329,6 @@ def get_streamer(loader: DataLoader, device: torch.device, num_streams: int) -> 
 
 def get_padbatch(level: HierarchicalLevel, do_parse: bool,do_entropy: bool, do_characteristics: bool, min_lengths: list[int], batch_size: int) -> FSamples | HSamples:
     """Return a short batch of purely padding samples."""
-    from src.data import Name
     file = ["./" + "0" * 64] * batch_size
     name = [Name("0" * 64)] * batch_size
     label = torch.zeros(batch_size, dtype=torch.int64)
@@ -317,10 +337,10 @@ def get_padbatch(level: HierarchicalLevel, do_parse: bool,do_entropy: bool, do_c
         return torch.zeros((batch_size, length), dtype=torch.int32)
 
     def get_guides(length: int) -> SemanticGuides:
-        parse = torch.zeros((batch_size, length), dtype=torch.float32) if do_parse else None
+        parse = torch.zeros((batch_size, length), dtype=torch.bool) if do_parse else None
         entropy = torch.zeros((batch_size, length), dtype=torch.float32) if do_entropy else None
-        characteristics = torch.zeros((batch_size, length, CharacteristicGuider.CHARACTERISTICS), dtype=torch.float32) if do_characteristics else None
-        return SemanticGuides(parse, entropy, characteristics)
+        characteristics = torch.zeros((batch_size, length, len(CharacteristicGuider.CHARACTERISTICS)), dtype=torch.bool) if do_characteristics else None
+        return SemanticGuides(parse, entropy, characteristics).decompress()
 
     def get_structure() -> StructureMaps:
         index: list[list[tuple[int, int]]] = [[] for _ in LEVEL_STRUCTURE_MAP[level]]
@@ -382,16 +402,14 @@ def main() -> None:
     print(f"{num_parameters=}")
     print(f"{min_length=}")
     print(f"{min_lengths=}")
+
     if args.ddp:
-        model = model.to(args.device)
-        model = DistributedDataParallel(model, static_graph=True)
+        wrap_model = partial(wrap_model_ddp, device=args.device, static_graph=True)
     elif args.fsdp:
-        mesh = init_device_mesh("cuda", (world_size(),))
-        mp_policy = MixedPrecisionPolicy(mpdtype)
-        offload_policy = CPUOffloadPolicy() if args.fsdp_offload else OffloadPolicy()
-        model.fully_shard(mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+        wrap_model = partial(wrap_model_fsdp, mpdtype=mpdtype, fsdp_offload=args.fsdp_offload)
     else:
-        model = model.to(args.device)
+        wrap_model = partial(wrap_model_base, device=args.device)
+    print(f"{wrap_model=}")
 
     preprocessor = Preprocessor(
         args.do_parser,
@@ -500,7 +518,7 @@ def main() -> None:
     if args.db_type == DBType.CHK:
         # TODO: design a sampler that only selects from the subset of idx, not the entire db; adjust the __len__ of the dataset accordingly.
         warnings.warn(f"Properly sample selection for {args.db_type} is not implemented yet.")
-        tr_sampler = ShardAwareBatchSampler(args.tr_batch_size, tr_db.size_df["shard"], tr_db.size_df["size"], tr_db.size_df["offset"], shuffle=True, seed=args.seed)
+        tr_sampler = ShardAwareBatchSampler(args.tr_batch_size, tr_db.size_df["shard"], tr_db.size_df["size"], tr_db.size_df["offset"], shuffle=True,  seed=args.seed)
         vl_sampler = ShardAwareBatchSampler(args.vl_batch_size, vl_db.size_df["shard"], vl_db.size_df["size"], vl_db.size_df["offset"], shuffle=False, seed=args.seed)
         ts_sampler = ShardAwareBatchSampler(args.ts_batch_size, ts_db.size_df["shard"], ts_db.size_df["size"], ts_db.size_df["offset"], shuffle=False, seed=args.seed)
     print(f"{tr_sampler=}")
@@ -536,6 +554,9 @@ def main() -> None:
     print(f"{tr_streamer=}")
     print(f"{vl_streamer=}")
     print(f"{ts_streamer=}")
+
+    model = wrap_model(model)
+    print(f"{model=}")
 
     loss_fn = CrossEntropyLoss()
     print(f"{loss_fn=}")
