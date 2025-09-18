@@ -1,5 +1,10 @@
 """
 Train and validation loops.
+
+TODO: update the Trainer class to maintain responsibility for wrapping models.
+ - Pass in model_init and optimizer_init Callables to the Trainer constructor.
+ - At each validation iteration, create a new model, set its state_dict, then wrap it.
+ - This should circumvent the issues with FSDP in the validation loop.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import json
 import math
 import os
 from pathlib import Path
+import pickle
 import shutil
 import threading
 import time
@@ -50,11 +56,13 @@ from torch.distributed import checkpoint as dist_checkpoint
 from torch.distributed.algorithms.join import Join
 from torch.distributed.algorithms.join import Joinable
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
+from torch.distributed.checkpoint.state_dict import set_model_state_dict
 from torch.distributed.checkpoint.state_dict import StateDictOptions
 from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.distributed.tensor import DTensor
 from torch.nn import Module
 from torch.nn.parallel import DistributedDataParallel
+from torch.nn.parallel import DataParallel
 from torch.optim import Optimizer
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LRScheduler
@@ -63,6 +71,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.data import FOrHSamples
+
+# TODO: Write a `Batch` Protocol instead of using FOrHSamples directly.
+# Currently, it must define __len__ (number of samples), .clone() (a deep copy),
+# .inputs (Tensor), .characteristics (Tensor|None), and .label (Tensor).
 
 
 def is_dist() -> bool:
@@ -192,9 +204,30 @@ def mp_dtype(mp16: bool, device: torch.device) -> torch.dtype:
     raise RuntimeError(f"Unsupported device for mixed precision: {device}.")
 
 
+def unwrapddp(model: Module) -> Module:
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
+
+
+def is_fsdp2(model: Module) -> bool:
+    return any(isinstance(p, DTensor) for p in model.parameters())
+
+
 class Trainer:
     """
     Trainer class for training models with PyTorch.
+
+    Parameters
+    ----------
+    epoch (int): this is the current number of completed epochs, i.e., it is incremented after train().
+        If starting from scratch, epoch is 0 at initialization. If you want to start training ON the i-th
+        epoch, set trainer.epoch = i - 1 before calling trainer().
+
+    Notes
+    -----
+    - If the GradScaler causes all optimization steps to be skipped, the LR scheduler will trigger a
+        warning that it was called before optimizer.step().
     """
 
     def __init__(
@@ -225,6 +258,7 @@ class Trainer:
         self.best_epoch = -1
         self.best_metric = -float("inf") if args.lower_is_worse else float("inf")
         self.glbl_step = -1
+        self.epoch = -1
 
     def __repr__(self) -> str:
         return str(self)
@@ -245,35 +279,41 @@ class Trainer:
         )
 
     def __call__(self) -> Self:
-        shutil.rmtree(self.args.outdir, ignore_errors=True)
         self.args.outdir.mkdir(parents=True, exist_ok=True)
         self.monitor.start()
-        self.glbl_step = 0
 
-        tr_report  = {"tr_loss": float("nan"), "tr_time": float("nan")}
-        tr_report |= {f"tr_{k}": float("nan") for k, _ in self.monitor.get_report(clear=True).items()}
-        vl_report  = self.evaluate()
-        vl_report |= {f"vl_{k}": v for k, v in self.monitor.get_report(clear=True).items()}
-        report  = {"epoch": 0, "lr": float("nan")}
-        report |= tr_report | vl_report
-        self._update_cons(report)
-        self._update_logs(report)
-        self._update_best(report)
-        self._update_save(report)
+        # NOTE: epoch and glbl_step are -1 at initialization, but may have been modified before __call__,
+        # especially by Trainer.from_checkpoint, which operates in presicely this manner.
+        self.epoch     = max(self.epoch, 0)
+        self.glbl_step = max(self.glbl_step, 0)
 
-        pbar = list(range(1, self.args.epochs + 1))
-        for epoch in pbar:
+        # Conduct an initial validation on the naked model before any training, if starting from epoch 0.
+        if self.epoch == 0:
+            tr_report  = {"tr_loss": float("nan"), "tr_time": float("nan")}
+            tr_report |= {f"tr_{k}": float("nan") for k, _ in self.monitor.get_report(clear=True).items()}
+            vl_report  = self.evaluate()
+            vl_report |= {f"vl_{k}": v for k, v in self.monitor.get_report(clear=True).items()}
+            report  = {"epoch": 0, "glbl_step": self.glbl_step, "lr": float("nan")}
+            report |= tr_report | vl_report
+            self._update_cons(report)
+            self._update_logs(report)
+            self._update_best(report)
+            self.to_checkpoint(self.args.outdir / f"checkpoint-{self.epoch}.pt")
+
+        # Conduct training/validation for the remaining epochs (`self.args.epochs`` in total).
+        for _ in range(self.args.epochs - self.epoch):
+            self.epoch += 1
             self.monitor.clear()
             tr_report  = self.train()
             tr_report |= {f"tr_{k}": v for k, v in self.monitor.get_report(clear=True).items()}
             vl_report  = self.evaluate()
             vl_report |= {f"vl_{k}": v for k, v in self.monitor.get_report(clear=True).items()}
-            report  = {"epoch": epoch, "lr": self.scheduler.get_last_lr()[0]}
+            report  = {"epoch": self.epoch, "glbl_step": self.glbl_step, "lr": self.scheduler.get_last_lr()[0]}
             report |= tr_report | vl_report
             self._update_cons(report)
             self._update_logs(report)
             self._update_best(report)
-            self._update_save(report)
+            self.to_checkpoint(self.args.outdir / f"checkpoint-{self.epoch}.pt")
             self.scheduler.step()
             if self.stopper is not None:
                 self.stopper.step(vl_report[self.args.metric])
@@ -384,6 +424,8 @@ class Trainer:
                     padbatch = batch.clone() if mini_step == 0 and padbatch is None else padbatch
                     real = 1.0
                 except StopIteration:
+                    if world_size() == 1:
+                        break
                     if padbatch is None:
                         raise RuntimeError("This rank has no data and we could not create a dummy batch.")
                     mini_step, batch = mini_step + 1, padbatch
@@ -458,8 +500,7 @@ class Trainer:
         """
         Compute the validation metrics over a set of examples.
 
-        NOTE: This method (summing over batches) may not be ideal for metrics that
-            may be more likely to be not-well defined on smaller sets of examples, e.g., F1.
+        FIXME: we need to compute the global tp, tn, fp, fn across all samples, then compute the metrics.
         """
         outputs = outputs.to(torch.float32)
         labels = batch.label
@@ -507,8 +548,115 @@ class Trainer:
             self.best_epoch = results["epoch"]  # type: ignore[assignment]
             self.best_metric = results[self.args.metric]
 
-    def _update_save(self, results: Mapping[str, int | float]) -> None:
-        ...
+    def to_checkpoint(self, file: Path) -> None:
+        if rank() != 0:
+            return
+
+        if is_fsdp2(self.model):
+            warnings.warn("Trainer::to_checkpoint does not save FSDP models' optimizer state across all ranks.")
+
+        payload = {
+            "args": pickle.dumps(self.args),
+            "log": pickle.dumps(self.log),
+            "best_epoch": self.best_epoch,
+            "best_metric": self.best_metric,
+            "epoch": self.epoch,
+            "glbl_step": self.glbl_step,
+            "model": get_model_state_dict(unwrapddp(self.model), options=StateDictOptions(full_state_dict=True, cpu_offload=True)),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+            "loss_fn": self.loss_fn.state_dict(),
+            "stopper": pickle.dumps(self.stopper),
+            "padbatch": self.padbatch,
+            "rng-cpu": torch.random.get_rng_state(),
+            "rng-gpu": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+
+        torch.save(payload, file)
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        file: str | Path,
+        model: Module,
+        tr_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
+        vl_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
+        loss_fn: Module,
+        optimizer: Optional[Optimizer] = None,
+        scheduler: Optional[LRScheduler] = None,
+        stopper: Optional[EarlyStopper] = None,
+        device: Optional[torch.device] = None,
+        padbatch: Optional[FOrHSamples] = None,
+    ) -> Trainer:
+        # NOTE: this will not create the optimizer for FSDP models properly.
+
+        if isinstance(model, (FullyShardedDataParallel, DistributedDataParallel, DataParallel)) or is_fsdp2(model):
+            raise RuntimeError("Trainer.from_checkpoint requires a non-distributed model instance.")
+
+        payload: dict[str, Any] = torch.load(file, map_location="cpu")
+
+        # These must match the default in the __init__ method
+        optimizer = optimizer if optimizer is not None else AdamW(model.parameters())
+        scheduler = scheduler if scheduler is not None else LambdaLR(optimizer, lambda _: 1.0)
+
+        # log, epoch, glbl_step, best_epoch, best_metric
+        log = pickle.loads(payload.pop("log"))
+        epoch = payload.pop("epoch")
+        glbl_step = payload.pop("glbl_step")
+        best_epoch = payload.pop("best_epoch")
+        best_metric = payload.pop("best_metric")
+
+        # model, optimzier
+        set_model_state_dict(model, payload.pop("model"))
+        optimizer.load_state_dict(payload.pop("optimizer"))
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(device if device is not None else next(model.parameters()).device)
+
+        # loss_fn, scheduler, stopper, padbatch
+        loss_fn.load_state_dict(payload.pop("loss_fn"))
+        scheduler.load_state_dict(payload.pop("scheduler"))
+        stopper = pickle.loads(payload.pop("stopper"))
+        padbatch = payload.pop("padbatch")
+
+        # rng-cpu, rng-gpu
+        rng_cpu = payload.pop("rng-cpu")
+        if rng_cpu is not None:
+            torch.random.set_rng_state(rng_cpu)
+        rng_gpu = payload.pop("rng-gpu")
+        if rng_gpu is not None:
+            if torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(rng_gpu)
+            else:
+                warnings.warn("Saved GPU state detected but CUDA is not available.")
+
+        # args
+        args: TrainerArgs = pickle.loads(payload.pop("args"))
+
+        # trainer
+        trainer = cls(
+            args,
+            model,
+            tr_loader,
+            vl_loader,
+            loss_fn,
+            optimizer,
+            scheduler,
+            stopper,
+            device,
+            padbatch,
+        )
+        trainer.epoch = epoch
+        trainer.glbl_step = glbl_step
+        trainer.best_epoch = best_epoch
+        trainer.best_metric = best_metric
+        trainer.log = log
+
+        if payload:
+            raise RuntimeError(f"Unexpected keys in checkpoint payload: {list(payload.keys())}.")
+
+        return trainer
 
 
 class Monitor:
