@@ -581,11 +581,14 @@ class Trainer:
             self.best_metric = results[self.args.metric]
 
     def to_checkpoint(self, file: Path) -> None:
-        if rank() != 0:
-            return
 
         if is_fsdp2(self.model):
-            warnings.warn("Trainer::to_checkpoint does not save FSDP models' optimizer state across all ranks.")
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            mstate = get_model_state_dict(self.model, options=options)
+            ostate = None
+        else:
+            mstate = unwrapddp(self.model).state_dict()
+            ostate = self.optimizer.state_dict()
 
         payload = {
             "args": pickle.dumps(self.args),
@@ -594,8 +597,8 @@ class Trainer:
             "best_metric": self.best_metric,
             "epoch": self.epoch,
             "glbl_step": self.glbl_step,
-            "model": get_model_state_dict(unwrapddp(self.model), options=StateDictOptions(full_state_dict=True, cpu_offload=True)),
-            "optimizer": self.optimizer.state_dict(),
+            "model": mstate,
+            "optimizer": ostate,
             "scheduler": self.scheduler.state_dict(),
             "loss_fn": self.loss_fn.state_dict(),
             "stopper": pickle.dumps(self.stopper),
@@ -604,7 +607,10 @@ class Trainer:
             "rng-gpu": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
 
-        torch.save(payload, file)
+        if rank() == 0:
+            torch.save(payload, file)
+        if is_dist():
+            dist.barrier(device_ids=[torch.cuda.current_device()])
 
     @classmethod
     def from_checkpoint(
