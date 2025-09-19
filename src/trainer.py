@@ -1,10 +1,5 @@
 """
 Train and validation loops.
-
-TODO: update the Trainer class to maintain responsibility for wrapping models.
- - Pass in model_init and optimizer_init Callables to the Trainer constructor.
- - At each validation iteration, create a new model, set its state_dict, then wrap it.
- - This should circumvent the issues with FSDP in the validation loop.
 """
 
 from __future__ import annotations
@@ -18,7 +13,9 @@ from dataclasses import dataclass
 import datetime
 from functools import partial
 import gc
+import hashlib
 import inspect
+import itertools
 import json
 import math
 import os
@@ -369,6 +366,15 @@ class Trainer:
         iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
 
+        # If FSDP pad the dataloader so all ranks have the same number of batches. For DDP, we can rely on Join.
+        if is_dist() and is_fsdp2(self.model):
+            assert self.padbatch is not None
+            length = torch.tensor(len(dataloader), device=self.device)
+            longest = length.clone()
+            dist.all_reduce(longest, op=dist.ReduceOp.MAX, group=None)
+            padding = itertools.repeat(self.padbatch, longest.item() - length.item())
+            iterable = itertools.chain(iterable, enumerate(padding, start=len(dataloader)))
+
         locl_step = 0   # local step within this epoch
         mini_step = -1  # mini-step within this epoch
         def step() -> None:
@@ -384,15 +390,17 @@ class Trainer:
 
         with maybe_join(self.model):
             for mini_step, batch in iterable:
-                results["num_samples"] += len(batch)
+                real = mini_step < len(dataloader)
+                results["num_samples"] += len(batch) * int(real)
                 sync_gradients = (mini_step + 1) % self.args.gradient_accumulation_steps == 0
 
                 # Compute normalized loss
                 with maybe_no_sync(self.model, sync_gradients):
                     outputs = self.forward(batch)
-                    loss = self.compute_loss(batch, outputs) / self.args.gradient_accumulation_steps
+                    loss = self.compute_loss(batch, outputs)
+                    loss = loss * int(real) / self.args.gradient_accumulation_steps
                     scaler.scale(loss).backward()
-                    results["tr_loss"] += loss.detach() * len(batch)
+                    results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
 
                 # Update model weights
                 if sync_gradients:
@@ -423,13 +431,6 @@ class Trainer:
     def evaluate(self) -> dict[str, float]:
         """
         Evaluate the model on the validation set.
-
-        NOTE: Metrics are computed locally per rank, then averaged across ranks. This is not technically
-        correct for metrics such as precision, but should be a close enough approximation when the validation
-        set is large and relatively balanced across ranks.
-
-        NOTE: We use a padding-batch strategy so each worker performs the same number of forward passes.
-        This helps prevent deadlocks and hanging. Unfortunately, this still does not work with FSDP models.
         """
         t_0 = time.time()
 
@@ -440,58 +441,41 @@ class Trainer:
         iterable = tqdm(iterable, "Validating...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
         iterable = iter(iterable)
 
+        # If distributed, pad the dataloader so all ranks have the same number of batches.
+        if is_dist():
+            assert self.padbatch is not None
+            length = torch.tensor(len(dataloader), device=self.device)
+            longest = length.clone()
+            dist.all_reduce(longest, op=dist.ReduceOp.MAX, group=None)
+            padding = itertools.repeat(self.padbatch, longest.item() - length.item())
+            iterable = itertools.chain(iterable, enumerate(padding, start=len(dataloader)))
+
         mini_step = -1
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
-        alllabels: list[Tensor] = []  # -1  indicates a padded batch
-        alllogits: list[Tensor] = []  # nan indicates a padded batch
-
-        batch: FOrHSamples
-        padbatch = self.padbatch
+        alllabels: list[Tensor] = []
+        alllogits: list[Tensor] = []
 
         with torch.no_grad():
-            while True:
-                # Get the next batch of data or padbatch if this rank is out of data.
-                try:
-                    mini_step, batch = next(iterable)
-                    has_local = torch.tensor([1], dtype=torch.int32, device=self.device)
-                    padbatch = batch.clone() if mini_step == 0 and padbatch is None else padbatch
-                    real = True
-                except StopIteration:
-                    if world_size() == 1:
-                        break
-                    if padbatch is None:
-                        raise RuntimeError("This rank has no data and we could not create a dummy batch.")
-                    mini_step, batch = mini_step + 1, padbatch
-                    has_local = torch.tensor([0], dtype=torch.int32, device=self.device)
-                    real = False
-                # If all ranks are out of data, all ranks should stop.
-                if world_size() > 1:
-                    has_any = has_local.clone()
-                    dist.all_reduce(has_any, op=dist.ReduceOp.SUM, group=None)
-                    if int(has_any[0].item()) == 0:
-                        break
-                # Run the inputs through the model.
+            for mini_step, batch in iterable:
+                real = mini_step < len(dataloader)
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 if real:
                     results["num_samples"] += len(batch)
                     results["vl_loss"] += loss * len(batch)
-                    alllabels.append(batch.label.detach())
-                    alllogits.append(outputs.detach())
-                else:
-                    alllabels.append(torch.full_like(batch.label, -1))
-                    alllogits.append(torch.full_like(outputs, np.nan))
+                    alllabels.append(batch.label)
+                    alllogits.append(outputs)
 
         if mini_step < 0:
             raise RuntimeError(f"[rank {rank()}] empty dataloader.")
 
         labels = torch.cat(alllabels, dim=0)
         logits = torch.cat(alllogits, dim=0)
-        select = labels >= 0
-        metrics = self.compute_metrics(labels[select], logits[select])
+
         # Weight-average the metrics in this rank by the number of valid samples
+        metrics = self.compute_metrics(labels, logits)
         for k, v in metrics.items():
-            results[f"vl_{k}"] = v.detach() * select.sum()
+            results[f"vl_{k}"] = v.detach() * labels.shape[0]
 
         # Aggregate results across workers and/or move to CPU
         if is_dist():
@@ -526,18 +510,23 @@ class Trainer:
         """
         Reduce the results dictionary across all distributed ranks using a separate CPU process group.
         """
-        # Verify all ranks have the same keys
         keys = sorted(results.keys())
+
+        # Verify all ranks have the same keys using a hash signature.
         if check:
-            sizes = [None] * world_size()
-            dist.all_gather_object(sizes, len(keys), group=None)
-            if len(set(sizes)) != 1:
-                raise RuntimeError(f"Metrics keys do not match across ranks. Detected key sets with sizes: {sizes}.")
+            sig_bytes = hashlib.sha1(",".join(keys).encode()).digest()[:8]
+            sig = int.from_bytes(sig_bytes, "big", signed=True)
+            sig_t = torch.tensor([sig], dtype=torch.int64, device=self.device)
+            sig_min = sig_t.clone()
+            sig_max = sig_t.clone()
+            dist.all_reduce(sig_min, op=dist.ReduceOp.MIN)
+            dist.all_reduce(sig_max, op=dist.ReduceOp.MAX)
+            if sig_min.item() != sig_max.item():
+                raise RuntimeError("Metrics keys do not match across ranks.")
+
         # Sum-reduce values across workers
-        vals = torch.empty((len(results)), dtype=torch.float64, device=self.device)
-        for i, k in enumerate(keys):
-            vals[i] = results[k].detach()
-        dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=None)
+        vals = torch.stack([results[k].to(self.device, dtype=torch.float64) for k in keys], dim=0)
+        dist.all_reduce(vals, op=dist.ReduceOp.SUM)
         return {k: vals[i] for i, k in enumerate(keys)}
 
     def compute_metrics(self, labels: Tensor, logits: Tensor) -> dict[str, Tensor]:
