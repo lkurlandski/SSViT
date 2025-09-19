@@ -101,7 +101,6 @@ from src.trainer import rank
 from src.trainer import local_world_size
 from src.trainer import world_size
 from src.trainer import mp_dtype
-from src.trainer import init_metrics_group
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
 from src.utils import count_parameters
@@ -394,7 +393,6 @@ def main() -> None:
         dist.init_process_group(backend=backend)
         torch.cuda.set_device(local_rank())
         args.device = torch.device(local_rank())
-        init_metrics_group()
         print(f"Distrubted worker {rank()} of {world_size()} with local rank {local_rank()}.")
 
     if args.tf32:

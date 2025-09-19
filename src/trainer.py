@@ -125,18 +125,6 @@ def maybe_no_sync(model: Module, sync_now: bool) -> ContextManager[None]:
     return model.no_sync()  # type: ignore[no-any-return]
 
 
-_METRICS_PG: Optional[dist.ProcessGroup] = None
-def init_metrics_group() -> None:
-    """Create a small, CPU-only comms group for scalars/metrics."""
-    global _METRICS_PG
-    if _METRICS_PG is not None:
-        raise RuntimeError("Metrics process group is already initialized.")
-    if not is_dist():
-        return
-    _METRICS_PG = dist.new_group(ranks=list(range(world_size())), backend="gloo")
-    dist.barrier(group=_METRICS_PG)
-
-
 @dataclass
 class TrainerArgs:
     outdir: Path = Path("./output/tmp")
@@ -461,7 +449,7 @@ class Trainer:
                 # Get the next batch of data or padbatch if this rank is out of data.
                 try:
                     mini_step, batch = next(iterable)
-                    has_local = torch.tensor([1], dtype=torch.int32, device="cpu")
+                    has_local = torch.tensor([1], dtype=torch.int32, device=self.device)
                     padbatch = batch.clone() if mini_step == 0 and padbatch is None else padbatch
                     real = True
                 except StopIteration:
@@ -470,12 +458,12 @@ class Trainer:
                     if padbatch is None:
                         raise RuntimeError("This rank has no data and we could not create a dummy batch.")
                     mini_step, batch = mini_step + 1, padbatch
-                    has_local = torch.tensor([0], dtype=torch.int32, device="cpu")
+                    has_local = torch.tensor([0], dtype=torch.int32, device=self.device)
                     real = False
                 # If all ranks are out of data, all ranks should stop.
                 if world_size() > 1:
                     has_any = has_local.clone()
-                    dist.all_reduce(has_any, op=dist.ReduceOp.SUM, group=_METRICS_PG)
+                    dist.all_reduce(has_any, op=dist.ReduceOp.SUM, group=None)
                     if int(has_any[0].item()) == 0:
                         break
                 # Run the inputs through the model.
@@ -502,9 +490,9 @@ class Trainer:
             # If the last batch is smaller, the padding strategy will still lead to different
             # number of alllabels and alllogits on each worker. Here, we pad the possibly shorter
             # unpadded tensors to the maximum length across workers.
-            n_local = torch.tensor([alllabels.shape[0]], dtype=torch.int64)
+            n_local = torch.tensor([alllabels.shape[0]], dtype=torch.int64, device=self.device)
             n_list  = [torch.zeros_like(n_local) for _ in range(world_size())]
-            dist.all_gather(n_list, n_local, group=_METRICS_PG)
+            dist.all_gather(n_list, n_local, group=None)
             n_long  = max([int(t.item()) for t in n_list])
             alllabels = F.pad(alllabels, (0, n_long - alllabels.shape[0]), value=-1)
             alllogits = F.pad(alllogits, (0, 0, 0, n_long - alllogits.shape[0]), value=float("nan"))
@@ -512,8 +500,8 @@ class Trainer:
             labelslist = [torch.empty_like(alllabels) for _ in range(world_size())]
             logitslist = [torch.empty_like(alllogits) for _ in range(world_size())]
             print(f"[rank {rank()}] gathering {alllabels.shape} labels and {alllogits.shape} logits...")
-            dist.all_gather(labelslist, alllabels, group=_METRICS_PG)
-            dist.all_gather(logitslist, alllogits, group=_METRICS_PG)
+            dist.all_gather(labelslist, alllabels, group=None)
+            dist.all_gather(logitslist, alllogits, group=None)
             alllabels = torch.cat(labelslist, dim=0)
             alllogits = torch.cat(logitslist, dim=0)
             # Double check the padding entries are consistent and remove them.
@@ -565,14 +553,14 @@ class Trainer:
         keys = sorted(results.keys())
         if check:
             sizes = [None] * world_size()
-            dist.all_gather_object(sizes, len(keys), group=_METRICS_PG)
+            dist.all_gather_object(sizes, len(keys), group=None)
             if len(set(sizes)) != 1:
                 raise RuntimeError(f"Metrics keys do not match across ranks. Detected key sets with sizes: {sizes}.")
         # Sum-reduce values across workers
-        vals = torch.empty((len(results)), dtype=torch.float64, device="cpu")
+        vals = torch.empty((len(results)), dtype=torch.float64, device=self.device)
         for i, k in enumerate(keys):
             vals[i] = results[k].detach()
-        dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=_METRICS_PG)
+        dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=None)
         return {k: vals[i] for i, k in enumerate(keys)}
 
     def compute_metrics(self, labels: Tensor, logits: Tensor) -> dict[str, Tensor]:
