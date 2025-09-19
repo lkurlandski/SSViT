@@ -3,7 +3,7 @@ Tests.
 """
 
 from __future__ import annotations
-from tempfile import NamedTemporaryFile
+import tempfile
 from typing import Optional
 
 import torch
@@ -110,9 +110,16 @@ class TestTrainer:
 
     def test_checkpointing_functional(self) -> None:
         trainer = self.create_trainer()
-        with NamedTemporaryFile() as file:
-            trainer.to_checkpoint(file.name)
-            newtrainer = Trainer.from_checkpoint(file.name, trainer.model, trainer.tr_loader, trainer.vl_loader, trainer.loss_fn)
+        with tempfile.TemporaryDirectory() as path:
+            trainer.to_checkpoint(path)
+            newtrainer = Trainer.from_checkpoint(
+                path,
+                model=trainer.model,
+                wrap_model=lambda model: model,
+                tr_loader=trainer.tr_loader,
+                vl_loader=trainer.vl_loader,
+                loss_fn=trainer.loss_fn
+            )
         assert isinstance(newtrainer, Trainer)
         assert isinstance(newtrainer.args, TrainerArgs)
         assert isinstance(newtrainer.model, MockModel)
@@ -126,9 +133,16 @@ class TestTrainer:
         trainer = self.create_trainer()
         trainer.args.epochs = epochs
         trainer = trainer()
-        with NamedTemporaryFile() as file:
-            trainer.to_checkpoint(file.name)
-            newtrainer = Trainer.from_checkpoint(file.name, trainer.model, trainer.tr_loader, trainer.vl_loader, trainer.loss_fn)
+        with tempfile.TemporaryDirectory() as path:
+            trainer.to_checkpoint(path)
+            newtrainer = Trainer.from_checkpoint(
+                path,
+                model=trainer.model,
+                wrap_model=lambda model: model,
+                tr_loader=trainer.tr_loader,
+                vl_loader=trainer.vl_loader,
+                loss_fn=trainer.loss_fn
+            )
         assert isinstance(newtrainer, Trainer)
         assert newtrainer.args == trainer.args
         assert newtrainer.epoch == trainer.epoch

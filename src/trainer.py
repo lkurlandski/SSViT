@@ -49,11 +49,13 @@ from torch import IntTensor
 from torch import LongTensor
 from torch import distributed as dist
 from torch.amp import GradScaler
-from torch.distributed import checkpoint as dist_checkpoint
+from torch.distributed import checkpoint as dcp
 from torch.distributed.algorithms.join import Join
 from torch.distributed.algorithms.join import Joinable
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.distributed.checkpoint.state_dict import set_model_state_dict
+from torch.distributed.checkpoint.state_dict import get_state_dict
+from torch.distributed.checkpoint.state_dict import set_state_dict
 from torch.distributed.checkpoint.state_dict import StateDictOptions
 from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.distributed.tensor import DTensor
@@ -247,14 +249,22 @@ class Trainer:
 
     Parameters
     ----------
-    epoch (int): this is the current number of completed epochs, i.e., it is incremented after train().
+    - epoch (int): this is the current number of completed epochs, i.e., it is incremented after train().
         If starting from scratch, epoch is 0 at initialization. If you want to start training ON the i-th
         epoch, set trainer.epoch = i - 1 before calling trainer().
 
-    Notes
+    NOTE
     -----
     - If the GradScaler causes all optimization steps to be skipped, the LR scheduler will trigger a
         warning that it was called before optimizer.step().
+
+    FIXME
+    -----
+    - Fix the logging and printing to only occur on rank 0.
+
+    TODO
+    ----
+    - Adjust the progress bars to display the longest running rank automatically.
     """
 
     def __init__(
@@ -325,7 +335,7 @@ class Trainer:
             self._update_cons(report)
             self._update_logs(report)
             self._update_best(report)
-            self.to_checkpoint(self.args.outdir / f"checkpoint-{self.epoch}.pt")
+            self.to_checkpoint(self.args.outdir / f"checkpoint-{self.epoch}")
 
         # Conduct training/validation for the remaining epochs (`self.args.epochs`` in total).
         for _ in range(self.args.epochs - self.epoch):
@@ -340,7 +350,7 @@ class Trainer:
             self._update_cons(report)
             self._update_logs(report)
             self._update_best(report)
-            self.to_checkpoint(self.args.outdir / f"checkpoint-{self.epoch}.pt")
+            self.to_checkpoint(self.args.outdir / f"checkpoint-{self.epoch}")
             self.scheduler.step()
             if self.stopper is not None:
                 self.stopper.step(vl_report[self.args.metric])
@@ -364,7 +374,7 @@ class Trainer:
         dataloader = self.tr_loader
         iterable: Iterable[tuple[int, FOrHSamples]] = enumerate(dataloader)
         iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
-        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
+        iterable = iter(iterable)
 
         # If FSDP pad the dataloader so all ranks have the same number of batches. For DDP, we can rely on Join.
         if is_dist() and is_fsdp2(self.model):
@@ -375,6 +385,7 @@ class Trainer:
             padding = itertools.repeat(self.padbatch, longest.item() - length.item())
             iterable = itertools.chain(iterable, enumerate(padding, start=len(dataloader)))
 
+        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
         locl_step = 0   # local step within this epoch
         mini_step = -1  # mini-step within this epoch
         def step() -> None:
@@ -580,99 +591,162 @@ class Trainer:
             self.best_epoch = results["epoch"]  # type: ignore[assignment]
             self.best_metric = results[self.args.metric]
 
-    def to_checkpoint(self, file: Path) -> None:
+    def to_checkpoint(self, path: str | Path) -> None:
+        """
+        Save a checkpoint of the trainer state to the specified path.
 
-        if is_fsdp2(self.model):
-            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-            mstate = get_model_state_dict(self.model, options=options)
-            ostate = None
-        else:
-            mstate = unwrapddp(self.model).state_dict()
-            ostate = self.optimizer.state_dict()
+        Structure:
+            path
+            ├── meta.json
+            ├── args.pickle
+            ├── log.pickle
+            ├── stopper.pickle
+            ├── rng-cpu.pt
+            ├── rng-gpu.pt
+            ├── padbatch.pt
+            ├── loss_fn.pt
+            ├── scheduler.pt
+            ├── model.pt         # non-FSDP only
+            ├── optimizer.pt     # non-FSDP only
+            ├── model/           # FSDP only
+            └── optimizer/       # FSDP only
+        """
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
 
-        payload = {
-            "args": pickle.dumps(self.args),
-            "log": pickle.dumps(self.log),
-            "best_epoch": self.best_epoch,
-            "best_metric": self.best_metric,
-            "epoch": self.epoch,
-            "glbl_step": self.glbl_step,
-            "model": mstate,
-            "optimizer": ostate,
-            "scheduler": self.scheduler.state_dict(),
-            "loss_fn": self.loss_fn.state_dict(),
-            "stopper": pickle.dumps(self.stopper),
-            "padbatch": self.padbatch,
-            "rng-cpu": torch.random.get_rng_state(),
-            "rng-gpu": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        }
-
+        # Rank 0 saves everything except model and optimizer state dicts.
         if rank() == 0:
-            torch.save(payload, file)
+            # JSON-serializable metadata
+            meta = {
+                "best_epoch": self.best_epoch,
+                "best_metric": self.best_metric,
+                "epoch": self.epoch,
+                "glbl_step": self.glbl_step,
+            }
+            Path(path / "meta.json").write_text(json.dumps(meta, indent=2))
+            # Pickled objects
+            Path(path / "args.pickle").write_bytes(pickle.dumps(self.args))
+            Path(path / "log.pickle").write_bytes(pickle.dumps(self.log))
+            Path(path / "stopper.pickle").write_bytes(pickle.dumps(self.stopper))
+            # Torch objects
+            torch.save(torch.random.get_rng_state(), path / "rng-cpu.pt")
+            torch.save(torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, path / "rng-gpu.pt")
+            torch.save(self.padbatch, path / "padbatch.pt")
+            # Torch state dicts
+            torch.save(self.loss_fn.state_dict(), path / "loss_fn.pt")
+            torch.save(self.scheduler.state_dict(), path / "scheduler.pt")
+
+        # All ranks save model and optimizer state dicts for FSDP.
+        if is_fsdp2(self.model):
+            mstate, ostate = get_state_dict(self.model, self.optimizer)
+            dcp.save(mstate, checkpoint_id=path / "model")
+            dcp.save(ostate, checkpoint_id=path / "optimizer")
+        # Only rank 0 saves model and optimizer state dicts for non-FSDP.
+        elif rank() == 0:
+            mstate, ostate = unwrapddp(self.model).state_dict(), self.optimizer.state_dict()
+            torch.save(mstate, path / "model.pt")
+            torch.save(ostate, path / "optimizer.pt")
+
         if is_dist():
             dist.barrier(device_ids=[torch.cuda.current_device()])
 
     @classmethod
     def from_checkpoint(
         cls,
-        file: str | Path,
+        path: str | Path,
+        *,
         model: Module,
+        wrap_model: Callable[[Module], Module],
         tr_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
         vl_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
         loss_fn: Module,
         optimizer: Optional[Optimizer] = None,
+        optimizer_init: Optional[Callable[[Iterable[torch.nn.Parameter]], Optimizer]] = None,
         scheduler: Optional[LRScheduler] = None,
-        stopper: Optional[EarlyStopper] = None,
+        scheduler_init: Optional[Callable[[Optimizer], LRScheduler]] = None,
         device: Optional[torch.device] = None,
-        padbatch: Optional[FOrHSamples] = None,
     ) -> Trainer:
-        # NOTE: this will not create the optimizer for FSDP models properly.
+        """
+        Load a Trainer instance from a checkpoint.
 
-        if isinstance(model, (FullyShardedDataParallel, DistributedDataParallel, DataParallel)) or is_fsdp2(model):
-            raise RuntimeError("Trainer.from_checkpoint requires a non-distributed model instance.")
+        NOTE: `model`, `loss_fn`, `optimizer`, and `scheduler` must all be the same type
+        as those used to create the checkpoint; their prior state dicts will be loaded from disk.
+        The initializers `optimizer_init` and `scheduler_init` must return the same type as well.
+        `device` must correspond to the device of which `wrap_model` will move the model to.
+        """
+        if isinstance(model, (FullyShardedDataParallel, DistributedDataParallel, DataParallel)) or is_fsdp2(model) or next(model.parameters()).is_cuda:
+            raise RuntimeError("Trainer.from_checkpoint requires a non-distributed model instance on the cpu.")
 
-        payload: dict[str, Any] = torch.load(file, map_location="cpu")
+        path = Path(path)
 
-        # These must match the default in the __init__ method
-        optimizer = optimizer if optimizer is not None else AdamW(model.parameters())
-        scheduler = scheduler if scheduler is not None else LambdaLR(optimizer, lambda _: 1.0)
+        # Determine if we're loading from a DCP/FSDP checkpoint or a regular checkpoint.
+        if (path / "model").is_dir() and (path / "optimizer").is_dir():
+            is_dcp = True
+        elif (path / "model.pt").is_file() and (path / "optimizer.pt").is_file():
+            is_dcp = False
+        else:
+            raise RuntimeError(f"Invalid checkpoint path: {path}.")
 
-        # log, epoch, glbl_step, best_epoch, best_metric
-        log = pickle.loads(payload.pop("log"))
-        epoch = payload.pop("epoch")
-        glbl_step = payload.pop("glbl_step")
-        best_epoch = payload.pop("best_epoch")
-        best_metric = payload.pop("best_metric")
+        # Warn if custom optimizer or scheduler will be ignored.
+        if is_dcp and optimizer is not None and optimizer_init is None:
+            warnings.warn("A custom optimizer was provided but will be ignored since the checkpoint was saved with FSDP.")
+        if is_dcp and scheduler is not None and scheduler_init is None:
+            warnings.warn("A custom scheduler was provided but will be ignored since the checkpoint was saved with FSDP.")
 
-        # model, optimzier
-        set_model_state_dict(model, payload.pop("model"))
-        optimizer.load_state_dict(payload.pop("optimizer"))
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if torch.is_tensor(v):
-                    state[k] = v.to(device if device is not None else next(model.parameters()).device)
+        # Establish default optimizer and scheduler if not provided (defaults should match __init__).
+        if optimizer_init is None:
+            optimizer_init = lambda params: AdamW(params)
+        if optimizer is None and not is_dcp:
+            optimizer = optimizer_init(model.parameters())
+        if scheduler_init is None:
+            scheduler_init = lambda optim: LambdaLR(optim, lambda _: 1.0)
+        if scheduler is None and not is_dcp:
+            scheduler = scheduler_init(optimizer)
 
-        # loss_fn, scheduler, stopper, padbatch
-        loss_fn.load_state_dict(payload.pop("loss_fn"))
-        scheduler.load_state_dict(payload.pop("scheduler"))
-        stopper = pickle.loads(payload.pop("stopper"))
-        padbatch = payload.pop("padbatch")
-
-        # rng-cpu, rng-gpu
-        rng_cpu = payload.pop("rng-cpu")
-        if rng_cpu is not None:
+        # Load the simple objects first that don't require complex state dict handling.
+        meta = json.loads((path / "meta.json").read_text())
+        epoch = meta["epoch"]
+        glbl_step = meta["glbl_step"]
+        best_epoch = meta["best_epoch"]
+        best_metric = meta["best_metric"]
+        args = pickle.loads((path / "args.pickle").read_bytes())
+        log = pickle.loads((path / "log.pickle").read_bytes())
+        stopper = pickle.loads((path / "stopper.pickle").read_bytes())
+        if (rng_cpu := torch.load(path / "rng-cpu.pt", map_location="cpu")) is not None:
             torch.random.set_rng_state(rng_cpu)
-        rng_gpu = payload.pop("rng-gpu")
-        if rng_gpu is not None:
-            if torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(rng_gpu)
-            else:
-                warnings.warn("Saved GPU state detected but CUDA is not available.")
+        if (rng_gpu := torch.load(path / "rng-gpu.pt", map_location="cpu")) is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng_gpu)
+        padbatch = torch.load(path / "padbatch.pt", map_location="cpu", weights_only=False)  # Load custom types (unsafe)
+        loss_fn.load_state_dict(torch.load(path / "loss_fn.pt", map_location="cpu"))
 
-        # args
-        args: TrainerArgs = pickle.loads(payload.pop("args"))
+        if is_dcp:
+            # DCP/FSDP checkpoints require special handling to load the model and optimizer state dicts.
+            # Concretely, the model must first be wrapped appropriately, before the optimizer is initialized.
+            # Then both their state dicts can be loaded and from the checkpoint.
+            model = wrap_model(model)
+            optimizer = optimizer_init(model.parameters())
+            mstate, ostate = get_state_dict(model, optimizer)
+            dcp.load(mstate, checkpoint_id=path / "model")
+            dcp.load(ostate, checkpoint_id=path / "optimizer")
+            set_state_dict(model, optimizer, model_state_dict=mstate, optim_state_dict=ostate)
+        else:
+            # Regular/DDP checkpoints can just be loaded in standard fashion.
+            assert optimizer is not None
+            mstate = torch.load(path / "model.pt", map_location="cpu")
+            set_model_state_dict(model, mstate)
+            model = wrap_model(model)
+            ostate = torch.load(path / "optimizer.pt", map_location="cpu")
+            optimizer.load_state_dict(ostate)
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device if device is not None else "cpu")
 
-        # trainer
+        scheduler = scheduler_init(optimizer)
+        if scheduler is not None:
+            sstate = torch.load(path / "scheduler.pt", map_location="cpu")
+            scheduler.load_state_dict(sstate)
+
         trainer = cls(
             args,
             model,
@@ -690,9 +764,6 @@ class Trainer:
         trainer.best_epoch = best_epoch
         trainer.best_metric = best_metric
         trainer.log = log
-
-        if payload:
-            raise RuntimeError(f"Unexpected keys in checkpoint payload: {list(payload.keys())}.")
 
         return trainer
 
