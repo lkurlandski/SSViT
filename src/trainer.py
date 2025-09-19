@@ -61,6 +61,7 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions
 from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.distributed.tensor import DTensor
 from torch.nn import Module
+from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.nn.parallel import DataParallel
 from torch.optim import Optimizer
@@ -212,6 +213,47 @@ def unwrapddp(model: Module) -> Module:
 
 def is_fsdp2(model: Module) -> bool:
     return any(isinstance(p, DTensor) for p in model.parameters())
+
+
+# Source: torcheval.metrics.functional.classification.auroc
+@torch.jit.script  # type: ignore[misc]
+def _binary_auroc_compute_jit(
+    input: torch.Tensor,
+    target: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    threshold, indices = input.sort(descending=True)
+    mask = F.pad(threshold.diff(dim=-1) != 0, [0, 1], value=1.0)
+    sorted_target = torch.gather(target, -1, indices)
+    sorted_weight = (
+        torch.tensor(1.0, device=target.device)
+        if weight is None
+        else torch.gather(weight, -1, indices)
+    )
+    cum_tp_before_pad = (sorted_weight * sorted_target).cumsum(-1)
+    cum_fp_before_pad = (sorted_weight * (1 - sorted_target)).cumsum(-1)
+
+    shifted_mask = mask.sum(-1, keepdim=True) >= torch.arange(
+        mask.size(-1), 0, -1, device=target.device
+    )
+
+    cum_tp = torch.zeros_like(cum_tp_before_pad)
+    cum_fp = torch.zeros_like(cum_fp_before_pad)
+
+    cum_tp.masked_scatter_(shifted_mask, cum_tp_before_pad[mask])
+    cum_fp.masked_scatter_(shifted_mask, cum_fp_before_pad[mask])
+
+    if len(mask.shape) > 1:
+        factor = cum_tp[:, -1] * cum_fp[:, -1]
+    else:
+        factor = cum_tp[-1] * cum_fp[-1]
+    # Set AUROC to 0.5 when the target contains all ones or all zeros.
+    auroc = torch.where(
+        factor == 0,
+        0.5,
+        torch.trapz(cum_tp, cum_fp).double() / factor,
+    )
+    return auroc
 
 
 class Trainer:
@@ -408,58 +450,95 @@ class Trainer:
 
         mini_step = -1
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
+        alllabels: list[Tensor] = []  # -1  indicates a padded batch
+        alllogits: list[Tensor] = []  # nan indicates a padded batch
 
         batch: FOrHSamples
         padbatch = self.padbatch
-
-        procdev = torch.device("cpu")
-        procgrp = _METRICS_PG
 
         with torch.no_grad():
             while True:
                 # Get the next batch of data or padbatch if this rank is out of data.
                 try:
                     mini_step, batch = next(iterable)
-                    has_local = torch.tensor([1], dtype=torch.int32, device=procdev)
+                    has_local = torch.tensor([1], dtype=torch.int32, device="cpu")
                     padbatch = batch.clone() if mini_step == 0 and padbatch is None else padbatch
-                    real = 1.0
+                    real = True
                 except StopIteration:
                     if world_size() == 1:
                         break
                     if padbatch is None:
                         raise RuntimeError("This rank has no data and we could not create a dummy batch.")
                     mini_step, batch = mini_step + 1, padbatch
-                    has_local = torch.tensor([0], dtype=torch.int32, device=procdev)
-                    real = 0.0
+                    has_local = torch.tensor([0], dtype=torch.int32, device="cpu")
+                    real = False
                 # If all ranks are out of data, all ranks should stop.
                 if world_size() > 1:
                     has_any = has_local.clone()
-                    dist.all_reduce(has_any, op=dist.ReduceOp.SUM, group=procgrp)
+                    dist.all_reduce(has_any, op=dist.ReduceOp.SUM, group=_METRICS_PG)
                     if int(has_any[0].item()) == 0:
                         break
-                # Run the inputs through the model, but only count the metrics if this rank has real data.
-                results["num_samples"] += len(batch) * int(real)
+                # Run the inputs through the model.
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
-                metrics = self.compute_metrics(batch, outputs)
-                results["vl_loss"] += loss * len(batch) * real
-                for k in metrics:
-                    results[f"vl_{k}"] += metrics[k] * len(batch) * real
+                if real:
+                    results["num_samples"] += len(batch)
+                    results["vl_loss"] += loss * len(batch)
+                    alllabels.append(batch.label.detach())
+                    alllogits.append(outputs.detach())
+                else:
+                    alllabels.append(torch.full_like(batch.label, -1))
+                    alllogits.append(torch.full_like(outputs, np.nan))
 
         if mini_step < 0:
             raise RuntimeError(f"[rank {rank()}] empty dataloader.")
 
+        alllabels = torch.cat(alllabels, dim=0)
+        alllogits = torch.cat(alllogits, dim=0)
+
         # Aggregate results across workers and/or move to CPU
         if is_dist():
             results = self.reduce_results(results)
+            # If the last batch is smaller, the padding strategy will still lead to different
+            # number of alllabels and alllogits on each worker. Here, we pad the possibly shorter
+            # unpadded tensors to the maximum length across workers.
+            n_local = torch.tensor([alllabels.shape[0]], dtype=torch.int64)
+            n_list  = [torch.zeros_like(n_local) for _ in range(world_size())]
+            dist.all_gather(n_list, n_local, group=_METRICS_PG)
+            n_long  = max([int(t.item()) for t in n_list])
+            alllabels = F.pad(alllabels, (0, n_long - alllabels.shape[0]), value=-1)
+            alllogits = F.pad(alllogits, (0, 0, 0, n_long - alllogits.shape[0]), value=float("nan"))
+            # Now, gather all labels and logits across workers and concatenate.
+            labelslist = [torch.empty_like(alllabels) for _ in range(world_size())]
+            logitslist = [torch.empty_like(alllogits) for _ in range(world_size())]
+            print(f"[rank {rank()}] gathering {alllabels.shape} labels and {alllogits.shape} logits...")
+            dist.all_gather(labelslist, alllabels, group=_METRICS_PG)
+            dist.all_gather(logitslist, alllogits, group=_METRICS_PG)
+            alllabels = torch.cat(labelslist, dim=0)
+            alllogits = torch.cat(logitslist, dim=0)
+            # Double check the padding entries are consistent and remove them.
+            realidx = alllabels != -1
+            if not torch.equal(realidx, ~torch.isnan(alllogits).all(dim=1)):
+                raise RuntimeError("Mismatch between real label and logit indices.")
+            alllabels = alllabels[realidx]
+            alllogits = alllogits[realidx]
         else:
             results = {k: results[k].detach().to("cpu") for k in results}
         num_samples = int(results.pop("num_samples").item())
+
+        if torch.any(alllabels < 0):
+            raise RuntimeError("Negative values detected in labels.")
+        if torch.any(torch.isnan(alllogits)):
+            raise RuntimeError("NaN values detected in logits.")
+
+        metrics = self.compute_metrics(alllabels, alllogits)
 
         # Average statistics over total number of samples
         report = {}
         for k in results:
             report[k] = results[k].item() / num_samples
+        for k in metrics:
+            report[f"vl_{k}"] = metrics[k].item()
         report["vl_time"] = time.time() - t_0
 
         return report
@@ -496,15 +575,12 @@ class Trainer:
         dist.all_reduce(vals, op=dist.ReduceOp.SUM, group=_METRICS_PG)
         return {k: vals[i] for i, k in enumerate(keys)}
 
-    def compute_metrics(self, batch: FOrHSamples, outputs: Tensor) -> dict[str, Tensor]:
+    def compute_metrics(self, labels: Tensor, logits: Tensor) -> dict[str, Tensor]:
         """
-        Compute the validation metrics over a set of examples.
-
-        FIXME: we need to compute the global tp, tn, fp, fn across all samples, then compute the metrics.
+        Compute binary classification metrics.
         """
-        outputs = outputs.to(torch.float32)
-        labels = batch.label
-        preds = torch.argmax(outputs, dim=1)
+        probs = torch.softmax(logits, dim=1)[:,1]
+        preds = (probs >= 0.5).to(torch.int32)
 
         tp = ((preds == 1) & (labels == 1)).sum()
         tn = ((preds == 0) & (labels == 0)).sum()
@@ -515,12 +591,14 @@ class Trainer:
         pre = tp / (tp + fp).clamp_min_(1)
         rec = tp / (tp + fn).clamp_min_(1)
         f_1 = 2 * pre * rec / (pre + rec).clamp_min_(1)
+        roc = _binary_auroc_compute_jit(probs, labels)
 
         return {
             "acc": acc,
             "pre": pre,
             "rec": rec,
             "f-1": f_1,
+            "roc": roc,
         }
 
     def _update_logs(self, results: Mapping[str, int | float]) -> None:
