@@ -33,8 +33,10 @@ from torch.nn import Embedding
 from torch.nn import CrossEntropyLoss
 from torch.nn import Module
 from torch.nn.parallel import DistributedDataParallel
+from torch.optim import Optimizer
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LRScheduler
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
@@ -101,6 +103,7 @@ from src.trainer import rank
 from src.trainer import local_world_size
 from src.trainer import world_size
 from src.trainer import mp_dtype
+from src.utils import num_sort_files
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
 from src.utils import count_parameters
@@ -549,28 +552,69 @@ def main() -> None:
     print(f"{vl_streamer=}")
     print(f"{ts_streamer=}")
 
-    model = wrap_model(model)
-    print(f"{model=}")
+    rargs = TrainerArgs.from_dict(args.to_dict())
+    print(f"{rargs=}")
 
     loss_fn = CrossEntropyLoss()
     print(f"{loss_fn=}")
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    print(f"{optimizer=}")
+    optimizer_init: Callable[[Any], Optimizer] = lambda params: AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    print(f"{optimizer_init=}")
 
-    scheduler: Optional[LRScheduler] = None
-    print(f"{scheduler=}")
-
-    stopper: Optional[EarlyStopper] = None
-    print(f"{stopper=}")
+    scheduler_init: Callable[[Any], LRScheduler] = lambda optim: None
+    print(f"{scheduler_init=}")
 
     padbatch = get_padbatch(args.level, args.do_parser, args.do_entropy, args.do_characteristics, min_lengths, args.vl_batch_size)
     print(f"{padbatch=}")
 
-    trainer = Trainer(TrainerArgs.from_dict(args.to_dict()), model, tr_streamer, vl_streamer, loss_fn, optimizer, scheduler, stopper, args.device, padbatch)
+    stopper: Optional[EarlyStopper] = None
+    print(f"{stopper=}")
+
+    checkpoint = None
+    if args.resume and args.outdir.exists():
+        checkpoints = num_sort_files(args.outdir.glob("checkpoint-*"), lstrip="checkpoint-", rstrip="")
+        if len(checkpoints) > 0:
+            checkpoint = checkpoints[-1]
+            print(f"Resuming from checkpoint: {checkpoint}")
+
+    if checkpoint:
+        trainer = Trainer.from_checkpoint(
+            checkpoint,
+            model=model,
+            wrap_model=wrap_model,
+            tr_loader=tr_streamer,
+            vl_loader=vl_streamer,
+            loss_fn=loss_fn,
+            optimizer_init=optimizer_init,
+            scheduler_init=scheduler_init,
+            device=args.device,
+        )
+        try:
+            # If a scheduler is not used, we can train for more epochs.
+            # if trainer.scheduler_is_no_op():
+            if scheduler_init(None) is None:
+                trainer.args.epochs = args.epochs
+        except Exception:
+            pass
+    else:
+        model = wrap_model(model)
+        optimizer = optimizer_init(model.parameters())
+        scheduler = scheduler_init(optimizer)
+        trainer = Trainer(
+            args=rargs,
+            model=model,
+            tr_loader=tr_streamer,
+            vl_loader=vl_streamer,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            stopper=stopper,
+            device=args.device,
+            padbatch=padbatch,
+        )
     print(f"{trainer=}")
 
-    trainer()
+    trainer = trainer()
 
 
 if __name__ == "__main__":

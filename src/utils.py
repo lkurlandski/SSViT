@@ -3,8 +3,10 @@ Utilities.
 """
 
 from __future__ import annotations
+from collections.abc import Iterable
 import math
 import os
+from pathlib import Path
 import random
 from typing import Literal
 from typing import NamedTuple
@@ -92,6 +94,12 @@ def check_tensor(x: Tensor, s: Optional[tuple[Optional[int], ...]] = None, t: Op
         for i, j in zip(x.shape, s, strict=True):
             if j is not None and i != j:
                 raise TensorError(x, s, t)
+
+
+def num_sort_files(files: Iterable[Path], lstrip: str = "", rstrip: str = "", reverse: bool = False) -> list[Path]:
+    def key(p: Path) -> int:
+        return int(p.stem.lstrip(lstrip).rstrip(rstrip))
+    return list(sorted(files, key=key, reverse=reverse))
 
 
 def pad_sequence(

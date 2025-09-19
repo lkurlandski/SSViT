@@ -76,6 +76,7 @@ class MainArgs:
     fsdp_offload: bool = True
     tf32: bool = False
     db_type: DBType = DBType.ITR
+    resume: bool = False
 
     def __post_init__(self) -> None:
         if self.tr_batch_size == 1 or self.vl_batch_size == 1 or self.ts_batch_size == 1:
