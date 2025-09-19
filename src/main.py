@@ -24,6 +24,7 @@ import numpy as np
 from numpy import typing as npt
 import torch
 from torch import distributed as dist
+from torch.utils.data import IterableDataset
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.fsdp import OffloadPolicy
@@ -295,17 +296,28 @@ def worker_init_fn(worker_id: int) -> None:
 
 def get_loader(
     dataset: Dataset,
-    sampler: Sampler,
+    batch_size: Optional[int],
     shuffle: Optional[bool],
+    sampler: Optional[Sampler],
+    batch_sampler: Optional[Sampler],
     num_workers: int,
     collate_fn: Callable[[Sequence[FSample]], FSamples | HSamples],
     pin_memory: bool,
     prefetch_factor: int,
 ) -> DataLoader:
+    """
+    Return a DataLoader with proper settings for multiprocessing.
+
+    Note that providing `sampler` or `batch_sampler` will automatically
+    override `shuffle`, `batch_size`, and `drop_last`. Similarly, providing
+    and IterableDataset will override `shuffle` and `sampler`.
+    """
     return DataLoader(
         dataset=dataset,
-        batch_sampler=sampler,
-        shuffle=shuffle,
+        batch_size=batch_size if batch_sampler is None else None,
+        shuffle=shuffle if sampler is None and batch_sampler is None and not isinstance(dataset, IterableDataset) else None,
+        sampler=sampler,
+        batch_sampler=batch_sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
@@ -525,25 +537,9 @@ def main() -> None:
     print(f"{vl_sampler=}")
     print(f"{ts_sampler=}")
 
-    if args.db_type == DBType.ITR:
-        tr_shuffle = None
-        vl_shuffle = None
-        ts_shuffle = None
-    if args.db_type == DBType.RND:
-        tr_shuffle = True
-        vl_shuffle = False
-        ts_shuffle = False
-    if args.db_type == DBType.CHK:
-        tr_shuffle = None
-        vl_shuffle = None
-        ts_shuffle = None
-    print(f"{tr_shuffle=}")
-    print(f"{vl_shuffle=}")
-    print(f"{ts_shuffle=}")
-
-    tr_loader = get_loader(tr_dataset, tr_sampler, tr_shuffle, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
-    vl_loader = get_loader(vl_dataset, vl_sampler, vl_shuffle, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
-    ts_loader = get_loader(ts_dataset, ts_sampler, ts_shuffle, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, tr_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    vl_loader = get_loader(vl_dataset, args.vl_batch_size, False, None, vl_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    ts_loader = get_loader(ts_dataset, args.ts_batch_size, False, None, ts_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
     print(f"tr_loader=DataLoader(pin_memory={tr_loader.pin_memory}, num_workers={tr_loader.num_workers}, prefetch_factor={tr_loader.prefetch_factor})")
     print(f"vl_loader=DataLoader(pin_memory={vl_loader.pin_memory}, num_workers={vl_loader.num_workers}, prefetch_factor={vl_loader.prefetch_factor})")
     print(f"ts_loader=DataLoader(pin_memory={ts_loader.pin_memory}, num_workers={ts_loader.num_workers}, prefetch_factor={ts_loader.prefetch_factor})")
