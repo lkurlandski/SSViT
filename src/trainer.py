@@ -424,6 +424,10 @@ class Trainer:
         """
         Evaluate the model on the validation set.
 
+        NOTE: Metrics are computed locally per rank, then averaged across ranks. This is not technically
+        correct for metrics such as precision, but should be a close enough approximation when the validation
+        set is large and relatively balanced across ranks.
+
         NOTE: We use a padding-batch strategy so each worker performs the same number of forward passes.
         This helps prevent deadlocks and hanging. Unfortunately, this still does not work with FSDP models.
         """
@@ -481,52 +485,25 @@ class Trainer:
         if mini_step < 0:
             raise RuntimeError(f"[rank {rank()}] empty dataloader.")
 
-        alllabels = torch.cat(alllabels, dim=0)
-        alllogits = torch.cat(alllogits, dim=0)
+        labels = torch.cat(alllabels, dim=0)
+        logits = torch.cat(alllogits, dim=0)
+        select = labels >= 0
+        metrics = self.compute_metrics(labels[select], logits[select])
+        # Weight-average the metrics in this rank by the number of valid samples
+        for k, v in metrics.items():
+            results[f"vl_{k}"] = v.detach() * select.sum()
 
         # Aggregate results across workers and/or move to CPU
         if is_dist():
             results = self.reduce_results(results)
-            # If the last batch is smaller, the padding strategy will still lead to different
-            # number of alllabels and alllogits on each worker. Here, we pad the possibly shorter
-            # unpadded tensors to the maximum length across workers.
-            n_local = torch.tensor([alllabels.shape[0]], dtype=torch.int64, device=self.device)
-            n_list  = [torch.zeros_like(n_local) for _ in range(world_size())]
-            dist.all_gather(n_list, n_local, group=None)
-            n_long  = max([int(t.item()) for t in n_list])
-            alllabels = F.pad(alllabels, (0, n_long - alllabels.shape[0]), value=-1)
-            alllogits = F.pad(alllogits, (0, 0, 0, n_long - alllogits.shape[0]), value=float("nan"))
-            # Now, gather all labels and logits across workers and concatenate.
-            labelslist = [torch.empty_like(alllabels) for _ in range(world_size())]
-            logitslist = [torch.empty_like(alllogits) for _ in range(world_size())]
-            print(f"[rank {rank()}] gathering {alllabels.shape} labels and {alllogits.shape} logits...")
-            dist.all_gather(labelslist, alllabels, group=None)
-            dist.all_gather(logitslist, alllogits, group=None)
-            alllabels = torch.cat(labelslist, dim=0)
-            alllogits = torch.cat(logitslist, dim=0)
-            # Double check the padding entries are consistent and remove them.
-            realidx = alllabels != -1
-            if not torch.equal(realidx, ~torch.isnan(alllogits).all(dim=1)):
-                raise RuntimeError("Mismatch between real label and logit indices.")
-            alllabels = alllabels[realidx]
-            alllogits = alllogits[realidx]
         else:
             results = {k: results[k].detach().to("cpu") for k in results}
         num_samples = int(results.pop("num_samples").item())
-
-        if torch.any(alllabels < 0):
-            raise RuntimeError("Negative values detected in labels.")
-        if torch.any(torch.isnan(alllogits)):
-            raise RuntimeError("NaN values detected in logits.")
-
-        metrics = self.compute_metrics(alllabels, alllogits)
 
         # Average statistics over total number of samples
         report = {}
         for k in results:
             report[k] = results[k].item() / num_samples
-        for k in metrics:
-            report[f"vl_{k}"] = metrics[k].item()
         report["vl_time"] = time.time() - t_0
 
         return report
