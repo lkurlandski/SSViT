@@ -122,6 +122,14 @@ def patch_binary(
     return bytes(data)
 
 
+def get_timestamp(data: LiefParse) -> int:
+    """
+    Return the unix timestamp from the PE header.
+    """
+    pe = _parse_pe_and_get_size(data)[0]
+    return int(pe.header.time_date_stamps)
+
+
 def rearm_disarmed_binary(src: str | Path | bytes, sha: str) -> bytes:
     """
     Rearm a Sorel binary by patching its machine and subsystem until the target SHA-256 matches.
