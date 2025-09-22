@@ -129,7 +129,6 @@ class TrainerArgs:
     outdir: Path = Path("./output/tmp")
     epochs: int = 1
     disable_tqdm: bool = False
-    logging_steps: int = -1
     metric: str = "vl_loss"
     lower_is_worse: bool = False
     max_norm: float = 1.0
@@ -137,8 +136,7 @@ class TrainerArgs:
     mp16: bool = False
 
     def __post_init__(self) -> None:
-        if self.logging_steps > 0:
-            warnings.warn(f"Logging every {self.logging_steps} `logging_steps` is enabled, which may slow down training.")
+        ...
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
@@ -372,8 +370,8 @@ class Trainer:
         iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
         iterable = iter(iterable)
 
-        # If FSDP pad the dataloader so all ranks have the same number of batches. For DDP, we can rely on Join.
-        if is_dist() and is_fsdp2(self.model):
+        # If distributed, pad the dataloader so all ranks have the same number of batches.
+        if is_dist():
             assert self.padbatch is not None
             length = torch.tensor(len(dataloader), device=self.device)
             longest = length.clone()
@@ -384,6 +382,7 @@ class Trainer:
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
         locl_step = 0   # local step within this epoch
         mini_step = -1  # mini-step within this epoch
+        grda_modl = 0   # gradient accumulation modulo local steps
         def step() -> None:
             """Update the model parameters."""
             nonlocal locl_step
@@ -395,30 +394,32 @@ class Trainer:
             locl_step += 1
             self.glbl_step += 1
 
-        with maybe_join(self.model):
-            for mini_step, batch in iterable:
-                real = mini_step < len(dataloader)
-                results["num_samples"] += len(batch) * int(real)
-                sync_gradients = (mini_step + 1) % self.args.gradient_accumulation_steps == 0
+        for mini_step, batch in iterable:
+            # Determine if this is a real or padded batch of data.
+            real = mini_step < len(dataloader)
+            is_last_real = (mini_step + 1 == len(dataloader))
+            results["num_samples"] += len(batch) * int(real)
 
-                # Compute normalized loss
-                with maybe_no_sync(self.model, sync_gradients):
-                    outputs = self.forward(batch)
-                    loss = self.compute_loss(batch, outputs)
-                    loss = loss * int(real) / self.args.gradient_accumulation_steps
-                    scaler.scale(loss).backward()
-                    results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
+            # Sync on gradient accumulation boundary or final real mini-step
+            grda_modl = (grda_modl + 1) % self.args.gradient_accumulation_steps
+            sync_gradients = grda_modl == 0 or is_last_real
 
-                # Update model weights
-                if sync_gradients:
-                    step()
+            # Compute normalized loss
+            with maybe_no_sync(self.model, sync_gradients):
+                outputs = self.forward(batch)
+                loss = self.compute_loss(batch, outputs)
+                loss = loss * int(real) / self.args.gradient_accumulation_steps
+                scaler.scale(loss).backward()
+                results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
+
+            # Update model weights
+            if sync_gradients:
+                step()
+                if is_last_real and grda_modl != 0:
+                    grda_modl = 0
 
         if mini_step < 0:
             raise RuntimeError(f"[rank {rank()}] empty dataloader.")
-
-        # Update weights if there are remaining gradients
-        if mini_step > 0 and (mini_step + 1) % self.args.gradient_accumulation_steps != 0:
-            step()
 
         # Aggregate results across workers and/or move to CPU
         if is_dist():
