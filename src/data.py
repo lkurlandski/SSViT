@@ -1027,9 +1027,8 @@ class IterableSimpleDBDataset(BaseSimpleDBDataset, IterableDataset):  # type: ig
 
         # If not shuffling, just yield samples in order.
         if not self.shuffle:
-            for shard in self._local_shards:
-                for sample in self.db.iter_one_shard(shard):
-                    yield self.preprocess(sample)
+            for sample in self.db.iter_shards(self._local_shards):
+                yield self.preprocess(sample)
             return
 
         # Otherwise, randomize the order of the shards deterministically.
@@ -1040,14 +1039,13 @@ class IterableSimpleDBDataset(BaseSimpleDBDataset, IterableDataset):  # type: ig
 
         # Yield samples in random order using a reservoir sampling-like algorithm.
         pool: list[SimpleDBSample] = []
-        for shard in self._local_shards:
-            for sample in self.db.iter_one_shard(shard):
-                if len(pool) < self.poolsize:
-                    pool.append(sample)
-                    continue
-                i = random.randint(0, len(pool) - 1)
-                yield self.preprocess(pool[i])
-                pool[i] = sample
+        for sample in self.db.iter_shards(self._local_shards):
+            if len(pool) < self.poolsize:
+                pool.append(sample)
+                continue
+            i = random.randint(0, len(pool) - 1)
+            yield self.preprocess(pool[i])
+            pool[i] = sample
 
         # Yield the remaining samples in the pool.
         while len(pool) > 0:

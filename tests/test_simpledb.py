@@ -3,12 +3,14 @@ Tests.
 """
 
 from collections.abc import Generator
+import os
 from pathlib import Path
+import random
+import shutil
+import time
 from typing import Literal
 from typing import Optional
-
-import os
-import random
+import threading
 import warnings
 
 import numpy as np
@@ -16,15 +18,14 @@ import pandas as pd
 import pytest
 import torch
 
-from src.simpledb import (
-    PAGESIZE,
-    roundup,
-    CreateSimpleDB,
-    CreateSimpleDBSample,
-    RandomMappingSimpleDB,
-    ChunkedMappingSimpleDB,
-    IterableSimpleDB,
-)
+from src.simpledb import PAGESIZE
+from src.simpledb import roundup
+from src.simpledb import CreateSimpleDB
+from src.simpledb import CreateSimpleDBSample
+from src.simpledb import RandomMappingSimpleDB
+from src.simpledb import ChunkedMappingSimpleDB
+from src.simpledb import IterableSimpleDB
+from src.simpledb import ShardCopier
 
 # ---------- helpers ----------
 
@@ -338,3 +339,197 @@ def test_zero_length_entry_random_mapping(tmp_path: Path) -> None:
         assert bytes(rec.bview) == b""
     finally:
         db.close()
+
+
+# ---------- ShardCopier tests ----------
+
+
+def _write_blob(p: Path, n: int, seed: int = 0) -> bytes:
+    rng = np.random.default_rng(seed)
+    b = rng.integers(0, 256, size=n, dtype=np.uint8).tobytes()
+    p.write_bytes(b)
+    return b
+
+def test_shardcopier_wait_vs_now(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If we don't wait, we get the src; with a reasonable wait, we get the staged path."""
+    srcdir = tmp_path / "src"; srcdir.mkdir()
+    fastdir = tmp_path / "fast"; fastdir.mkdir()
+
+    # Make copy predictably take a moment so wait=0 returns src.
+    orig = ShardCopier._copy_streaming
+    def slow_copy(self: ShardCopier, src: Path) -> Path:
+        time.sleep(0.05)  # small but deterministic delay
+        return orig(self, src)
+    monkeypatch.setattr(ShardCopier, "_copy_streaming", slow_copy, raising=True)
+
+    src1 = srcdir / "a.bin"
+    src2 = srcdir / "b.bin"
+    _write_blob(src1, 256 * 1024, seed=1)
+    _write_blob(src2, 256 * 1024, seed=2)
+
+    c = ShardCopier(fastdir, max_workers=1)
+    try:
+        # Case 1: no wait ⇒ original path
+        c.prefetch(src1)
+        p1 = c.staged_or_src(src1, wait=0.0)
+        assert p1 == src1
+
+        # Case 2: adequate wait ⇒ staged path under fastdir
+        c.prefetch(src2)
+        p2 = c.staged_or_src(src2, wait=1.0)
+        assert p2 != src2 and p2.exists() and p2.parent == fastdir
+        assert p2.read_bytes() == src2.read_bytes()
+    finally:
+        c.close()
+
+def test_shardcopier_atomic_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Destination must not appear until the final os.replace; .part exists mid-copy."""
+    srcdir = tmp_path / "src"; srcdir.mkdir()
+    fastdir = tmp_path / "fast"; fastdir.mkdir()
+    src = srcdir / "x.bin"
+    _write_blob(src, 128 * 1024, seed=3)
+
+    mid_ready = threading.Event()
+    proceed = threading.Event()
+
+    def instrumented_copy(self: ShardCopier, s: Path) -> Path:
+        dst = self.dir / s.name
+        tmp = dst.with_suffix(dst.suffix + ".part")
+        with open(s, "rb", buffering=1024 * 1024) as r, open(tmp, "wb", buffering=1024 * 1024) as w:
+            # write a small prefix so .part exists
+            chunk = r.read(16 * 1024)
+            w.write(chunk); w.flush(); os.fsync(w.fileno())
+            mid_ready.set()
+            proceed.wait(timeout=2.0)
+            shutil.copyfileobj(r, w, length=8 * 1024 * 1024)  # type: ignore[misc]
+            w.flush(); os.fsync(w.fileno())
+        os.replace(tmp, dst)
+        return dst
+
+    monkeypatch.setattr(ShardCopier, "_copy_streaming", instrumented_copy, raising=True)
+
+    c = ShardCopier(fastdir, max_workers=1)
+    try:
+        c.prefetch(src)
+        assert mid_ready.wait(timeout=1.0), "copy should reach mid-point"
+        dst = fastdir / src.name
+        part = dst.with_suffix(dst.suffix + ".part")
+        assert part.exists() and not dst.exists(), "only .part should exist mid-copy"
+        proceed.set()
+        out = c.staged_or_src(src, wait=1.0)
+        assert out == dst and dst.exists()
+        assert not part.exists()
+        assert dst.read_bytes() == src.read_bytes()
+    finally:
+        c.close()
+
+def test_shardcopier_prefetch_idempotent(tmp_path: Path) -> None:
+    fastdir = tmp_path / "fast"; fastdir.mkdir()
+    src = tmp_path / "a.bin"
+    _write_blob(src, 64 * 1024, seed=5)
+
+    c = ShardCopier(fastdir, max_workers=1)
+    try:
+        c.prefetch(src)
+        c.prefetch(src)  # should not schedule a second task
+        # internal detail, but safe to assert in tests:
+        assert len(c.futs) == 1
+        out = c.staged_or_src(src, wait=1.0)
+        assert out.exists() and out.parent == fastdir
+    finally:
+        c.close()
+
+def test_shardcopier_skips_when_up_to_date(tmp_path: Path) -> None:
+    fastdir = tmp_path / "fast"; fastdir.mkdir()
+    src = tmp_path / "z.bin"
+    data = _write_blob(src, 96 * 1024, seed=7)
+
+    c = ShardCopier(fastdir, max_workers=1)
+    try:
+        # First copy
+        c.prefetch(src)
+        dst1 = c.staged_or_src(src, wait=1.0)
+        assert dst1.exists() and dst1.read_bytes() == data
+
+        # Make sure dst mtime is >= src mtime so the short-circuit triggers
+        now_plus = int(time.time()) + 5
+        os.utime(dst1, (now_plus, now_plus))
+
+        # Second "copy" should fast-path and keep the same file untouched
+        c.prefetch(src)
+        dst2 = c.staged_or_src(src, wait=1.0)
+        assert dst2 == dst1
+        # Content still matches source
+        assert dst2.read_bytes() == data
+    finally:
+        c.close()
+
+
+# ---------- IterableSimpleDB + fastdir (copier) ----------
+
+def test_iterable_uses_fastdir_and_preserves_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """IterableSimpleDB with fastdir should produce identical outputs and use at least one staged shard."""
+    root = tmp_path / "db"
+    fastdir = tmp_path / "fast"; fastdir.mkdir()
+
+    # Build enough data to ensure multiple shards
+    builder = CreateSimpleDB(root, shardsize=128 * 1024)
+    s_list = list(_samples(140, min_len=300, max_len=4000, seed=11))
+    builder(s_list)
+
+    # Capture which shardfile paths reach iter_one_shard
+    seen_paths: list[Path] = []
+    orig_iter_one = IterableSimpleDB.iter_one_shard
+
+    def wrapped_iter_one(self, shard_idx: int, shardfile: str):  # type: ignore[no-untyped-def]
+        seen_paths.append(Path(shardfile))
+        yield from orig_iter_one(self, shard_idx, shardfile)
+
+    monkeypatch.setattr(IterableSimpleDB, "iter_one_shard", wrapped_iter_one, raising=True)
+
+    produced = {}
+    db = IterableSimpleDB(root, fastdir=fastdir).open()
+    try:
+        for rec in db:
+            produced[rec.name] = bytes(rec.bview)
+    finally:
+        db.close()
+
+    expected = {s.name: s.data for s in s_list}
+    assert produced.keys() == expected.keys()
+    # spot-check a few bytes for integrity
+    for k in list(expected.keys())[:10]:
+        assert produced[k] == expected[k]
+
+    # Ensure at least one shard path came from fastdir
+    assert any(p.parent == fastdir for p in seen_paths), "no staged shard used; expected at least one"
+
+def test_iterable_fastdir_single_shard_bypass(tmp_path: Path) -> None:
+    """When there's only one shard, the copier path is bypassed per implementation."""
+    root = tmp_path / "db"
+    fastdir = tmp_path / "fast"; fastdir.mkdir()
+
+    # Big shard size to force a single shard
+    builder = CreateSimpleDB(root, shardsize=16 * 1024 * 1024)
+    s_list = [CreateSimpleDBSample(f"s{i}", b"x" * 4096, False, i, None) for i in range(50)]
+    builder(s_list)
+
+    db = IterableSimpleDB(root, fastdir=fastdir).open()
+    try:
+        _ = list(db)  # iterate everything
+    finally:
+        db.close()
+
+    # No data should have been copied into fastdir
+    copied = list(fastdir.glob("*"))
+    assert copied == []
+
+def test_iterable_fastdir_missing_raises(tmp_path: Path) -> None:
+    root = tmp_path / "db"
+    builder = CreateSimpleDB(root, shardsize=64 * 1024)
+    builder([CreateSimpleDBSample("one", b"\x00" * 256, False, 0, None),
+             CreateSimpleDBSample("two", b"\x01" * 512, True, 1, None)])
+
+    missing = tmp_path / "does" / "not" / "exist"
+    with pytest.raises(FileNotFoundError):
+        db = IterableSimpleDB(root, fastdir=missing)

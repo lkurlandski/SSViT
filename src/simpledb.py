@@ -6,6 +6,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError
+from concurrent.futures import Future
+
 import ctypes
 import ctypes.util
 from enum import Enum
@@ -13,6 +17,7 @@ import gc
 import os
 from pathlib import Path
 import random
+import shutil
 from typing import Any
 from typing import Generator
 from typing import Literal
@@ -443,6 +448,7 @@ class IterableSimpleDB(SimpleDB):
         dir_root: Path,
         *,
         allow_name_indexing: bool = False,
+        fastdir: Optional[str | Path] = None,
         pread_block_bytes: int = 32 * 2 ** 20,
         merge_slack_bytes: int = 0,
         prefetch_next_window: bool = True,
@@ -451,6 +457,11 @@ class IterableSimpleDB(SimpleDB):
     ) -> None:
         """
         Args:
+            fastdir (str | Path | None):
+                If not None, a directory to which shards will be copied in the background
+                before being read. This can help if the original data is on a slow or
+                heavily contended filesystem. The fastdir directory should be on a fast
+                local disk with enough space to hold at least one shard.
             pread_block_bytes (int):
                 Target size of each contiguous window read from a shard with a single pread.
                 Larger windows reduce syscall overhead and improve throughput, at the cost of
@@ -469,6 +480,9 @@ class IterableSimpleDB(SimpleDB):
                 but can help on spinning disks or network filesystems. Default False.
         """
         super().__init__(dir_root, allow_name_indexing=allow_name_indexing)
+        self.fastdir = Path(fastdir) if fastdir is not None else None
+        if self.fastdir is not None:
+            self.fastdir.mkdir(exist_ok=True)
         self.block_bytes = pread_block_bytes
         self.merge_slack = merge_slack_bytes
         self.prefetch_next_window = prefetch_next_window
@@ -477,11 +491,34 @@ class IterableSimpleDB(SimpleDB):
         self._fd = -1
 
     def __iter__(self) -> Iterator[SimpleDBSample]:
-        for f in self.files_data:
-            shard_idx = int(f.stem.split("-")[-1])
-            yield from self.iter_one_shard(shard_idx)
+        yield from self.iter_shards(range(len(self.files_data)))
 
-    def iter_one_shard(self, shard_idx: int) -> Iterator[SimpleDBSample]:
+    def iter_shards(self, shard_indices: Sequence[int]) -> Iterator[SimpleDBSample]:
+        shardfiles = [self.files_data[i] for i in shard_indices]
+
+        if self.fastdir is None or len(shardfiles) == 1:
+            for shard_idx, shardfile in zip(shard_indices, shardfiles):
+                yield from self.iter_one_shard(shard_idx, str(shardfile))
+            return
+
+        assert self.fastdir is not None
+        if not isinstance(self.fastdir, Path):
+            raise TypeError("fastdir must be a Path or None.")
+        if not self.fastdir.exists():
+            raise FileNotFoundError(f"Fastdir {self.fastdir} does not exist.")
+
+        copier = ShardCopier(self.fastdir, max_workers=2)
+        try:
+            copier.prefetch(shardfiles[1])
+            for k, (shard_idx, shardfile) in enumerate(zip(shard_indices, shardfiles)):
+                shardfile = copier.staged_or_src(shardfile, wait=1.0)
+                if k + 1 < len(shardfiles):
+                    copier.prefetch(shardfiles[k + 1])
+                yield from self.iter_one_shard(shard_idx, str(shardfile))
+        finally:
+            copier.close()
+
+    def iter_one_shard(self, shard_idx: int, shardfile: Optional[str] = None) -> Iterator[SimpleDBSample]:
         if not self.is_open:
             raise RuntimeError("Database is not open. Call open() before accessing data.")
         sub_df = self.size_df[self.size_df["shard"] == shard_idx][["idx", "name", "shard", "offset", "size"]]
@@ -489,7 +526,7 @@ class IterableSimpleDB(SimpleDB):
         if rows.empty:
             return
 
-        shardfile = str(self.files_data[shard_idx])
+        shardfile = str(self.files_data[shard_idx]) if shardfile is None else shardfile
         self._fd = os.open(shardfile, os.O_RDONLY | os.O_CLOEXEC)
         _posix_fadvise(self._fd, 0, 0, _POSIX_FADV_SEQUENTIAL)
         fsz = os.path.getsize(shardfile)
@@ -570,6 +607,61 @@ class IterableSimpleDB(SimpleDB):
             os.close(self._fd)
             self._fd = -1
         return self
+
+
+class ShardCopier:
+    """
+    Background copier for pre-staging shards to a fast local disk.
+    """
+
+    def __init__(self, dir: str | Path, *, max_workers: int = 1):
+        self.dir = Path(dir)
+        self.pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="precopy")
+        self.futs: dict[Path, Future[Path]] = {}
+
+    def _copy_streaming(self, src: Path) -> Path:
+        """Copy `src` and return the destination path when finished."""
+        dst = self.dir / src.name
+        tmp = dst.with_suffix(dst.suffix + ".part")
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+        # If dst already exists and looks complete, skip copy.
+        if dst.exists():
+            s = src.stat()
+            d = dst.stat()
+            if d.st_size == s.st_size and d.st_mtime >= s.st_mtime:
+                return dst
+
+        # Otherwise, perform a cross-filesystem safe copy.
+        with open(src, "rb", buffering=1024 * 1024) as r, open(tmp, "wb", buffering=1024 * 1024) as w:
+            shutil.copyfileobj(r, w, length=8 * 1024 * 1024)  # type: ignore[misc]
+            w.flush()
+            os.fsync(w.fileno())
+        os.replace(tmp, dst)
+
+        return dst
+
+    def prefetch(self, src: Path) -> None:
+        """If not already in progress, start copying `src` in the background."""
+        if src not in self.futs:
+            self.futs[src] = self.pool.submit(self._copy_streaming, src)
+
+    def staged_or_src(self, src: Path, *, wait: float = 0.0) -> Path:
+        """If the copy of `src` is ready, return the copied path; else return `src`."""
+        fut = self.futs.pop(src, None)
+        if not fut:
+            return src
+        if fut.done():
+            return fut.result()
+        if wait > 0:
+            try:
+                return fut.result(timeout=wait)
+            except TimeoutError:
+                pass
+        return src
+
+    def close(self) -> None:
+        self.pool.shutdown(wait=False, cancel_futures=True)
 
 
 class CreateSimpleDBSample(NamedTuple):
