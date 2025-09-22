@@ -258,10 +258,6 @@ class Trainer:
     - If the GradScaler causes all optimization steps to be skipped, the LR scheduler will trigger a
         warning that it was called before optimizer.step().
 
-    FIXME
-    -----
-    - Fix the logging and printing to only occur on rank 0.
-
     TODO
     ----
     - Adjust the progress bars to display the longest running rank automatically.
@@ -568,10 +564,14 @@ class Trainer:
 
     def _update_logs(self, results: Mapping[str, int | float]) -> None:
         self.log.append(results)
+        if rank() != 0:
+            return
         with open(self.args.outdir / "results.jsonl", "a") as fp:
             fp.write(json.dumps(results) + "\n")
 
     def _update_cons(self, results: Mapping[str, int | float]) -> None:
+        if rank() != 0:
+            return
         d = {}
         d["epoch"] = results["epoch"]
         d["tr_loss"] = round(results["tr_loss"], 3)
