@@ -8,6 +8,7 @@ from abc import abstractmethod
 from argparse import ArgumentParser
 from collections.abc import Generator
 from collections.abc import Iterable
+import csv
 import hashlib
 from itertools import batched
 from itertools import chain
@@ -20,7 +21,9 @@ from multiprocessing.synchronize import Event
 import os
 from pathlib import Path
 import queue
+import sqlite3
 import sys
+import time
 from typing import Any
 from typing import NamedTuple
 from typing import Optional
@@ -31,12 +34,14 @@ import boto3
 from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import ClientError
+import lief
 import requests
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.binanal import rearm_disarmed_binary
+from src.binanal import get_timestamp
 from src.simpledb import CreateSimpleDB
 from src.simpledb import CreateSimpleDBSample
 
@@ -125,6 +130,7 @@ class Sample(NamedTuple):
     sha: str
     data: bytes
     malware: bool
+    timestamp: int
 
 
 class DatasetStreamer(ABC):
@@ -263,7 +269,7 @@ class AssemblageStreamer(DatasetStreamer):
                     if not self.quiet: print(f"Skipping {name} (Unexpected magic {b[0:8].decode()})")
                     continue
                 sha = hashlib.sha256(b).hexdigest()
-                yield Sample(sha, b, False)
+                yield Sample(sha, b, False, self.get_timestamp(b))
 
     def namelist(self) -> Generator[str, None, None]:
         with zipfile.ZipFile(self.archive, "r") as zip_ref:
@@ -277,11 +283,28 @@ class AssemblageStreamer(DatasetStreamer):
                     continue
                 yield name
 
+    def get_timestamp(self, data: bytes) -> int:
+        try:
+            timestamp = get_timestamp(data)
+        except Exception:
+            return -1
+        if 0 <= timestamp <= 1713153600:  # (01-01-1970 - 04-14-2024)
+            return timestamp
+        return -1
+
 
 class SorelStreamer(DatasetStreamer):
 
     SOREL_BUCKET = "sorel-20m"
     SOREL_PREFIX = "09-DEC-2020/binaries/"
+
+    def __init__(self, **kwds: Any) -> None:
+        super().__init__(**kwds)
+        self.cachefile = Path("./cache/sorel_metadata.sqlite")
+        if not self.cachefile.exists():
+            s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+            with open(self.cachefile, "wb") as fp:
+                s3.download_fileobj(SorelStreamer.SOREL_BUCKET, "09-DEC-2020/processed-data/meta.db", fp)
 
     def stream(self, names: Optional[Iterable[str]]) -> Generator[Sample, None, None]:
         """
@@ -291,6 +314,8 @@ class SorelStreamer(DatasetStreamer):
         names = self.namelist() if names is None else names
 
         s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+        conn = sqlite3.connect(self.cachefile)
+        conn.execute("PRAGMA query_only=ON;")
 
         for s in names:
             buffer = BytesIO()
@@ -323,29 +348,31 @@ class SorelStreamer(DatasetStreamer):
                 if not self.quiet: print(f"Skipping {s} ({err.__class__.__name__}: {err})")
                 continue
 
-            yield Sample(s, b, True)
+            yield Sample(s, b, True, self.get_timestamp(s, conn))
+
+        s3.close()
+        conn.close()
 
     def namelist(self) -> Generator[str, None, None]:
-        if (cachefile := Path("./cache/sorel_namelist.txt")).exists():
-            with open(cachefile, "r") as fp:
-                for line in fp:
-                    yield line.strip()
-            return
+        conn = sqlite3.connect(self.cachefile)
+        conn.execute("PRAGMA query_only=ON;")
+        sql = "SELECT sha256 FROM meta WHERE is_malware = 1"
+        for row in conn.execute(sql):
+            yield row[0]
+        conn.close()
 
-        s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
-        paginator = s3.get_paginator("list_objects_v2")
-        page_iterator = paginator.paginate(Bucket=SorelStreamer.SOREL_BUCKET, Prefix=SorelStreamer.SOREL_PREFIX)
-
-        for page in page_iterator:
-            for obj in page.get("Contents", []):
-                key: str = obj["Key"]
-                if key.endswith("/"):
-                    continue
-                sha = key.split("/")[-1]
-                yield sha
+    def get_timestamp(self, sha: str, conn: sqlite3.Connection) -> int:
+        sql = "SELECT rl_fs_t FROM meta WHERE sha256 = ?"
+        for row in conn.execute(sql, (sha,)):
+            timestamp = int(row[0])
+            if 0 <= timestamp <= 1554955200:  # (01-01-1970 - 04-11-2019)
+                return timestamp
+        return -1
 
 
 def main() -> None:
+
+    lief.logging.set_level(lief.logging.LEVEL.OFF)
 
     parser = ArgumentParser()
     parser.add_argument("--dataset", type=str, choices=["ass", "sor"], required=True, nargs="+")
@@ -399,7 +426,7 @@ def main() -> None:
 
     if args.storage == "pack":
         creator = CreateSimpleDB(args.root, shardsize=args.shardsize)
-        cstream = (CreateSimpleDBSample(sample.sha, sample.data, sample.malware, -1) for sample in fullstream)
+        cstream = (CreateSimpleDBSample(sample.sha, sample.data, sample.malware, sample.timestamp) for sample in fullstream)
         creator(cstream)
 
 
