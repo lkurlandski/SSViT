@@ -12,5 +12,22 @@ uv pip install -r requirements.txt [-r requirements-dev.txt]
 ## Tests
 
 ```
-OMP_NUM_THREADS=1 pytest -n auto tests/
+OMP_NUM_THREADS=1 pytest -n auto --ignore tests/trainer tests/
+OMP_NUM_THREADS=$(nproc --all) pytest -n 1 tests/trainer
+```
+
+## Lint
+
+```
+ruff check .
+```
+
+```
+mypy .
+```
+
+## Format
+
+```
+isort --force-single-line-imports .
 ```
