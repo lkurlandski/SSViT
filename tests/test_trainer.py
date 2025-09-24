@@ -4,6 +4,7 @@ Tests.
 
 from __future__ import annotations
 import tempfile
+from typing import Any
 from typing import Optional
 
 import torch
@@ -17,7 +18,7 @@ from src.trainer import TrainerArgs
 from src.trainer import Trainer
 
 
-class MockModel(nn.Module):
+class MockModel(nn.Module):  # type: ignore[misc]
 
     def __init__(self) -> None:
         super().__init__()
@@ -27,9 +28,9 @@ class MockModel(nn.Module):
         return self.layer(x)
 
 
-class MockDataset(Dataset):
+class MockDataset(Dataset):  # type: ignore[misc]
 
-    def __init__(self):
+    def __init__(self) -> None:
         ...
 
     def __getitem__(self, _: int) -> tuple[Tensor, Tensor]:
@@ -48,7 +49,7 @@ class MockSamples:
         self.y = y
 
     def __len__(self) -> int:
-        return self.x.size(0)
+        return int(self.x.size(0))
 
     def clone(self) -> MockSamples:
         return MockSamples(self.x.clone(), self.y.clone())
@@ -68,15 +69,15 @@ class MockSamples:
 
 class MockCollateFn:
 
-    def __call__(self, batch: list[tuple[Tensor, Tensor]]) -> tuple[Tensor, Tensor]:
+    def __call__(self, batch: list[tuple[Tensor, Tensor]]) -> MockSamples:
         xs, ys = zip(*batch)
         return MockSamples(torch.stack(xs), torch.tensor(ys))
 
 
 class TestTrainer:
 
-    def create_trainer(self) -> Trainer:
-        args = TrainerArgs()
+    def create_trainer(self, **kwds: Any) -> Trainer:
+        args = TrainerArgs(**kwds)
         model = MockModel()
         dataset = MockDataset()
         loader = DataLoader(dataset, batch_size=3, collate_fn=MockCollateFn())
@@ -94,19 +95,12 @@ class TestTrainer:
 
     def test_train(self) -> None:
         trainer = self.create_trainer()
-        report = trainer.train()
-        assert isinstance(report, dict)
-        for k, v in report.items():
-            assert isinstance(k, str)
-            assert isinstance(v, float)
+        trainer.train()
 
     def test_call(self) -> None:
-        epochs = 2
-        trainer = self.create_trainer()
-        trainer.args.epochs = epochs
+        trainer = self.create_trainer(max_epochs=2)
         trainer = trainer()
-        assert trainer.epoch == epochs
-        assert len(trainer.log) == epochs + 1
+        assert len(trainer.log) == 3
 
     def test_checkpointing_functional(self) -> None:
         trainer = self.create_trainer()
@@ -129,9 +123,9 @@ class TestTrainer:
         assert isinstance(newtrainer.stopper, EarlyStopper)
 
     def test_checkpointing_correct(self) -> None:
-        epochs = 2
+        max_epochs = 2
         trainer = self.create_trainer()
-        trainer.args.epochs = epochs
+        trainer.args.max_epochs = max_epochs
         trainer = trainer()
         with tempfile.TemporaryDirectory() as path:
             trainer.to_checkpoint(path)
@@ -145,5 +139,5 @@ class TestTrainer:
             )
         assert isinstance(newtrainer, Trainer)
         assert newtrainer.args == trainer.args
-        assert newtrainer.epoch == trainer.epoch
+        assert newtrainer.glbl_step == trainer.glbl_step
         assert all((p1.data != p2.data).sum().item() == 0 for p1, p2 in zip(newtrainer.model.parameters(), trainer.model.parameters()))

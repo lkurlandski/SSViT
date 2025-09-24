@@ -124,19 +124,51 @@ def maybe_no_sync(model: Module, sync_now: bool) -> ContextManager[None]:
     return model.no_sync()  # type: ignore[no-any-return]
 
 
+def barrier(tag: str = "", device: Optional[torch.device] = None) -> None:
+    if not is_dist():
+        return
+    try:
+        if "nccl" in dist.get_backend():
+            torch.cuda.synchronize(device)
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+        else:
+            dist.barrier()
+    except Exception as e:
+        print(f"[rank {rank()}] barrier({tag}) failed: {e}", flush=True)
+        raise
+
+
 @dataclass
 class TrainerArgs:
     outdir: Path = Path("./output/tmp")
-    epochs: int = 1
     disable_tqdm: bool = False
     metric: str = "vl_loss"
     lower_is_worse: bool = False
     max_norm: float = 1.0
     gradient_accumulation_steps: int = 1
     mp16: bool = False
+    max_epochs: Optional[float] = 1.0
+    max_steps: Optional[int] = None
+    eval_epochs: Optional[float] = 1.0
+    eval_steps: Optional[int] = None
+    chpt_epochs: Optional[float] = 1.0
+    chpt_steps: Optional[int] = None
+    schd_epochs: Optional[float] = 1.0
+    schd_steps: Optional[int] = None
+    logg_epochs: Optional[float] = 1.0
+    logg_steps: Optional[int] = None
 
     def __post_init__(self) -> None:
-        ...
+        if (self.max_epochs is not None) == (self.max_steps is not None):
+            raise ValueError("Exactly one of `max_epochs` or `max_steps` must be specified.")
+        if (self.eval_epochs is not None) and (self.eval_steps is not None):
+            raise ValueError("At most one of `eval_epochs` or `eval_steps` may be specified.")
+        if (self.chpt_epochs is not None) and (self.chpt_steps is not None):
+            raise ValueError("At most one of `chpt_epochs` or `chpt_steps` may be specified.")
+        if (self.schd_epochs is not None) and (self.schd_steps is not None):
+            raise ValueError("At most one of `schd_epochs` or `schd_steps` may be specified.")
+        if (self.logg_epochs is not None) and (self.logg_steps is not None):
+            raise ValueError("At most one of `logg_epochs` or `logg_steps` may be specified.")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
@@ -245,11 +277,13 @@ class Trainer:
     """
     Trainer class for training models with PyTorch.
 
-    Parameters
-    ----------
-    - epoch (int): this is the current number of completed epochs, i.e., it is incremented after train().
-        If starting from scratch, epoch is 0 at initialization. If you want to start training ON the i-th
-        epoch, set trainer.epoch = i - 1 before calling trainer().
+    Usage
+    -----
+    It is not recommended to use trainer.train() or trainer.evaluate() directly, as these
+    have complex side effects on the Trainer's internal state. Instead, use Trainer.__call__().
+    >>> trainer = Trainer(...)
+    >>> trainer = trainer()
+    >>> print(trainer.best_epoch, trainer.best_metric)
 
     NOTE
     -----
@@ -286,10 +320,12 @@ class Trainer:
         self.padbatch = padbatch.to(self.device) if padbatch is not None else None
         self.monitor = Monitor(device=self.device)
         self.log: list[Mapping[str, int | float]] = []
-        self.best_epoch = -1
-        self.best_metric = -float("inf") if args.lower_is_worse else float("inf")
-        self.glbl_step = -1
-        self.epoch = -1
+        self.glbl_step = 0
+        self._next_eval_step: Optional[int] = None
+        self._next_chpt_step: Optional[int] = None
+        self._next_schd_step: Optional[int] = None
+        self._next_logg_step: Optional[int] = None
+        self._done: bool = False
 
     def __repr__(self) -> str:
         return str(self)
@@ -310,56 +346,39 @@ class Trainer:
         )
 
     def __call__(self) -> Self:
+        if self.glbl_step < 0:
+            raise RuntimeError("glbl_step must be non-negative.")
+
         self.args.outdir.mkdir(parents=True, exist_ok=True)
         self.monitor.start()
 
-        # NOTE: epoch and glbl_step are -1 at initialization, but may have been modified before __call__,
-        # especially by Trainer.from_checkpoint, which operates in presicely this manner.
-        self.epoch     = max(self.epoch, 0)
-        self.glbl_step = max(self.glbl_step, 0)
+        # Initialize hook schedules.
+        if self.eval_steps is not None:
+            self._next_eval_step = self.glbl_step + self.eval_steps
+        if self.chpt_steps is not None:
+            self._next_chpt_step = self.glbl_step + self.chpt_steps
+        if self.schd_steps is not None:
+            self._next_schd_step = self.glbl_step + self.schd_steps
+        if self.logg_steps is not None:
+            self._next_logg_step = self.glbl_step + self.logg_steps
 
-        # Conduct an initial validation on the naked model before any training, if starting from epoch 0.
-        if self.epoch == 0:
-            tr_report  = {"tr_loss": float("nan"), "tr_time": float("nan")}
-            tr_report |= {f"tr_{k}": float("nan") for k, _ in self.monitor.get_report(clear=True).items()}
-            vl_report  = self.evaluate()
-            vl_report |= {f"vl_{k}": v for k, v in self.monitor.get_report(clear=True).items()}
-            report  = {"epoch": 0, "glbl_step": self.glbl_step, "lr": float("nan")}
-            report |= tr_report | vl_report
-            self._update_cons(report)
-            self._update_logs(report)
-            self._update_best(report)
-            self.to_checkpoint(self.args.outdir / f"checkpoint-{self.epoch}")
+        # Conduct an initial validation and checkpointing on the naked model.
+        if self.glbl_step == 0:
+            self.run_due_hooks(None, do_eval=True, do_chpt=True, do_schd=False, do_logg=True)
 
-        # Conduct training/validation for the remaining epochs (`self.args.epochs`` in total).
-        for _ in range(self.args.epochs - self.epoch):
-            self.epoch += 1
-            self.monitor.clear()
-            tr_report  = self.train()
-            tr_report |= {f"tr_{k}": v for k, v in self.monitor.get_report(clear=True).items()}
-            vl_report  = self.evaluate()
-            vl_report |= {f"vl_{k}": v for k, v in self.monitor.get_report(clear=True).items()}
-            report  = {"epoch": self.epoch, "glbl_step": self.glbl_step, "lr": self.scheduler.get_last_lr()[0]}
-            report |= tr_report | vl_report
-            self._update_cons(report)
-            self._update_logs(report)
-            self._update_best(report)
-            self.to_checkpoint(self.args.outdir / f"checkpoint-{self.epoch}")
-            self.scheduler.step()
-            if self.stopper is not None:
-                self.stopper.step(vl_report[self.args.metric])
-                if self.stopper.stop:
-                    break
+        # Continuously train the model on the training set until finished.
+        while not self._done:
+            self.train()
 
         self.monitor.stop()
 
         return self
 
-    def train(self) -> dict[str, float]:
+    def train(self) -> None:
         """
-        Train the model for one epoch.
+        Train the model on the training set.
         """
-        t_0 = time.time()
+        barrier("Trainer::train:before", self.device)
 
         self.optimizer.zero_grad()
         self.model.train()
@@ -379,21 +398,38 @@ class Trainer:
             padding = itertools.repeat(self.padbatch, longest.item() - length.item())
             iterable = itertools.chain(iterable, enumerate(padding, start=len(dataloader)))
 
-        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
-        locl_step = 0   # local step within this epoch
-        mini_step = -1  # mini-step within this epoch
-        grda_modl = 0   # gradient accumulation modulo local steps
         def step() -> None:
-            """Update the model parameters."""
-            nonlocal locl_step
+            """Update the model parameters and increment the global step counter."""
             scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
             scaler.step(self.optimizer)
             scaler.update()
             self.optimizer.zero_grad()
-            locl_step += 1
             self.glbl_step += 1
 
+        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
+        t_0: float = time.time()
+        def report() -> dict[str, float]:
+            """Assemble a training report (excluding GPU statistics) and reset the `results` container."""
+            nonlocal results
+            nonlocal t_0
+            # Aggregate results across workers and move to CPU.
+            if is_dist():
+                results = self.reduce_results(results)
+            results = {k: results[k].detach().to("cpu") for k in results}
+            num_samples = int(results.pop("num_samples").item())
+            # Average statistics over total number of samples.
+            report = {}
+            for k in results:
+                report[k] = results[k].item() / num_samples
+            report["tr_time"] = time.time() - t_0
+            # Clear results container for next cycle before returning and reset the timer.
+            results = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
+            t_0 = time.time()
+            return report
+
+        mini_step = -1  # mini-step within this epoch
+        grda_modl = 0   # gradient accumulation modulo local steps
         for mini_step, batch in iterable:
             # Determine if this is a real or padded batch of data.
             real = mini_step < len(dataloader)
@@ -412,36 +448,35 @@ class Trainer:
                 scaler.scale(loss).backward()
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
 
-            # Update model weights
+            # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
                 step()
                 if is_last_real and grda_modl != 0:
                     grda_modl = 0
+                do_log = any(self._due_hooks())
+                self.run_due_hooks(report() if do_log else None)
+                self.model.train()
+                if do_log:
+                    self.monitor.clear()
+
+            # Stop if we've reached the maximum number of global steps
+            if self.glbl_step >= self.max_steps:
+                self._done = True
+                break
 
         if mini_step < 0:
             raise RuntimeError(f"[rank {rank()}] empty dataloader.")
 
-        # Aggregate results across workers and/or move to CPU
-        if is_dist():
-            results = self.reduce_results(results)
-        else:
-            results = {k: results[k].detach().to("cpu") for k in results}
-        num_samples = int(results.pop("num_samples").item())
-
-        # Average statistics over total number of samples
-        report = {}
-        for k in results:
-            report[k] = results[k].item() / num_samples
-        report["tr_time"] = time.time() - t_0
-
-        return report
+        barrier("Trainer::train:after", self.device)
 
     def evaluate(self) -> dict[str, float]:
         """
         Evaluate the model on the validation set.
         """
+        barrier("Trainer::evaluate:before", self.device)
         t_0 = time.time()
 
+        was_training = self.model.training
         self.model.eval()
 
         dataloader = self.vl_loader
@@ -498,7 +533,92 @@ class Trainer:
             report[k] = results[k].item() / num_samples
         report["vl_time"] = time.time() - t_0
 
+        if was_training:
+            self.model.train()
+
+        barrier("Trainer::evaluate:after", self.device)
         return report
+
+    def _due_hooks(self) -> tuple[bool, bool, bool, bool]:
+        do_eval = self._next_eval_step is not None and self.glbl_step >= self._next_eval_step
+        do_chpt = self._next_chpt_step is not None and self.glbl_step >= self._next_chpt_step
+        do_schd = self._next_schd_step is not None and self.glbl_step >= self._next_schd_step
+        do_logg = self._next_logg_step is not None and self.glbl_step >= self._next_logg_step
+        return do_eval, do_chpt, do_schd, do_logg
+
+    def run_due_hooks(
+        self,
+        tr_report: Optional[dict[str, float]],
+        *,
+        do_eval: Optional[bool] = None,
+        do_chpt: Optional[bool] = None,
+        do_schd: Optional[bool] = None,
+        do_logg: Optional[bool] = None,
+    ) -> None:
+        """
+        Conduct periodic activities, such as running validation and checkpointing.
+
+        Args:
+            tr_report: Optional dictionary of training statistics to include in the report.
+            do_eval: If True, run validation even if not scheduled.
+            do_chpt: If True, save a checkpoint even if not scheduled.
+            do_schd: If True, step the LR scheduler even if not scheduled.
+            do_logg: If True, update the console and log files even if not scheduled.
+
+        NOTE: the schedules are only advanced if fired organically, not via the `do_*` arguments.
+        NOTE: logging will occur if any hook fires, but will not advance the logging schedule.
+        """
+        due_eval, due_chpt, due_schd, due_logg = self._due_hooks()
+
+        do_eval = do_eval if do_eval is not None else due_eval
+        do_chpt = do_chpt if do_chpt is not None else due_chpt
+        do_schd = do_schd if do_schd is not None else due_schd
+        do_logg = do_logg if do_logg is not None else due_logg
+
+        # If no hooks are scheduled, exit prematurely.
+        if not (do_eval or do_chpt or do_schd or do_logg):
+            return
+
+        # Otherwise, assemble report to log.
+        report = {"epoch": self.glbl_step / self.steps_per_epoch, "glbl_step": self.glbl_step, "lr": self.scheduler.get_last_lr()[0]}
+        if tr_report is not None:
+            report |= tr_report
+            report |= {f"tr_{k}": v for k, v in self.get_monitor_report().items()}
+
+        # If scheduled, conduct validation and add to the report.
+        if do_eval:
+            self.monitor.clear()
+            report |= self.evaluate()
+            report |= {f"vl_{k}": v for k, v in self.get_monitor_report().items()}
+
+        # If scheduled, save a checkpoint.
+        if do_chpt:
+            self.to_checkpoint(self.args.outdir / f"checkpoint-{self.glbl_step}")
+
+        # If scheduled, step the LR scheduler.
+        if do_schd:
+            self.scheduler.step()
+
+        # Update console and log files.
+        self._update_cons(report)
+        self._update_logs(report)
+
+        # Advance schedules that fired.
+        if due_eval:
+            self._next_eval_step += self.eval_steps  # type: ignore[operator]
+        if due_chpt:
+            self._next_chpt_step += self.chpt_steps  # type: ignore[operator]
+        if due_schd:
+            self._next_schd_step += self.schd_steps  # type: ignore[operator]
+        if due_logg:
+            self._next_logg_step += self.logg_steps  # type: ignore[operator]
+
+        # Handle early stopping (only if validation is orgnanically scheduled).
+        if self.stopper is not None:
+            if due_eval:
+                self.stopper.step(report[f"{self.args.metric}"])
+            if self.stopper.stop:
+                self._done = True
 
     def forward(self, batch: FOrHSamples) -> Tensor:
         """
@@ -516,7 +636,7 @@ class Trainer:
 
     def reduce_results(self, results: dict[str, Tensor], check: bool = True) -> dict[str, Tensor]:
         """
-        Reduce the results dictionary across all distributed ranks using a separate CPU process group.
+        Reduce a results dictionary across all distributed ranks.
         """
         keys = sorted(results.keys())
 
@@ -563,10 +683,77 @@ class Trainer:
             "roc": roc,
         }
 
+    def _dataloader_lengths(self, dataloader: Collection[FOrHSamples] | DataLoader[FOrHSamples]) -> list[int]:
+        """Return the lengths of the dataloader on each distributed rank."""
+        if not is_dist():
+            return [len(dataloader)]
+        length = torch.tensor(len(dataloader), device=self.device)
+        lengths = [torch.zeros(1, dtype=length.dtype, device=self.device) for _ in range(world_size())]
+        dist.all_gather(lengths, length, group=None)
+        return [int(l.item()) for l in lengths]
+
+    @property
+    def tr_dataloader_lengths(self) -> list[int]:
+        return self._dataloader_lengths(self.tr_loader)
+
+    @property
+    def vl_dataloader_lengths(self) -> list[int]:
+        return self._dataloader_lengths(self.vl_loader)
+
+    @property
+    def steps_per_epoch(self) -> int:
+        length = max(self.tr_dataloader_lengths)
+        return math.ceil(length / self.args.gradient_accumulation_steps)
+
+    def _epochs_to_steps(self, f: Optional[float]) -> Optional[int]:
+        if f is None:
+            return None
+        return max(1, math.ceil(self.steps_per_epoch * f))
+
+    @property
+    def max_steps(self) -> int:
+        if self.args.max_steps is not None:
+            return self.args.max_steps
+        assert self.args.max_epochs is not None
+        max_steps = self._epochs_to_steps(self.args.max_epochs)
+        assert max_steps is not None
+        return max_steps
+
+    @property
+    def eval_steps(self) -> Optional[int]:
+        if self.args.eval_steps is not None:
+            return max(1, self.args.eval_steps)
+        return self._epochs_to_steps(self.args.eval_epochs)
+
+    @property
+    def chpt_steps(self) -> Optional[int]:
+        if self.args.chpt_steps is not None:
+            return max(1, self.args.chpt_steps)
+        return self._epochs_to_steps(self.args.chpt_epochs)
+
+    @property
+    def schd_steps(self) -> Optional[int]:
+        if self.args.schd_steps is not None:
+            return max(1, self.args.schd_steps)
+        return self._epochs_to_steps(self.args.schd_epochs)
+
+    @property
+    def logg_steps(self) -> Optional[int]:
+        if self.args.logg_steps is not None:
+            return max(1, self.args.logg_steps)
+        return self._epochs_to_steps(self.args.logg_epochs)
+
+    def get_monitor_report(self) -> dict[str, float]:
+        mn_report = self.monitor.get_report(clear=True)
+        mn_report = {k: torch.tensor(v, device=self.device, dtype=torch.float64) for k, v in mn_report.items()}
+        mn_report = self.reduce_results(mn_report) if is_dist() else mn_report
+        mn_report = {k: v.detach().to("cpu").item() for k, v in mn_report.items()}
+        return mn_report
+
     def _update_logs(self, results: Mapping[str, int | float]) -> None:
-        self.log.append(results)
         if rank() != 0:
             return
+        self.log.append(results)
         with open(self.args.outdir / "results.jsonl", "a") as fp:
             fp.write(json.dumps(results) + "\n")
 
@@ -574,23 +761,19 @@ class Trainer:
         if rank() != 0:
             return
         d = {}
-        d["epoch"] = results["epoch"]
-        d["tr_loss"] = round(results["tr_loss"], 3)
-        d["vl_loss"] = round(results["vl_loss"], 3)
-        d["vl_acc"] = round(results["vl_acc"], 3)
-        d["tr_gpu_utl"] = round(results["tr_gpu_utl"], 2)
-        d["vl_gpu_utl"] = round(results["vl_gpu_utl"], 2)
-        d["tr_time"] = int(round(results["tr_time"], 0)) if not math.isnan(results["tr_time"]) else float("nan")
-        d["vl_time"] = int(round(results["vl_time"], 0)) if not math.isnan(results["vl_time"]) else float("nan")
+        d["epoch"] = round(results["epoch"], 2)
+        d["glbl_step"] = int(results["glbl_step"])
+        d["lr"] = round(results["lr"], 6)
+        if any(k.startswith("tr_") for k in results):
+            d["tr_loss"] = round(results["tr_loss"], 3)
+            d["tr_gpu_utl"] = round(results["tr_gpu_utl"], 2)
+            d["tr_time"] = round(results["tr_time"], 0)
+        if any(k.startswith("vl_") for k in results):
+            d["vl_loss"] = round(results["vl_loss"], 3)
+            d["vl_acc"] = round(results["vl_acc"], 3)
+            d["vl_gpu_utl"] = round(results["vl_gpu_utl"], 2)
+            d["vl_time"] = round(results["vl_time"], 0)
         print(d)
-
-    def _update_best(self, results: Mapping[str, int | float]) -> None:
-        if self.args.lower_is_worse and results[self.args.metric] > self.best_metric:
-            self.best_epoch = results["epoch"]  # type: ignore[assignment]
-            self.best_metric = results[self.args.metric]
-        elif not self.args.lower_is_worse and results[self.args.metric] < self.best_metric:
-            self.best_epoch = results["epoch"]  # type: ignore[assignment]
-            self.best_metric = results[self.args.metric]
 
     def to_checkpoint(self, path: str | Path) -> None:
         """
@@ -619,10 +802,11 @@ class Trainer:
         if rank() == 0:
             # JSON-serializable metadata
             meta = {
-                "best_epoch": self.best_epoch,
-                "best_metric": self.best_metric,
-                "epoch": self.epoch,
                 "glbl_step": self.glbl_step,
+                "_next_eval_step": self._next_eval_step,
+                "_next_chpt_step": self._next_chpt_step,
+                "_next_schd_step": self._next_schd_step,
+                "_next_logg_step": self._next_logg_step,
             }
             Path(path / "meta.json").write_text(json.dumps(meta, indent=2))
             # Pickled objects
@@ -706,10 +890,11 @@ class Trainer:
 
         # Load the simple objects first that don't require complex state dict handling.
         meta = json.loads((path / "meta.json").read_text())
-        epoch = meta["epoch"]
         glbl_step = meta["glbl_step"]
-        best_epoch = meta["best_epoch"]
-        best_metric = meta["best_metric"]
+        _next_eval_step = meta["_next_eval_step"]
+        _next_chpt_step = meta["_next_chpt_step"]
+        _next_schd_step = meta["_next_schd_step"]
+        _next_logg_step = meta["_next_logg_step"]
         args = pickle.loads((path / "args.pickle").read_bytes())
         log = pickle.loads((path / "log.pickle").read_bytes())
         stopper = pickle.loads((path / "stopper.pickle").read_bytes())
@@ -760,10 +945,11 @@ class Trainer:
             device,
             padbatch,
         )
-        trainer.epoch = epoch
         trainer.glbl_step = glbl_step
-        trainer.best_epoch = best_epoch
-        trainer.best_metric = best_metric
+        trainer._next_eval_step = _next_eval_step
+        trainer._next_chpt_step = _next_chpt_step
+        trainer._next_schd_step = _next_schd_step
+        trainer._next_logg_step = _next_logg_step
         trainer.log = log
 
         return trainer
