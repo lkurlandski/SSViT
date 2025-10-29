@@ -589,13 +589,6 @@ def main() -> None:
             scheduler_init=scheduler_init,
             device=args.device,
         )
-        try:
-            # If a scheduler is not used, we can train for more epochs.
-            # if trainer.scheduler_is_no_op():
-            if scheduler_init(None) is None:
-                trainer.args.epochs = args.epochs
-        except Exception:
-            pass
     else:
         model = wrap_model(model)
         optimizer = optimizer_init(model.parameters())
