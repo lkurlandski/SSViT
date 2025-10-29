@@ -682,16 +682,19 @@ class CreateSimpleDB:
     Create a SimpleDB from files and metadata.
     """
 
-    def __init__(self, root: Path, shardsize: int = 2 ** 30) -> None:
+    def __init__(self, root: Path, shardsize: int = 2 ** 30, samples_per_shard: int = -1, exist_ok: bool = False) -> None:
         self.root = root
         self.dir_data = root / "data"
         self.dir_size = root / "size"
         self.dir_meta = root / "meta"
-        self.root.mkdir(parents=True, exist_ok=False)
+        self.root.mkdir(parents=True, exist_ok=exist_ok)
         self.dir_data.mkdir()
         self.dir_size.mkdir()
         self.dir_meta.mkdir()
         self.shardsize = shardsize
+        self.samples_per_shard = samples_per_shard
+        if (shardsize > 0) == (samples_per_shard > 0):
+            raise ValueError("Exactly one of `shardsize` or `samples_per_shard` must be greater than zero.")
 
         # ---- internal state for incremental use ----
         self._cur_data: bytearray | None = None
@@ -704,6 +707,8 @@ class CreateSimpleDB:
 
     @property
     def max_capacity(self) -> int:
+        if self.samples_per_shard is not None:
+            raise NotImplementedError("max_capacity is not defined when samples_per_shard is used.")
         return self.shardsize * int(10 ** len('*******'))
 
     # ---------- Batch Build API ----------
@@ -777,6 +782,8 @@ class CreateSimpleDB:
         return self
 
     def _should_dump_shard_containers(self, data: bytearray, size_df: pd.DataFrame, meta_df: pd.DataFrame, num_samples: int, sample: "CreateSimpleDBSample") -> bool:
+        if self.samples_per_shard > 0:
+            return num_samples >= self.samples_per_shard
         if num_samples == 0:
             return False
         if len(sample.data) > self.shardsize:
