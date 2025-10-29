@@ -5,6 +5,8 @@ Binary analysis.
 from __future__ import annotations
 from collections.abc import Sequence
 import enum
+from functools import cache
+from functools import partial
 import hashlib
 import io
 import os
@@ -330,6 +332,23 @@ class CharacteristicGuider:
         self.pe, self.size = _parse_pe_and_get_size(data, size)
         self.use_packed = use_packed
 
+    def _get_characteristic_offsets(self) -> dict[lief.PE.Section.CHARACTERISTICS, list[tuple[int, int]]]:
+        offsets: dict[int, list[tuple[int, int]]] = {c: [] for c in lief.PE.Section.CHARACTERISTICS}
+
+        for section in self.pe.sections:
+            offset = section.offset
+            size = section.size
+            lo = max(0, offset)
+            hi = min(self.size, offset + size)
+            if hi <= lo:
+                continue
+
+            for c in lief.PE.Section.CHARACTERISTICS:
+                if section.has_characteristic(c):
+                    offsets[c].append((lo, hi))
+
+        return offsets
+
     def _get_bool_mask(self) -> npt.NDArray[np.bool_]:
         # NOTE: allocating the (T, C) array is quite expensive.
         x = np.full((self.size, len(self.CHARACTERISTICS)), False, dtype=bool)
@@ -631,6 +650,14 @@ class HierarchicalLevel(enum.Enum):
     FINE = "fine"
 
 
+# NOTE: Directory info is parsed at the section-level, e.g.,
+ # IDATA grabs the entire section, not just the import table.
+# NOTE: DIRECTORY takes precendence over CODE and DATA.
+ # Similarily, IDATA takes precedence over RDATA, etc.
+# NOTE: Other partioning schemes exists, e.g.,
+ # lief.PE.SECTION_TYPES and lief.PE.DataDirectory.TYPES.
+
+
 class HierarchicalStructure(enum.Enum):
     ...
 
@@ -652,15 +679,15 @@ class HierarchicalStructureMiddle(HierarchicalStructure):
     OTHER = "other"         # All other bytes       (ANY)
     CODE = "code"           # Code sections         (SECTION)
     DATA = "data"           # Data sections         (SECTION)
-    DIRECTORY = "directory" # Resouce directories   (SECTION)
+    DIRECTORY = "directory" # Resource directories  (SECTION)
     OTHERSEC = "othersec"   # No clean split        (SECTION)
 
 
 class HierarchicalStructureFine(HierarchicalStructure):
-    # TODO: Should we consider using the lief.PE.SECTION_TYPES?
     OVERLAY = "overlay"          # Overlay data     (ANY)
     OTHER = "other"              # All other bytes  (ANY)
     DOS_HEADER  = "dos_header"   # DOS header       (HEADER)
+    DOS_STUB    = "dos_stub"     # DOS stub         (HEADER)
     COFF_HEADER = "coff_header"  # COFF header      (HEADER)
     OPTN_HEADER = "optn_header"  # Optional header  (HEADER)
     SECTN_TABLE = "sectn_table"  # Section table    (HEADER)
@@ -676,7 +703,7 @@ class HierarchicalStructureFine(HierarchicalStructure):
     OTHERDIR = "otherdir"        # Other directory  (DIRECTORY)
 
 
-LEVEL_STRUCTURE_MAP = {
+LEVEL_STRUCTURE_MAP: dict[HierarchicalLevel, type[HierarchicalStructure]] = {
     HierarchicalLevel.NONE: HierarchicalStructureNone,
     HierarchicalLevel.COARSE: HierarchicalStructureCoarse,
     HierarchicalLevel.MIDDLE: HierarchicalStructureMiddle,
@@ -714,6 +741,7 @@ class StructureParser:
             HierarchicalStructureMiddle.OTHER: self.get_other,
 
             HierarchicalStructureFine.DOS_HEADER: self.get_dos_header,
+            HierarchicalStructureFine.DOS_STUB: self.get_dos_stub,
             HierarchicalStructureFine.COFF_HEADER: self.get_coff_header,
             HierarchicalStructureFine.OPTN_HEADER: self.get_optional_header,
             HierarchicalStructureFine.SECTN_TABLE: self.get_section_table,
@@ -730,6 +758,8 @@ class StructureParser:
             HierarchicalStructureFine.OVERLAY: self.get_overlay,
             HierarchicalStructureFine.OTHER: self.get_other,
         }
+
+        self._get_directory_cached_val: Optional[list[Range]] = None
 
     def __call__(self, structure: HierarchicalStructure) -> list[Range]:
         if self.pe is None:
@@ -753,6 +783,13 @@ class StructureParser:
         if end <= start:
             return None
         return (start, end)
+
+    @staticmethod
+    def _ranges_overlap(a: Range, b: Range) -> bool:
+        """Return True if byte ranges a and b overlap at all."""
+        a_lo, a_hi = a
+        b_lo, b_hi = b
+        return not (a_hi <= b_lo or b_hi <= a_lo)
 
     # ---------- PE Helpers ----------
     def _sec_raw_range(self, s: lief.PE.Section) -> Optional[Range]:
@@ -786,10 +823,10 @@ class StructureParser:
                 return (off, off + int(d.size))
             if d.size == 0:
                 return None
-            if d.rva == 0:  # TODO: is this really an invalid RVA?
+            if d.rva == 0:
                 return None
             off = self.pe.rva_to_offset(int(d.rva))
-            if off is None or off <= 0:
+            if off is None or off < 0:
                 return None
             return (int(off), int(off + d.size))
         except Exception:
@@ -804,6 +841,24 @@ class StructureParser:
                 if r:
                     out.append(r)
         return out
+
+    def _section_has_dir_types(self, s: lief.PE.Section, types: set[lief.PE.DataDirectory.TYPES]) -> bool:
+        """Return True if section `s` overlaps with any data directory whose type is in `types`."""
+        sec_rng = self._sec_raw_range(s)
+        if not sec_rng:
+            return False
+
+        for d in self._dirs():
+            if d.type not in types:
+                continue
+            dr = self._dir_range(d)
+            if dr and self._ranges_overlap(sec_rng, dr):
+                return True
+
+        return False
+
+    def _bounds_are_not_directory(self, b: Range) -> bool:
+        return b not in self.get_directory()
 
     # ---------- PE Logic ----------
     @staticmethod
@@ -922,19 +977,37 @@ class StructureParser:
 
     # ---------- MIDDLE ----------
     def get_code(self) -> list[Range]:
-        return self._norm(self._select_sections(self._is_code))
+        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_code)))
 
     def get_data(self) -> list[Range]:
-        return self._norm(self._select_sections(self._is_data))
+        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_data)))
 
-    def get_directory(self) -> list[Range]:
-        warnings.warn("StructureParser::get_directory() has not been tested thoroughly.")
+    def get_directory_precise(self) -> list[Range]:
+        """Returns the exact locations of the directory entries themselves."""
         out = []
         for d in self._dirs():
             r = self._dir_range(d)
             if r:
                 out.append(r)
         return self._norm(out)
+
+    def get_directory(self) -> list[Range]:
+        """Returns the sections that contain directory entries."""
+        if self._get_directory_cached_val is not None:
+            return self._get_directory_cached_val
+        out = []
+        dirs = self._dirs()
+        for s in self.pe.sections:
+            sec_rng = self._sec_raw_range(s)
+            if not sec_rng:
+                continue
+            for d in dirs:
+                dr = self._dir_range(d)
+                if dr and self._ranges_overlap(sec_rng, dr):
+                    out.append(sec_rng)
+                    break  # this section is DIRECTORY; no need to check more dirs
+        self._get_directory_cached_val = self._norm(out)
+        return self.get_directory()
 
     def get_othersec(self) -> list[Range]:
         allsec = self.get_sections()
@@ -946,12 +1019,19 @@ class StructureParser:
     # ---------- FINE ----------
     def get_dos_header(self) -> list[Range]:
         try:
-            e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
-            dos_start = 0
-            dos_end   = e_lfanew + 64  # DOS header is 64 bytes long
-            return self._norm([(dos_start, dos_end)])
-        except Exception:  # TODO: why catch?
+            return self._norm([(0, 64)])
+        except Exception:
             warnings.warn("An error occurred while computing DOS header range.")
+            return []
+
+    def get_dos_stub(self) -> list[Range]:
+        try:
+            e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
+            stub_start = 64
+            stub_end   = e_lfanew
+            return self._norm([(stub_start, stub_end)])
+        except Exception:
+            warnings.warn("An error occurred while computing DOS stub range.")
             return []
 
     def get_coff_header(self) -> list[Range]:
@@ -992,35 +1072,38 @@ class StructureParser:
             return []
 
     def get_rdata(self) -> list[Range]:
-        return self._norm(self._select_sections(self._is_rdata))
+        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_rdata)))
 
     def get_wdata(self) -> list[Range]:
-        return self._norm(self._select_sections(self._is_wdata))
+        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_wdata)))
 
     def get_rcode(self) -> list[Range]:
-        return self._norm(self._select_sections(self._is_rcode))
+        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_rcode)))
 
     def get_wcode(self) -> list[Range]:
-        return self._norm(self._select_sections(self._is_wcode))
+        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_wcode)))
 
     def get_idata(self) -> list[Range]:
-        warnings.warn("StructureParser::get_idata() has not been tested thoroughly.")
-        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.IMPORT_TABLE}))
+        # return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.IMPORT_TABLE}))
+        select = partial(self._section_has_dir_types, types={lief.PE.DataDirectory.TYPES.IMPORT_TABLE})
+        return self._norm(self._select_sections(select))
 
     def get_edata(self) -> list[Range]:
-        warnings.warn("StructureParser::get_edata() has not been tested thoroughly.")
-        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.EXPORT_TABLE}))
+        # return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.EXPORT_TABLE}))
+        select = partial(self._section_has_dir_types, types={lief.PE.DataDirectory.TYPES.EXPORT_TABLE})
+        return self._norm(self._select_sections(select))
 
     def get_reloc(self) -> list[Range]:
-        warnings.warn("StructureParser::get_reloc() has not been tested thoroughly.")
-        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.BASE_RELOCATION_TABLE}))
+        # return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.BASE_RELOCATION_TABLE}))
+        select = partial(self._section_has_dir_types, types={lief.PE.DataDirectory.TYPES.BASE_RELOCATION_TABLE})
+        return self._norm(self._select_sections(select))
 
     def get_clr(self) -> list[Range]:
-        warnings.warn("StructureParser::get_clr() has not been tested thoroughly.")
-        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.CLR_RUNTIME_HEADER}))
+        # return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.CLR_RUNTIME_HEADER}))
+        select = partial(self._section_has_dir_types, types={lief.PE.DataDirectory.TYPES.CLR_RUNTIME_HEADER})
+        return self._norm(self._select_sections(select))
 
     def get_otherdir(self) -> list[Range]:
-        warnings.warn("StructureParser::get_otherdir() has not been tested thoroughly.")
         alldir = self.get_directory()
         for b in self.get_idata() + self.get_edata() + self.get_reloc() + self.get_clr():
             if b in alldir:
