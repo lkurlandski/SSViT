@@ -9,11 +9,11 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError
 from concurrent.futures import Future
-
 import ctypes
 import ctypes.util
 from enum import Enum
 import gc
+from itertools import chain
 import os
 from pathlib import Path
 import random
@@ -34,6 +34,11 @@ import torch
 from torch import ByteTensor
 from torch import UntypedStorage
 from tqdm import tqdm
+import zstandard as zstd
+
+from typing import Union, Optional
+from os import PathLike
+import zstandard as zstd
 
 
 PAGESIZE = 4096
@@ -123,9 +128,9 @@ class SimpleDB:
     Structure:
         root
         ├── data
-            ├── data-0000000.bin
-            ├── data-*******.bin
-            └── data-9999999.bin
+            ├── data-0000000.bin[.zst]
+            ├── data-*******.bin[.zst]
+            └── data-9999999.bin[.zst]
         ├── size
             ├── size-0000000.csv
             ├── size-*******.csv
@@ -139,7 +144,7 @@ class SimpleDB:
     Each size-*.csv file contains the size of each entry, essential for indexing.
     Each meta-*.csv file contains non-essential metadata for each entry.
 
-    data-*******.bin
+    data-*******.bin[.zst]
     -------------
     This is a simple binary file containing concatenated binary blobs of each entry.
     Each sample is padded to a multiple of `PAGESIZE` bytes for paging efficiency.
@@ -204,7 +209,7 @@ class SimpleDB:
 
     @property
     def files_data(self) -> list[Path]:
-        return sorted(self.dir_data.glob("data-*.bin"), key=lambda p: p.stem.split("-")[-1])
+        return sorted(chain(self.dir_data.glob("data-*.bin"), self.dir_data.glob("data-*.bin.zst")), key=lambda p: p.stem.split("-")[-1])
 
     @property
     def files_size(self) -> list[Path]:
@@ -252,7 +257,7 @@ class SimpleDB:
     def get_size_df(self) -> pd.DataFrame:
         size_dfs = [pd.read_csv(f) for f in self.files_size]
         for f, df in zip(self.files_data, size_dfs):
-            if (df["offset"] + df["size"]).max() > os.path.getsize(f):
+            if f.suffix != ".zst" and (df["offset"] + df["size"]).max() > os.path.getsize(f):
                 raise RuntimeError("Size file contains an entry that exceeds the size its data file.")
         size_df = pd.concat(size_dfs, ignore_index=True)
         size_df = size_df.sort_values(by="idx").set_index("idx", drop=False)
@@ -688,9 +693,9 @@ class CreateSimpleDB:
         self.dir_size = root / "size"
         self.dir_meta = root / "meta"
         self.root.mkdir(parents=True, exist_ok=exist_ok)
-        self.dir_data.mkdir()
-        self.dir_size.mkdir()
-        self.dir_meta.mkdir()
+        self.dir_data.mkdir(exist_ok=exist_ok)
+        self.dir_size.mkdir(exist_ok=exist_ok)
+        self.dir_meta.mkdir(exist_ok=exist_ok)
         self.shardsize = shardsize
         self.samples_per_shard = samples_per_shard
         if (shardsize > 0) == (samples_per_shard > 0):
@@ -796,13 +801,18 @@ class CreateSimpleDB:
             return True
         return False
 
-    def _dump_shard_containers(self, data: bytearray, size_df: pd.DataFrame, meta_df: pd.DataFrame, num_samples: int, shard_idx: int) -> None:
+    def _dump_shard_containers(self, data: bytearray, size_df: pd.DataFrame, meta_df: pd.DataFrame, num_samples: int, shard_idx: int, *, compress: bool = False, level: int = 22, threads: int = 0) -> None:
         if num_samples == 0:
             return
         if shard_idx >= 10 ** len('*******'):
             raise RuntimeError(f"Exceeded maximum number of shards ({10 ** len('*******')}).")
         prefix = f"{(len('*******') - len(str(shard_idx))) * '0'}{shard_idx}"
-        Path(self.dir_data / f"data-{prefix}.bin").write_bytes(data)
+        outfile = self.dir_data / f"data-{prefix}.bin"
+        data = bytes(data)
+        if compress:
+            data = zstd.ZstdCompressor(level=level, threads=threads).compress(data)
+            outfile = outfile.with_name(f"{outfile.name}.zst")
+        outfile.write_bytes(data)
         size_df.to_csv(self.dir_size / f"size-{prefix}.csv", index=False)
         meta_df.to_csv(self.dir_meta / f"meta-{prefix}.csv", index=False)
 
