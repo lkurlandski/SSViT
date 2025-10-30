@@ -13,7 +13,6 @@ import ctypes
 import ctypes.util
 from enum import Enum
 import gc
-from itertools import chain
 import os
 from pathlib import Path
 import random
@@ -209,7 +208,7 @@ class SimpleDB:
 
     @property
     def files_data(self) -> list[Path]:
-        return sorted(chain(self.dir_data.glob("data-*.bin"), self.dir_data.glob("data-*.bin.zst")), key=lambda p: p.stem.split("-")[-1])
+        return sorted(self.dir_data.glob("data-*.bin*"), key=lambda p: p.stem.split("-")[-1])
 
     @property
     def files_size(self) -> list[Path]:
