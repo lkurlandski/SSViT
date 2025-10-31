@@ -650,14 +650,6 @@ class HierarchicalLevel(enum.Enum):
     FINE = "fine"
 
 
-# NOTE: Directory info is parsed at the section-level, e.g.,
- # IDATA grabs the entire section, not just the import table.
-# NOTE: DIRECTORY takes precendence over CODE and DATA.
- # Similarily, IDATA takes precedence over RDATA, etc.
-# NOTE: Other partioning schemes exists, e.g.,
- # lief.PE.SECTION_TYPES and lief.PE.DataDirectory.TYPES.
-
-
 class HierarchicalStructure(enum.Enum):
     ...
 
@@ -667,40 +659,50 @@ class HierarchicalStructureNone(HierarchicalStructure):
 
 
 class HierarchicalStructureCoarse(HierarchicalStructure):
-    HEADERS = "headers"  # Headers      (ANY)
-    SECTION = "sections" # Sections     (ANY)
-    OVERLAY = "overlay"  # Overlay data (ANY)
-    OTHER   = "other"    # All other bytes  (ANY)
+    HEADERS   = "headers"   # Headers                (ANY)
+    SECTION   = "sections"  # Sections               (ANY)
+    OVERLAY   = "overlay"   # Overlay data           (ANY)
+    DIRECTORY = "directory" # Directories            (ANY)
+    OTHER     = "other"     # All other bytes        (ANY)
 
 
 class HierarchicalStructureMiddle(HierarchicalStructure):
-    HEADERS = "headers"     # Headers               (ANY)
-    OVERLAY = "overlay"     # Overlay data          (ANY)
-    OTHER = "other"         # All other bytes       (ANY)
-    CODE = "code"           # Code sections         (SECTION)
-    DATA = "data"           # Data sections         (SECTION)
-    DIRECTORY = "directory" # Resource directories  (SECTION)
-    OTHERSEC = "othersec"   # No clean split        (SECTION)
+    HEADERS   = "headers"   # Headers               (ANY)
+    OVERLAY   = "overlay"   # Overlay data          (ANY)
+    DIRECTORY = "directory" # Directories           (ANY)
+    OTHER     = "other"     # All other bytes       (ANY)
+    DNETCODE  = "dnetcode"  # .NET code sections    (SECTION)
+    DNETDATA  = "dnetdata"  # .NET data sections    (SECTION)
+    CODE      = "code"      # Code sections         (SECTION)
+    DATA      = "data"      # Data sections         (SECTION)
 
 
 class HierarchicalStructureFine(HierarchicalStructure):
     OVERLAY = "overlay"          # Overlay data     (ANY)
-    OTHER = "other"              # All other bytes  (ANY)
+    OTHER   = "other"            # All other bytes  (ANY)
     DOS_HEADER  = "dos_header"   # DOS header       (HEADER)
     DOS_STUB    = "dos_stub"     # DOS stub         (HEADER)
     COFF_HEADER = "coff_header"  # COFF header      (HEADER)
     OPTN_HEADER = "optn_header"  # Optional header  (HEADER)
     SECTN_TABLE = "sectn_table"  # Section table    (HEADER)
-    OTHERSEC = "othersec"        # No clean split   (SECTION)
-    RDATA = "rdata"              # Read-only data   (DATA)
-    WDATA = "wdata"              # Writeable data   (DATA)
+    RDNETCODE = "rdnetcode"      # Read-only .NET code (DNETCODE)
+    WDNETCODE = "wdnetcode"      # Writeable .NET code (DNETCODE)
+    RDNETDATA = "rdnetdata"      # Read-only .NET data (DNETDATA)
+    WDNETDATA = "wdnetdata"      # Writeable .NET data (DNETDATA)
     RCODE = "rcode"              # Read-only code   (CODE)
     WCODE = "wcode"              # Writeable code   (CODE)
-    IDATA = "idata"              # Import data      (DIRECTORY)
-    EDATA = "edata"              # Export data      (DIRECTORY)
-    RELOC = "reloc"              # Relocation data  (DIRECTORY)
-    CLR   = "clr"                # CLR/.NET data    (DIRECTORY)
-    OTHERDIR = "otherdir"        # Other directory  (DIRECTORY)
+    RDATA = "rdata"              # Read-only data   (DATA)
+    WDATA = "wdata"              # Writeable data   (DATA)
+    IDATA    = "idata"           # Import descriptors         (DIRECTORY)
+    DELAYIMP = "delayimp"        # Delay import descriptors   (DIRECTORY)
+    EDATA    = "edata"           # Export descriptors         (DIRECTORY)
+    RESOURCE = "resource"        # Resource directory (.rsrc) (DIRECTORY)
+    TLS      = "tls"             # TLS directory / callbacks  (DIRECTORY)
+    LOADCFG  = "loadcfg"         # Load config directory      (DIRECTORY)
+    RELOC    = "reloc"           # Relocation table           (DIRECTORY)
+    DEBUG    = "debug"           # Debug directory            (DIRECTORY)
+    CLR      = "clr"             # CLR/.NET header/metadata   (DIRECTORY)
+    OTHERDIR = "otherdir"        # Any other data directory   (DIRECTORY)
 
 
 LEVEL_STRUCTURE_MAP: dict[HierarchicalLevel, type[HierarchicalStructure]] = {
@@ -717,68 +719,127 @@ class StructureParser:
     _SCN_MEM_READ    = 0x40000000
     _SCN_MEM_WRITE   = 0x80000000
 
-    # _SCN_CNT_CODE    = 0x00000020
-    # _SCN_CNT_IN_DATA = 0x00000040
-    # _SCN_CNT_UN_DATA = 0x00000080
-
     def __init__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> None:
-        self.pe, self.size = _parse_pe_and_get_size(data, size)
+        self._pe, self._size = _parse_pe_and_get_size(data, size)
 
-        self.functions = {
-            HierarchicalStructureNone.ANY: self.get_any,
+    @property
+    def pe(self) -> lief.PE.Binary:
+        return self._pe
 
-            HierarchicalStructureCoarse.HEADERS: self.get_headers,
-            HierarchicalStructureCoarse.SECTION: self.get_sections,
-            HierarchicalStructureCoarse.OVERLAY: self.get_overlay,
-            HierarchicalStructureCoarse.OTHER: self.get_other,
+    @property
+    def size(self) -> int:
+        return self._size
 
-            HierarchicalStructureMiddle.HEADERS: self.get_headers,
-            HierarchicalStructureMiddle.CODE: self.get_code,
-            HierarchicalStructureMiddle.DATA: self.get_data,
-            HierarchicalStructureMiddle.DIRECTORY: self.get_directory,
-            HierarchicalStructureMiddle.OTHERSEC: self.get_othersec,
-            HierarchicalStructureMiddle.OVERLAY: self.get_overlay,
-            HierarchicalStructureMiddle.OTHER: self.get_other,
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, StructureParser):
+            return NotImplemented
+        return (self.pe is other.pe) and (self.size == other.size)
 
-            HierarchicalStructureFine.DOS_HEADER: self.get_dos_header,
-            HierarchicalStructureFine.DOS_STUB: self.get_dos_stub,
-            HierarchicalStructureFine.COFF_HEADER: self.get_coff_header,
-            HierarchicalStructureFine.OPTN_HEADER: self.get_optional_header,
-            HierarchicalStructureFine.SECTN_TABLE: self.get_section_table,
-            HierarchicalStructureFine.RDATA: self.get_rdata,
-            HierarchicalStructureFine.WDATA: self.get_wdata,
-            HierarchicalStructureFine.RCODE: self.get_rcode,
-            HierarchicalStructureFine.WCODE: self.get_wcode,
-            HierarchicalStructureFine.OTHERSEC: self.get_othersec,
-            HierarchicalStructureFine.IDATA: self.get_idata,
-            HierarchicalStructureFine.EDATA: self.get_edata,
-            HierarchicalStructureFine.RELOC: self.get_reloc,
-            HierarchicalStructureFine.CLR: self.get_clr,
-            HierarchicalStructureFine.OTHERDIR: self.get_otherdir,
-            HierarchicalStructureFine.OVERLAY: self.get_overlay,
-            HierarchicalStructureFine.OTHER: self.get_other,
-        }
-
-        self._get_directory_cached_val: Optional[list[Range]] = None
+    def __hash__(self) -> int:
+        return hash((id(self.pe), self.size))
 
     def __call__(self, structure: HierarchicalStructure) -> list[Range]:
-        if self.pe is None:
-            return []
-        return self._norm(self.functions[structure]())
+        match structure:
+            # None
+            case HierarchicalStructureNone.ANY:
+                ranges = self.get_any()
+            # Coarse
+            case HierarchicalStructureCoarse.HEADERS:
+                ranges = self.get_headers()
+            case HierarchicalStructureCoarse.SECTION:
+                ranges = self.get_sections()
+            case HierarchicalStructureCoarse.OVERLAY:
+                ranges = self.get_overlay()
+            case HierarchicalStructureCoarse.DIRECTORY:
+                ranges = self.get_directory()
+            case HierarchicalStructureCoarse.OTHER:
+                ranges = self.get_other()
+            # Middle
+            case HierarchicalStructureMiddle.HEADERS:
+                ranges = self.get_headers()
+            case HierarchicalStructureMiddle.OVERLAY:
+                ranges = self.get_overlay()
+            case HierarchicalStructureMiddle.OTHER:
+                ranges = self.get_other()
+            case HierarchicalStructureMiddle.DIRECTORY:
+                ranges = self.get_directory()
+            case HierarchicalStructureMiddle.DNETCODE:
+                ranges = self.get_dnet_code()
+            case HierarchicalStructureMiddle.DNETDATA:
+                ranges = self.get_dnet_data()
+            case HierarchicalStructureMiddle.CODE:
+                ranges = self.get_code()
+            case HierarchicalStructureMiddle.DATA:
+                ranges = self.get_data()
+            # Fine
+            case HierarchicalStructureFine.OVERLAY:
+                ranges = self.get_overlay()
+            case HierarchicalStructureFine.OTHER:
+                ranges = self.get_other()
+            case HierarchicalStructureFine.DOS_HEADER:
+                ranges = self.get_dos_header()
+            case HierarchicalStructureFine.DOS_STUB:
+                ranges = self.get_dos_stub()
+            case HierarchicalStructureFine.COFF_HEADER:
+                ranges = self.get_coff_header()
+            case HierarchicalStructureFine.OPTN_HEADER:
+                ranges = self.get_optional_header()
+            case HierarchicalStructureFine.SECTN_TABLE:
+                ranges = self.get_section_table()
+            case HierarchicalStructureFine.RDNETCODE:
+                ranges = self.get_rdnet_code()
+            case HierarchicalStructureFine.WDNETCODE:
+                ranges = self.get_wdnet_code()
+            case HierarchicalStructureFine.RDNETDATA:
+                ranges = self.get_rdnet_data()
+            case HierarchicalStructureFine.WDNETDATA:
+                ranges = self.get_wdnet_data()
+            case HierarchicalStructureFine.RDATA:
+                ranges = self.get_rdata()
+            case HierarchicalStructureFine.WDATA:
+                ranges = self.get_wdata()
+            case HierarchicalStructureFine.RCODE:
+                ranges = self.get_rcode()
+            case HierarchicalStructureFine.WCODE:
+                ranges = self.get_wcode()
+            case HierarchicalStructureFine.IDATA:
+                ranges = self.get_idata()
+            case HierarchicalStructureFine.DELAYIMP:
+                ranges = self.get_delayimp()
+            case HierarchicalStructureFine.EDATA:
+                ranges = self.get_edata()
+            case HierarchicalStructureFine.RESOURCE:
+                ranges = self.get_resource()
+            case HierarchicalStructureFine.TLS:
+                ranges = self.get_tls()
+            case HierarchicalStructureFine.LOADCFG:
+                ranges = self.get_loadcfg()
+            case HierarchicalStructureFine.RELOC:
+                ranges = self.get_reloc()
+            case HierarchicalStructureFine.DEBUG:
+                ranges = self.get_debug()
+            case HierarchicalStructureFine.CLR:
+                ranges = self.get_clr()
+            case HierarchicalStructureFine.OTHERDIR:
+                ranges = self.get_otherdir()
+            case _:
+                raise ValueError(f"Unknown structure type: {structure}.")
+
+        return self._norm(ranges)
 
     # ---------- Range Helpers ----------
     def _norm(self, ranges: Iterable[Range]) -> list[Range]:
+        """Normalize ranges, clipping to file size."""
         ranges = [r for r in ranges if r is not None]
         ranges = [self._clip(*r) for r in ranges]
         ranges = [r for r in ranges if r is not None]
         return ranges
 
     def _clip(self, start: int, end: int) -> Optional[Range]:
-        """Clip range to be within the file size. Return None if invalid.
-        """
-        if start is None or end is None:  # TODO: remove?
+        """Clip range to be within the file size. Return None if invalid."""
+        if start is None or end is None:
             return None
-        start = max(0, start)  # TODO: add warnings for stuff out of bounds.
+        start = max(0, start)
         end   = min(self.size, end)
         if end <= start:
             return None
@@ -793,13 +854,13 @@ class StructureParser:
 
     # ---------- PE Helpers ----------
     def _sec_raw_range(self, s: lief.PE.Section) -> Optional[Range]:
-        """Get the raw data range of a section if it has raw data.
-        """
+        """Get the raw data range of a section if it has raw data."""
         if s.sizeof_raw_data == 0:
             return None
         return (int(s.pointerto_raw_data), int(s.pointerto_raw_data + s.sizeof_raw_data))
 
     def _select_sections(self, function: Callable[[lief.PE.Section], bool]) -> list[Range]:
+        """Filter sections by a function and return their raw ranges."""
         out = []
         for s in self.pe.sections:
             if function(s):
@@ -808,14 +869,8 @@ class StructureParser:
                     out.append(r)
         return out
 
-    def _dirs(self) -> list[lief.PE.DataDirectory]:
-        try:
-            return list(self.pe.data_directories)
-        except Exception:
-            print("An error occurred while accessing data directories.")
-            return []
-
     def _dir_range(self, d: lief.PE.DataDirectory) -> Optional[Range]:
+        """Return the raw range of the directory."""
         try:
             # SECURITY (certificate table) is special: VirtualAddress is a FILE OFFSET (not an RVA)
             if d.type == lief.PE.DataDirectory.TYPES.CERTIFICATE_TABLE:
@@ -834,35 +889,104 @@ class StructureParser:
             return None
 
     def _dir_type_range(self, types: set[lief.PE.DataDirectory.TYPES]) -> list[Range]:
+        """Return the raw ranges of all data directories of the given types."""
         out = []
-        for d in self._dirs():
+        for d in self.pe.data_directories:
             if d.type in types:
                 r = self._dir_range(d)
                 if r:
                     out.append(r)
         return out
 
-    def _section_has_dir_types(self, s: lief.PE.Section, types: set[lief.PE.DataDirectory.TYPES]) -> bool:
-        """Return True if section `s` overlaps with any data directory whose type is in `types`."""
-        sec_rng = self._sec_raw_range(s)
-        if not sec_rng:
-            return False
+    def _rva_size_to_range(self, rva: int, size: int) -> Optional[Range]:
+        """Convert an RVA+size pair into a raw file (offset, offset+size) range."""
+        if not rva or not size:
+            return None
+        off = self.pe.rva_to_offset(int(rva))
+        if off is None or off < 0:
+            return None
+        return (int(off), int(off + size))
 
-        for d in self._dirs():
-            if d.type not in types:
+    @cache
+    def _get_dotnet_sections(self) -> list[lief.PE.Section]:
+        """Identify sections that belong to the .NET / CLR world."""
+        # Get the CLR directory.
+        for clr_dir in self.pe.data_directories:
+            if clr_dir.type == lief.PE.DataDirectory.TYPES.CLR_RUNTIME_HEADER:
+                break
+        else:
+            return []
+        if clr_dir.size == 0 or clr_dir.rva == 0:
+            return []
+        clr_rva  = int(clr_dir.rva)
+        clr_size = int(clr_dir.size)
+
+        # Parse IMAGE_COR20_HEADER
+        def _u32(off: int) -> int:
+            return int.from_bytes(header_bytes[off : off + 4], "little", signed=False)
+
+        HEADER_LEN = 0x48
+        try:
+            header_bytes = bytes(self.pe.get_content_from_virtual_address(clr_rva, HEADER_LEN))
+        except Exception:
+            warnings.warn("A CLR Header was located but we failed to read its bytes.")
+            return []
+        header_bytes = header_bytes.ljust(HEADER_LEN, b"\x00")
+
+        MetaDataRVA                     = _u32(0x08)
+        MetaDataSize                    = _u32(0x0C)
+        ResourcesRVA                    = _u32(0x18)
+        ResourcesSize                   = _u32(0x1C)
+        StrongNameSignatureRVA          = _u32(0x20)
+        StrongNameSignatureSize         = _u32(0x24)
+        CodeManagerTableRVA             = _u32(0x28)
+        CodeManagerTableSize            = _u32(0x2C)
+        VTableFixupsRVA                 = _u32(0x30)
+        VTableFixupsSize                = _u32(0x34)
+        ExportAddressTableJumpsRVA      = _u32(0x38)
+        ExportAddressTableJumpsSize     = _u32(0x3C)
+        ManagedNativeHeaderRVA          = _u32(0x40)
+        ManagedNativeHeaderSize         = _u32(0x44)
+
+        # Gather candidate .NET regions.
+        def _add_region_from_rva_size(accum_ranges: list[Range], rva: int, sz: int) -> None:
+            if not rva or not sz:
+                return
+            rng = self._rva_size_to_range(int(rva), int(sz))
+            if rng is not None:
+                accum_ranges.append(rng)
+
+        dotnet_file_ranges: list[Range] = []
+
+        _add_region_from_rva_size(dotnet_file_ranges, clr_rva, clr_size)
+        _add_region_from_rva_size(dotnet_file_ranges, MetaDataRVA, MetaDataSize)
+        _add_region_from_rva_size(dotnet_file_ranges, ResourcesRVA, ResourcesSize)
+        _add_region_from_rva_size(dotnet_file_ranges, StrongNameSignatureRVA, StrongNameSignatureSize)
+        _add_region_from_rva_size(dotnet_file_ranges, CodeManagerTableRVA, CodeManagerTableSize)
+        _add_region_from_rva_size(dotnet_file_ranges, VTableFixupsRVA, VTableFixupsSize)
+        _add_region_from_rva_size(dotnet_file_ranges, ExportAddressTableJumpsRVA, ExportAddressTableJumpsSize)
+        _add_region_from_rva_size(dotnet_file_ranges, ManagedNativeHeaderRVA, ManagedNativeHeaderSize)
+
+        if not dotnet_file_ranges:
+            return []
+
+        # Map ranges to sections.
+        dotnet_secs: set[lief.PE.Section] = set()
+        for sec in self.pe.sections:
+            sec_range = self._sec_raw_range(sec)
+            if sec_range is None:
                 continue
-            dr = self._dir_range(d)
-            if dr and self._ranges_overlap(sec_rng, dr):
-                return True
+            for dr in dotnet_file_ranges:
+                if self._ranges_overlap(sec_range, dr):
+                    dotnet_secs.add(sec)
+                    break
 
-        return False
+        return list(dotnet_secs)
 
-    def _bounds_are_not_directory(self, b: Range) -> bool:
-        return b not in self.get_directory()
-
-    # ---------- PE Logic ----------
+    # ---------- PE Section Logic ----------
     @staticmethod
     def _is_code(s: lief.PE.Section) -> bool:
+        """Returns True if the section contains "code" else False."""
         c = int(s.characteristics)
         is_executable = bool(c & StructureParser._SCN_MEM_EXECUTE)
         is_code_section = False # bool(c & StructureParser._SCN_CNT_CODE)
@@ -870,18 +994,21 @@ class StructureParser:
 
     @staticmethod
     def _is_rcode(s: lief.PE.Section) -> bool:
+        """Returns True if the section contains read-only "code" else False."""
         c = int(s.characteristics)
         is_writeable = bool(c & StructureParser._SCN_MEM_WRITE)
         return StructureParser._is_code(s) and not is_writeable
 
     @staticmethod
     def _is_wcode(s: lief.PE.Section) -> bool:
+        """Returns True if the section contains writeable "code" else False."""
         c = int(s.characteristics)
         is_writeable = bool(c & StructureParser._SCN_MEM_WRITE)
         return StructureParser._is_code(s) and is_writeable
 
     @staticmethod
     def _is_data(s: lief.PE.Section) -> bool:
+        """Returns True if the section contains "data" else False."""
         c = int(s.characteristics)
         is_readable = bool(c & StructureParser._SCN_MEM_READ)
         is_executable = bool(c & StructureParser._SCN_MEM_EXECUTE)
@@ -891,32 +1018,28 @@ class StructureParser:
 
     @staticmethod
     def _is_rdata(s: lief.PE.Section) -> bool:
+        """Returns True if the section contains read-only "data" else False."""
         c = int(s.characteristics)
         is_writeable = bool(c & StructureParser._SCN_MEM_WRITE)
         return StructureParser._is_data(s) and not is_writeable
 
     @staticmethod
     def _is_wdata(s: lief.PE.Section) -> bool:
+        """Returns True if the section contains writeable "data" else False."""
         c = int(s.characteristics)
         is_writeable = bool(c & StructureParser._SCN_MEM_WRITE)
         return StructureParser._is_data(s) and is_writeable
 
-    # ---------- ANY ----------
+    def _is_dotnet(self, s: lief.PE.Section) -> bool:
+        """Returns True if the section is part of the .NET runtime else False."""
+        return s in self._get_dotnet_sections()
+
+    # ---------- ANY ---------- #
+
     def get_any(self) -> list[Range]:
         return self._norm([(0, self.size)])
 
-    # ---------- COARSE ----------
-    def get_headers(self) -> list[Range]:
-        return self._norm([(0, self.pe.sizeof_headers)])
-
-    def get_sections(self) -> list[Range]:
-        out = []
-        for s in self.pe.sections:
-            r = self._sec_raw_range(s)
-            if r:
-                out.append(r)
-        return self._norm(out)
-
+    @cache
     def get_overlay(self) -> list[Range]:
         sec_end = 0
         for s in self.pe.sections:
@@ -926,6 +1049,7 @@ class StructureParser:
             return self._norm([(sec_end, self.size)])
         return []
 
+    @cache
     def get_other(self) -> list[Range]:
 
         def _normalize_and_merge(ranges: Iterable[Range], size: int) -> list[Range]:
@@ -970,142 +1094,150 @@ class StructureParser:
                 other.append((cursor, size))
             return other
 
-        ranges = self.get_headers() + self.get_sections() + self.get_overlay()
+        ranges = self.get_headers() + self.get_sections() + self.get_overlay() + self.get_directory()
         merged = _normalize_and_merge(ranges, self.size)
         other = _complement_of_merged(merged, self.size)
         return self._norm(other)
 
-    # ---------- MIDDLE ----------
+    # ---------- HEADER ---------- #
+
+    def get_headers(self) -> list[Range]:
+        return self._norm([(0, self.pe.sizeof_headers)])
+
+    def get_dos_header(self) -> list[Range]:
+        return self._norm([(0, 64)])
+
+    def get_dos_stub(self) -> list[Range]:
+        e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
+        stub_start = 64
+        stub_end   = e_lfanew
+        return self._norm([(stub_start, stub_end)])
+
+    def get_coff_header(self) -> list[Range]:
+        e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
+        coff_start = e_lfanew + 4
+        coff_end   = coff_start + 20
+        return self._norm([(coff_start, coff_end)])
+
+    def get_optional_header(self) -> list[Range]:
+        e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
+        coff_start = e_lfanew + 4
+        coff_end   = coff_start + 20
+        opt_start  = coff_end
+        opt_end    = opt_start + int(self.pe.header.sizeof_optional_header)
+        return self._norm([(opt_start, opt_end)])
+
+    def get_section_table(self) -> list[Range]:
+        e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
+        coff_start = e_lfanew + 4
+        coff_end   = coff_start + 20
+        opt_start  = coff_end
+        opt_end    = opt_start + int(self.pe.header.sizeof_optional_header)
+        nsects     = int(self.pe.header.numberof_sections)
+        sectab_start = opt_end
+        sectab_end   = sectab_start + 40 * nsects
+        return self._norm([(sectab_start, sectab_end)])
+
+    # --------- SECTION ---------- #
+
+    def get_sections(self) -> list[Range]:
+        out = []
+        for s in self.pe.sections:
+            r = self._sec_raw_range(s)
+            if r:
+                out.append(r)
+        return self._norm(out)
+
+    def get_dnet_code(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: self._is_dotnet(s) and self._is_code(s)))
+
+    def get_rdnet_code(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: self._is_dotnet(s) and self._is_rcode(s)))
+
+    def get_wdnet_code(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: self._is_dotnet(s) and self._is_wcode(s)))
+
+    def get_dnet_data(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: self._is_dotnet(s) and self._is_data(s)))
+
+    def get_rdnet_data(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: self._is_dotnet(s) and self._is_rdata(s)))
+
+    def get_wdnet_data(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: self._is_dotnet(s) and self._is_wdata(s)))
+
     def get_code(self) -> list[Range]:
-        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_code)))
+        return self._norm(self._select_sections(lambda s: not self._is_dotnet(s) and self._is_code(s)))
+
+    def get_rcode(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: not self._is_dotnet(s) and self._is_rcode(s)))
+
+    def get_wcode(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: not self._is_dotnet(s) and self._is_wcode(s)))
 
     def get_data(self) -> list[Range]:
-        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_data)))
+        return self._norm(self._select_sections(lambda s: not self._is_dotnet(s) and self._is_data(s)))
 
-    def get_directory_precise(self) -> list[Range]:
-        """Returns the exact locations of the directory entries themselves."""
+    def get_rdata(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: not self._is_dotnet(s) and self._is_rdata(s)))
+
+    def get_wdata(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: not self._is_dotnet(s) and self._is_wdata(s)))
+
+    # --------- DIRECTORY ---------- #
+
+    def get_directory(self) -> list[Range]:
         out = []
-        for d in self._dirs():
+        for d in self.pe.data_directories:
             r = self._dir_range(d)
             if r:
                 out.append(r)
         return self._norm(out)
 
-    def get_directory(self) -> list[Range]:
-        """Returns the sections that contain directory entries."""
-        if self._get_directory_cached_val is not None:
-            return self._get_directory_cached_val
-        out = []
-        dirs = self._dirs()
-        for s in self.pe.sections:
-            sec_rng = self._sec_raw_range(s)
-            if not sec_rng:
-                continue
-            for d in dirs:
-                dr = self._dir_range(d)
-                if dr and self._ranges_overlap(sec_rng, dr):
-                    out.append(sec_rng)
-                    break  # this section is DIRECTORY; no need to check more dirs
-        self._get_directory_cached_val = self._norm(out)
-        return self.get_directory()
-
-    def get_othersec(self) -> list[Range]:
-        allsec = self.get_sections()
-        for b in self.get_code() + self.get_data() + self.get_directory():
-            if b in allsec:
-                allsec.remove(b)
-        return self._norm(allsec)
-
-    # ---------- FINE ----------
-    def get_dos_header(self) -> list[Range]:
-        try:
-            return self._norm([(0, 64)])
-        except Exception:
-            warnings.warn("An error occurred while computing DOS header range.")
-            return []
-
-    def get_dos_stub(self) -> list[Range]:
-        try:
-            e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
-            stub_start = 64
-            stub_end   = e_lfanew
-            return self._norm([(stub_start, stub_end)])
-        except Exception:
-            warnings.warn("An error occurred while computing DOS stub range.")
-            return []
-
-    def get_coff_header(self) -> list[Range]:
-        try:
-            e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
-            coff_start = e_lfanew + 4  # skip "PE\0\0"
-            coff_end   = coff_start + 20
-            return self._norm([(coff_start, coff_end)])
-        except Exception:  # TODO: why catch?
-            warnings.warn("An error occurred while computing COFF header range.")
-            return []
-
-    def get_optional_header(self) -> list[Range]:
-        try:
-            e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
-            coff_start = e_lfanew + 4
-            coff_end   = coff_start + 20
-            opt_start  = coff_end
-            opt_end    = opt_start + int(self.pe.header.sizeof_optional_header)
-            return self._norm([(opt_start, opt_end)])
-        except Exception:  # TODO: why catch?
-            warnings.warn("An error occurred while computing optional header range.")
-            return []
-
-    def get_section_table(self) -> list[Range]:
-        try:
-            e_lfanew = int(self.pe.dos_header.addressof_new_exeheader)
-            coff_start = e_lfanew + 4
-            coff_end   = coff_start + 20
-            opt_start  = coff_end
-            opt_end    = opt_start + int(self.pe.header.sizeof_optional_header)
-            nsects     = int(self.pe.header.numberof_sections)
-            sectab_start = opt_end
-            sectab_end   = sectab_start + 40 * nsects
-            return self._norm([(sectab_start, sectab_end)])
-        except Exception:  # TODO: why catch?
-            warnings.warn("An error occurred while computing section table range.")
-            return []
-
-    def get_rdata(self) -> list[Range]:
-        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_rdata)))
-
-    def get_wdata(self) -> list[Range]:
-        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_wdata)))
-
-    def get_rcode(self) -> list[Range]:
-        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_rcode)))
-
-    def get_wcode(self) -> list[Range]:
-        return self._norm(filter(self._bounds_are_not_directory, self._select_sections(self._is_wcode)))
-
     def get_idata(self) -> list[Range]:
-        # return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.IMPORT_TABLE}))
-        select = partial(self._section_has_dir_types, types={lief.PE.DataDirectory.TYPES.IMPORT_TABLE})
-        return self._norm(self._select_sections(select))
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.IMPORT_TABLE}))
 
     def get_edata(self) -> list[Range]:
-        # return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.EXPORT_TABLE}))
-        select = partial(self._section_has_dir_types, types={lief.PE.DataDirectory.TYPES.EXPORT_TABLE})
-        return self._norm(self._select_sections(select))
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.EXPORT_TABLE}))
 
     def get_reloc(self) -> list[Range]:
-        # return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.BASE_RELOCATION_TABLE}))
-        select = partial(self._section_has_dir_types, types={lief.PE.DataDirectory.TYPES.BASE_RELOCATION_TABLE})
-        return self._norm(self._select_sections(select))
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.BASE_RELOCATION_TABLE}))
 
     def get_clr(self) -> list[Range]:
-        # return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.CLR_RUNTIME_HEADER}))
-        select = partial(self._section_has_dir_types, types={lief.PE.DataDirectory.TYPES.CLR_RUNTIME_HEADER})
-        return self._norm(self._select_sections(select))
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.CLR_RUNTIME_HEADER}))
+
+    def get_resource(self) -> list[Range]:
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.RESOURCE_TABLE}))
+
+    def get_tls(self) -> list[Range]:
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.TLS_TABLE}))
+
+    def get_loadcfg(self) -> list[Range]:
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.LOAD_CONFIG_TABLE}))
+
+    def get_delayimp(self) -> list[Range]:
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.DELAY_IMPORT_DESCRIPTOR}))
+
+    def get_debug(self) -> list[Range]:
+        return self._norm(self._dir_type_range({lief.PE.DataDirectory.TYPES.DEBUG_DIR}))
 
     def get_otherdir(self) -> list[Range]:
-        alldir = self.get_directory()
-        for b in self.get_idata() + self.get_edata() + self.get_reloc() + self.get_clr():
-            if b in alldir:
-                alldir.remove(b)
-        return self._norm(alldir)
+        special = {
+            lief.PE.DataDirectory.TYPES.IMPORT_TABLE,
+            lief.PE.DataDirectory.TYPES.EXPORT_TABLE,
+            lief.PE.DataDirectory.TYPES.BASE_RELOCATION_TABLE,
+            lief.PE.DataDirectory.TYPES.CLR_RUNTIME_HEADER,
+            lief.PE.DataDirectory.TYPES.RESOURCE_TABLE,
+            lief.PE.DataDirectory.TYPES.TLS_TABLE,
+            lief.PE.DataDirectory.TYPES.LOAD_CONFIG_TABLE,
+            lief.PE.DataDirectory.TYPES.DELAY_IMPORT_DESCRIPTOR,
+            lief.PE.DataDirectory.TYPES.DEBUG_DIR,
+        }
+        other_ranges = []
+        for d in self.pe.data_directories:
+            if d.type in special:
+                continue
+            r = self._dir_range(d)
+            if r:
+                other_ranges.append(r)
+        return self._norm(other_ranges)
