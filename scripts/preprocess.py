@@ -26,6 +26,7 @@ from __future__ import annotations
 from argparse import ArgumentParser
 from collections.abc import Iterable
 from collections import defaultdict
+from copy import deepcopy
 import hashlib
 from itertools import batched
 import math
@@ -38,6 +39,7 @@ import sys
 import time
 from typing import Any
 from typing import Optional
+import warnings
 
 import lief
 import numpy as np
@@ -240,19 +242,99 @@ def process_one_shard_wrapper(args: tuple) -> None:  # type: ignore[type-arg]
     process_one_shard(*args)
 
 
+def verify_one_shard(
+    outdir: Path,
+    split: str,
+    shardidx: int,
+    sha_batch: Iterable[str],
+    lab_batch: Iterable[int],
+    samples_per_shard: int,
+    max_length: int,
+    compress: bool,
+    level: int,
+) -> tuple[int, int]:
+    """
+    Verify one shard of the dataset. Return the number of samples and metadata entries found.
+    """
+    sha_batch: list[str] = list(sha_batch)
+    lab_batch: list[int] = list(lab_batch)
+
+    if len(sha_batch) != len(lab_batch):
+        raise ValueError(f"Error (split {split}, shard {shardidx}): mismatch in number of names and labels.")
+    if len(sha_batch) > samples_per_shard:
+        raise ValueError(f"Error (split {split}, shard {shardidx}): too many samples in batch.")
+    if len(sha_batch) < samples_per_shard:
+        warnings.warn(f"Warning (split {split}, shard {shardidx}): fewer samples in `sha_batch` ({len(sha_batch)}) than expected ({samples_per_shard}).")
+
+    # Verify the data (size and meta).
+    size_df = pl.read_csv(outdir / "data" / split / "size" / f"size-{shardidx:07d}.csv")
+    meta_df = pl.read_csv(outdir / "data" / split / "meta" / f"meta-{shardidx:07d}.csv")
+    for c in ["idx", "name", "shard"]:
+        if not size_df[c].equals(meta_df[c]):
+            raise ValueError(f"Error (split {split}, shard {shardidx}): mismatch in column '{c}' between size and meta dataframes.")
+
+    # Adjust `sha_batch` and `lab_batch` if some samples are missing.
+    if meta_df.shape[0] < len(sha_batch):
+        _present_sha = set(meta_df["name"].to_list())
+        _present_idx = [i for i, sha in enumerate(sha_batch) if sha in _present_sha]
+        sha_batch = [sha_batch[i] for i in _present_idx]
+        lab_batch = [lab_batch[i] for i in _present_idx]
+
+    # Check the names and labels.
+    if meta_df["name"].to_list() != sha_batch:
+        raise ValueError(f"Error (split {split}, shard {shardidx}): mismatch between names and expected names.")
+    if meta_df["malware"].to_list() != lab_batch:
+        raise ValueError(f"Error (split {split}, shard {shardidx}): mismatch between labels and expected labels.")
+    if int(size_df["size"].max()) > max_length:  # type: ignore[arg-type]
+        raise ValueError(f"Error (split {split}, shard {shardidx}): some samples exceed maximum bytes.")
+
+    # Verify the data (data).
+    if compress:
+        file = (outdir / "data" / split / "data" / f"data-{shardidx:07d}.bin.zst")
+        data = zstd.decompress(file.read_bytes())
+    else:
+        file = (outdir / "data" / split / "data" / f"data-{shardidx:07d}.bin")
+        data = file.read_bytes()
+
+    # Check the stored data matches the expected hashes.
+    for i in range(len(sha_batch)):
+        offset = size_df.item(i, "offset")
+        size = size_df.item(i, "size")
+        buf = data[offset:offset + size]
+        sha = hashlib.sha256(buf).hexdigest()
+        if sha != sha_batch[i] and size < max_length:
+            raise ValueError(f"Error (split {split}, shard {shardidx}): mismatch between stored data and expected name.")
+
+    # Check the metadata.
+    file = outdir / "meta" / split / f"shard_{shardidx:08d}.parquet"
+    shas = set(pl.read_parquet(file, columns=["sha"])["sha"].unique().to_list())
+    if not shas.issubset(set(sha_batch)):
+        raise ValueError(f"Error (split {split}, shard {shardidx}): mismatch between stored metadata and expected names.")
+
+    return len(sha_batch), len(shas)
+
+def verify_one_shard_wrapper(args: tuple) -> Optional[tuple[int, int]]:  # type: ignore[type-arg]
+    try:
+        return verify_one_shard(*args)
+    except Exception as err:
+        print(err)
+    return None
+
+
 def main() -> None:
 
     parser = ArgumentParser(description="Preprocess EMBER dataset.")
     parser.add_argument("--outdir", type=Path, required=True, help="Output directory for the shards.")
-    parser.add_argument("--tr_index", type=Path, required=True, help="Path to an index file for the tr set.")
-    parser.add_argument("--vl_index", type=Path, required=True, help="Path to an index file for the vl set.")
-    parser.add_argument("--ts_index", type=Path, required=True, help="Path to an index file for the ts set.")
+    parser.add_argument("--tr_index", type=Path, required=False, help="Path to an index file for the tr set.")
+    parser.add_argument("--vl_index", type=Path, required=False, help="Path to an index file for the vl set.")
+    parser.add_argument("--ts_index", type=Path, required=False, help="Path to an index file for the ts set.")
     parser.add_argument("--samples_per_shard", type=int, default=4096, help="Number of samples per shard.")
     parser.add_argument("--max_length", type=int, default=2**22, help="Truncate files larger than this size (in bytes).")
     parser.add_argument("--num_workers", type=int, default=0, help="Process shards in parallel using this many additional workers.")
     parser.add_argument("--compress", action="store_true", help="Compress data and metadata using Zstandard.")
     parser.add_argument("--level", type=int, default=22, help="Zstandard compression level (1-22).")
     parser.add_argument("--num_check", type=int, default=16, help="Number of samples to check after processing each split.")
+    parser.add_argument("--verify", action="store_true", help="Verify the integrity of a processed dataset. If set, other arguments are ignored.")
     args = parser.parse_args()
 
     print("preprocess:")
@@ -266,6 +348,7 @@ def main() -> None:
     print(f"  compress: {args.compress}")
     print(f"  level: {args.level}")
     print(f"  num_check: {args.num_check}")
+    print(f"  verify: {args.verify}")
 
     if args.max_length > 2**32:
         raise ValueError("max_length cannot exceed 4 GiB (2^32 bytes).")
@@ -277,29 +360,77 @@ def main() -> None:
     compress = bool(args.compress)
     level = int(args.level)
 
+    splits = []
+    sfiles = []
+    if args.ts_index is not None:
+        splits.append("ts")
+        sfiles.append(args.ts_index)
+    if args.vl_index is not None:
+        splits.append("vl")
+        sfiles.append(args.vl_index)
+    if args.tr_index is not None:
+        splits.append("tr")
+        sfiles.append(args.tr_index)
+    if not splits or not sfiles:
+        raise ValueError("At least one of --tr_index, --vl_index, or --ts_index must be provided.")
+
     # Create output directories.
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "meta").mkdir(exist_ok=True)
     (outdir / "data").mkdir(exist_ok=True)
-    for split in ["ts", "vl", "tr"]:
+    for split in splits:
         (outdir / "meta" / split).mkdir(exist_ok=True)
 
     # Sort shas and labels lexicographically for each split.
     shas: dict[str, list[str]] = {}
     labs: dict[str, list[int]] = {}
-    for split, file in zip(["ts", "vl", "tr"], [args.ts_index, args.vl_index, args.tr_index]):
+    for split, file in zip(splits, sfiles):
         _blob = np.loadtxt(file, dtype=str)  # type: ignore[no-untyped-call]
         _shas = _blob[:, 0]
         _labs = _blob[:, 1].astype(int)
         _idx  = np.argsort(_shas)
         shas[split] = _shas[_idx].tolist()
         labs[split] = _labs[_idx].tolist()
+        if np.unique(_shas).shape[0] != _shas.shape[0]:
+            raise ValueError(f"Duplicate SHA entries found in index file {file}.")
     print("Split information:")
-    print(f"  ts: {np.unique(labs['ts'], return_counts=True)}")  # type: ignore[no-untyped-call]
-    print(f"  vl: {np.unique(labs['vl'], return_counts=True)}")  # type: ignore[no-untyped-call]
-    print(f"  tr: {np.unique(labs['tr'], return_counts=True)}")  # type: ignore[no-untyped-call]
+    for split in splits:
+        print(f"  {split}: {np.unique(labs[split], return_counts=True)}")
 
-    for split in ["ts", "vl", "tr"]:
+    # If verifying, do that and return.
+    if args.verify:
+        for split in splits:
+            print(f"Verifying {split} ({num_workers} workers)...")
+            total = math.ceil(len(shas[split]) / samples_per_shard)
+            desc = f"Progress ({total} shards)..."
+            sha_batches = batched(shas[split], n=samples_per_shard)
+            lab_batches = batched(labs[split], n=samples_per_shard)
+            iterable: list[tuple] = []  # type: ignore[type-arg]
+            for shardidx, (sha_batch_, lab_batch_) in enumerate(zip(sha_batches, lab_batches)):
+                sha_batch = list(sha_batch_)
+                lab_batch = list(lab_batch_)  # type: ignore[call-overload]
+                arg = (outdir, split, shardidx, sha_batch, lab_batch, samples_per_shard, max_length, compress, level)
+                iterable.append(arg)
+            t_start = time.time()
+            results = []
+            if num_workers == 0:
+                for args_ in tqdm(iterable, total=total, desc=desc):
+                    r = verify_one_shard_wrapper(args_)
+                    results.append(r)
+            else:
+                with mp.Pool(num_workers) as pool:
+                    results
+                    for r in tqdm(pool.imap_unordered(verify_one_shard_wrapper, iterable), total=total, desc=desc):
+                        results.append(r)
+            print(f"  Total verified shards: {len(results) - results.count(None)}")
+            print(f"  Total corrupted shards: {results.count(None)}")
+            n_samp = [r[0] for r in results if r is not None]
+            n_meta = [r[1] for r in results if r is not None]
+            print(f"  Total samples: {sum(n_samp)}")
+            print(f"  Total metadata {sum(n_meta)}")
+        return
+
+    for split in splits:
         # Build the shards for each split.
         print(f"Preprocessing {split} ({num_workers} workers)...")
         total = math.ceil(len(shas[split]) / samples_per_shard)
