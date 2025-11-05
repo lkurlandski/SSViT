@@ -365,6 +365,17 @@ class CharacteristicGuider:
 
         return x
 
+    @staticmethod
+    def _get_bit_mask_(
+        size: int,
+        offsets: npt.NDArray[np.int64],
+        sizes: npt.NDArray[np.int64],
+        flags: npt.NDArray[np.uint8],
+    ) -> npt.NDArray[np.uint8]:
+        x = np.zeros(((size + 7) // 8, flags.shape[1]), dtype=np.uint8)
+        _paint_packed_or(x, offsets, sizes, flags, size)
+        return x
+
     def _get_bit_mask(self) -> npt.NDArray[np.uint8]:
         x = np.zeros(((self.size + 7) // 8, len(self.CHARACTERISTICS)), dtype=np.uint8)
 
