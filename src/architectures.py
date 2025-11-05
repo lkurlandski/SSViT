@@ -1137,7 +1137,7 @@ class HierarchicalMalConvClassifier(HierarchicalClassifier):
         and averages these hidden representations before feeding them to a classification head.
     """
 
-    def __init__(self, embeddings: list[nn.Embedding], filmers: list[FiLM | FiLMNoP], backbones: list[MalConv], head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: list[nn.Embedding], filmers: list[FiLM | FiLMNoP], backbones: list[MalConvBase], head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(backbones)):
