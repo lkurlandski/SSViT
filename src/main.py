@@ -2,27 +2,28 @@
 Train and validate models.
 """
 
+from collections.abc import Iterable
 from collections.abc import Sequence
-from collections import Counter
 from copy import deepcopy
 from functools import partial
-from hashlib import md5
 import math
 import os
 from pathlib import Path
-import resource
 import sys
-import time
+from typing import cast
 from typing import Any
 from typing import Callable
-from typing import NamedTuple
 from typing import Optional
+from typing import Protocol
+from typing import TypeVar
 import warnings
 
 import lief
 import numpy as np
 from numpy import typing as npt
+import pandas as pd
 import torch
+from torch import Tensor
 from torch import distributed as dist
 from torch.utils.data import IterableDataset
 from torch.distributed.device_mesh import init_device_mesh
@@ -67,17 +68,12 @@ from src.binanal import HierarchicalStructure
 from src.binanal import CharacteristicGuider
 from src.data import SemanticGuides
 from src.data import StructureMaps
-from src.data import BinaryDataset
-from src.data import BaseSimpleDBDataset
-from src.data import MappingSimpleDBDataset
 from src.data import IterableSimpleDBDataset
 from src.data import CollateFn
 from src.data import CollateFnHierarchical
 from src.data import CUDAPrefetcher
 from src.data import Name
 from src.data import Preprocessor
-from src.data import GroupedLengthBatchSampler
-from src.data import ShardAwareBatchSampler
 from src.data import FSample
 from src.data import FSamples
 from src.data import HSamples
@@ -86,15 +82,9 @@ from src.helpers import flatten_dataclasses
 from src.helpers import _MTArgs
 from src.helpers import Architecture
 from src.helpers import ModelSize
-from src.helpers import DBType
 from src.helpers import MainArgs
 from src.simpledb import SimpleDB
-from src.simpledb import RandomMappingSimpleDB
-from src.simpledb import ChunkedMappingSimpleDB
-from src.simpledb import IterableSimpleDB
-from src.simpledb import SimpleDBSample
-from src.simpledb import split_simple_db
-from src.split import tr_vl_ts_split
+from src.simpledb import MetadataDB
 from src.trainer import Trainer
 from src.trainer import TrainerArgs
 from src.trainer import EarlyStopper
@@ -175,8 +165,8 @@ def get_model(
         filmer = FiLMCls(guide_dim, embedding_dim, guide_hidden)
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
             MalConvCls = arch_to_malconv_backbone[arch]
-            backbone = MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
-            return MalConvClassifier(embedding, filmer, backbone, head)
+            backbone_ = MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
+            return MalConvClassifier(embedding, filmer, backbone_, head)
         if arch in (Architecture.VIT,):
             patcher = PatchEncoder(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
             backbone = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
@@ -260,22 +250,27 @@ def get_model(
     raise NotImplementedError(f"{level} {arch}")
 
 
-def wrap_model_base(model: Module, device: torch.device) -> Module:
+class SupportsFullyShard(Protocol):
+
+    def fully_shard(self, *args: Any, **kwds: Any) -> None:
+        ...
+
+M = TypeVar("M", bound=Module)
+
+def wrap_model_base(model: M, device: torch.device) -> M:
     model = model.to(device)
     return model
 
-
-def wrap_model_ddp(model: Module, device: torch.device, static_graph: bool) -> Module:
+def wrap_model_ddp(model: M, device: torch.device, static_graph: bool) -> DistributedDataParallel:
     model = model.to(device)
     model = DistributedDataParallel(model, static_graph=static_graph)
     return model
 
-
-def wrap_model_fsdp(model: Module, mpdtype: torch.dtype, fsdp_offload: bool) -> Module:
+def wrap_model_fsdp(model: M, mpdtype: torch.dtype, fsdp_offload: bool) -> M:
     mesh = init_device_mesh("cuda", (world_size(),))
     mp_policy = MixedPrecisionPolicy(mpdtype)
     offload_policy = CPUOffloadPolicy() if fsdp_offload else OffloadPolicy()
-    model.fully_shard(mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+    cast(SupportsFullyShard, model).fully_shard(mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
     return model
 
 
@@ -287,26 +282,26 @@ def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int]) -> CollateF
 
 def worker_init_fn(worker_id: int) -> None:
     info = torch.utils.data.get_worker_info()
+    if info is None:
+        raise RuntimeError("worker_init_fn called outside of worker process.")
     lief.logging.set_level(lief.logging.LEVEL.OFF)
     org_num_threads = torch.get_num_threads()
     new_num_threads = get_optimal_num_worker_threads(info.num_workers, ngpu=local_world_size())
     torch.set_num_threads(new_num_threads)
-    if isinstance(info.dataset, BaseSimpleDBDataset):
-        info.dataset.worker_open_and_register_finalizer()
     print(f"Worker {worker_id} of {info.num_workers} using {org_num_threads} --> {torch.get_num_threads()} threads.")
 
 
 def get_loader(
-    dataset: Dataset,
+    dataset: Dataset[Any],
     batch_size: Optional[int],
     shuffle: Optional[bool],
-    sampler: Optional[Sampler],
-    batch_sampler: Optional[Sampler],
+    sampler: Optional[Sampler[Any]],
+    batch_sampler: Optional[Sampler[Any]],
     num_workers: int,
     collate_fn: Callable[[Sequence[FSample]], FSamples | HSamples],
     pin_memory: bool,
     prefetch_factor: int,
-) -> DataLoader:
+) -> DataLoader[Any]:
     """
     Return a DataLoader with proper settings for multiprocessing.
 
@@ -326,18 +321,15 @@ def get_loader(
         worker_init_fn=None if num_workers == 0 else worker_init_fn,
         multiprocessing_context=None if num_workers == 0 else "forkserver",
         prefetch_factor=None if num_workers == 0 else prefetch_factor,
-        persistent_workers=None if num_workers == 0 else True,
+        persistent_workers=False if num_workers == 0 else True,
     )
 
 
-def get_streamer(loader: DataLoader, device: torch.device, num_streams: int) -> CUDAPrefetcher:
+def get_streamer(loader: DataLoader[Any], device: torch.device, num_streams: int) -> CUDAPrefetcher:
     """Wrap a DataLoader with a CUDAPrefetcher and warmup its workers."""
     streamer = CUDAPrefetcher(loader, device, num_streams)
     if loader.persistent_workers:
         streamer.warmup(0)
-        time.sleep(4)
-    if loader.num_workers == 0 and isinstance(loader.dataset, BaseSimpleDBDataset):
-        loader.dataset.worker_open_and_register_finalizer()
     return streamer
 
 
@@ -416,6 +408,7 @@ def main() -> None:
     print(f"{min_length=}")
     print(f"{min_lengths=}")
 
+    wrap_model: Callable[[M], M | DistributedDataParallel]
     if args.ddp:
         wrap_model = partial(wrap_model_ddp, device=args.device, static_graph=True)
     elif args.fsdp:
@@ -425,7 +418,6 @@ def main() -> None:
     print(f"{wrap_model=}")
 
     preprocessor = Preprocessor(
-        args.do_parser,
         args.do_entropy,
         args.do_characteristics,
         args.level,
@@ -433,123 +425,84 @@ def main() -> None:
     )
     print(f"{preprocessor=}")
 
-    tr_db_root = Path("./datadb_tr")
-    vl_db_root = Path("./datadb_vl")
-    ts_db_root = Path("./datadb_ts")
-    print(f"{tr_db_root=}")
-    print(f"{vl_db_root=}")
-    print(f"{ts_db_root=}")
+    root = Path("./data")
+    print(f"{root=}")
 
-    tr_db: SimpleDB
-    vl_db: SimpleDB
-    ts_db: SimpleDB
-    if args.db_type == DBType.ITR:
-        tr_db = IterableSimpleDB(tr_db_root, pread_block_bytes=8 * 2**20, merge_slack_bytes=1 * 2**20)
-        vl_db = IterableSimpleDB(vl_db_root, pread_block_bytes=8 * 2**20, merge_slack_bytes=1 * 2**20)
-        ts_db = IterableSimpleDB(ts_db_root, pread_block_bytes=8 * 2**20, merge_slack_bytes=1 * 2**20)
-    if args.db_type == DBType.RND:
-        ulimit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-        tr_db = RandomMappingSimpleDB(tr_db_root, num_open=ulimit // 2, backend="mmap")
-        vl_db = RandomMappingSimpleDB(vl_db_root, num_open=ulimit // 8, backend="mmap")
-        ts_db = RandomMappingSimpleDB(ts_db_root, num_open=ulimit // 8, backend="mmap")
-    if args.db_type == DBType.CHK:
-        tr_db = ChunkedMappingSimpleDB(tr_db_root)
-        vl_db = ChunkedMappingSimpleDB(vl_db_root)
-        ts_db = ChunkedMappingSimpleDB(ts_db_root)
-    print(f"{tr_db=}")
-    print(f"{vl_db=}")
-    print(f"{ts_db=}")
+    tr_datadb = SimpleDB(root / "data" / "tr")
+    ts_datadb = SimpleDB(root / "data" / "ts")
+    print(f"{tr_datadb=}")
+    print(f"{ts_datadb=}")
 
-    tr_max_shard = len(tr_db.files_data) - 1 if args.tr_num_samples is None else tr_db.meta_df["shard"].iloc[args.tr_num_samples]
-    vl_max_shard = len(vl_db.files_data) - 1 if args.vl_num_samples is None else vl_db.meta_df["shard"].iloc[args.vl_num_samples]
-    ts_max_shard = len(ts_db.files_data) - 1 if args.ts_num_samples is None else ts_db.meta_df["shard"].iloc[args.ts_num_samples]
-    print(f"{tr_max_shard=}")
-    print(f"{vl_max_shard=}")
-    print(f"{ts_max_shard=}")
+    tr_metadb = MetadataDB(root / "meta" / "tr")
+    ts_metadb = MetadataDB(root / "meta" / "ts")
+    print(f"{tr_metadb=}")
+    print(f"{ts_metadb=}")
 
-    tr_shards = list(range(len(tr_db.files_data)))[0: tr_max_shard + 1]
-    vl_shards = list(range(len(vl_db.files_data)))[0: vl_max_shard + 1]
-    ts_shards = list(range(len(ts_db.files_data)))[0: ts_max_shard + 1]
-    print(f"tr_shards=[0, ..., {tr_max_shard}]")
-    print(f"vl_shards=[0, ..., {vl_max_shard}]")
-    print(f"ts_shards=[0, ..., {ts_max_shard}]")
+    def get_last_shard(datadb: SimpleDB, num_samples: Optional[int]) -> int:
+        if num_samples is None:
+            return datadb.num_shards - 1
+        s = 0
+        for i in range(datadb.num_shards):
+            s += sum(datadb.num_samples(i))
+            if s >= num_samples:
+                return i
+        raise RuntimeError(f"There are only {s} samples in the database, so {num_samples} is too large.")
 
-    tr_idx = tr_db.meta_df[tr_db.meta_df["shard"] <= tr_max_shard]["idx"].to_numpy(np.int64)
-    vl_idx = vl_db.meta_df[vl_db.meta_df["shard"] <= vl_max_shard]["idx"].to_numpy(np.int64)
-    ts_idx = ts_db.meta_df[ts_db.meta_df["shard"] <= ts_max_shard]["idx"].to_numpy(np.int64)
-    tr_labels = tr_db.meta_df["malware"].to_numpy(np.int64)[tr_idx]
-    vl_labels = vl_db.meta_df["malware"].to_numpy(np.int64)[vl_idx]
-    ts_labels = ts_db.meta_df["malware"].to_numpy(np.int64)[ts_idx]
-    print(f"tr_idx ({len(tr_idx)}): distribution={np.unique(tr_labels, return_counts=True)}")  # type: ignore[no-untyped-call]
-    print(f"vl_idx ({len(vl_idx)}): distribution={np.unique(vl_labels, return_counts=True)}")  # type: ignore[no-untyped-call]
-    print(f"ts_idx ({len(ts_idx)}): distribution={np.unique(ts_labels, return_counts=True)}")  # type: ignore[no-untyped-call]
+    tr_last_shard = get_last_shard(tr_datadb, args.tr_num_samples)
+    ts_last_shard = get_last_shard(ts_datadb, args.ts_num_samples)
+    print(f"{tr_last_shard=}")
+    print(f"{ts_last_shard=}")
 
-    # Split the shards or idx between distributed workers.
+    tr_shards = list(range(len(tr_datadb.files_data)))[0: tr_last_shard + 1]
+    ts_shards = list(range(len(ts_datadb.files_data)))[0: ts_last_shard + 1]
+    print(f"tr_shards=[0, ..., {tr_last_shard}]")
+    print(f"ts_shards=[0, ..., {ts_last_shard}]")
+
+    def get_shardwise_stats(datadb: SimpleDB, last_shard: int) -> pd.DataFrame:
+        dfs = []
+        for shard, (size_df, meta_df) in enumerate(zip(datadb.get_size_dfs(), datadb.get_meta_dfs())):
+            s = size_df["size"].to_numpy(np.int64)
+            l = meta_df["malware"].to_numpy(np.int64)
+            d = np.unique(l, return_counts=True)[1]
+            df = pd.DataFrame({
+                "shard-idx": shard,
+                "size-max": np.max(s),
+                "size-min": np.min(s),
+                "size-avg": np.mean(s),
+                "ratio-malware": d[1] / (d[0] + d[1]),
+            }, index=[0])
+            dfs.append(df)
+            if shard >= last_shard:
+                break
+        return pd.concat(dfs, ignore_index=True)
+
+    tr_stats_df = get_shardwise_stats(tr_datadb, tr_last_shard)
+    ts_stats_df = get_shardwise_stats(ts_datadb, ts_last_shard)
+    with pd.option_context("display.max_rows", None, "display.max_columns", None):
+        print(f"tr_stats_df=\n{tr_stats_df}")
+        print(f"ts_stats_df=\n{ts_stats_df}")
+
+    # Split the shards between distributed workers.
     if world_size() > 1:
-        if args.db_type == DBType.ITR:
-            tr_shards = tr_shards[rank()::world_size()]
-            vl_shards = vl_shards[rank()::world_size()]
-            ts_shards = ts_shards[rank()::world_size()]
-        if args.db_type == DBType.RND:
-            tr_idx = tr_idx[rank()::world_size()]
-            vl_idx = vl_idx[rank()::world_size()]
-            ts_idx = ts_idx[rank()::world_size()]
-        if args.db_type == DBType.CHK:
-            tr_idx = tr_idx[rank()::world_size()]
-            vl_idx = vl_idx[rank()::world_size()]
-            ts_idx = ts_idx[rank()::world_size()]
+        tr_shards = tr_shards[rank()::world_size()]
+        ts_shards = ts_shards[rank()::world_size()]
 
-    if args.db_type == DBType.ITR:
-        tr_dataset = IterableSimpleDBDataset(tr_db, preprocessor, shuffle=True,  shards=tr_shards)  # type: ignore[arg-type]
-        vl_dataset = IterableSimpleDBDataset(vl_db, preprocessor, shuffle=False, shards=vl_shards)  # type: ignore[arg-type]
-        ts_dataset = IterableSimpleDBDataset(ts_db, preprocessor, shuffle=False, shards=ts_shards)  # type: ignore[arg-type]
-    if args.db_type == DBType.RND:
-        tr_dataset = MappingSimpleDBDataset(tr_db, preprocessor)  # type: ignore[arg-type]
-        vl_dataset = MappingSimpleDBDataset(vl_db, preprocessor)  # type: ignore[arg-type]
-        ts_dataset = MappingSimpleDBDataset(ts_db, preprocessor)  # type: ignore[arg-type]
-    if args.db_type == DBType.CHK:
-        tr_dataset = MappingSimpleDBDataset(tr_db, preprocessor)  # type: ignore[arg-type]
-        vl_dataset = MappingSimpleDBDataset(vl_db, preprocessor)  # type: ignore[arg-type]
-        ts_dataset = MappingSimpleDBDataset(ts_db, preprocessor)  # type: ignore[arg-type]
+    tr_dataset = IterableSimpleDBDataset(tr_datadb, tr_metadb, preprocessor, tr_shards, shuffle=True)
+    ts_dataset = IterableSimpleDBDataset(ts_datadb, ts_metadb, preprocessor, ts_shards, shuffle=False)
     print(f"{tr_dataset=}")
-    print(f"{vl_dataset=}")
     print(f"{ts_dataset=}")
 
     collate_fn = get_collate_fn(args.level, min_lengths)
     print(f"{collate_fn=}")
 
-    if args.db_type == DBType.ITR:
-        tr_sampler = None
-        vl_sampler = None
-        ts_sampler = None
-    if args.db_type == DBType.RND:
-        # TODO: design a sampler that only selects from the subset of idx, not the entire db; adjust the __len__ of the dataset accordingly.
-        warnings.warn(f"Properly sample selection for {args.db_type} is not implemented yet.")
-        tr_sampler = None
-        vl_sampler = None
-        ts_sampler = None
-    if args.db_type == DBType.CHK:
-        # TODO: design a sampler that only selects from the subset of idx, not the entire db; adjust the __len__ of the dataset accordingly.
-        warnings.warn(f"Properly sample selection for {args.db_type} is not implemented yet.")
-        tr_sampler = ShardAwareBatchSampler(args.tr_batch_size, tr_db.size_df["shard"], tr_db.size_df["size"], tr_db.size_df["offset"], shuffle=True,  seed=args.seed)
-        vl_sampler = ShardAwareBatchSampler(args.vl_batch_size, vl_db.size_df["shard"], vl_db.size_df["size"], vl_db.size_df["offset"], shuffle=False, seed=args.seed)
-        ts_sampler = ShardAwareBatchSampler(args.ts_batch_size, ts_db.size_df["shard"], ts_db.size_df["size"], ts_db.size_df["offset"], shuffle=False, seed=args.seed)
-    print(f"{tr_sampler=}")
-    print(f"{vl_sampler=}")
-    print(f"{ts_sampler=}")
-
-    tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, tr_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
-    vl_loader = get_loader(vl_dataset, args.vl_batch_size, False, None, vl_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
-    ts_loader = get_loader(ts_dataset, args.ts_batch_size, False, None, ts_sampler, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    ts_loader = get_loader(ts_dataset, args.ts_batch_size, False, None, None, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
     print(f"tr_loader=DataLoader(pin_memory={tr_loader.pin_memory}, num_workers={tr_loader.num_workers}, prefetch_factor={tr_loader.prefetch_factor})")
-    print(f"vl_loader=DataLoader(pin_memory={vl_loader.pin_memory}, num_workers={vl_loader.num_workers}, prefetch_factor={vl_loader.prefetch_factor})")
     print(f"ts_loader=DataLoader(pin_memory={ts_loader.pin_memory}, num_workers={ts_loader.num_workers}, prefetch_factor={ts_loader.prefetch_factor})")
 
     tr_streamer = get_streamer(tr_loader, args.device, args.num_streams)
-    vl_streamer = get_streamer(vl_loader, args.device, args.num_streams)
     ts_streamer = get_streamer(ts_loader, args.device, args.num_streams)
     print(f"{tr_streamer=}")
-    print(f"{vl_streamer=}")
     print(f"{ts_streamer=}")
 
     rargs = TrainerArgs.from_dict(args.to_dict())
@@ -558,16 +511,16 @@ def main() -> None:
     loss_fn = CrossEntropyLoss()
     print(f"{loss_fn=}")
 
-    optimizer_init: Callable[[Any], Optimizer] = lambda params: AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = lambda params: AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
     print(f"{optimizer_init=}")
 
-    scheduler_init: Callable[[Any], LRScheduler] = lambda optim: None
+    scheduler_init: Callable[[Optimizer], LRScheduler] = lambda optim: LambdaLR(optim, lambda _: 1.0)
     print(f"{scheduler_init=}")
 
     padbatch = get_padbatch(args.level, args.do_parser, args.do_entropy, args.do_characteristics, min_lengths, args.vl_batch_size)
     print(f"{padbatch=}")
 
-    stopper: Optional[EarlyStopper] = None
+    stopper: EarlyStopper = EarlyStopper(patience=float("inf"))
     print(f"{stopper=}")
 
     checkpoint = None
@@ -583,21 +536,21 @@ def main() -> None:
             model=model,
             wrap_model=wrap_model,
             tr_loader=tr_streamer,
-            vl_loader=vl_streamer,
+            vl_loader=ts_streamer,
             loss_fn=loss_fn,
             optimizer_init=optimizer_init,
             scheduler_init=scheduler_init,
             device=args.device,
         )
     else:
-        model = wrap_model(model)
-        optimizer = optimizer_init(model.parameters())
+        wmodel = wrap_model(model)
+        optimizer = optimizer_init(wmodel.parameters())
         scheduler = scheduler_init(optimizer)
         trainer = Trainer(
             args=rargs,
-            model=model,
+            model=wmodel,
             tr_loader=tr_streamer,
-            vl_loader=vl_streamer,
+            vl_loader=ts_streamer,
             loss_fn=loss_fn,
             optimizer=optimizer,
             scheduler=scheduler,

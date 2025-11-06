@@ -32,6 +32,7 @@ import warnings
 
 import lief
 import numpy as np
+import polars as pl
 import torch
 from torch import Tensor
 from torch import BoolTensor
@@ -50,6 +51,7 @@ from torch.utils.data import Sampler
 from torch.utils.data import get_worker_info
 from torch.utils._pytree import tree_map
 
+from src.binanal import LEVEL_STRUCTURE_MAP
 from src.binanal import _parse_pe_and_get_size
 from src.binanal import _get_size_of_liefparse
 from src.binanal import LiefParse
@@ -66,11 +68,11 @@ from src.binentropy import compute_entropy_rolling_numpy
 from src.bitpacking import packbits
 from src.bitpacking import unpackbits
 from src.bitpacking import slice_bitpacked_tensor
+from src.simpledb import Sample as SimpleDBSample
 from src.simpledb import SimpleDB
-from src.simpledb import RandomMappingSimpleDB
-from src.simpledb import ChunkedMappingSimpleDB
-from src.simpledb import IterableSimpleDB
-from src.simpledb import SimpleDBSample
+from src.simpledb import SimpleDBIterator
+from src.simpledb import SimpleDBReader
+from src.simpledb import MetadataDB
 from src.utils import check_tensor
 from src.utils import pad_sequence
 
@@ -351,41 +353,64 @@ class SemanticGuider:
     Semantic guides to acompany a byte stream.
     """
 
-    def __init__(self, do_parse: bool = False, do_entropy: bool = False, do_characteristics: bool = False, radius: int = 256, simple: bool = False) -> None:
+    def __init__(
+        self,
+        do_parse: bool = False,
+        do_entropy: bool = False,
+        do_characteristics: bool = False,
+        radius: int = 256,
+        simple: bool = False,
+        use_packed: bool = True,
+    ) -> None:
         self.do_parse = do_parse
         self.do_entropy = do_entropy
         self.do_characteristics = do_characteristics
         self.radius = radius
         self.simple = simple
+        self.use_packed = use_packed
 
-    def __call__(self, data: Optional[LiefParse | lief.PE.Binary], size: Optional[int] = None, inputs: Optional[torch.CharTensor] = None) -> SemanticGuide:
-        if not any((self.do_parse, self.do_entropy, self.do_characteristics)):
-            return SemanticGuide(None, None, None)
-
-        if data is None:
-            raise ValueError("Data must be provided for semantic guides.")
+    def __call__(
+        self,
+        data: Optional[LiefParse | lief.PE.Binary] = None,
+        size: Optional[int] = None,
+        inputs: Optional[torch.CharTensor] = None,
+    ) -> SemanticGuide:
 
         parse = None
         if self.do_parse:
-            parse = ParserGuider(data, size)(simple=self.simple)
-            parse = torch.from_numpy(parse)
+            if data is None:
+                raise ValueError("Data must be provided for parse computation.")
+            parse = self._get_parse(data, size)
 
         entropy = None
         if self.do_entropy:
             if inputs is None:
                 raise RuntimeError("Inputs must be provided for entropy computation.")
-            # NOTE: computing entropy with JIT-based numba is faster than torch.
-            # TODO: there may be a better way to prevent additional data copying.
-            inputs = inputs.numpy(force=True)
-            entropy = compute_entropy_rolling_numpy(inputs, self.radius)
-            entropy = torch.from_numpy(entropy).to(torch.float16)
+            entropy = self._get_entropy(inputs)
 
         characteristics = None
         if self.do_characteristics:
-            characteristics = CharacteristicGuider(data, size, use_packed=True)()
-            characteristics = torch.from_numpy(characteristics)
+            if data is None:
+                raise ValueError("Data must be provided for characteristics computation.")
+            characteristics = self._get_characteristics(data, size)
 
         return SemanticGuide(parse, entropy, characteristics)
+
+    def _get_parse(self, data: LiefParse | lief.PE.Binary, size: Optional[int]) -> Tensor:
+        parse = ParserGuider(data, size)(simple=self.simple)
+        parse = torch.from_numpy(parse)
+        return parse
+
+    def _get_entropy(self, inputs: torch.CharTensor) -> Tensor:
+        inputs = inputs.numpy(force=True)
+        entropy = compute_entropy_rolling_numpy(inputs, self.radius)
+        entropy = torch.from_numpy(entropy).to(torch.float16)
+        return entropy
+
+    def _get_characteristics(self, data: LiefParse | lief.PE.Binary, size: Optional[int]) -> Tensor:
+        characteristics = CharacteristicGuider(data, size, use_packed=self.use_packed)()
+        characteristics = torch.from_numpy(characteristics)
+        return characteristics
 
 
 class _StructureMapOrStructureMaps(ABC):
@@ -523,8 +548,14 @@ class StructurePartitioner:
         self.level = level
 
     def __call__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> StructureMap:
+        lexicon: Mapping[int, HierarchicalStructure]
+        index: list[list[tuple[int, int]]]
+
         if self.level == HierarchicalLevel.NONE:
-            size = _get_size_of_liefparse(data) if size is None else size
+            if size is None:
+                if not isinstance(data, LiefParse):
+                    raise TypeError("Data must be LiefParse to infer size when level is NONE.")
+                size = _get_size_of_liefparse(data)
             index = [[(0, size)]]
             lexicon = {0: HierarchicalStructureNone.ANY}
             return StructureMap(index, lexicon)
@@ -534,21 +565,10 @@ class StructurePartitioner:
 
         parser = StructureParser(data, size)
 
-        if self.level == HierarchicalLevel.NONE:
-            structures = list(HierarchicalStructureNone)
-        if self.level == HierarchicalLevel.COARSE:
-            structures = list(HierarchicalStructureCoarse)
-        elif self.level == HierarchicalLevel.MIDDLE:
-            structures = list(HierarchicalStructureMiddle)
-        elif self.level == HierarchicalLevel.FINE:
-            structures = list(HierarchicalStructureFine)
-        else:
-            raise TypeError(f"Unknown HierarchicalLevel: {self.level}. Expected one of {list(HierarchicalLevel)}.")
-
-        index = [[] for _ in structures]
+        index = []
         lexicon = {}
-        for i, s in enumerate(structures):
-            index[i] = parser(s)
+        for i, s in enumerate(LEVEL_STRUCTURE_MAP[self.level]):
+            index.append(parser(s))
             lexicon[i] = s
         return StructureMap(index, lexicon)
 
@@ -585,15 +605,15 @@ class _FSampleOrSamples(ABC):
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
 
     @property
-    def parse(self) -> Optional[list[Tensor]]:
+    def parse(self) -> Optional[Tensor]:
         return self.guides.parse
 
     @property
-    def entropy(self) -> Optional[list[Tensor]]:
+    def entropy(self) -> Optional[Tensor]:
         return self.guides.entropy
 
     @property
-    def characteristics(self) -> Optional[list[Tensor]]:
+    def characteristics(self) -> Optional[Tensor]:
         return self.guides.characteristics
 
     @abstractmethod
@@ -915,230 +935,190 @@ FOrHSample  = FSample | HSample
 FOrHSamples = FSamples | HSamples
 
 
-class BinaryDataset(Dataset):  # type: ignore[misc]
-    """Map-style dataset for files on disk."""
+class IterableSimpleDBDataset(IterableDataset[FSample]):
 
-    def __init__(self, files: Sequence[StrPath], labels: Sequence[int], preprocessor: Preprocessor) -> None:
-        self.files = files
-        self.labels = labels
+    def __init__(
+        self,
+        db: SimpleDB,
+        metadb: MetadataDB,
+        preprocessor: Preprocessor,
+        shards: Optional[list[int]] = None,
+        *,
+        shuffle: bool = False,
+        poolsize: int = 16,
+    ) -> None:
+        self.db = db
+        self.metadb = metadb
         self.preprocessor = preprocessor
-
-    def __getitem__(self, i: int) -> FSample:
-        return self.preprocessor(self.labels[i], file=self.files[i])
-
-    def __len__(self) -> int:
-        return len(self.files)
-
-
-class BaseSimpleDBDataset(ABC):
-    """
-    Base class for SimpleDB-backed datasets.
-
-    Usage:
-        >>> db = SimpleDB(...).close()
-        >>> preprocessor = Preprocessor(...)
-        >>> dataset = SimpleDBBinaryDataset(db, preprocessor)
-        >>> dataset.worker_open_and_register_finalizer()
-        >>> sample = dataset[0]
-    """
-
-    db: SimpleDB
-
-    def __init__(self, db: SimpleDB, preprocessor: Preprocessor) -> None:
-        self.db = db.close()
-        self.preprocessor = preprocessor
-        self._finalizer_registered = False
-
-    def __getstate__(self) -> dict[str, Any]:
-        """Ensure DB is closed before pickling and clear worker-only flags."""
-        state = self.__dict__.copy()
-        self.db.close()
-        state["_finalizer_registered"] = False
-        return state
-
-    def __len__(self) -> int:
-        """Return the number of samples in the underlying database."""
-        return len(self.db.meta_df.index)
-
-    def safe_close_db(self) -> None:
-        """Close the DB connection if it is open."""
-        try:
-            self.db.close()
-        except Exception:
-            pass
-
-    def preprocess(self, sample: SimpleDBSample) -> FSample:
-        """Preprocess a SimpleDBSample into an FSample using the preprocessor."""
-        label = 1 if sample.malware else 0
-        name = Name(sample.name)
-        inputs = sample.data
-        bview = sample.bview
-        return self.preprocessor(label=label, name=name, inputs=inputs, liefblob=bview)
-
-    def worker_open_and_register_finalizer(self) -> None:
-        """Open the DB connection and register a finalizer to close it at exit."""
-        self.db.open()
-        if not self._finalizer_registered:
-            atexit.register(self.safe_close_db)
-            self._finalizer_registered = True
-
-
-class MappingSimpleDBDataset(BaseSimpleDBDataset, Dataset):  # type: ignore[misc]
-    """Map-style dataset for SimpleDB databases."""
-
-    db: RandomMappingSimpleDB | ChunkedMappingSimpleDB
-
-    def __init__(self, db: RandomMappingSimpleDB | ChunkedMappingSimpleDB, preprocessor: Preprocessor) -> None:
-        super().__init__(db, preprocessor)
-
-    def __getitem__(self, i: int) -> FSample:
-        if not self.db.is_open:
-            raise RuntimeError("SimpleDB is not open. Ensure that `worker_open_and_register_finalizer` is called.")
-        sample = self.db[i]
-        return self.preprocess(sample)
-
-    def __len__(self) -> int:
-        warnings.warn("MappingSimpleDBDataset.__len__ is not implemented properly to account for sharding or sample selection.")
-        return super().__len__()
-
-
-class IterableSimpleDBDataset(BaseSimpleDBDataset, IterableDataset):  # type: ignore[misc]
-    """Iterable-style dataset for SimpleDB databases."""
-
-    db: IterableSimpleDB
-
-    def __init__(self, db: IterableSimpleDB, preprocessor: Preprocessor, shuffle: bool = False, poolsize: int = 16, shards: Optional[list[int]] = None) -> None:
-        super().__init__(db, preprocessor)
-        self.shards = [int(f.stem.split("-")[-1]) for f in self.db.files_data] if shards is None else shards
+        self.shards = list(range(db.num_shards)) if shards is None else deepcopy(shards)
         self.shuffle = shuffle
         self.poolsize = poolsize
-        self._local_shards = deepcopy(self.shards)
 
-    def __iter__(self) -> Iterable[FSample]:
-        if not self.db.is_open:
-            raise RuntimeError("SimpleDB is not open. Ensure that `worker_open_and_register_finalizer` is called.")
+    def __iter__(self) -> Iterator[FSample]:
+        reader = SimpleDBIterator(self.db)
 
-        # Determine which shards this worker will process.
-        if (worker_info := get_worker_info()) is not None:
-            if len(self.shards) < worker_info.num_workers:
-                raise ValueError(f"Number of shards ({len(self.shards)}) is less than number of workers ({worker_info.num_workers}).")
-            per_worker = math.ceil(len(self.shards) / worker_info.num_workers)
-            self._local_shards = list(list(batched(self.shards, per_worker))[worker_info.id])
+        shards = self._get_local_shards()
 
         # If not shuffling, just yield samples in order.
         if not self.shuffle:
-            for sample in self.db.iter_shards(self._local_shards):
-                yield self.preprocess(sample)
+            for sample in reader.iter(shards):
+                meta = self.metadb.get(sample.name, reader.curshardidx)
+                yield self.preprocess(sample, meta)
             return
 
         # Otherwise, randomize the order of the shards deterministically.
-        seed = worker_info.seed if worker_info is not None and hasattr(worker_info, "seed") else torch.initial_seed()
+        seed = self._get_local_seed()
         rng = random.Random(int(seed))
         if self.shuffle:
-            rng.shuffle(self._local_shards)
+            rng.shuffle(shards)
 
-        # Yield samples in random order using a reservoir sampling-like algorithm.
-        pool: list[SimpleDBSample] = []
-        for sample in self.db.iter_shards(self._local_shards):
+        # Yield samples randomly using a reservoir sampling.
+        pool: list[tuple[SimpleDBSample, pl.DataFrame]] = []
+        for sample in reader.iter(shards):
+            meta = self.metadb.get(sample.name, reader.curshardidx)
             if len(pool) < self.poolsize:
-                pool.append(sample)
+                pool.append((sample, meta))
                 continue
             i = random.randint(0, len(pool) - 1)
-            yield self.preprocess(pool[i])
-            pool[i] = sample
+            yield self.preprocess(*pool[i])
+            pool[i] = (sample, meta)
 
         # Yield the remaining samples in the pool.
         while len(pool) > 0:
             i = random.randint(0, len(pool) - 1)
-            yield self.preprocess(pool[i])
+            yield self.preprocess(*pool[i])
             pool.pop(i)
 
     def __len__(self) -> int:
-        a = self.db.number_of_samples_in_shards()
-        return int(a[self._local_shards].sum())
+        return sum(self.db.num_samples(self._get_local_shards()))
+
+    def preprocess(self, sample: SimpleDBSample, meta: pl.DataFrame) -> FSample:
+        return self.preprocessor(
+            sample.name,
+            1 if sample.malware else 0,
+            sample.data,
+            meta,
+        )
+
+    def _get_local_shards(self) -> list[int]:
+        if (worker_info := get_worker_info()) is None:
+            return self.shards
+        if len(self.shards) < worker_info.num_workers:
+            raise ValueError(f"Number of shards ({len(self.shards)}) is less than number of workers ({worker_info.num_workers}).")
+        per_worker = math.ceil(len(self.shards) / worker_info.num_workers)
+        return list(list(batched(self.shards, per_worker))[worker_info.id])
+
+    def _get_local_seed(self) -> int:
+        if (worker_info := get_worker_info()) is None:
+            return torch.initial_seed()
+        if not hasattr(worker_info, "seed"):
+            return torch.initial_seed() + worker_info.id
+        return worker_info.seed
 
 
 class Preprocessor:
 
     def __init__(
         self,
-        do_parser: bool = True,
         do_entropy: bool = True,
         do_characteristics: bool = True,
         level: HierarchicalLevel | str = HierarchicalLevel.NONE,
         max_length: Optional[int] = None,
+        unsafe: bool = False,
     ) -> None:
-        self.do_parser = do_parser
         self.do_entropy = do_entropy
         self.do_characteristics = do_characteristics
         self.level = HierarchicalLevel(level)
         self.max_length = max_length
-        self.guider = SemanticGuider(do_parser, do_entropy, do_characteristics)
+        self.unsafe = unsafe
+        self.guider = SemanticGuider()
         self.partitioner = StructurePartitioner(HierarchicalLevel(level))
 
-    @property
-    def should_lief_parse(self) -> bool:
-        return self.do_parser or self.do_entropy or self.do_characteristics or self.level != HierarchicalLevel.NONE
+    def __call__(self, name: str, label: int, data: bytes, meta: pl.DataFrame) -> FSample:
+        mv = memoryview(data)[0:self.max_length]
+        size = len(mv)
 
-    def __call__(
-        self,
-        label: int,
-        *,
-        name: Optional[Name] = None,
-        file: Optional[StrPath] = None,
-        inputs: Optional[ByteTensor] = None,
-        liefblob: Optional[LiefParse] = None,
-    ) -> FSample:
-        """
-        Args:
-            label: integer label for the binary.
-            name: name of the binary. If None, `file` must be provided, from which the name is inferred.
-            file: path to the binary file. If None, `inputs` and `name` must be provided.
-            inputs: byte tensor containing the binary data. If None, `file` must be provided, from which the data is read.
-            liefblob: datablob to pass to `_parse_pe_and_get_size` if custom behavior is desired.
-        """
-        label = torch.tensor(label)
-
-        # If `name` is not provided, infer it from the file path.
-        if name is None:
-            if file is None:
-                raise ValueError("If name is None, file must be provided.")
-            name = Name(file)
-
-        # If `inputs` is not provided, read it from the file as a byte tensor.
-        if inputs is None:
-            if file is None:
-                raise ValueError("If inputs is None, file must be provided.")
-            inputs = torch.from_file(str(file), shared=False, size=os.path.getsize(file), dtype=torch.uint8)
-        assert inputs is not None
-
-        # If we need to parse the binary, do so from `liefblob`, then `file`, then `inputs`.
-        if self.should_lief_parse:
-            if liefblob is not None:
-                pe = _parse_pe_and_get_size(liefblob)[0]
-            elif file is not None:
-                pe = _parse_pe_and_get_size(file)[0]
-            else:
-                pe = _parse_pe_and_get_size(memoryview(inputs.numpy()).cast("B"))[0]
+        buffer: bytearray | memoryview
+        if self.unsafe:
+            warnings.filterwarnings("ignore", message=r"The given buffer is not writable.*", category=UserWarning)
+            buffer = mv
         else:
-            pe = None
-        size = len(inputs)
+            buffer = bytearray(mv)
 
-        guides = self.guider(pe, size, inputs)
-        structure = self.partitioner(pe, size)
+        file = ""
+        name = Name(name)
+        label = torch.tensor(label, dtype=torch.int64)
+        inputs = torch.frombuffer(buffer, dtype=torch.uint8)
+        guides = SemanticGuides(None, None, None)
+        if self.do_entropy:
+            guides.entropy = self.guider._get_entropy(inputs)
+        if self.do_characteristics:
+            guides.characteristics = self.get_characteristics(meta, size)
+        structure = self.get_structure(meta, size)
 
-        if self.max_length is not None:
-            inputs = inputs[:self.max_length]
-            guides = guides.trim(self.max_length)
-            structure = structure.trim(self.max_length)
-            if not inputs.is_contiguous():
-                warnings.warn("`inputs` is not contiguous after trimming. Making it contiguous.")
-                inputs = inputs.contiguous()
-            if not guides.is_contiguous():
-                warnings.warn("`guides` is not contiguous after trimming. Making it contiguous.")
-                guides = guides.contiguous()
+        return FSample(
+            file=file,
+            name=name,
+            label=label,
+            inputs=inputs,
+            guides=guides,
+            structure=structure,
+        )
 
-        return FSample(file, name, label, inputs, guides, structure)
+    def get_characteristics(self, meta: pl.DataFrame, size: int) -> torch.Tensor:
+        df_sec = meta.filter(
+            pl.col("group") == "partitions",
+            pl.col("level") == "COARSE",
+            pl.col("label") == "SECTION",
+        )
+        df_chr = meta.filter(
+            pl.col("group") == "characteristics",
+        )
+
+        n_sec = len(df_sec)
+        n_chr = len(CharacteristicGuider.CHARACTERISTICS)
+
+        offsets = np.empty(n_sec, dtype=np.int64)
+        sizes   = np.empty(n_sec, dtype=np.int64)
+        flags   = np.zeros((n_sec, n_chr), dtype=np.uint8)
+
+        for i, row in enumerate(df_sec.iter_rows(named=True)):
+            s = row["start"]
+            e = row["end"]
+            offsets[i] = s
+            sizes[i]   = e - s
+
+            df = df_chr.filter(
+                pl.col("start") == s,
+                pl.col("end") == e,
+            )
+            for row2 in df.iter_rows(named=True):
+                c = row2["label"]
+                l = getattr(lief.PE.Section.CHARACTERISTICS, c)
+                if l not in CharacteristicGuider.CHARACTERISTICS:
+                    continue
+                j = CharacteristicGuider.CHARACTERISTICS.index(l)
+                flags[i, j] = 1
+
+        x = CharacteristicGuider._get_bit_mask_(size, offsets, sizes, flags)
+        return torch.from_numpy(x)
+
+    def get_structure(self, meta: pl.DataFrame, size: int) -> StructureMap:
+        df = meta.filter(
+            pl.col("group") == "partitions",
+            pl.col("level") == self.level.name,
+        )
+        lexicon = {}
+        index: list[list[tuple[int, int]]] = []
+        for i, structure in enumerate(LEVEL_STRUCTURE_MAP[self.level]):
+            lexicon[i] = structure
+            index.append([])
+            for row in df.filter(pl.col("label") == structure.name).iter_rows(named=True):
+                s = row["start"]
+                e = row["end"]
+                index[i].append((s, e))
+
+        return StructureMap(index, lexicon)
 
 
 class CollateFn:
@@ -1166,7 +1146,7 @@ class CollateFn:
         return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, min_length={self.min_length})"
 
     @staticmethod
-    def get_padded_inputs(inputs: list[ByteTensor], min_length: int, pin_memory: bool, change_dtype_after_pad: bool = True) -> ShortTensor:
+    def get_padded_inputs(inputs: list[Tensor], min_length: int, pin_memory: bool, change_dtype_after_pad: bool = True) -> ShortTensor:
         """
         NOTE: some benchmarks indicate that Tensor.to(torch.int16) is a massive bottleneck. change_dtype_after_pad=True might resolve this.
         """
@@ -1240,7 +1220,7 @@ class CUDAPrefetcher:
     A DataLoader wrapper that prefetches batches to a CUDA device using multiple streams.
     """
 
-    def __init__(self, loader: DataLoader, device: torch.device, num_streams: int) -> None:
+    def __init__(self, loader: DataLoader[FOrHSamples], device: torch.device, num_streams: int) -> None:
         if num_streams > 0 and (device.type != "cuda" or not torch.cuda.is_available()):
             raise ValueError(f"{self.__class__.__name__} with num_streams > 0 requires a CUDA device.")
         if os.environ.get("TORCH_NCCL_BLOCKING_WAIT") == "1":
@@ -1367,7 +1347,7 @@ class CUDAPrefetcher:
             self._buf.append((s, dev_batch))
 
     @property
-    def dataset(self) -> Dataset:
+    def dataset(self) -> Dataset[Any]:
         return self.loader.dataset
 
 
@@ -1376,7 +1356,7 @@ class StreamlessCUDAPrefetcher:
     A simpler prefetcher that does not use multiple streams, useful for debugging.
     """
 
-    def __init__(self, loader: DataLoader, device: torch.device) -> None:
+    def __init__(self, loader: DataLoader[FOrHSamples], device: torch.device) -> None:
         self.loader = loader
         self.device = device
         self.it: Optional[Iterator[FOrHSamples]] = None
@@ -1415,11 +1395,11 @@ class StreamlessCUDAPrefetcher:
         return f"{self.__class__.__name__}(loader={self.loader.__class__.__name__}(...), device={self.device})"
 
     @property
-    def dataset(self) -> Dataset:
+    def dataset(self) -> Dataset[Any]:
         return self.loader.dataset
 
 
-class GroupedLengthBatchSampler(Sampler[list[int]]):  # type: ignore[misc]
+class GroupedLengthBatchSampler(Sampler[list[int]]):
 
     def __init__(self, chunks: Sequence[IntTensor | list[int]], first: bool, shuffle: bool, drop_last: bool) -> None:
         self.chunks = chunks
@@ -1483,7 +1463,7 @@ class GroupedLengthBatchSampler(Sampler[list[int]]):  # type: ignore[misc]
         return order_
 
 
-class ShardAwareBatchSampler(Sampler[list[int]]):  # type: ignore[misc]
+class ShardAwareBatchSampler(Sampler[list[int]]):
     """
     Samples indices so that (full) mini-batches come from a single shard.
 
