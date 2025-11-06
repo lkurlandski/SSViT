@@ -77,13 +77,13 @@ class TensorError(ValueError):
     Exception raised when the shape of a tensor does not match the expected shape.
     """
 
-    def __init__(self, x: Tensor, s: Optional[tuple[Optional[int], ...]], t: Optional[torch.dtype | tuple[torch.dtype]]) -> None:
+    def __init__(self, x: Tensor, s: Optional[tuple[Optional[int], ...]], t: Optional[torch.dtype | tuple[torch.dtype, ...]]) -> None:
         super().__init__(
             f"Expected tensor with dtype {t} and shape {s}. Got tensor with dtype {x.dtype} and shape {tuple(x.shape)}."
         )
 
 
-def check_tensor(x: Tensor, s: Optional[tuple[Optional[int], ...]] = None, t: Optional[torch.dtype | tuple[torch.dtype]] = None) -> None:
+def check_tensor(x: Tensor, s: Optional[tuple[Optional[int], ...]] = None, t: Optional[torch.dtype | tuple[torch.dtype, ...]] = None) -> None:
     if t is not None and isinstance(t, torch.dtype):
         t = (t,)
     if t is not None and x.dtype not in t:
