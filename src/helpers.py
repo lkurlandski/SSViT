@@ -40,12 +40,6 @@ class ModelSize(Enum):
     LG = "lg"  # Large
 
 
-class DBType(Enum):
-    RND = "rnd"
-    CHK = "chk"
-    ITR = "itr"
-
-
 # TODO: figure out how to elegantly combine different dataclasses into a new class.
 # TODO: write an ArgumentParser that takes a dataclass and generates arguments.
 @dataclass
@@ -75,7 +69,6 @@ class MainArgs:
     fsdp: bool = False
     fsdp_offload: bool = True
     tf32: bool = False
-    db_type: DBType = DBType.ITR
     resume: bool = False
 
     def __post_init__(self) -> None:
