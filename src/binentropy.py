@@ -4,30 +4,21 @@ Sliding window entropy calculations for binary data.
 
 import os
 from enum import Enum
+from typing import Any
 
 import numpy as np
 from numpy import typing as npt
 import numba as nb
 import torch
 from torch import Tensor
-from torch import BoolTensor
-from torch import ByteTensor
-from torch import HalfTensor
-from torch import FloatTensor
-from torch import DoubleTensor
-from torch import LongTensor
 
 
-AnyFloatTensor = HalfTensor | FloatTensor | DoubleTensor
-AnyFloatArray  = npt.NDArray[np.float16] | npt.NDArray[np.float32] | npt.NDArray[np.float64]
-
-
-TORCH_JIT_KWDS = {
+TORCH_JIT_KWDS: dict[str, Any] = {
     "fullgraph": False,
     "dynamic": False,
 }
 
-NUMBA_JIT_KWDS = {
+NUMBA_JIT_KWDS: dict[str, Any] = {
     "nopython": True,
     "cache": True,
     "nogil": True,
@@ -49,19 +40,19 @@ def is_integer_tensor(t: Tensor) -> bool:
     return t.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
 
 
-def isfinite(x: np.ndarray | Tensor) -> BoolTensor | npt.NDArray[np.bool_]:  # type: ignore[type-arg]
+def isfinite(x: np.ndarray | Tensor) -> Tensor | npt.NDArray[np.bool_]:  # type: ignore[type-arg]
     if isinstance(x, Tensor):
         return torch.isfinite(x)
     elif isinstance(x, np.ndarray):
-        return np.isfinite(x)
+        return np.isfinite(x)  # type: ignore[no-any-return]
     raise TypeError(f"Unsupported type: {type(x)}. Expected Tensor or ndarray.")
 
 
-def isnan(x: np.ndarray | Tensor) -> BoolTensor | npt.NDArray[np.bool_]:  # type: ignore[type-arg]
+def isnan(x: np.ndarray | Tensor) -> Tensor | npt.NDArray[np.bool_]:  # type: ignore[type-arg]
     if isinstance(x, Tensor):
         return torch.isnan(x)
     elif isinstance(x, np.ndarray):
-        return np.isnan(x)
+        return np.isnan(x)  # type: ignore[no-any-return]
     raise TypeError(f"Unsupported type: {type(x)}. Expected Tensor or ndarray.")
 
 
@@ -69,9 +60,9 @@ def _get_numpy_array_from_input(input: str | os.PathLike[str] | bytes | memoryvi
     x: npt.NDArray[np.uint8]
 
     if isinstance(input, (str, os.PathLike)):
-        x = np.fromfile(input, dtype=np.uint8)  # type: ignore[no-untyped-call]
+        x = np.fromfile(input, dtype=np.uint8)
     elif isinstance(input, (bytes, memoryview)):
-        x = np.frombuffer(input, dtype=np.uint8)  # type: ignore[no-untyped-call]
+        x = np.frombuffer(input, dtype=np.uint8)
     elif isinstance(input, torch.Tensor) and is_integer_tensor(input) and input.ndim == 1:
         x = input.numpy(force=True).astype(np.uint8)
     elif isinstance(input, np.ndarray) and np.issubdtype(input.dtype, np.integer) and input.ndim == 1:
@@ -89,11 +80,11 @@ def _get_numpy_array_from_input(input: str | os.PathLike[str] | bytes | memoryvi
     return x
 
 
-def _get_torch_array_from_input(input: str | os.PathLike[str] | bytes | memoryview | np.ndarray | torch.Tensor) -> ByteTensor:  # type: ignore[type-arg]
-    x: ByteTensor
+def _get_torch_array_from_input(input: str | os.PathLike[str] | bytes | memoryview | np.ndarray | torch.Tensor) -> Tensor:  # type: ignore[type-arg]
+    x: Tensor
 
     if isinstance(input, (str, os.PathLike)):
-        x = torch.from_file(input, shared=False, dtype=torch.uint8, size=os.path.getsize(input))
+        x = torch.from_file(str(input), shared=False, dtype=torch.uint8, size=os.path.getsize(input))
     elif isinstance(input, (bytes, memoryview)):
         x = torch.frombuffer(input, dtype=torch.uint8)
     elif isinstance(input, np.ndarray) and np.issubdtype(input.dtype, np.integer) and input.ndim == 1:
@@ -121,8 +112,8 @@ def _compute_discrete_entropy_from_counts_numpy(n: int, c: npt.NDArray[np.int64]
     return float(h)
 
 
-@torch.compile(**TORCH_JIT_KWDS)  # type: ignore[misc]
-def _compute_discrete_entropy_from_counts_torch(n: int, c: LongTensor) -> float:
+@torch.compile(**TORCH_JIT_KWDS)
+def _compute_discrete_entropy_from_counts_torch(n: int, c: Tensor) -> float:
     c = c[c > 0]
     c = c.to(torch.float64)
     h = torch.log2(torch.tensor(n, dtype=torch.float64)) - (c * torch.log2(c)).sum() / n
@@ -137,8 +128,10 @@ def _compute_discrete_entropy_numpy(x: npt.NDArray[np.uint8]) -> float:
     return h
 
 
-@torch.compile(**TORCH_JIT_KWDS)  # type: ignore[misc]
-def _compute_discrete_entropy_torch(x: npt.NDArray[np.uint8]) -> float:
+@torch.compile(**TORCH_JIT_KWDS)
+def _compute_discrete_entropy_torch(x: Tensor) -> float:
+    if x.dtype != torch.uint8:
+        raise TypeError(f"Expected torch.uint8 tensor, got {x.dtype}.")
     n = len(x)
     c = torch.bincount(x, minlength=256)
     h: float = _compute_discrete_entropy_from_counts_torch(n, c)
@@ -176,8 +169,10 @@ def compute_entropy_naive_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) ->
     return h
 
 
-@torch.compile(**TORCH_JIT_KWDS)  # type: ignore[misc]
-def compute_entropy_naive_torch(x: ByteTensor, r: int, s: int = 1) -> DoubleTensor:
+@torch.compile(**TORCH_JIT_KWDS)
+def compute_entropy_naive_torch(x: Tensor, r: int, s: int = 1) -> Tensor:
+    if x.dtype != torch.uint8:
+        raise TypeError()
     _check_inputs(len(x), r, s)
     w = 2 * r + 1
     o = torch.full((len(x),), float("nan"), dtype=torch.float64)
@@ -268,8 +263,18 @@ def compute_entropy_rolling_numpy(x: npt.NDArray[np.uint8], r: int, s: int = 1) 
     return h
 
 
-@torch.compile(**TORCH_JIT_KWDS)  # type: ignore[misc]
-def compute_entropy_rolling_torch(x: ByteTensor, r: int, s: int = 1) -> DoubleTensor:
+def _int_(x: float | int) -> int:
+    if isinstance(x, float):
+        if not x.is_integer():
+            raise ValueError(f"Expected integer value, got float {x}.")
+        return int(x)
+    return x
+
+
+@torch.compile(**TORCH_JIT_KWDS)
+def compute_entropy_rolling_torch(x: Tensor, r: int, s: int = 1) -> Tensor:
+    if x.dtype != torch.uint8:
+        raise TypeError()
     _check_inputs(len(x), r, s)
     w = 2 * r + 1
     o = torch.full((len(x),), float("nan"), dtype=torch.float64)
@@ -277,9 +282,9 @@ def compute_entropy_rolling_torch(x: ByteTensor, r: int, s: int = 1) -> DoubleTe
     # i is one above the index of the last byte in the current window.
     for i in range(w, len(x) + 1, s):
         for j in range(i - s, i):
-            c[x[j].item()] += 1
+            c[_int_(x[j].item())] += 1
         for j in range(max(i - s - w, 0), i - w):
-            c[x[j].item()] -= 1
+            c[_int_(x[j].item())] -= 1
         if len(torch.nonzero(c, as_tuple=True)[0]) > w:
             raise RuntimeError(f"Expected at most {w} unique values in the window, got {len(torch.nonzero(c, as_tuple=True)[0])} at iteration {i}. {c}")
         if torch.sum(c) != w:
