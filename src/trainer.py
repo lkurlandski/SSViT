@@ -121,7 +121,7 @@ def maybe_no_sync(model: Module, sync_now: bool) -> ContextManager[None]:
     """Return a no_sync context if in distributed and the model has a no_sync method, else a no-op context."""
     if not is_dist() or sync_now or not hasattr(model, "no_sync"):
         return contextlib.nullcontext()
-    return model.no_sync()  # type: ignore[no-any-return]
+    return model.no_sync()  # type: ignore[no-any-return,operator]
 
 
 def barrier(tag: str = "", device: Optional[torch.device] = None) -> None:
@@ -217,14 +217,14 @@ def mp_dtype(mp16: bool, device: torch.device) -> torch.dtype:
             return torch.bfloat16
         if torch.cuda.is_bf16_supported(True):
             return torch.float16
-        if not torch.cuda.is_available(True):
+        if not torch.cuda.is_available():
             return torch.float16
     raise RuntimeError(f"Unsupported device for mixed precision: {device}.")
 
 
 def unwrapddp(model: Module) -> Module:
     if isinstance(model, DistributedDataParallel):
-        return model.module
+        return model.module  # type: ignore[no-any-return]
     return model
 
 
@@ -233,7 +233,7 @@ def is_fsdp2(model: Module) -> bool:
 
 
 # Source: torcheval.metrics.functional.classification.auroc
-@torch.jit.script  # type: ignore[misc]
+@torch.jit.script
 def _binary_auroc_compute_jit(
     input: torch.Tensor,
     target: torch.Tensor,
@@ -395,7 +395,7 @@ class Trainer:
             length = torch.tensor(len(dataloader), device=self.device)
             longest = length.clone()
             dist.all_reduce(longest, op=dist.ReduceOp.MAX, group=None)
-            padding = itertools.repeat(self.padbatch, longest.item() - length.item())
+            padding = itertools.repeat(self.padbatch, int(longest.item() - length.item()))
             iterable = itertools.chain(iterable, enumerate(padding, start=len(dataloader)))
 
         def step() -> None:
@@ -445,7 +445,7 @@ class Trainer:
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 loss = loss * int(real) / self.args.gradient_accumulation_steps
-                scaler.scale(loss).backward()
+                scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
 
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
@@ -490,7 +490,7 @@ class Trainer:
             length = torch.tensor(len(dataloader), device=self.device)
             longest = length.clone()
             dist.all_reduce(longest, op=dist.ReduceOp.MAX, group=None)
-            padding = itertools.repeat(self.padbatch, longest.item() - length.item())
+            padding = itertools.repeat(self.padbatch, int(longest.item() - length.item()))
             iterable = itertools.chain(iterable, enumerate(padding, start=len(dataloader)))
 
         mini_step = -1
@@ -625,14 +625,14 @@ class Trainer:
         Send a batch of inputs forward through the model.
         """
         with torch.autocast(self.device.type, dtype=mp_dtype(self.args.mp16, self.device), enabled=self.args.mp16):
-            return self.model(batch.inputs, batch.characteristics)
+            return self.model(batch.inputs, batch.characteristics)  # type: ignore[no-any-return]
 
     def compute_loss(self, batch: FOrHSamples, outputs: Tensor) -> Tensor:
         """
         Compute the loss over a batch of examples.
         """
         with torch.autocast(self.device.type, dtype=mp_dtype(self.args.mp16, self.device), enabled=self.args.mp16):
-            return self.loss_fn(outputs, batch.label)
+            return self.loss_fn(outputs, batch.label)  # type: ignore[no-any-return]
 
     def reduce_results(self, results: dict[str, Tensor], check: bool = True) -> dict[str, Tensor]:
         """
@@ -886,6 +886,7 @@ class Trainer:
         if scheduler_init is None:
             scheduler_init = lambda optim: LambdaLR(optim, lambda _: 1.0)
         if scheduler is None and not is_dcp:
+            assert optimizer is not None
             scheduler = scheduler_init(optimizer)
 
         # Load the simple objects first that don't require complex state dict handling.
@@ -993,7 +994,12 @@ class Monitor:
     def start(self) -> Monitor:
         if not self._cpu_only:
             pynvml.nvmlInit()
-            self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.dindex) if self.dindex is not None else self._get_handle_from_device(self.device)
+            if self.dindex is not None:
+                self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.dindex)
+            elif self.device is not None:
+                self.handle = self._get_handle_from_device(self.device)
+            else:
+                raise RuntimeError("Internal error: neither device nor dindex is set.")
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -1015,7 +1021,7 @@ class Monitor:
         return self
 
     def get_report(self, clear: bool = False) -> dict[str, float]:
-        d = {k: np.mean(v) if len(v) > 0 else float("nan") for k, v in self._samples.items()}
+        d = {k: float(np.mean(v)) if len(v) > 0 else float("nan") for k, v in self._samples.items()}
         if clear:
             self.clear()
         return d
