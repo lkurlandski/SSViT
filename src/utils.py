@@ -4,6 +4,7 @@ Utilities.
 
 from __future__ import annotations
 from collections.abc import Iterable
+from collections.abc import Sequence
 import math
 import os
 from pathlib import Path
@@ -103,7 +104,7 @@ def num_sort_files(files: Iterable[Path], lstrip: str = "", rstrip: str = "", re
 
 
 def pad_sequence(
-    sequences: list[Tensor],
+    sequences: Sequence[Tensor],
     batch_first: bool = False,
     padding_value: float | int | bool = 0.0,
     padding_side: Literal["right", "left"] = "right",
@@ -118,7 +119,7 @@ def pad_sequence(
         raise ValueError(f"pad_to_multiple_of must be a positive integer. Got {pad_to_multiple_of}.")
 
     if not pin_memory and pad_to_multiple_of == 1 and min_length == 0:
-        return _pad_sequence(sequences, batch_first, padding_value, padding_side)
+        return _pad_sequence(list(sequences), batch_first, padding_value, padding_side)
 
     if padding_side != "right":
         raise NotImplementedError("pad_sequence with pin_memory=True requires padding_side='right'.")
