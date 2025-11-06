@@ -152,12 +152,17 @@ class SimpleDB:
     def num_shards(self) -> int:
         return len(self.files_data)
 
+    @cached_property
+    def num_samples_per_shard(self) -> list[int]:
+        return [len(self.get_size_df(i).index) for i in range(self.num_shards)]
+
     def num_samples(self, idx: Optional[int | list[int]]) -> list[int]:
         if idx is None:
             idx = list(range(self.num_shards))
         if isinstance(idx, int):
             idx = [idx]
-        return [len(self.get_size_df(i).index) for i in idx]
+        num_samples = self.num_samples_per_shard
+        return [num_samples[i] for i in idx]
 
     def _get_size_df(self, idx: int) -> pd.DataFrame:
         return pd.read_csv(self.files_size[idx])
