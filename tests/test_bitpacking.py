@@ -3,15 +3,13 @@ Tests.
 """
 
 import math
-from typing import Callable
+from typing import Optional
 from typing import Protocol
 
 import pytest
 import numpy as np
 import torch
 from torch import Tensor
-from torch import BoolTensor
-from torch import ByteTensor
 
 from src.binanal import get_ranges_numpy
 from src.bitpacking import pack_bool_tensor
@@ -120,7 +118,7 @@ class TestSliceBitpackedTensor:
         if ndim == 1 and axis > 0:
             return
 
-        size = [torch.randint(1, length + 1, size=(1,)).item() for _ in range(ndim)]
+        size: list[int] = [int(torch.randint(1, length + 1, size=(1,)).item()) for _ in range(ndim)]
         size[axis] = length
         size = tuple(size)
         mask: Tensor = torch.randint(0, 2, size=(size[axis],), dtype=torch.bool)
@@ -137,20 +135,22 @@ class TestSliceBitpackedTensor:
             axis_ = axis if axis >= 0 else original.ndim + axis
             preference = torch.empty(size[:axis_] + (0,) + size[axis_ + 1:], dtype=torch.uint8)
 
+        mask_: Optional[Tensor]
         if mode == "mask":
             idx = None
             ranges = None
+            mask_ = mask
         if mode == "idx":
             idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
             ranges = None
-            mask = None
+            mask_ = None
         if mode == "ranges":
             lo, hi = get_ranges_numpy(mask.numpy())
             ranges = list(zip(lo.tolist(), hi.tolist()))
             idx = None
-            mask = None
+            mask_ = None
 
-        psliced = slice_bitpacked_tensor(poriginal, mask=mask, idx=idx, ranges=ranges, bigchunks=bigchunks, axis=axis)
+        psliced = slice_bitpacked_tensor(poriginal, mask=mask_, idx=idx, ranges=ranges, bigchunks=bigchunks, axis=axis)
 
         assert psliced.dtype == torch.uint8
         assert psliced.device == poriginal.device
@@ -177,7 +177,7 @@ MASKED_SELECT_PACKED = [_slice_bitpacked_tensor_from_mask_general, _slice_bitpac
 
 class _MaskSelectPacked(Protocol):
 
-    def __call__(self, packed: ByteTensor, mask: BoolTensor, axis: int) -> ByteTensor:
+    def __call__(self, packed: Tensor, mask: Tensor, axis: int) -> Tensor:
         ...
 
 
@@ -309,7 +309,7 @@ class TestSliceBitpackedTensorLegacy:
         assert torch.equal(got.cpu(), ref.cpu())
 
     # Helper: safe reference (unpacked -> mask -> repack), works even when mask.sum()==0
-    def _ref(self, x: torch.Tensor, mask: torch.BoolTensor, axis: int) -> torch.Tensor:
+    def _ref(self, x: Tensor, mask: Tensor, axis: int) -> Tensor:
         if not bool(mask.any()):
             # produce a correctly-shaped empty packed tensor by slicing an existing packed
             base = packbits(x, axis=axis)

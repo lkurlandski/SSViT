@@ -8,9 +8,6 @@ import warnings
 
 import torch
 from torch import Tensor
-from torch import BoolTensor
-from torch import ByteTensor
-from torch import IntTensor
 import torch.nn.functional as F
 
 from src.utils import check_tensor
@@ -40,8 +37,8 @@ def smallest_unsigned_integer_dtype(n: int) -> torch.dtype:
     raise ValueError(f"Cannot represent {n} bits with an unsigned integer dtype.")
 
 
-@torch.no_grad()  # type: ignore[misc]
-def pack_bool_tensor(b: BoolTensor) -> Tensor:
+@torch.no_grad()
+def pack_bool_tensor(b: Tensor) -> Tensor:
     """
     Packs a boolean tensor along the last dimension into an integer tensor.
 
@@ -60,14 +57,14 @@ def pack_bool_tensor(b: BoolTensor) -> Tensor:
 
     # Use torch.int64 because shift ops aren’t implemented for smaller uint types on CPU
     weights = (1 << torch.arange(d, device=b.device, dtype=torch.int64))
-    x = (b.to(torch.int64) * weights).sum(dim=-1)
+    x: Tensor = (b.to(torch.int64) * weights).sum(dim=-1)
 
     # Cast down to the minimal unsigned dtype (storage stays compact for transfer)
     out_dtype = smallest_unsigned_integer_dtype(d)
     return x.to(out_dtype)
 
 
-@torch.no_grad()  # type: ignore[misc]
+@torch.no_grad()
 def unpack_bit_tensor(x: Tensor, d: int, dtype: torch.dtype = torch.bool) -> Tensor:
     """
     Unpacks an integer tensor into a boolean (or other) tensor along a new last dimension.
@@ -84,12 +81,12 @@ def unpack_bit_tensor(x: Tensor, d: int, dtype: torch.dtype = torch.bool) -> Ten
     # Use torch.int64 workspace for safe shifts
     x = x.to(torch.int64)
     masks = (1 << torch.arange(d, device=x.device, dtype=torch.int64))
-    z = (x.unsqueeze(-1) & masks) != 0
+    z: Tensor = (x.unsqueeze(-1) & masks) != 0
     return z.to(dtype)
 
 
-@torch.no_grad()  # type: ignore[misc]
-def packbits(x: BoolTensor, axis: int = -1) -> ByteTensor:
+@torch.no_grad()
+def packbits(x: Tensor, axis: int = -1) -> Tensor:
     """
     Torch variant of numpy.packbits(..., bitorder='little').
 
@@ -119,14 +116,14 @@ def packbits(x: BoolTensor, axis: int = -1) -> ByteTensor:
 
     # Pack each 8-bit block into a byte (little-endian: first element -> LSB)
     weights = (1 << torch.arange(8, device=y8.device, dtype=torch.uint8))  # [8]
-    out = (y8.to(torch.uint8) * weights).sum(dim=-1, dtype=torch.uint8)    # [..., B]
+    out: Tensor = (y8.to(torch.uint8) * weights).sum(dim=-1, dtype=torch.uint8)    # [..., B]
 
     # Move bytes axis back to original position
     return out.movedim(-1, axis)
 
 
-@torch.no_grad()  # type: ignore[misc]
-def unpackbits(x: ByteTensor, count: int = -1, axis: int = -1) -> BoolTensor:
+@torch.no_grad()
+def unpackbits(x: Tensor, count: int = -1, axis: int = -1) -> Tensor:
     """
     Torch variant of numpy.unpackbits(..., bitorder='little').
 
@@ -154,22 +151,22 @@ def unpackbits(x: ByteTensor, count: int = -1, axis: int = -1) -> BoolTensor:
 
     # Flatten the (B,8) pair to total_bits; use flatten to avoid unnecessary copies
     bits_flat = bits.flatten(-2)           # [..., total_bits]
-    z = bits_flat[..., :count]             # [..., count]
+    z: Tensor = bits_flat[..., :count]             # [..., count]
 
     # Move the expanded bit-axis back
     return z.movedim(-1, axis)
 
 
-@torch.no_grad()  # type: ignore[misc]
+@torch.no_grad()
 def slice_bitpacked_tensor(
-    packed: ByteTensor,
+    packed: Tensor,
     *,
-    mask: Optional[BoolTensor] = None,
-    idx: Optional[IntTensor] = None,
+    mask: Optional[Tensor] = None,
+    idx: Optional[Tensor] = None,
     ranges: Optional[list[tuple[int, int]]] = None,
     bigchunks: bool = True,
     axis: int = -1,
-) -> ByteTensor:
+) -> Tensor:
     """
     Slice a bit-packed tensor using indices that refer the unpacked bit positions.
 
@@ -261,8 +258,8 @@ def _weights8(device: torch.device) -> torch.Tensor:
     return w
 
 
-@torch.no_grad()  # type: ignore[misc]
-def _slice_bitpacked_tensor_from_mask_general(packed: ByteTensor, mask: BoolTensor, axis: int = -1) -> ByteTensor:
+@torch.no_grad()
+def _slice_bitpacked_tensor_from_mask_general(packed: Tensor, mask: Tensor, axis: int = -1) -> Tensor:
 
     axis = axis if axis >= 0 else packed.ndim + axis
     if not (0 <= axis < packed.ndim):
@@ -341,8 +338,8 @@ def _slice_bitpacked_tensor_from_mask_general(packed: ByteTensor, mask: BoolTens
     return out.to(torch.uint8).movedim(-1, axis)
 
 
-@torch.no_grad()  # type: ignore[misc]
-def _slice_bitpacked_tensor_from_mask_bigchunks(packed: ByteTensor, mask: BoolTensor, axis: int = -1) -> ByteTensor:
+@torch.no_grad()
+def _slice_bitpacked_tensor_from_mask_bigchunks(packed: Tensor, mask: Tensor, axis: int = -1) -> Tensor:
 
     axis = axis if axis >= 0 else packed.ndim + axis
     if not (0 <= axis < packed.ndim):
@@ -445,23 +442,23 @@ def _slice_bitpacked_tensor_from_mask_bigchunks(packed: ByteTensor, mask: BoolTe
     return out.to(torch.uint8).movedim(-1, axis)
 
 
-@torch.no_grad()  # type: ignore[misc]
-def _slice_bitpacked_tensor_from_idx_general(packed: ByteTensor, idx: IntTensor, axis: int = -1) -> ByteTensor:
+@torch.no_grad()
+def _slice_bitpacked_tensor_from_idx_general(packed: Tensor, idx: Tensor, axis: int = -1) -> Tensor:
     raise NotImplementedError()
 
 
-@torch.no_grad()  # type: ignore[misc]
-def _slice_bitpacked_tensor_from_idx_bigchunks(packed: ByteTensor, idx: IntTensor, axis: int = -1) -> ByteTensor:
+@torch.no_grad()
+def _slice_bitpacked_tensor_from_idx_bigchunks(packed: Tensor, idx: Tensor, axis: int = -1) -> Tensor:
     raise NotImplementedError()
 
 
-@torch.no_grad()  # type: ignore[misc]
-def _slice_bitpacked_tensor_from_ranges_general(packed: ByteTensor, ranges: list[tuple[int, int]], axis: int = -1) -> ByteTensor:
+@torch.no_grad()
+def _slice_bitpacked_tensor_from_ranges_general(packed: Tensor, ranges: list[tuple[int, int]], axis: int = -1) -> Tensor:
     raise NotImplementedError()
 
 
-@torch.no_grad()  # type: ignore[misc]
-def _slice_bitpacked_tensor_from_ranges_bigchunks(packed: ByteTensor, ranges: list[tuple[int, int]], axis: int = -1) -> ByteTensor:
+@torch.no_grad()
+def _slice_bitpacked_tensor_from_ranges_bigchunks(packed: Tensor, ranges: list[tuple[int, int]], axis: int = -1) -> Tensor:
     axis = axis if axis >= 0 else packed.ndim + axis
     if not (0 <= axis < packed.ndim):
         raise IndexError("axis out of range")
