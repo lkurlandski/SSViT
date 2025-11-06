@@ -24,6 +24,7 @@ Notations (ViT):
 
 from abc import ABC
 from abc import abstractmethod
+from collections.abc import Sequence
 from functools import partial
 import inspect
 import math
@@ -45,7 +46,10 @@ from src.utils import check_tensor
 from src.utils import pad_sequence
 
 
-NORMS: dict[str, nn.Module] = {
+# mypy: disable-error-code=no-any-return
+
+
+NORMS: dict[str, type[nn.Module]] = {
     "layer": nn.LayerNorm,
     "rms": nn.RMSNorm,
 }
@@ -79,7 +83,7 @@ def get_model_input_lengths(model: nn.Module) -> tuple[int, int]:
 # Other
 # -------------------------------------------------------------------------------- #
 
-class ClassifificationHead(nn.Module):  # type: ignore[misc]
+class ClassifificationHead(nn.Module):
     """
     Classification head for a neural network.
     """
@@ -136,7 +140,7 @@ class ClassifificationHead(nn.Module):  # type: ignore[misc]
 # FiLM
 # -------------------------------------------------------------------------------- #
 
-class FiLM(nn.Module):  # type: ignore[misc]
+class FiLM(nn.Module):
     """
     Feature-wise linear modulation (FiLM) layer.
 
@@ -176,7 +180,7 @@ class FiLM(nn.Module):  # type: ignore[misc]
         return z
 
 
-class FiLMNoP(nn.Module):  # type: ignore[misc]
+class FiLMNoP(nn.Module):
     """
     No-op FiLM layer that does nothing but check the inputs.
     """
@@ -195,7 +199,7 @@ class FiLMNoP(nn.Module):  # type: ignore[misc]
 # ViT
 # -------------------------------------------------------------------------------- #
 
-class SinusoidalPositionalEncoding(nn.Module):  # type: ignore[misc]
+class SinusoidalPositionalEncoding(nn.Module):
     """
     Sinusoidal Positional Encoding.
 
@@ -246,7 +250,7 @@ class SinusoidalPositionalEncoding(nn.Module):  # type: ignore[misc]
         return z
 
 
-class PatchEncoder(nn.Module):  # type: ignore[misc]
+class PatchEncoder(nn.Module):
     """
     Breaks a sequence into patches and convolves them fixed-size kernels.
 
@@ -363,7 +367,7 @@ class PatchEncoder(nn.Module):  # type: ignore[misc]
         raise RuntimeError("This should never happen.")
 
 
-class ViT(nn.Module):  # type: ignore[misc]
+class ViT(nn.Module):
     """
     Vision Transformer.
 
@@ -371,6 +375,8 @@ class ViT(nn.Module):  # type: ignore[misc]
 
     # FIXME: remove proj; upscaling the embeddings should be done outside of ViT, e.g., in PatchEncoder.
     """
+
+    cls_token: Optional[nn.Parameter]
 
     def __init__(
         self,
@@ -418,6 +424,7 @@ class ViT(nn.Module):  # type: ignore[misc]
         check_tensor(x, (None, None, self.embedding_dim), FLOATS)
 
         if self.pooling == "cls":  # T <-- T + 1
+            assert self.cls_token is not None
             t = self.cls_token.expand(x.shape[0], -1, -1)  # (B, 1, E)
             x = torch.cat((t, x), dim=1)  # (B, T, E)
         z = self.posencoder(x)            # (B, T, E)
@@ -439,7 +446,7 @@ class ViT(nn.Module):  # type: ignore[misc]
 # MalConv
 # -------------------------------------------------------------------------------- #
 
-class MalConvBase(nn.Module, ABC):  # type: ignore[misc]
+class MalConvBase(nn.Module, ABC):
     """
     Base class of MalConv backbones.
 
@@ -978,7 +985,7 @@ def _eval_max_windows_vectorized_per_batch(
 # Classifiers
 # -------------------------------------------------------------------------------- #
 
-class Classifier(nn.Module, ABC):  # type: ignore[misc]
+class Classifier(nn.Module, ABC):
 
     @abstractmethod
     def forward(self, x: Tensor, g: Optional[Tensor]) -> Tensor:
@@ -1068,7 +1075,7 @@ class ViTClassifier(Classifier):
 # Hierarchical Classifiers
 # -------------------------------------------------------------------------------- #
 
-class HierarchicalClassifier(nn.Module, ABC):  # type: ignore[misc]
+class HierarchicalClassifier(nn.Module, ABC):
 
     def __init__(self, num_structures: int) -> None:
         super().__init__()
@@ -1121,14 +1128,14 @@ class HierarchicalClassifier(nn.Module, ABC):  # type: ignore[misc]
         if all(x[i] is None for i in range(self.num_structures)):
             raise ValueError("At least one structure must have input.")
 
-        x_ref: Tensor = next((x[i] for i in range(self.num_structures) if x[i] is not None))
+        x_ref: Tensor = next((x[i] for i in range(self.num_structures) if x[i] is not None))  # type: ignore[assignment]
 
         for i in range(self.num_structures):
             if x[i] is None:
                 continue
-            check_tensor(x[i], (x_ref.shape[0], None), INTEGERS)
+            check_tensor(x[i], (x_ref.shape[0], None), INTEGERS)  # type: ignore[arg-type]
             if g[i] is not None:
-                check_tensor(g[i], (x_ref.shape[0], x[i].shape[1], None), FLOATS)  # type: ignore[union-attr]
+                check_tensor(g[i], (x_ref.shape[0], x[i].shape[1], None), FLOATS)  # type: ignore[union-attr,arg-type]
 
 
 class HierarchicalMalConvClassifier(HierarchicalClassifier):
@@ -1137,7 +1144,7 @@ class HierarchicalMalConvClassifier(HierarchicalClassifier):
         and averages these hidden representations before feeding them to a classification head.
     """
 
-    def __init__(self, embeddings: list[nn.Embedding], filmers: list[FiLM | FiLMNoP], backbones: list[MalConvBase], head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(backbones)):
@@ -1178,7 +1185,7 @@ class HierarchicalMalConvClassifier(HierarchicalClassifier):
     def fully_shard(self, **kwds: Any) -> None:
         for i in range(self.num_structures):
             fully_shard([self.embeddings[i], self.filmers[i]], **kwds)
-            self.backbones[i].fully_shard(**kwds)
+            self.backbones[i].fully_shard(**kwds)  # type: ignore[operator]
         fully_shard(self, **kwds | {"reshard_after_forward": False})
 
 
@@ -1188,7 +1195,7 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         and feeds the encoded patches to a shared ViT backbone followed by a classification head.
     """
 
-    def __init__(self, embeddings: list[nn.Embedding], filmers: list[FiLM | FiLMNoP], patchers: list[PatchEncoder], backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoder], backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(patchers)):

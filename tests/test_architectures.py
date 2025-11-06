@@ -274,7 +274,7 @@ class TestMalConvs:
         _PARAMS,
         ids=_IDS,
     )
-    def test_forward(self, cls: type[MalConvBase], guides: bool, batch_size: int, seq_length: int, embedding_dim: int, channels: int, kernel_size: int, stride: int, chunk_size: int, overlap: Optional[int]) -> None:
+    def test_forward(self, cls: type[MalConv | MalConvLowMem | MalConvGCG], guides: bool, batch_size: int, seq_length: int, embedding_dim: int, channels: int, kernel_size: int, stride: int, chunk_size: int, overlap: Optional[int]) -> None:
         if cls == MalConv:
             if chunk_size is not None or overlap is not None:
                 pytest.skip("NA")
@@ -285,12 +285,14 @@ class TestMalConvs:
         print(f"{cls=} {guides=} {batch_size=}, {seq_length=}, {embedding_dim=}, {channels=}, {kernel_size=}, {stride=}, {chunk_size=}, {overlap=}")
 
         embedding = Embedding(self.VOCAB_SZE, embedding_dim)
-        filmer = FiLMNoP(self.GUIDE_DIM, embedding_dim, self.GUIDE_HID)
+        filmer: FiLM | FiLMNoP
         if guides:
             filmer = FiLM(self.GUIDE_DIM, embedding_dim, self.GUIDE_HID)
+        else:
+            filmer = FiLMNoP(self.GUIDE_DIM, embedding_dim, self.GUIDE_HID)
 
         def preprocess(x: torch.Tensor, g: Optional[torch.Tensor] = None) -> torch.Tensor:
-            return filmer(embedding(x), g)
+            return filmer(embedding(x), g)  # type: ignore[no-any-return]
 
         x = torch.randint(0, self.VOCAB_SZE, (batch_size, seq_length))
         g = torch.rand((batch_size, seq_length, self.GUIDE_DIM)) if guides else None
@@ -310,7 +312,7 @@ class TestMalConvs:
             _clear_grads(net, embedding, filmer)
             z0: Tensor = net(z, recompute=None)
             loss = z0.sum()
-            loss.backward()
+            loss.backward()  # type: ignore[no-untyped-call]
             assert z0.shape == (batch_size, channels)
             assert net.conv_1.weight.grad is not None and net.conv_1.weight.grad.abs().sum() > 0
             assert embedding.weight.grad is not None and embedding.weight.grad.abs().sum() > 0
@@ -325,7 +327,7 @@ class TestMalConvs:
         _clear_grads(net, embedding, filmer)
         z1: Tensor = net(z, recompute=None)
         loss = z1.sum()
-        loss.backward()
+        loss.backward()  # type: ignore[no-untyped-call]
         assert z1.shape == (batch_size, channels)
         assert net.conv_1.weight.grad is not None and net.conv_1.weight.grad.abs().sum() > 0
         assert embedding.weight.grad is None
@@ -337,7 +339,7 @@ class TestMalConvs:
         _clear_grads(net, embedding, filmer)
         z2: Tensor = net(z, recompute=recompute)
         loss = z2.sum()
-        loss.backward()
+        loss.backward()  # type: ignore[no-untyped-call]
         assert z2.shape == (batch_size, channels)
         assert net.conv_1.weight.grad is not None and net.conv_1.weight.grad.abs().sum() > 0
         assert embedding.weight.grad is not None and embedding.weight.grad.abs().sum() > 0
@@ -395,8 +397,8 @@ class TestHierarchicalMalConvClassifier:
         head = ClassifificationHead(channels, num_classes=num_classes)
         net = HierarchicalMalConvClassifier(embeddings, filmers, backbones, head)
 
-        x = [torch.randint(0, vocab_size, (batch_size, seq_length + i)) for i in range(num_structures)]
-        g = [torch.rand((batch_size, seq_length + i, guide_dim)) for i in range(num_structures)]
+        x: list[Optional[Tensor]] = [torch.randint(0, vocab_size, (batch_size, seq_length + i)) for i in range(num_structures)]
+        g: list[Optional[Tensor]] = [torch.rand((batch_size, seq_length + i, guide_dim)) for i in range(num_structures)]
 
         if add_none:
             x[0] = None
@@ -409,7 +411,7 @@ class TestHierarchicalMalConvClassifier:
 
         too_short = False
         for i in range(num_structures):
-            if x[i] is not None and x[i].shape[1] < net.min_lengths[i]:
+            if x[i] is not None and x[i].shape[1] < net.min_lengths[i]:  # type: ignore[union-attr]
                 too_short = True
                 break
 
@@ -436,8 +438,8 @@ class TestHierarchicalViTClassifier:
         head = ClassifificationHead(d_model, num_classes=num_classes)
         net = HierarchicalViTClassifier(embeddings, filmers, patchers, backbone, head)
 
-        x = [torch.randint(0, vocab_size, (batch_size, seq_length + i)) for i in range(num_structures)]
-        g = [torch.rand((batch_size, seq_length + i, guide_dim)) for i in range(num_structures)]
+        x: list[Optional[Tensor]] = [torch.randint(0, vocab_size, (batch_size, seq_length + i)) for i in range(num_structures)]
+        g: list[Optional[Tensor]] = [torch.rand((batch_size, seq_length + i, guide_dim)) for i in range(num_structures)]
 
         if add_none:
             x[0] = None
@@ -450,7 +452,7 @@ class TestHierarchicalViTClassifier:
 
         too_short = False
         for i in range(num_structures):
-            if x[i] is not None and x[i].shape[1] < net.min_lengths[i]:
+            if x[i] is not None and x[i].shape[1] < net.min_lengths[i]:  # type: ignore[union-attr]
                 too_short = True
                 break
 
