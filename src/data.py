@@ -35,15 +35,6 @@ import numpy as np
 import polars as pl
 import torch
 from torch import Tensor
-from torch import BoolTensor
-from torch import HalfTensor
-from torch import FloatTensor
-from torch import DoubleTensor
-from torch import CharTensor
-from torch import ByteTensor
-from torch import ShortTensor
-from torch import IntTensor
-from torch import LongTensor
 from torch.utils.data import Dataset
 from torch.utils.data import IterableDataset
 from torch.utils.data import DataLoader
@@ -265,12 +256,16 @@ class _SemanticGuideOrSemanticGuides(ABC):
 
         return self.__class__(parse, entropy, characteristics)
 
-    def select(self, *, mask: Optional[BoolTensor] = None, idx: Optional[IntTensor] = None, ranges: Optional[list[tuple[int, int]]] = None) -> Self:
+    def select(self, *, mask: Optional[Tensor] = None, idx: Optional[Tensor] = None, ranges: Optional[list[tuple[int, int]]] = None) -> Self:
         """
         Select a subset of the data along the length axis.
 
         NOTE: if data is bitpacked, the selectors are assumed to correspond to the unpacked data.
         """
+        if mask is not None:
+            check_tensor(mask, (None,), torch.bool)
+        if idx is not None:
+            check_tensor(idx, (None,), (torch.int32, torch.int64))
 
         def slice_normal_optional_tensor(t: Optional[Tensor]) -> Optional[Tensor]:
             if t is None:
@@ -331,19 +326,24 @@ class SemanticGuides(_SemanticGuideOrSemanticGuides):
         if len(guides) == 0:
             raise ValueError("Cannot create Guides from empty list.")
 
+        def checked(ts: list[Optional[Tensor]]) -> list[Tensor]:
+            if any(t is None for t in ts):
+                raise ValueError("All guides must have the same fields to be batched.")
+            return ts  # type: ignore[return-value]
+
         parse = None
         if guides[0].parse is not None:
             padding_value = False if guides[0].parse.dtype == torch.bool else 0
             pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if guides[0].parse.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
-            parse = pad_sequence([g.parse for g in guides], True, padding_value, "right", pin_memory, pad_to_multiple_of, min_length)
+            parse = pad_sequence(checked([g.parse for g in guides]), True, padding_value, "right", pin_memory, pad_to_multiple_of, min_length)
         entropy = None
         if guides[0].entropy is not None:
-            entropy = pad_sequence([g.entropy for g in guides], True, 0.0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
+            entropy = pad_sequence(checked([g.entropy for g in guides]), True, 0.0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
         characteristics = None
         if guides[0].characteristics is not None:
             padding_value = False if guides[0].characteristics.dtype == torch.bool else 0
             pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if guides[0].characteristics.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
-            characteristics = pad_sequence([g.characteristics for g in guides], True, padding_value, "right", pin_memory, pad_to_multiple_of, min_length)
+            characteristics = pad_sequence(checked([g.characteristics for g in guides]), True, padding_value, "right", pin_memory, pad_to_multiple_of, min_length)
 
         return cls(parse, entropy, characteristics)
 
@@ -373,7 +373,7 @@ class SemanticGuider:
         self,
         data: Optional[LiefParse | lief.PE.Binary] = None,
         size: Optional[int] = None,
-        inputs: Optional[torch.CharTensor] = None,
+        inputs: Optional[Tensor] = None,
     ) -> SemanticGuide:
 
         parse = None
@@ -401,7 +401,8 @@ class SemanticGuider:
         parse = torch.from_numpy(parse)
         return parse
 
-    def _get_entropy(self, inputs: torch.CharTensor) -> Tensor:
+    def _get_entropy(self, inputs: Tensor) -> Tensor:
+        check_tensor(inputs, (None,), torch.uint8)
         inputs = inputs.numpy(force=True)
         entropy = compute_entropy_rolling_numpy(inputs, self.radius)
         entropy = torch.from_numpy(entropy).to(torch.float16)
@@ -579,8 +580,8 @@ class _FSampleOrSamples(ABC):
 
     file: StrPath | list[StrPath]
     name: Name | list[Name]
-    label: ShortTensor | IntTensor | LongTensor
-    inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
+    label: Tensor
+    inputs: Tensor
     guides: _SemanticGuideOrSemanticGuides
     structure: _StructureMapOrStructureMaps
 
@@ -588,8 +589,8 @@ class _FSampleOrSamples(ABC):
         self,
         file: StrPath | list[StrPath],
         name: Name | list[Name],
-        label: ShortTensor | IntTensor | LongTensor,
-        inputs: ByteTensor | ShortTensor | IntTensor | LongTensor,
+        label: Tensor,
+        inputs: Tensor,
         guides: _SemanticGuideOrSemanticGuides,
         structure: _StructureMapOrStructureMaps,
     ) -> None:
@@ -601,7 +602,7 @@ class _FSampleOrSamples(ABC):
         self.structure = structure
         self.verify_inputs()
 
-    def __iter__(self) -> Iterable[tuple[StrPath | list[StrPath], Name | list[Name], IntTensor, IntTensor, SemanticGuides, StructureMap]]:
+    def __iter__(self) -> Iterator[StrPath | list[StrPath] | Name | list[Name] | Tensor | _SemanticGuideOrSemanticGuides | _StructureMapOrStructureMaps]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
 
     @property
@@ -697,8 +698,8 @@ class _FSampleOrSamples(ABC):
 class FSample(_FSampleOrSamples):
     file: StrPath
     name: Name
-    label: ShortTensor | IntTensor | LongTensor
-    inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
+    label: Tensor
+    inputs: Tensor
     guides: SemanticGuide
     structure: StructureMap
 
@@ -713,8 +714,8 @@ class FSample(_FSampleOrSamples):
 class FSamples(_FSampleOrSamples):
     file: list[StrPath]
     name: list[Name]
-    label: ShortTensor | IntTensor | LongTensor
-    inputs: ByteTensor | ShortTensor | IntTensor | LongTensor
+    label: Tensor
+    inputs: Tensor
     guides: SemanticGuides
     structure: StructureMaps
 
@@ -740,8 +741,8 @@ class _HSampleOrSamples(Generic[TGuide], ABC):
     """
     file: StrPath | list[StrPath]
     name: Name | list[Name]
-    label: ShortTensor | IntTensor | LongTensor
-    inputs: MutableSequence[ByteTensor | ShortTensor | IntTensor | LongTensor]
+    label: Tensor
+    inputs: MutableSequence[Tensor]
     guides: MutableSequence[TGuide]
     structure: _StructureMapOrStructureMaps
 
@@ -749,8 +750,8 @@ class _HSampleOrSamples(Generic[TGuide], ABC):
         self,
         file: StrPath | list[StrPath],
         name: Name | list[Name],
-        label: ShortTensor | IntTensor | LongTensor,
-        inputs: MutableSequence[ByteTensor | ShortTensor | IntTensor | LongTensor],
+        label: Tensor,
+        inputs: MutableSequence[Tensor],
         guides: MutableSequence[TGuide],
         structure: _StructureMapOrStructureMaps,
     ) -> None:
@@ -762,7 +763,7 @@ class _HSampleOrSamples(Generic[TGuide], ABC):
         self.structure = structure
         self.verify_inputs()
 
-    def __iter__(self) -> Iterable[tuple[StrPath | list[StrPath], Name | list[Name], IntTensor, MutableSequence[IntTensor], MutableSequence[SemanticGuides], StructureMap]]:
+    def __iter__(self) -> Iterator[StrPath | list[StrPath] | Name | list[Name] | Tensor | MutableSequence[Tensor] | MutableSequence[TGuide] | _StructureMapOrStructureMaps]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
 
     @property
@@ -898,8 +899,8 @@ class _HSampleOrSamples(Generic[TGuide], ABC):
 class HSample(_HSampleOrSamples[SemanticGuide]):
     file: StrPath
     name: Name
-    label: ShortTensor | IntTensor | LongTensor
-    inputs: MutableSequence[ByteTensor | ShortTensor | IntTensor | LongTensor]
+    label: Tensor
+    inputs: MutableSequence[Tensor]
     guides: MutableSequence[SemanticGuide]
     structure: StructureMap
 
@@ -916,8 +917,8 @@ class HSample(_HSampleOrSamples[SemanticGuide]):
 class HSamples(_HSampleOrSamples[SemanticGuides]):
     file: list[StrPath]
     name: list[Name]
-    label: ShortTensor | IntTensor | LongTensor
-    inputs: MutableSequence[ByteTensor | ShortTensor | IntTensor | LongTensor]
+    label: Tensor
+    inputs: MutableSequence[Tensor]
     guides: MutableSequence[SemanticGuides]
     structure: StructureMaps
 
@@ -1146,7 +1147,7 @@ class CollateFn:
         return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, min_length={self.min_length})"
 
     @staticmethod
-    def get_padded_inputs(inputs: list[Tensor], min_length: int, pin_memory: bool, change_dtype_after_pad: bool = True) -> ShortTensor:
+    def get_padded_inputs(inputs: list[Tensor], min_length: int, pin_memory: bool, change_dtype_after_pad: bool = True) -> Tensor:
         """
         NOTE: some benchmarks indicate that Tensor.to(torch.int16) is a massive bottleneck. change_dtype_after_pad=True might resolve this.
         """
@@ -1229,7 +1230,7 @@ class CUDAPrefetcher:
         self.loader = loader
         self.device = device
         self.num_streams = max(0, int(num_streams))
-        self.streams = [torch.cuda.Stream(device=device) for _ in range(self.num_streams)]
+        self.streams = [torch.cuda.Stream(device=device) for _ in range(self.num_streams)]  # type: ignore[no-untyped-call]
         self._rr = 0
         self._buf: deque[tuple[torch.cuda.Stream, FOrHSamples]] = deque()
         self.it: Optional[Iterator[FOrHSamples]] = None
