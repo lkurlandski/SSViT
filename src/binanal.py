@@ -3,10 +3,8 @@ Binary analysis.
 """
 
 from __future__ import annotations
-from collections.abc import Sequence
 import enum
 from functools import cache
-from functools import partial
 import hashlib
 import io
 import os
@@ -25,7 +23,7 @@ import numpy.typing as npt
 
 
 StrPath = str | os.PathLike[str]
-LiefParse = str | io.IOBase | os.PathLike | bytes | memoryview
+LiefParse = str | io.IOBase | os.PathLike[str] | bytes | memoryview | bytearray | list[int]
 Range = tuple[int, int]
 
 NPUInt = np.uint8 | np.uint16 | np.uint32 | np.uint64
@@ -38,7 +36,7 @@ def get_ranges_numpy(x: npt.NDArray[np.bool_]) -> tuple[npt.NDArray[np.int32], n
     """
     Detects the ranges of consecutive True values in a boolean numpy array.
     """
-    if x.dtype != np.bool_ or x.ndim != 1:  # type: ignore[comparison-overlap]
+    if x.dtype != np.bool_ or x.ndim != 1:
         raise TypeError(f"Expected a 1D boolean numpy array, got {type(x)} with shape {x.shape}.")
 
     n = x.size
@@ -60,26 +58,6 @@ def get_ranges_numpy(x: npt.NDArray[np.bool_]) -> tuple[npt.NDArray[np.int32], n
     return lo, hi
 
 
-def is_section_executable(section: lief.PE.Section) -> bool:
-    for c in section.characteristics_lists:
-        if "MEM_EXECUTE" in c:
-            return True
-        if "CNT_CODE" in c:
-            return True
-    return False
-
-
-def is_dotnet(data: LiefParse) -> bool:
-    data = io.BytesIO(data) if isinstance(data, bytes) else data
-    pe = lief.PE.parse(data)
-    if not isinstance(pe, lief.PE.Binary):
-        raise RuntimeError(f"Expected lief.PE.Binary, got {type(pe)}")
-    dd: lief.PE.DataDirectory = pe.data_directory(lief.PE.DataDirectory.TYPES.CLR_RUNTIME_HEADER)
-    if not isinstance(dd, lief.PE.DataDirectory):
-        raise RuntimeError(f"Expected lief.PE.DataDirectory, got {type(pe)}")
-    return bool(dd.rva != 0) and bool(dd.size != 0)
-
-
 def get_machine_and_subsystem(data: LiefParse) -> tuple[lief.PE.Header.MACHINE_TYPES, lief.PE.OptionalHeader.SUBSYSTEM]:
     data = io.BytesIO(data) if isinstance(data, bytes) else data
     pe = lief.PE.parse(data)
@@ -90,8 +68,8 @@ def get_machine_and_subsystem(data: LiefParse) -> tuple[lief.PE.Header.MACHINE_T
 
 def patch_binary(
     data: LiefParse,
-    machine: Optional[lief.PE.Header.MACHINE_TYPES] = None,
-    subsystem: Optional[lief.PE.OptionalHeader.SUBSYSTEM] = None,
+    machine: Optional[lief.PE.Header.MACHINE_TYPES | int] = None,
+    subsystem: Optional[lief.PE.OptionalHeader.SUBSYSTEM | int] = None,
 ) -> bytes:
     if isinstance(data, (str, os.PathLike)):
         data = bytearray(Path(data).read_bytes())
@@ -110,16 +88,12 @@ def patch_binary(
 
     # Patch Machine (IMAGE_FILE_HEADER.Machine).
     if machine is not None:
-        if hasattr(machine, "value"):  # LIEF enum
-            machine = machine.value
-        struct.pack_into("<H", data, filehdr_off + 0, machine)
+        struct.pack_into("<H", data, filehdr_off + 0, machine.value if isinstance(machine, enum.Enum) else machine)
 
     # Patch Subsystem (IMAGE_OPTIONAL_HEADER.Subsystem).
     subsys_rel = 68
     if subsystem is not None:
-        if hasattr(subsystem, "value"):
-            subsystem = subsystem.value
-        struct.pack_into("<H", data, opthdr_off + subsys_rel, subsystem)
+        struct.pack_into("<H", data, opthdr_off + subsys_rel, subsystem.value if isinstance(subsystem, enum.Enum) else subsystem)
 
     return bytes(data)
 
@@ -203,7 +177,7 @@ class BinaryCreator:
         builder.build()
         pe_bytes = bytes(builder.get_build())
         pe_bytes += self.overlay
-        pe: lief.PE.Binary = lief.parse(pe_bytes)
+        pe = _parse_pe_and_get_size(pe_bytes)[0]
         if pe is None:
             raise RuntimeError(f"lief.parse({type(pe_bytes)}) returned None")
         if pe.overlay_offset == 0:
@@ -220,13 +194,12 @@ class BinaryCreator:
         self.pe.add_section(section, type_)
         return self
 
-    def add_section_text(self, name: str = ".text", content: Optional[Sequence[int]] = None, characteristics: Optional[int] = None) -> Self:
+    def add_section_text(self, name: str = ".text", content: Optional[bytes | bytearray] = None, characteristics: Optional[int] = None) -> Self:
         section = lief.PE.Section(name)
         if content is None:
             content = bytearray(0x200)
             content[0] = 0xC3  # RET
-            content = list(content)
-        section.content = content
+        section.content = memoryview(content)
         if characteristics is None:
             characteristics = (
                 int(lief.PE.Section.CHARACTERISTICS.CNT_CODE) |
@@ -237,15 +210,14 @@ class BinaryCreator:
         self.add_section(section, lief.PE.SECTION_TYPES.TEXT)
         return self
 
-    def add_section_data(self, name: str = ".data", content: Optional[Sequence[int]] = None, characteristics: Optional[int] = None) -> Self:
+    def add_section_data(self, name: str = ".data", content: Optional[bytes | bytearray] = None, characteristics: Optional[int] = None) -> Self:
         if characteristics is not None:
             warnings.warn("Characteristics may be ignored when using the lief.PE.SECTION_TYPES.DATA type.")
         section = lief.PE.Section(name)
         if content is None:
             content = bytearray(0x200)
             content[0] = 0x00
-            content = list(content)
-        section.content = content
+        section.content = memoryview(content)
         if characteristics is None:
             characteristics = (
                 int(lief.PE.Section.CHARACTERISTICS.CNT_INITIALIZED_DATA) |
@@ -333,7 +305,7 @@ class CharacteristicGuider:
         self.use_packed = use_packed
 
     def _get_characteristic_offsets(self) -> dict[lief.PE.Section.CHARACTERISTICS, list[tuple[int, int]]]:
-        offsets: dict[int, list[tuple[int, int]]] = {c: [] for c in lief.PE.Section.CHARACTERISTICS}
+        offsets: dict[lief.PE.Section.CHARACTERISTICS, list[tuple[int, int]]] = {c: [] for c in lief.PE.Section.CHARACTERISTICS}
 
         for section in self.pe.sections:
             offset = section.offset
@@ -468,23 +440,26 @@ def _paint_packed_or(x: npt.NDArray[np.uint8], offsets: npt.NDArray[np.int64], s
 
 class ParserGuider:
 
-    PARSEERRORS = [
-        lief.lief_errors.asn1_bad_tag,
-        lief.lief_errors.build_error,
-        lief.lief_errors.conversion_error,
-        lief.lief_errors.corrupted,
-        lief.lief_errors.data_too_large,
-        lief.lief_errors.file_error,
-        lief.lief_errors.file_format_error,
-        lief.lief_errors.not_found,
-        lief.lief_errors.not_implemented,
-        lief.lief_errors.not_supported,
-        lief.lief_errors.parsing_error,
-        lief.lief_errors.read_error,
-        lief.lief_errors.read_out_of_bound,
-        lief.lief_errors.require_extended_version
-    ]
-    PARSEERRORS = [Exception]  # FIXME: remove.
+    # NOTE: I couldn't figure out how to properly catch/handle lief errors.
+
+    # PARSEERRORS = [
+    #     lief.lief_errors.asn1_bad_tag,
+    #     lief.lief_errors.build_error,
+    #     lief.lief_errors.conversion_error,
+    #     lief.lief_errors.corrupted,
+    #     lief.lief_errors.data_too_large,
+    #     lief.lief_errors.file_error,
+    #     lief.lief_errors.file_format_error,
+    #     lief.lief_errors.not_found,
+    #     lief.lief_errors.not_implemented,
+    #     lief.lief_errors.not_supported,
+    #     lief.lief_errors.parsing_error,
+    #     lief.lief_errors.read_error,
+    #     lief.lief_errors.read_out_of_bound,
+    #     lief.lief_errors.require_extended_version
+    # ]
+
+    PARSEERRORS = [Exception]
 
     def __init__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> None:
         warnings.warn("ParserGuider not yet fully operational. All errors marked in same channel.")
@@ -518,10 +493,10 @@ class ParserGuider:
                     for s in self.pe.sections:
                         _ = (s.name, s.size)
                 elif attr == "data_directories":
-                    for dd in self.pe.data_directories[:8]:
+                    for dd in self.pe.data_directories:
                         _ = (dd.type, dd.size)
                 elif attr == "imports":
-                    for im in self.pe.imports[:5]:
+                    for im in self.pe.imports:
                         _ = im.name
                 elif attr == "exports":
                     _ = self.pe.has_exports

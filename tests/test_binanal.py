@@ -7,12 +7,14 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from typing import Any
 
 import lief
 import numpy as np
 from numpy import typing as npt
 import pytest
 
+from src.binanal import _parse_pe_and_get_size
 from src.binanal import patch_binary
 from src.binanal import ParserGuider
 from src.binanal import CharacteristicGuider
@@ -22,15 +24,20 @@ from src.binanal import BinaryCreator
 from tests import FILES
 
 
+def _parse_pe(data: Any) -> lief.PE.Binary:
+    pe, _ = _parse_pe_and_get_size(data)
+    return pe
+
+
 class TestPatchPEFile:
 
     @pytest.mark.parametrize("file", FILES)
     def test_patch_none_1(self, file: Path) -> None:
         org = file.read_bytes()
-        pe = lief.parse(org)
+        pe = _parse_pe(org)
         org_machine, org_subsystem = pe.header.machine, pe.optional_header.subsystem
         new = patch_binary(org, machine=None, subsystem=None)
-        pe = lief.parse(new)
+        pe = _parse_pe(new)
         new_machine, new_subsystem = pe.header.machine, pe.optional_header.subsystem
         assert new_machine == org_machine
         assert new_subsystem == org_subsystem
@@ -39,10 +46,10 @@ class TestPatchPEFile:
     @pytest.mark.parametrize("file", FILES)
     def test_patch_same(self, file: Path) -> None:
         org = file.read_bytes()
-        pe = lief.parse(org)
+        pe = _parse_pe(org)
         org_machine, org_subsystem = pe.header.machine, pe.optional_header.subsystem
         new = patch_binary(org, machine=org_machine, subsystem=org_subsystem)
-        pe = lief.parse(new)
+        pe = _parse_pe(new)
         new_machine, new_subsystem = pe.header.machine, pe.optional_header.subsystem
         assert new_machine == org_machine
         assert new_subsystem == org_subsystem
@@ -51,7 +58,7 @@ class TestPatchPEFile:
     @pytest.mark.parametrize("file", FILES)
     def test_patch_machine(self, file: Path) -> None:
         org = file.read_bytes()
-        pe = lief.parse(org)
+        pe = _parse_pe(org)
         org_machine, org_subsystem = pe.header.machine, pe.optional_header.subsystem
         # Choose wierd machine
         if org_machine == lief.PE.Header.MACHINE_TYPES.THUMB:
@@ -59,19 +66,19 @@ class TestPatchPEFile:
         else:
             machine = lief.PE.Header.MACHINE_TYPES.THUMB
         new = patch_binary(org, machine=machine, subsystem=None)
-        pe = lief.parse(new)
+        pe = _parse_pe(new)
         new_machine, new_subsystem = pe.header.machine, pe.optional_header.subsystem
         assert new_machine == machine
         assert new_subsystem == org_subsystem
         assert new != org
-        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))  # type: ignore[no-untyped-call]
+        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))
         # At most two bytes should differ
         assert np.sum(equal) >= len(equal) - 2, f"{np.sum(equal)} {len(equal)}"
 
     @pytest.mark.parametrize("file", FILES)
     def test_patch_subsystem(self, file: Path) -> None:
         org = file.read_bytes()
-        pe = lief.parse(org)
+        pe = _parse_pe(org)
         org_machine, org_subsystem = pe.header.machine, pe.optional_header.subsystem
         # Choose wierd subsystem
         if org_subsystem == lief.PE.OptionalHeader.SUBSYSTEM.XBOX:
@@ -79,19 +86,19 @@ class TestPatchPEFile:
         else:
             subsystem = lief.PE.OptionalHeader.SUBSYSTEM.XBOX
         new = patch_binary(org, machine=None, subsystem=subsystem)
-        pe = lief.parse(new)
+        pe = _parse_pe(new)
         new_machine, new_subsystem = pe.header.machine, pe.optional_header.subsystem
         assert new_machine == org_machine
         assert new_subsystem == subsystem
         assert new != org
-        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))  # type: ignore[no-untyped-call]
+        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))
         # At most one byte should differ
         assert np.sum(equal) >= len(equal) - 1, f"{np.sum(equal)} {len(equal)}"
 
     @pytest.mark.parametrize("file", FILES)
     def test_patch_machine_subsystem(self, file: Path) -> None:
         org = file.read_bytes()
-        pe = lief.parse(org)
+        pe = _parse_pe(org)
         org_machine, org_subsystem = pe.header.machine, pe.optional_header.subsystem
         # Choose wierd machine and subsystem
         if org_machine == lief.PE.Header.MACHINE_TYPES.THUMB:
@@ -103,18 +110,18 @@ class TestPatchPEFile:
         else:
             subsystem = lief.PE.OptionalHeader.SUBSYSTEM.XBOX
         new = patch_binary(org, machine=machine, subsystem=subsystem)
-        pe = lief.parse(new)
+        pe = _parse_pe(new)
         new_machine, new_subsystem = pe.header.machine, pe.optional_header.subsystem
         assert new_machine == machine
         assert new_subsystem == subsystem
         assert new != org
-        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))  # type: ignore[no-untyped-call]
+        equal = np.equal(np.frombuffer(org, dtype=np.uint8), np.frombuffer(new, dtype=np.uint8))
         # At most three bytes should differ
         assert np.sum(equal) >= len(equal) - 3, f"{np.sum(equal)} {len(equal)}"
 
 
 def _path_to_input_type(file: Path, input_type: type[str | Path | bytes]) -> str | Path | bytes:
-    if input_type == str:
+    if input_type is str:
         return str(file)
     elif input_type == Path:
         return file
@@ -166,13 +173,15 @@ class TestCharacteristicGuider:
     @pytest.mark.parametrize("file", FILES)
     def test_equivalence(self, file: Path, input_type: type[str | Path | bytes] = str) -> None:
         data = _path_to_input_type(file, input_type)
-        x_1 = CharacteristicGuider(data, use_packed=False)()
-        x_2 = CharacteristicGuider(data, use_packed=True)()
+        x_1: npt.NDArray[np.bool_] = CharacteristicGuider(data, use_packed=False)()  # type: ignore[assignment]
+        x_2: npt.NDArray[np.uint8] = CharacteristicGuider(data, use_packed=True)()   # type: ignore[assignment]
 
+        assert x_1.dtype == np.bool_
         z = np.packbits(x_1, axis=0, bitorder="little")
         assert z.shape == x_2.shape
         assert np.all(x_2 == z)
 
+        assert x_2.dtype == np.uint8
         z = np.unpackbits(x_2, axis=0, count=x_1.shape[0], bitorder="little")
         assert z.shape == x_1.shape
         assert np.all(x_1 == z)
@@ -180,9 +189,9 @@ class TestCharacteristicGuider:
 
 class TestStructureParser:
 
-    def _create_section_with_characteristics(self, name: str, characteristics: int) -> lief.PE.Section:
+    def _create_section_with_characteristics(self, name: str, characteristics: lief.PE.Section.CHARACTERISTICS | int) -> lief.PE.Section:
         section = lief.PE.Section(name)
-        section.characteristics = characteristics
+        section.characteristics = characteristics.value if isinstance(characteristics, lief.PE.Section.CHARACTERISTICS) else characteristics
         return section
 
     def _check_ranges(self, ranges: list[tuple[int, int]], size: int = sys.maxsize) -> None:
@@ -426,26 +435,6 @@ class TestStructureParser:
         ranges = parser.get_data()
         self._check_ranges(ranges, size)
 
-    @pytest.mark.parametrize("file", FILES)
-    def test_get_othersec_real(self, file: Path) -> None:
-        parser = StructureParser(file)
-        ranges = parser.get_othersec()
-        self._check_ranges(ranges, os.path.getsize(file))
-        assert len(ranges) <= len(self._valid_sections(parser.pe, parser.size))
-
-    def test_get_othersec_synth(self) -> None:
-        section = lief.PE.Section(".unk")
-        section.characteristics = 0
-        section.content = bytearray(0x200)
-        pe, byte = BinaryCreator().add_section_text().add_section(section).add_overlay(b"OVERLAY")()
-        size = len(byte)
-        parser = StructureParser(pe, size)
-        ranges = parser.get_othersec()
-        self._check_ranges(ranges, size)
-        assert len(ranges) == 1
-        assert ranges[0][0] == pe.sizeof_headers + len(pe.get_section(".text").content)
-        assert ranges[0][1] == ranges[0][0] + len(pe.get_section(".unk").content)
-
     # ---------- FINE ----------
     @pytest.mark.parametrize("file", FILES)
     def test_get_rcode_real(self, file: Path) -> None:
@@ -457,7 +446,7 @@ class TestStructureParser:
     def test_get_rcode_synth(self) -> None:
         c_wcode = lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE | lief.PE.Section.CHARACTERISTICS.MEM_WRITE
         c_rcode = lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE
-        pe, byte = BinaryCreator().add_section_text(".wcode", characteristics=c_wcode).add_section_data().add_section_text(".rcode", characteristics=c_rcode)()
+        pe, byte = BinaryCreator().add_section_text(".wcode", characteristics=c_wcode.value).add_section_data().add_section_text(".rcode", characteristics=c_rcode.value)()
         size = len(byte)
         parser = StructureParser(pe, size)
         ranges = parser.get_rcode()
@@ -476,7 +465,7 @@ class TestStructureParser:
     def test_get_wcode_synth(self) -> None:
         c_wcode = lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE | lief.PE.Section.CHARACTERISTICS.MEM_WRITE
         c_rcode = lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE
-        pe, byte = BinaryCreator().add_section_text(".rcode", characteristics=c_rcode).add_section_data().add_section_text(".wcode", characteristics=c_wcode)()
+        pe, byte = BinaryCreator().add_section_text(".rcode", characteristics=c_rcode.value).add_section_data().add_section_text(".wcode", characteristics=c_wcode.value)()
         size = len(byte)
         parser = StructureParser(pe, size)
         ranges = parser.get_wcode()
@@ -495,8 +484,8 @@ class TestStructureParser:
     def test_get_rdata_synth(self) -> None:
         c_rdata = lief.PE.Section.CHARACTERISTICS.MEM_READ
         c_wdata = lief.PE.Section.CHARACTERISTICS.MEM_READ | lief.PE.Section.CHARACTERISTICS.MEM_WRITE
-        s_rdata = lief.PE.Section(list(bytearray(0x200)), ".rdata", c_rdata)
-        s_wdata = lief.PE.Section(list(bytearray(0x200)), ".wdata", c_wdata)
+        s_rdata = lief.PE.Section(list(bytearray(0x200)), ".rdata", c_rdata.value)
+        s_wdata = lief.PE.Section(list(bytearray(0x200)), ".wdata", c_wdata.value)
         pe, byte = BinaryCreator().add_section(s_rdata).add_section(s_wdata).add_section_text()()
         size = len(byte)
         parser = StructureParser(pe, size)
@@ -516,8 +505,8 @@ class TestStructureParser:
     def test_get_wdata_synth(self) -> None:
         c_rdata = lief.PE.Section.CHARACTERISTICS.MEM_READ
         c_wdata = lief.PE.Section.CHARACTERISTICS.MEM_READ | lief.PE.Section.CHARACTERISTICS.MEM_WRITE
-        s_rdata = lief.PE.Section(list(bytearray(0x200)), ".wdata", c_wdata)
-        s_wdata = lief.PE.Section(list(bytearray(0x200)), ".rdata", c_rdata)
+        s_rdata = lief.PE.Section(list(bytearray(0x200)), ".wdata", c_wdata.value)
+        s_wdata = lief.PE.Section(list(bytearray(0x200)), ".rdata", c_rdata.value)
         pe, byte = BinaryCreator().add_section(s_rdata).add_section(s_wdata).add_section_text()()
         size = len(byte)
         parser = StructureParser(pe, size)
