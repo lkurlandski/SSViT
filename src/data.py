@@ -520,7 +520,7 @@ class StructureMaps(_StructureMapOrStructureMaps):
             raise ValueError(f"StructureMaps index and lexicon must have the same length. Got {len(self.index[0])} and {len(self.lexicon)}.")
 
     @classmethod
-    def from_singles(cls, maps: Sequence[StructureMap], pin_memory: bool = False, min_length: int = 0) -> _StructureMapOrStructureMaps:
+    def from_singles(cls, maps: Sequence[StructureMap], pin_memory: bool = False, min_length: int = 0) -> StructureMaps:
         if len(maps) == 0:
             raise ValueError("Cannot create BatchedStructureMap from empty list.")
         lexicon = maps[0].lexicon
@@ -574,25 +574,29 @@ class StructurePartitioner:
         return StructureMap(index, lexicon)
 
 
-class _FSampleOrSamples(ABC):
+F = TypeVar("F")                                        # file
+N = TypeVar("N")                                        # name
+G = TypeVar("G", bound=_SemanticGuideOrSemanticGuides)  # guides
+S = TypeVar("S", bound=_StructureMapOrStructureMaps)    # structures
 
-    # FIXME: some of these methods, e.g., `clone`, should return a new instance!
 
-    file: StrPath | list[StrPath]
-    name: Name | list[Name]
+class _FSampleOrSamples(Generic[F, N, G, S], ABC):
+
+    file: F
+    name: N
     label: Tensor
     inputs: Tensor
-    guides: _SemanticGuideOrSemanticGuides
-    structure: _StructureMapOrStructureMaps
+    guides: G
+    structure: S
 
     def __init__(
         self,
-        file: StrPath | list[StrPath],
-        name: Name | list[Name],
+        file: F,
+        name: N,
         label: Tensor,
         inputs: Tensor,
-        guides: _SemanticGuideOrSemanticGuides,
-        structure: _StructureMapOrStructureMaps,
+        guides: G,
+        structure: S,
     ) -> None:
         self.file = file
         self.name = name
@@ -602,7 +606,7 @@ class _FSampleOrSamples(ABC):
         self.structure = structure
         self.verify_inputs()
 
-    def __iter__(self) -> Iterator[StrPath | list[StrPath] | Name | list[Name] | Tensor | _SemanticGuideOrSemanticGuides | _StructureMapOrStructureMaps]:
+    def __iter__(self) -> Iterator[F | N | Tensor | Tensor | G | S]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
 
     @property
@@ -695,13 +699,7 @@ class _FSampleOrSamples(ABC):
         return self.__class__(file, name, label, inputs, guides, structure)
 
 
-class FSample(_FSampleOrSamples):
-    file: StrPath
-    name: Name
-    label: Tensor
-    inputs: Tensor
-    guides: SemanticGuide
-    structure: StructureMap
+class FSample(_FSampleOrSamples[StrPath, Name, SemanticGuide, StructureMap]):
 
     def __len__(self) -> int:
         return 1
@@ -711,13 +709,7 @@ class FSample(_FSampleOrSamples):
         check_tensor(self.inputs, (None,), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
-class FSamples(_FSampleOrSamples):
-    file: list[StrPath]
-    name: list[Name]
-    label: Tensor
-    inputs: Tensor
-    guides: SemanticGuides
-    structure: StructureMaps
+class FSamples(_FSampleOrSamples[Sequence[StrPath], Sequence[Name], SemanticGuides, StructureMaps]):
 
     def __len__(self) -> int:
         return len(self.file)
@@ -727,33 +719,28 @@ class FSamples(_FSampleOrSamples):
         check_tensor(self.inputs, (self.label.shape[0], None), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
-TGuide = TypeVar("TGuide", bound=_SemanticGuideOrSemanticGuides)
-
-class _HSampleOrSamples(Generic[TGuide], ABC):
+class _HSampleOrSamples(Generic[F, N, G, S], ABC):
     """
     A similar container as _FSampleOrSamples, but specifically for hierarchical models.
     The main difference is that the guides and structure are lists, one per hierarchical structure.
 
-    NOTE: its unclear whether or not the lists of tensors can be moved efficiently across processes,
-        i.e., when num_workers > 0 in DataLoader.
-
-    FIXME: some of these methods, e.g., `clone`, should return a new instance!
+    NOTE: can lists of tensors be efficiently shared across processes?
     """
-    file: StrPath | list[StrPath]
-    name: Name | list[Name]
+    file: F
+    name: N
     label: Tensor
-    inputs: MutableSequence[Tensor]
-    guides: MutableSequence[TGuide]
-    structure: _StructureMapOrStructureMaps
+    inputs: Sequence[Tensor]
+    guides: Sequence[G]
+    structure: S
 
     def __init__(
         self,
-        file: StrPath | list[StrPath],
-        name: Name | list[Name],
+        file: F,
+        name: N,
         label: Tensor,
-        inputs: MutableSequence[Tensor],
-        guides: MutableSequence[TGuide],
-        structure: _StructureMapOrStructureMaps,
+        inputs: Sequence[Tensor],
+        guides: Sequence[G],
+        structure: S,
     ) -> None:
         self.file = file
         self.name = name
@@ -763,7 +750,7 @@ class _HSampleOrSamples(Generic[TGuide], ABC):
         self.structure = structure
         self.verify_inputs()
 
-    def __iter__(self) -> Iterator[StrPath | list[StrPath] | Name | list[Name] | Tensor | MutableSequence[Tensor] | MutableSequence[TGuide] | _StructureMapOrStructureMaps]:
+    def __iter__(self) -> Iterator[F | N | Tensor | Sequence[Tensor] | Sequence[G] | S]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
 
     @property
@@ -896,13 +883,7 @@ class _HSampleOrSamples(Generic[TGuide], ABC):
         return self.__class__(file, name, label, inputs, guides, structure)
 
 
-class HSample(_HSampleOrSamples[SemanticGuide]):
-    file: StrPath
-    name: Name
-    label: Tensor
-    inputs: MutableSequence[Tensor]
-    guides: MutableSequence[SemanticGuide]
-    structure: StructureMap
+class HSample(_HSampleOrSamples[StrPath, Name, SemanticGuide, StructureMap]):
 
     def __len__(self) -> int:
         return 1
@@ -914,13 +895,7 @@ class HSample(_HSampleOrSamples[SemanticGuide]):
             check_tensor(inp, (None,), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
-class HSamples(_HSampleOrSamples[SemanticGuides]):
-    file: list[StrPath]
-    name: list[Name]
-    label: Tensor
-    inputs: MutableSequence[Tensor]
-    guides: MutableSequence[SemanticGuides]
-    structure: StructureMaps
+class HSamples(_HSampleOrSamples[Sequence[StrPath], Sequence[Name], SemanticGuides, StructureMaps]):
 
     def __len__(self) -> int:
         return len(self.file)
@@ -1050,7 +1025,7 @@ class Preprocessor:
         name = Name(name)
         label = torch.tensor(label, dtype=torch.int64)
         inputs = torch.frombuffer(buffer, dtype=torch.uint8)
-        guides = SemanticGuides(None, None, None)
+        guides = SemanticGuide(None, None, None)
         if self.do_entropy:
             guides.entropy = self.guider._get_entropy(inputs)
         if self.do_characteristics:
@@ -1201,6 +1176,19 @@ class CollateFnHierarchical:
                 ranges = batch[j].structure.index[i]
                 x_i_j = torch.cat([batch[j].inputs[lo:hi] for lo, hi in ranges] + [torch.tensor([], dtype=batch[j].inputs.dtype)])
                 g_i_j = batch[j].guides.select(ranges=ranges)
+                # TODO: remove these checks.
+                if g_i_j.parse is not None:
+                    expected = x_i_j.size(0) if not g_i_j.is_bitpacked else math.ceil(x_i_j.size(0) / 8)
+                    if g_i_j.parse.size(0) != expected:
+                        raise RuntimeError(f"{i=} {j=} {ranges=} {expected=} x_i_j.shape={tuple(x_i_j.shape)} g_i_j.parse.shape={tuple(g_i_j.parse.shape)}")
+                if g_i_j.characteristics is not None:
+                    expected = x_i_j.size(0) if not g_i_j.is_bitpacked else math.ceil(x_i_j.size(0) / 8)
+                    if g_i_j.characteristics.size(0) != expected:
+                        raise RuntimeError(f"{i=} {j=} {ranges=} {expected=} x_i_j.shape={tuple(x_i_j.shape)} g_i_j.characteristics.shape={tuple(g_i_j.characteristics.shape)}")
+                if g_i_j.entropy is not None:
+                    expected = x_i_j.size(0)
+                    if g_i_j.entropy.size(0) != expected:
+                        raise RuntimeError(f"{i=} {j=} {ranges=} {expected=} x_i_j.shape={tuple(x_i_j.shape)} g_i_j.entropy.shape={tuple(g_i_j.entropy.shape)}")
                 xs.append(x_i_j)
                 gs.append(g_i_j.compress() if self.bitpack else g_i_j)
             xs = CollateFn.get_padded_inputs(xs, self.min_lengths[i], self.pin_memory)
