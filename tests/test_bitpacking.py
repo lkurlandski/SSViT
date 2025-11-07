@@ -114,18 +114,32 @@ class TestSliceBitpackedTensor:
     @pytest.mark.parametrize("length", [1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129])
     @pytest.mark.parametrize("ndim", [1, 2, 3, 4])
     def test_random_selection(self, mode: str, bigchunks: bool, axis: int, length: int, ndim: int) -> None:
+        print(f"{mode=}, {bigchunks=}, {axis=}, {length=}, {ndim=}")
+
         torch.manual_seed(0)
         if ndim == 1 and axis > 0:
             return
 
+        # Determine the shape of the tensor to select from.
         size: list[int] = [int(torch.randint(1, length + 1, size=(1,)).item()) for _ in range(ndim)]
         size[axis] = length
         size = tuple(size)
+        print(f"{size=}")
+
+        # Build a 1D mask selecting random bits along the specified axis.
         mask: Tensor = torch.randint(0, 2, size=(size[axis],), dtype=torch.bool)
         num_selected = int(mask.sum())
+        print(f"{mask.shape=}")
+        print(f"{num_selected=}")
 
+        # Construct the original tensor (`original`) and its bitpacked version (`poriginal`).
         original = torch.randint(0, 2, size=size, dtype=torch.bool)
         poriginal = packbits(original, axis=axis)
+        print(f"{original.shape=}")
+        print(f"{poriginal.shape=}")
+
+        # Construct the reference result by selecting from the original tensor and repacking.
+        # If the mask selects no bits, we handle that case separately to avoid errors.
         reference: Tensor = original.movedim(axis, -1)[..., mask].movedim(-1, axis)
         if num_selected > 0:
             preference = packbits(reference, axis=axis)
@@ -134,8 +148,13 @@ class TestSliceBitpackedTensor:
                 preference = packbits(reference, axis=axis)
             axis_ = axis if axis >= 0 else original.ndim + axis
             preference = torch.empty(size[:axis_] + (0,) + size[axis_ + 1:], dtype=torch.uint8)
+        print(f"{reference.shape=}")
+        print(f"{preference.shape=}")
 
+        # Determine the selection parameters based on the mode.
         mask_: Optional[Tensor]
+        idx: Optional[Tensor]
+        ranges: Optional[list[tuple[int, int]]]
         if mode == "mask":
             idx = None
             ranges = None
@@ -149,17 +168,26 @@ class TestSliceBitpackedTensor:
             ranges = list(zip(lo.tolist(), hi.tolist()))
             idx = None
             mask_ = None
+        print(f"{mask_=}")
+        print(f"{idx=}")
+        print(f"{ranges=}")
 
+        # Perform the slicing on the bitpacked tensor.
         psliced = slice_bitpacked_tensor(poriginal, mask=mask_, idx=idx, ranges=ranges, bigchunks=bigchunks, axis=axis)
+        print(f"{psliced.shape=}")
 
+        # Check the dtype, device, and shape of the sliced packed tensor.
         assert psliced.dtype == torch.uint8
         assert psliced.device == poriginal.device
         for i in range(psliced.ndim):
+            # Check the dimension of the sliced axis.
             if i == (axis if axis >= 0 else psliced.ndim + axis):
-                assert psliced.shape[i] <= preference.shape[i]
+                assert psliced.shape[i] == (num_selected + 7) // 8
+            # Check the other dimensions are unchanged.
             else:
                 assert psliced.shape[i] == poriginal.shape[i]
 
+        # Unpack the sliced packed tensor to compare with the reference.
         if num_selected > 0:
             sliced = unpackbits(psliced, reference.shape[axis], axis=axis)
         else:
@@ -167,6 +195,7 @@ class TestSliceBitpackedTensor:
                 sliced = unpackbits(psliced, reference.shape[axis], axis=axis)
             axis_ = axis if axis >= 0 else original.ndim + axis
             sliced = torch.empty(size[:axis_] + (0,) + size[axis_ + 1:], dtype=torch.bool)
+        print(f"{sliced.shape=}")
         assert sliced.dtype == reference.dtype
         assert sliced.shape == reference.shape
         assert torch.all(sliced == reference)
