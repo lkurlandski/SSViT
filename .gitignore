@@ -209,6 +209,7 @@ __marimo__/
 # Custom
 cache/*
 data/*
+datafiles/*
 datadb/*
 datadb_tr/*
 datadb_vl/*
