@@ -1162,9 +1162,19 @@ class HierarchicalMalConvClassifier(HierarchicalClassifier):
         for i in range(self.num_structures):
             if x[i] is None:
                 continue
-            z = self.embeddings[i](x[i])  # (B, T, E)
-            z = self.filmers[i](z, g[i])  # (B, T, E)
-            z = self.backbones[i](z)      # (B, C)
+
+            def preprocess(x: Optional[Tensor], g: Optional[Tensor] = None) -> Tensor:
+                if x is None:  raise TypeError()
+                z = self.embeddings[i](x)  # (B, T, E)
+                z = self.filmers[i](z, g)  # (B, T, E)
+                return z
+
+            recompute = None
+            if self.training:
+                recompute = partial(self.backbones[i].recompute, preprocess, (x[i], g[i]) if g is not None else (x[i],))  # type: ignore
+
+            z = preprocess(x[i], g[i])           # (B, T, E)
+            z = self.backbones[i](z, recompute)  # (B, C)
             zs.append(z)
 
         z = torch.stack(zs, dim=1)  # (B, sum(C))
