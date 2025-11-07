@@ -362,11 +362,11 @@ def get_padbatch(level: HierarchicalLevel, do_parse: bool,do_entropy: bool, do_c
     if level == HierarchicalLevel.NONE:
         inputs = get_inputs(min_lengths[0])
         guides = get_guides(min_lengths[0])
-        return FSamples(file, name, label, inputs, guides, structure)  # type: ignore[arg-type]
+        return FSamples(file, name, label, inputs, guides, structure)
 
     inputs_ = [get_inputs(l) for l in min_lengths]
     guides_ = [get_guides(l) for l in min_lengths]
-    return HSamples(file, name, label, inputs_, guides_, structure)  # type: ignore[arg-type]
+    return HSamples(file, name, label, inputs_, guides_, structure)
 
 
 def main() -> None:
