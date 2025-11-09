@@ -767,11 +767,13 @@ class Trainer:
         if any(k.startswith("tr_") for k in results):
             d["tr_loss"] = round(results["tr_loss"], 3)
             d["tr_gpu_utl"] = round(results["tr_gpu_utl"], 2)
+            d["tr_gpu_mem"] = round(results["tr_gpu_mem"] / (1024 ** 3), 2)
             d["tr_time"] = round(results["tr_time"], 0)
         if any(k.startswith("vl_") for k in results):
             d["vl_loss"] = round(results["vl_loss"], 3)
             d["vl_acc"] = round(results["vl_acc"], 3)
             d["vl_gpu_utl"] = round(results["vl_gpu_utl"], 2)
+            d["vl_gpu_mem"] = round(results["vl_gpu_mem"] / (1024 ** 3), 2)
             d["vl_time"] = round(results["vl_time"], 0)
         print(d)
 
