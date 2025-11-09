@@ -698,6 +698,9 @@ class _FSampleOrSamples(Generic[F, N, G, S], ABC):
         structure = self.structure.clone()
         return self.__class__(file, name, label, inputs, guides, structure)
 
+    def finalize(self, device: torch.device) -> Self:
+        return self.to(device, non_blocking=True).decompress()
+
 
 class FSample(_FSampleOrSamples[StrPath, Name, SemanticGuide, StructureMap]):
 
@@ -881,6 +884,9 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
             guides.append(self.guides[i].decompress())
         structure = self.structure.clone()
         return self.__class__(file, name, label, inputs, guides, structure)
+
+    def finalize(self, device: torch.device) -> Self:
+        return self.to(device, non_blocking=True).decompress()
 
 
 class HSample(_HSampleOrSamples[StrPath, Name, SemanticGuide, StructureMap]):

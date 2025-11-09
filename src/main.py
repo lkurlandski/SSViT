@@ -72,11 +72,13 @@ from src.data import IterableSimpleDBDataset
 from src.data import CollateFn
 from src.data import CollateFnHierarchical
 from src.data import CUDAPrefetcher
+from src.data import StreamlessCUDAPrefetcher
 from src.data import Name
 from src.data import Preprocessor
 from src.data import FSample
 from src.data import FSamples
 from src.data import HSamples
+from src.data import FOrHSamples
 from src.helpers import create_argument_parser_from_dataclass
 from src.helpers import flatten_dataclasses
 from src.helpers import _MTArgs
@@ -93,6 +95,7 @@ from src.trainer import rank
 from src.trainer import local_world_size
 from src.trainer import world_size
 from src.trainer import mp_dtype
+from src.trainer import Batch
 from src.utils import num_sort_files
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
@@ -301,7 +304,7 @@ def get_loader(
     collate_fn: Callable[[Sequence[FSample]], FSamples | HSamples],
     pin_memory: bool,
     prefetch_factor: int,
-) -> DataLoader[Any]:
+) -> DataLoader[FOrHSamples]:
     """
     Return a DataLoader with proper settings for multiprocessing.
 
@@ -325,8 +328,14 @@ def get_loader(
     )
 
 
-def get_streamer(loader: DataLoader[Any], device: torch.device, num_streams: int) -> CUDAPrefetcher:
-    """Wrap a DataLoader with a CUDAPrefetcher and warmup its workers."""
+def get_streamer(loader: DataLoader[Any], device: torch.device, num_streams: int) -> DataLoader[FOrHSamples] | StreamlessCUDAPrefetcher | CUDAPrefetcher:
+    """If multiple streams in use, wrap a DataLoader with a CUDAPrefetcher and warmup its workers."""
+    if num_streams < 0:
+        raise ValueError(f"`num_streams` must be non-negative, got {num_streams}.")
+    if num_streams == 0:
+        return loader
+    if num_streams == 1:
+        return StreamlessCUDAPrefetcher(loader, device)
     streamer = CUDAPrefetcher(loader, device, num_streams)
     if loader.persistent_workers:
         streamer.warmup(0)

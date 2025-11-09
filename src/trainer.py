@@ -10,27 +10,22 @@ from collections.abc import Iterable
 from collections.abc import Mapping
 import contextlib
 from dataclasses import dataclass
-import datetime
-from functools import partial
 import gc
 import hashlib
-import inspect
 import itertools
 import json
 import math
 import os
 from pathlib import Path
 import pickle
-import shutil
 import threading
 import time
 from typing import Any
 from typing import Callable
 from typing import ContextManager
-from typing import Literal
 from typing import Optional
+from typing import Protocol
 from typing import Self
-from typing import Union
 import warnings
 
 import numpy as np
@@ -38,25 +33,14 @@ import psutil
 import pynvml
 import torch
 from torch import Tensor
-from torch import BFloat16Tensor
-from torch import HalfTensor
-from torch import FloatTensor
-from torch import DoubleTensor
-from torch import CharTensor
-from torch import ByteTensor
-from torch import ShortTensor
-from torch import IntTensor
-from torch import LongTensor
 from torch import distributed as dist
 from torch.amp import GradScaler
 from torch.distributed import checkpoint as dcp
 from torch.distributed.algorithms.join import Join
 from torch.distributed.algorithms.join import Joinable
-from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.distributed.checkpoint.state_dict import set_model_state_dict
 from torch.distributed.checkpoint.state_dict import get_state_dict
 from torch.distributed.checkpoint.state_dict import set_state_dict
-from torch.distributed.checkpoint.state_dict import StateDictOptions
 from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.distributed.tensor import DTensor
 from torch.nn import Module
@@ -70,11 +54,52 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data import FOrHSamples
 
-# TODO: Write a `Batch` Protocol instead of using FOrHSamples directly.
-# Currently, it must define __len__ (number of samples), .clone() (a deep copy),
-# .inputs (Tensor), .characteristics (Tensor|None), and .label (Tensor).
+class Batch(Protocol):
+    """
+    Structural type for a batch of samples.
+
+    CUDA, PyTorch, and Python are a little weird and picky about when, where, and how
+    data is moved to/from the GPU and doing things incorrectly can hurt memory utilization.
+
+    For example, if the Iterable[Batch] yields a Batch that is already on the GPU, then
+    Python cannot properly garbage collect the previous Batch until the new Batch is fully
+    materialized on the GPU. Using `del batch` or `torch.cuda.empty_cache()` inside the training
+    loop does nothing to properly decrement the reference count of the previous Batch and
+    thus does not free GPU memory as expected. Therefore, we wind up with extra batches on
+    the GPU. CUDA, being asynchronous, does not free the memory from the previous Batch until
+    the next-next batch. So we wind up with three batches on the GPU at once instead of just one.
+    """
+
+    def __len__(self) -> int:
+        """
+        Return the number of samples in the batch.
+        """
+        ...
+
+    def finalize(self, device: torch.device) -> Self:
+        """
+        Finalize the batch for use (e.g., move to device, change data types, etc.).
+        """
+        ...
+
+    def clone(self) -> Self:
+        """
+        Return a deep copy of the batch.
+        """
+        ...
+
+    @property
+    def label(self) -> Tensor:
+        ...
+
+    @property
+    def inputs(self) -> Any:
+        ...
+
+    @property
+    def characteristics(self) -> Any:
+        ...
 
 
 def is_dist() -> bool:
@@ -299,14 +324,14 @@ class Trainer:
         self,
         args: TrainerArgs,
         model: Module,
-        tr_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
-        vl_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
+        tr_loader: Collection[Batch] | DataLoader[Batch],
+        vl_loader: Collection[Batch] | DataLoader[Batch],
         loss_fn: Module,
         optimizer: Optional[Optimizer] = None,
         scheduler: Optional[LRScheduler] = None,
         stopper: Optional[EarlyStopper] = None,
         device: Optional[torch.device] = None,
-        padbatch: Optional[FOrHSamples] = None,
+        padbatch: Optional[Batch] = None,
     ) -> None:
         self.args = args
         self.model = model
@@ -317,7 +342,7 @@ class Trainer:
         self.scheduler = scheduler if scheduler is not None else LambdaLR(self.optimizer, lambda _: 1.0)
         self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
         self.device = device if device is not None else next(self.model.parameters()).device
-        self.padbatch = padbatch.to(self.device) if padbatch is not None else None
+        self.padbatch = padbatch.finalize(self.device) if padbatch is not None else None
         self.monitor = Monitor(device=self.device)
         self.log: list[Mapping[str, int | float]] = []
         self.glbl_step = 0
@@ -385,7 +410,7 @@ class Trainer:
         scaler = GradScaler(self.device.type, enabled=mp_dtype(self.args.mp16, self.device) == torch.float16)
 
         dataloader = self.tr_loader
-        iterable: Iterable[tuple[int, FOrHSamples]] = enumerate(dataloader)
+        iterable: Iterable[tuple[int, Batch]] = enumerate(dataloader)
         iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
         iterable = iter(iterable)
 
@@ -431,6 +456,7 @@ class Trainer:
         mini_step = -1  # mini-step within this epoch
         grda_modl = 0   # gradient accumulation modulo local steps
         for mini_step, batch in iterable:
+            batch = batch.finalize(self.device)
             # Determine if this is a real or padded batch of data.
             real = mini_step < len(dataloader)
             is_last_real = (mini_step + 1 == len(dataloader))
@@ -454,6 +480,12 @@ class Trainer:
                 if is_last_real and grda_modl != 0:
                     grda_modl = 0
                 do_log = any(self._due_hooks())
+                do_eval = self._due_hooks()[0]
+                # Freeing up memory before running the validation cycle seems to keep GPU memory usage lower
+                # across all subsequent training and validation phases (yes, both of them). Why? Don't know!
+                if do_eval:
+                    del batch, outputs, loss
+                    gc.collect()
                 self.run_due_hooks(report() if do_log else None)
                 self.model.train()
                 if do_log:
@@ -480,7 +512,7 @@ class Trainer:
         self.model.eval()
 
         dataloader = self.vl_loader
-        iterable: Iterable[tuple[int, FOrHSamples]] = enumerate(dataloader)
+        iterable: Iterable[tuple[int, Batch]] = enumerate(dataloader)
         iterable = tqdm(iterable, "Validating...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
         iterable = iter(iterable)
 
@@ -500,6 +532,7 @@ class Trainer:
 
         with torch.no_grad():
             for mini_step, batch in iterable:
+                batch = batch.finalize(self.device)
                 real = mini_step < len(dataloader)
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
@@ -620,14 +653,14 @@ class Trainer:
             if self.stopper.stop:
                 self._done = True
 
-    def forward(self, batch: FOrHSamples) -> Tensor:
+    def forward(self, batch: Batch) -> Tensor:
         """
         Send a batch of inputs forward through the model.
         """
         with torch.autocast(self.device.type, dtype=mp_dtype(self.args.mp16, self.device), enabled=self.args.mp16):
             return self.model(batch.inputs, batch.characteristics)  # type: ignore[no-any-return]
 
-    def compute_loss(self, batch: FOrHSamples, outputs: Tensor) -> Tensor:
+    def compute_loss(self, batch: Batch, outputs: Tensor) -> Tensor:
         """
         Compute the loss over a batch of examples.
         """
@@ -683,7 +716,7 @@ class Trainer:
             "roc": roc,
         }
 
-    def _dataloader_lengths(self, dataloader: Collection[FOrHSamples] | DataLoader[FOrHSamples]) -> list[int]:
+    def _dataloader_lengths(self, dataloader: Collection[Batch] | DataLoader[Batch]) -> list[int]:
         """Return the lengths of the dataloader on each distributed rank."""
         if not is_dist():
             return [len(dataloader)]
@@ -844,8 +877,8 @@ class Trainer:
         *,
         model: Module,
         wrap_model: Callable[[Module], Module],
-        tr_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
-        vl_loader: Collection[FOrHSamples] | DataLoader[FOrHSamples],
+        tr_loader: Collection[Batch] | DataLoader[Batch],
+        vl_loader: Collection[Batch] | DataLoader[Batch],
         loss_fn: Module,
         optimizer: Optional[Optimizer] = None,
         optimizer_init: Optional[Callable[[Iterable[torch.nn.Parameter]], Optimizer]] = None,

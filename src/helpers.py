@@ -89,6 +89,8 @@ class MainArgs:
         self.prefetch_factor = max(1, self.prefetch_factor) if self.num_workers > 0 else 0
         if self.fsdp:
             warnings.warn("The Trainer::evaluate method currently hangs with FSDP modules.")
+        if self.num_streams > 0:
+            warnings.warn("Using multiple data streams leads to substantially larger memory usage than zero streams.")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
