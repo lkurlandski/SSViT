@@ -25,15 +25,13 @@ Notations (ViT):
 from abc import ABC
 from abc import abstractmethod
 from collections.abc import Sequence
-from functools import partial
-import inspect
 import math
 import sys
 from typing import Any
 from typing import Callable
 from typing import Literal
 from typing import Optional
-from typing import Sequence
+from typing import Protocol
 import warnings
 
 import torch
@@ -43,6 +41,7 @@ from torch import nn
 from torch import Tensor
 
 from src.utils import check_tensor
+from src.utils import TensorError
 from src.utils import pad_sequence
 
 
@@ -171,7 +170,9 @@ class FiLM(nn.Module):
         """
         check_tensor(x, (None, None, self.embedding_dim), FLOATS)
         check_tensor(g, (x.shape[0], x.shape[1], self.guide_dim), FLOATS)
-    
+        if g.requires_grad:
+            warnings.warn(f"FiLM conditioning vector `g` has `requires_grad={g.requires_grad}`.")
+
         film: Tensor = self.mlp(g)               # (B, T, 2E)
         gamma, beta = film.chunk(2, dim=-1)      # (B, T, E), (B, T, E)
         z = x * gamma + beta                     # (B, T, E)
@@ -305,7 +306,7 @@ class PatchEncoder(nn.Module):
         P = self.patch_dims(T, self.patch_size, self.num_patches)[0]
         N = self.patch_dims(T, self.patch_size, self.num_patches)[1]
         C = self.out_channels
-        S = math.floor((T - self.kernel_size) / self.stride + 1)
+        S = math.floor((T - self.kernel_size) / self.stride + 1)  # noqa
 
         z = self.split_patches(z, P)  # (B,  N, P, E)
         z = z.reshape(B * N, P, E)    # (BN, P, E)
@@ -446,6 +447,12 @@ class ViT(nn.Module):
 # MalConv
 # -------------------------------------------------------------------------------- #
 
+class PreprocessFn(Protocol):
+
+    def __call__(self, *parts: Tensor) -> Tensor:
+        ...
+
+
 class MalConvBase(nn.Module, ABC):
     """
     Base class of MalConv backbones.
@@ -478,90 +485,52 @@ class MalConvBase(nn.Module, ABC):
         self.chunk_size = chunk_size
         self.overlap = kernel_size - stride if overlap is None else overlap
 
-    @abstractmethod
-    def forward(self, x: Tensor, recompute: Optional[Callable[[int, Tensor, int], Tensor]] = None) -> Tensor:
-        """
-        Construct a dense hidden representation from a long sequence.
-
-        Args:
-            x: Input embeddings of shape (B, T, E).
-            recompute: Callable that recomputes the activations on the winning windows. See `MalConvBase.recompute`.
-
-        Returns:
-            z: Hidden representation of shape (B, C).
-        """
-        ...
-
     @property
     def min_length(self) -> int:
         return self.kernel_size
 
+    def forward(self, z: Optional[Tensor] = None, preprocess: Optional[PreprocessFn] = None, ts: Optional[Sequence[Tensor]] = None) -> Tensor:
+        """
+        Args:
+            z: input tensor of shape (B, T, E). If provided, will invoke the `forward_embeddings` method.
+            preprocess: callable to compute the input tensor. If provided, will invoke the `forward_streaming` method.
+            ts: arguments to `preprocess`, each of shape (B, T, *). If provided, will invoke the `forward_streaming` method.
+
+        Returns:
+            (B, C) hidden representation.
+        """
+        if z is not None:
+            check_tensor(z, (None, None, self.embedding_dim), FLOATS)
+            if z.shape[1] < self.min_length:
+                raise RuntimeError(f"Input sequence length {z.shape[1]} is less than the minimum required length {self.min_length}.")
+            z = self.forward_embeddings(z)
+
+        elif preprocess is not None and ts is not None:
+            for t in ts:
+                if t.shape[0] != ts[0].shape[0]:
+                    raise TensorError(t, (ts[0].shape[0], ts[0].shape[1], None), None)
+                if t.shape[1] != ts[0].shape[1]:
+                    raise TensorError(t, (ts[0].shape[0], ts[0].shape[1], None), None)
+                if t.shape[1] < self.min_length:
+                    raise RuntimeError(f"Input sequence length {t.shape[1]} is less than the minimum required length {self.min_length}.")
+            z = self.forward_streaming(preprocess=preprocess, ts=ts)
+
+        else:
+            raise ValueError("Either `z` or both `preprocess` and `ts` must be provided.")
+
+        check_tensor(z, (z.shape[0], self.channels), FLOATS)
+        return z
+
     def fully_shard(self, **kwds: Any) -> None:
         fully_shard(self, **kwds)
 
-    @staticmethod
-    def recompute(preprocess: Callable[[Any], Tensor], ts: Sequence[Tensor], b: int, pos: Tensor, rf: int) -> Tensor:
-        """
-        Basic recomputation function that can be passed to `MalConvLowMem.forward`.
+    @abstractmethod
+    def forward_embeddings(self, z: Tensor) -> Tensor:
+        ...
 
-        Args:
-            preprocess: Module that computed the hidden representation, `z`, passed to `forward`.
-            ts:     Original input tensor(s) of shape (B, T, *).
-            b:      batch index
-            pos:    (U,) winning start positions
-            rf:     receptive field
-
-        Returns:
-            z:     Output tensor of shape (U, rf, E), which is a subset of the original input to `forward`.
-
-        Usage:
-            >>> embedding = nn.Embedding(...)
-            >>> model = MalConvLowMem(...)
-            >>> x = torch.randint(...)
-            >>> z = embedding(x)
-            >>> model(z)                       # No gradient flow to embedding
-            >>> ...
-            >>> from functools import partial
-            >>> recompute = partial(MalConvLowMem.recompute, embedding, [x])
-            >>> model(z, recompute=recompute)  # Gradients flow to embedding
-        """
-        if not isinstance(ts, Sequence):
-            raise TypeError(f"`ts` must be a sequence of tensors. Got {type(ts)} instead.")
-        if not all(isinstance(t, Tensor) for t in ts):
-            raise TypeError(f"All elements of `ts` must be tensors. Got {[type(t) for t in ts]} instead.")
-        if not all(t.dim() >= 2 for t in ts):
-            raise ValueError(f"All tensors in `ts` must have at least 2 dimensions. Got {[t.dim() for t in ts]} instead.")
-
-        # Handle degenerate case of no winners cleanly.
-        if pos.numel() == 0:
-            wins = [t.new_empty((0, rf) + tuple(t.shape[2:])) for t in ts]
-            z = preprocess(*wins)
-            z = z.contiguous()
-            check_tensor(z, (0, rf, None))
-            return z
-
-        # Select this sample's winning windows and preprocess them.
-        # This needs to be done index-by-index to avoid massive tensor expansion.
-        wins = []
-        for t in ts:
-            if t.shape[1] < rf:
-                raise RuntimeError(f"Sequence too short: T={t.shape[1]} < rf={rf}")
-
-            t_b = t[b]  # (T, *)
-
-            # Build (U, rf) start indices: pos + [0..rf-1]
-            rng = torch.arange(rf, device=pos.device)
-            idx = pos.to(t_b.device).unsqueeze(1) + rng.unsqueeze(0)  # (U, rf)
-
-            # Advanced indexing along the first dim yields (U, rf, *) for any tail
-            w = t_b[idx]
-            wins.append(w.contiguous())
-
-        z = preprocess(*wins)                        # (U, rf, None)
-        z = z.contiguous()
-
-        check_tensor(z, (wins[0].shape[0] if len(wins) > 0 else None, rf, None), FLOATS)
-        return z
+    @abstractmethod
+    def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
+        ...
 
 
 class MalConv(MalConvBase):
@@ -573,19 +542,18 @@ class MalConv(MalConvBase):
         self.sigmoid = nn.Sigmoid()
         self.pool = nn.AdaptiveMaxPool1d(1)
 
-    def forward(self, x: Tensor, recompute: Optional[Callable[[int, Tensor, int], Tensor]] = None) -> Tensor:
-        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
-        if x.shape[1] < self.min_length:
-            raise RuntimeError(f"Input sequence length {x.shape[1]} is less than the minimum required length {self.min_length}.")
-
-        z = x.transpose(1, 2)        # (B, E, T)
+    def forward_embeddings(self, z: Tensor) -> Tensor:
+        z = z.transpose(1, 2)        # (B, E, T)
         c_1 = self.conv_1(z)         # (B, C, S - 1)
         c_2 = self.conv_2(z)         # (B, C, S - 1)
         g = c_1 * self.sigmoid(c_2)  # (B, C, S - 1)
         z = self.pool(g)             # (B, C, 1)
         z = z.squeeze(-1)            # (B, C)
+        return z
 
-        check_tensor(z, (x.shape[0], self.channels), FLOATS)
+    def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
+        z = preprocess(*ts)                # (B, T, E)
+        z = self.forward_embeddings(z)     # (B, C)
         return z
 
 
@@ -596,57 +564,55 @@ class MalConvLowMem(MalConvBase):
         self.conv_1 = nn.Conv1d(self.embedding_dim, self.channels, self.kernel_size, self.stride)
         self.conv_2 = nn.Conv1d(self.embedding_dim, self.channels, self.kernel_size, self.stride)
         self.sigmoid = nn.Sigmoid()
+        self.pool = nn.AdaptiveMaxPool1d(1)
 
-    def forward(self, x: Tensor, recompute: Optional[Callable[[int, Tensor, int], Tensor]] = None) -> Tensor:
-        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
-        if x.shape[1] < self.min_length:
-            raise RuntimeError(f"Input sequence length {x.shape[1]} is less than the minimum required length {self.min_length}.")
+    def forward_embeddings(self, z: Tensor) -> Tensor:
+        z = z.transpose(1, 2)        # (B, E, T)
+        c_1 = self.conv_1(z)         # (B, C, S - 1)
+        c_2 = self.conv_2(z)         # (B, C, S - 1)
+        g = c_1 * self.sigmoid(c_2)  # (B, C, S - 1)
+        z = self.pool(g)             # (B, C, 1)
+        z = z.squeeze(-1)            # (B, C)
+        return z
 
-        if self.training and recompute is None:
-            warnings.warn("`recompute` is None during training; gradients will not flow to previous components.")
+    def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
 
-        z_full = x.transpose(1, 2)  # (B, E, T)
-
-        _, pos = _lowmem_max_over_time(
-            z_full,
-            chunk_size=self.chunk_size,
-            overlap=self.overlap,
+        max_vals, pos = _lowmem_max_over_time_streaming(
+            preprocess=preprocess,
+            ts=ts,
+            to_device=self.conv_1.weight.device,
+            to_dtype=self.conv_1.weight.dtype,
             rf=self.kernel_size,
             first_stride=self.stride,
+            chunk_size=self.chunk_size,
+            overlap=self.overlap,
             channels=self.channels,
             activations_fn=self._activations,
-        )  # (B, C)
+        )
 
-        if recompute is not None:
-            wins_cat, meta = _gather_wins_via_recompute(
-                positions=pos,
-                rf=self.kernel_size,
-                embedding_dim=self.embedding_dim,
-                recompute=recompute,
-                to_device=self.conv_1.weight.device,
-                to_dtype=self.conv_1.weight.dtype,
-            )                                                # wins_cat: (sum_U, E, rf)
+        # Inference: pooled output is already done
+        if not self.training:
+            return max_vals
 
-            g_all = self._activations(wins_cat).squeeze(-1)     # (sum_U, C)
-            z = _scatter_g_to_BC(
-                g_all=g_all,
-                meta=meta,
-                batch_size=x.shape[0],
-                channels=self.channels,
-                to_device=g_all.device,
-                to_dtype=g_all.dtype,
-            )                                                   # (B, C)
-        else:
-            z = _eval_max_windows_vectorized(
-                z_full,
-                rf=self.kernel_size,
-                channels=self.channels,
-                positions=pos,
-                activations_fn=self._activations,
-                stop_grad_input=True,
-            )
-
-        check_tensor(z, (x.shape[0], self.channels), FLOATS)
+        # Training: recompute only the winners to let grads flow upstream
+        wins_cat, meta = _gather_wins_via_preprocess(
+            preprocess=preprocess,
+            ts=ts,
+            positions=pos,
+            rf=self.kernel_size,
+            embedding_dim=self.embedding_dim,
+            to_device=self.conv_1.weight.device,
+            to_dtype=self.conv_1.weight.dtype,
+        )
+        g_all = self._activations(wins_cat).squeeze(-1)  # (sum_U, C)
+        z = _scatter_g_to_BC(
+            g_all=g_all,
+            meta=meta,
+            batch_size=ts[0].shape[0],
+            channels=self.channels,
+            to_device=g_all.device,
+            to_dtype=g_all.dtype,
+        )
         return z
 
     def _activations(self, z: torch.Tensor) -> torch.Tensor:
@@ -667,104 +633,113 @@ class MalConvGCG(MalConvBase):
         self.conv_2 = nn.Conv1d(self.channels, self.channels, 1)
         self.gct_proj = nn.Linear(self.channels, self.channels)
 
-    def forward(self, x: Tensor, recompute: Optional[Callable[[int, Tensor, int], Tensor]] = None) -> Tensor:
-        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
-        if x.shape[1] < self.min_length:
-            raise RuntimeError(f"Input sequence length {x.shape[1]} is less than the minimum required length {self.min_length}.")
-        if self.training and recompute is None:
-            warnings.warn("`recompute` is None during training; gradients will not flow to previous components.")
+    def forward_embeddings(self, z: Tensor) -> Tensor:
+        z = z.transpose(1, 2).contiguous()  # (B, E, T)
 
-        z_full = x.transpose(1, 2).contiguous()  # (B, E, T)
+        # ---------------- Context path: compute gct (B, C) ----------------
+        ctx_map = self._ctx_activations(z)          # (B, C, T_ctx)
+        gct, _ = ctx_map.max(dim=-1)                # (B, C)
 
-        # -------- Context path (produces gct: (B, C)) --------
-        _, ctx_pos = _lowmem_max_over_time(
-            z_full,
-            chunk_size=self.chunk_size,
-            overlap=self.overlap,
+        # ---------------- Main path: GCG gating over full seq -------------
+        main_map = self._main_activations(z, gct)   # (B, C, T_main)
+
+        # Global max over time (temporal max pooling)
+        z, _ = main_map.max(dim=-1)                      # (B, C)
+
+        return z
+
+    def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
+        B = ts[0].shape[0]
+
+        # ------------------------- Context path: gct (B, C) -------------------------
+        ctx_max_vals, ctx_pos = _lowmem_max_over_time_streaming(
+            preprocess=preprocess,
+            ts=ts,
+            to_device=self.ctx_conv.weight.device,
+            to_dtype=self.ctx_conv.weight.dtype,
             rf=self.kernel_size,
             first_stride=self.stride,
+            chunk_size=self.chunk_size,
+            overlap=self.overlap,
             channels=self.channels,
-            activations_fn=self._ctx_activations,
+            activations_fn=self._ctx_activations,   # (B,E,L) -> (B,C,L_out)
         )
 
-        if recompute is not None:
-            wins_ctx, meta_ctx = _gather_wins_via_recompute(
-                positions=ctx_pos,
+        if self.training:
+            # recompute winners so gradients flow back through preprocess (Embedding+FiLM)
+            wins_ctx, meta_ctx = _gather_wins_via_preprocess(
+                preprocess=preprocess,
+                ts=ts,
+                positions=ctx_pos,                   # (B, C)
                 rf=self.kernel_size,
                 embedding_dim=self.embedding_dim,
-                recompute=recompute,
                 to_device=self.ctx_conv.weight.device,
                 to_dtype=self.ctx_conv.weight.dtype,
-            )                                              # (sum_Uc, E, rf)
-            g_all_ctx = self._ctx_activations(wins_ctx).squeeze(-1)     # (sum_Uc, C)
+            )                                       # wins_ctx: (sum_Uc, E, rf)
+
+            g_all_ctx = self._ctx_activations(wins_ctx).squeeze(-1)   # (sum_Uc, C)
             gct = _scatter_g_to_BC(
                 g_all=g_all_ctx,
                 meta=meta_ctx,
-                batch_size=x.shape[0],
+                batch_size=B,
                 channels=self.channels,
                 to_device=g_all_ctx.device,
                 to_dtype=g_all_ctx.dtype,
-            )                                              # (B, C)
+            )                                       # (B, C)
         else:
-            gct = _eval_max_windows_vectorized(
-                z_full,
-                rf=self.kernel_size,
-                channels=self.channels,
-                positions=ctx_pos,
-                activations_fn=self._ctx_activations,
-            )                                              # (B, C)
+            # eval: no grads to preprocess; ctx_max_vals already is global max over time
+            gct = ctx_max_vals                      # (B, C)
 
-        # -------- Main path (uses gct) --------
-        _, main_pos = _lowmem_max_over_time(
-            z_full,
-            chunk_size=self.chunk_size,
-            overlap=self.overlap,
+        # ------------------------- Main path: gated activations -------------------------
+        # Streaming scan uses gct as a fixed per-batch context (no-grad during scan).
+        main_max_vals, main_pos = _lowmem_max_over_time_streaming(
+            preprocess=preprocess,
+            ts=ts,
+            to_device=self.conv_1.weight.device,
+            to_dtype=self.conv_1.weight.dtype,
             rf=self.kernel_size,
             first_stride=self.stride,
+            chunk_size=self.chunk_size,
+            overlap=self.overlap,
             channels=self.channels,
             activations_fn=lambda z_chunk: self._main_activations(z_chunk, gct),
         )
 
-        if recompute is not None:
-            # Gather windows for main, plus a repeated ctx per-window tensor aligned with wins_cat
-            wins_main, meta_main = _gather_wins_via_recompute(
-                positions=main_pos,
-                rf=self.kernel_size,
-                embedding_dim=self.embedding_dim,
-                recompute=recompute,
-                to_device=self.conv_1.weight.device,
-                to_dtype=self.conv_1.weight.dtype,
-            )                                              # (sum_Um, E, rf)
+        # Inference: global pooled output is just the max over time on main path
+        if not self.training:
+            return main_max_vals                     # (B, C)
 
-            # Build ctx per-window: concat repeats of gct[b] for each U_b
-            ctx_per_win = []
-            for (start, inv, u_b), b in zip(meta_main, range(x.shape[0])):
-                if u_b == 0:
-                    continue
-                ctx_per_win.append(gct[b].unsqueeze(0).expand(u_b, -1))  # (U_b, C)
-            ctx_cat = torch.cat(ctx_per_win, dim=0) if ctx_per_win else gct.new_empty((0, self.channels))
+        # Training: recompute only winner windows (like MalConvLowMem) with autograd on
+        wins_main, meta_main = _gather_wins_via_preprocess(
+            preprocess=preprocess,
+            ts=ts,
+            positions=main_pos,                      # (B, C)
+            rf=self.kernel_size,
+            embedding_dim=self.embedding_dim,
+            to_device=self.conv_1.weight.device,
+            to_dtype=self.conv_1.weight.dtype,
+        )                                            # (sum_Um, E, rf)
 
-            g_all_main = self._main_activations(wins_main, ctx_cat).squeeze(-1)  # (sum_Um, C)
+        # Build per-window context tensor aligned with wins_main
+        ctx_per_win = []
+        for (start, inv, u_b), b in zip(meta_main, range(B)):
+            if u_b == 0:
+                continue
+            ctx_per_win.append(gct[b].unsqueeze(0).expand(u_b, -1))  # (U_b, C)
+        ctx_cat = (torch.cat(ctx_per_win, dim=0)
+                   if ctx_per_win else
+                   gct.new_empty((0, self.channels)))                 # (sum_Um, C)
 
-            z = _scatter_g_to_BC(
-                g_all=g_all_main,
-                meta=meta_main,
-                batch_size=x.shape[0],
-                channels=self.channels,
-                to_device=g_all_main.device,
-                to_dtype=g_all_main.dtype,
-            )                                              # (B, C)
-        else:
-            z = _eval_max_windows_vectorized_per_batch(
-                z_full,
-                rf=self.kernel_size,
-                channels=self.channels,
-                positions=main_pos,
-                activations_per_batch_fn=lambda wins_b, gct_b: self._main_activations(wins_b, gct_b),
-                ctx=gct,
-            )
+        g_all_main = self._main_activations(wins_main, ctx_cat).squeeze(-1)  # (sum_Um, C)
 
-        check_tensor(z, (x.shape[0], self.channels), FLOATS)
+        z = _scatter_g_to_BC(
+            g_all=g_all_main,
+            meta=meta_main,
+            batch_size=B,
+            channels=self.channels,
+            to_device=g_all_main.device,
+            to_dtype=g_all_main.dtype,
+        )                                            # (B, C)
         return z
 
     def _ctx_activations(self, z: Tensor) -> Tensor:
@@ -793,68 +768,30 @@ class MalConvGCG(MalConvBase):
 # MalConv Helpers
 # -------------------------------------------------------------------------------- #
 
-def _eval_max_windows_vectorized(
-    z: torch.Tensor,
+def _lowmem_max_over_time_streaming(
     *,
-    rf: int,
-    channels: int,
-    positions: torch.Tensor,
-    activations_fn: Callable[[torch.Tensor], torch.Tensor],
-    stop_grad_input: bool = True,
-) -> torch.Tensor:
-    B, E, T = z.shape
-    device = z.device
-    out = torch.empty((B, channels), device=device, dtype=z.dtype)
-
-    z_unf = z.unfold(dimension=2, size=rf, step=1)  # (B, E, T-rf+1, rf)
-
-    win_batches: list[torch.Tensor] = []
-    meta: list[tuple[int, torch.Tensor, torch.Tensor]] = []
-    total = 0
-    for b in range(B):
-        pos_b = positions[b]                              # (C,)
-        uniq_b, inv_b = torch.unique(pos_b, sorted=True, return_inverse=True)
-        wins_b = z_unf[b, :, uniq_b].permute(1, 0, 2)     # (U_b, E, rf)
-        if stop_grad_input:
-            with torch.no_grad():
-                wins_b = wins_b.clone()                  # detach from z; no grad to input
-        win_batches.append(wins_b)
-        meta.append((total, uniq_b, inv_b))
-        total += wins_b.shape[0]
-
-    wins = torch.cat(win_batches, dim=0) if len(win_batches) > 1 else win_batches[0]  # (sum_U, E, rf)
-
-    g = activations_fn(wins)     # (sum_U, C, 1)  <- params still get grad
-    g = g.squeeze(-1)            # (sum_U, C)
-
-    for b in range(B):
-        offset, uniq_b, inv_b = meta[b]
-        g_b = g[offset:offset + uniq_b.shape[0]]          # (U_b, C)
-        out[b] = g_b[inv_b, torch.arange(channels, device=device)]
-
-    return out
-
-
-def _lowmem_max_over_time(
-    z: torch.Tensor,
-    *,
-    chunk_size: int,
-    overlap: int,
+    preprocess: PreprocessFn,
+    ts: Sequence[Tensor],
+    to_device: torch.device,
+    to_dtype: torch.dtype,
     rf: int,
     first_stride: int,
+    chunk_size: int,
+    overlap: int,
     channels: int,
-    activations_fn: Callable[[torch.Tensor], torch.Tensor],
+    activations_fn: Callable[[torch.Tensor], torch.Tensor],  # (B,E,L)->(B,C,L_out)
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    (unchanged interface; minor micro-opts)
+    Streaming version: never materializes (B,T,E). Returns (max_vals, max_pos) with memory O(B·C).
     """
-    B, E, T = z.shape
-    device, dtype = z.device, z.dtype
+    if not ts or any(t.shape[0] != ts[0].shape[0] for t in ts):
+        raise ValueError("All tensors in `ts` must share batch dim.")
+    B, T = ts[0].shape[0], ts[0].shape[1]
     if T < rf:
-        raise RuntimeError(f"Input sequence length {T} is less than the minimum required length {rf}.")
+        raise RuntimeError(f"Input sequence length {T} < receptive field {rf}")
 
-    max_vals = torch.full((B, channels), torch.finfo(dtype).min, device=device, dtype=dtype)
-    max_pos  = torch.zeros((B, channels), device=device, dtype=torch.long)
+    max_vals = torch.full((B, channels), torch.finfo(to_dtype).min, device=to_device, dtype=to_dtype)
+    max_pos  = torch.zeros((B, channels), device=to_device, dtype=torch.long)
 
     step = max(1, chunk_size - overlap)
     start = 0
@@ -862,14 +799,17 @@ def _lowmem_max_over_time(
     with torch.no_grad():
         while start < T:
             end = min(start + chunk_size, T)
-            # include extra overlap so every rf-window crossing the right edge is seen
-            end_ext = min(end + overlap, T)
-            z_chunk = z[:, :, start:end_ext]  # (B, E, L_chunk)
+            end_ext = min(end + overlap, T)   # ensure windows crossing right edge are seen
+
+            # Slice originals and run your embedding+FiLM lazily per chunk
+            slices = [t[:, start:end_ext] for t in ts]
+            z_chunk = preprocess(*slices)                     # (B, L, E)
+            z_chunk = z_chunk.to(device=to_device, dtype=to_dtype).transpose(1, 2).contiguous()  # (B,E,L)
 
             if z_chunk.shape[-1] >= rf:
-                g = activations_fn(z_chunk)             # (B, C, T_out)
-                v, idx = g.max(dim=-1)                  # (B, C)
-                pos = start + idx * first_stride        # map back to input
+                g = activations_fn(z_chunk)                   # (B, C, L_out)
+                v, idx = g.max(dim=-1)                       # (B, C)
+                pos = start + idx * first_stride             # map back to input indices
 
                 upd = v > max_vals
                 max_vals = torch.where(upd, v, max_vals)
@@ -883,20 +823,73 @@ def _lowmem_max_over_time(
     return max_vals, max_pos
 
 
-def _gather_wins_via_recompute(
+def _recompute_winners(preprocess: PreprocessFn, ts: Sequence[Tensor], b: int, pos: Tensor, rf: int) -> Tensor:
+    """
+    Recomputation function.
+
+    Args:
+        preprocess:  callable to compute the input tensor.
+        ts:          arguments to `preprocess`
+        b:           batch index
+        pos:         (U,) winning start positions
+        rf:          receptive field
+
+    Returns:
+        z:     Output tensor of shape (U, rf, E), which is a subset of the original input to `forward`.
+    """
+    if not isinstance(ts, Sequence):
+        raise TypeError(f"`ts` must be a sequence of tensors. Got {type(ts)} instead.")
+    if not all(isinstance(t, Tensor) for t in ts):
+        raise TypeError(f"All elements of `ts` must be tensors. Got {[type(t) for t in ts]} instead.")
+    if not all(t.dim() >= 2 for t in ts):
+        raise ValueError(f"All tensors in `ts` must have at least 2 dimensions. Got {[t.dim() for t in ts]} instead.")
+
+    # Handle degenerate case of no winners cleanly.
+    if pos.numel() == 0:
+        wins = [t.new_empty((0, rf) + tuple(t.shape[2:])) for t in ts]
+        z = preprocess(*wins)
+        z = z.contiguous()
+        check_tensor(z, (0, rf, None))
+        return z
+
+    # Select this sample's winning windows and preprocess them.
+    # This needs to be done index-by-index to avoid massive tensor expansion.
+    wins = []
+    for t in ts:
+        if t.shape[1] < rf:
+            raise RuntimeError(f"Sequence too short: T={t.shape[1]} < rf={rf}")
+
+        t_b = t[b]  # (T, *)
+
+        # Build (U, rf) start indices: pos + [0..rf-1]
+        rng = torch.arange(rf, device=pos.device)
+        idx = pos.to(t_b.device).unsqueeze(1) + rng.unsqueeze(0)  # (U, rf)
+
+        # Advanced indexing along the first dim yields (U, rf, *) for any tail
+        w = t_b[idx]
+        wins.append(w.contiguous())
+
+    z = preprocess(*wins)                        # (U, rf, None)
+    z = z.contiguous()
+
+    check_tensor(z, (wins[0].shape[0] if len(wins) > 0 else None, rf, None), FLOATS)
+    return z
+
+
+def _gather_wins_via_preprocess(
     *,
-    positions: torch.Tensor,              # (B, C)
+    preprocess: PreprocessFn,
+    ts: Sequence[Tensor],
+    positions: torch.Tensor,   # (B, C)
     rf: int,
     embedding_dim: int,
-    recompute: Callable[[int, torch.Tensor, int], torch.Tensor],
     to_device: torch.device,
     to_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, list[tuple[int, torch.Tensor, int]]]:
     """
-    Calls `recompute(b, posuniq, rf)` per sample, validates shapes, casts,
-    permutes to (U_b, E, rf), concatenates all windows, and returns:
-      wins_cat : (sum_U, E, rf)
-      meta     : list of (offset, inv, U_b) for scattering back
+    For each batch b: unique winner starts (posuniq), call _recompute_winners
+    to get (U_b, rf, E), cast & transpose, and concatenate to (sum_U, E, rf).
+    Return the meta needed for scattering back.
     """
     B = positions.shape[0]
     wins_list: list[torch.Tensor] = []
@@ -904,11 +897,11 @@ def _gather_wins_via_recompute(
     offset = 0
 
     for b in range(B):
-        pos_b = positions[b]                                                # (C,)
+        pos_b = positions[b]  # (C,)
         posuniq, inv = torch.unique(pos_b, sorted=True, return_inverse=True)  # (U_b,), (C,)
-        z_b = recompute(b, posuniq, rf)                                     # (U_b, rf, E)
-        if z_b.dim() != 3 or z_b.shape[1] != rf or z_b.shape[2] != embedding_dim:
-            raise RuntimeError(f"recompute must return (U_b, rf, E); got {tuple(z_b.shape)}")
+        z_b = _recompute_winners(preprocess, ts, b, posuniq, rf)  # (U_b, rf, E)
+        if z_b.shape[2] != embedding_dim:
+            raise RuntimeError(f"preprocess returned wrong E: {z_b.shape[2]} vs {embedding_dim}")
         z_b = z_b.to(device=to_device, dtype=to_dtype).transpose(1, 2).contiguous()  # (U_b, E, rf)
         wins_list.append(z_b)
         meta.append((offset, inv, z_b.shape[0]))
@@ -936,49 +929,6 @@ def _scatter_g_to_BC(
     for b, (start, inv, u_b) in enumerate(meta):
         g_b = g_all[start:start + u_b]                       # (U_b, C)
         out[b] = g_b[inv, torch.arange(channels, device=to_device)]
-    return out
-
-
-def _eval_max_windows_vectorized_per_batch(
-    z: torch.Tensor,
-    *,
-    rf: int,
-    channels: int,
-    positions: torch.Tensor,
-    activations_per_batch_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    ctx: torch.Tensor,
-    stop_grad_input: bool = True,
-) -> torch.Tensor:
-    """
-    Vectorized recomputation per batch for activations that depend on a per-batch context.
-    Args:
-        z:   (B, E, T)
-        rf:  receptive field
-        positions: (B, C) winning start positions
-        activations_per_batch_fn: (wins_b, ctx_b) -> (U_b, C, 1)
-        ctx: (B, C) context (e.g., gct)
-    Returns:
-        (B, C)
-    """
-    B, E, T = z.shape
-    device = z.device
-    out = torch.empty((B, channels), device=device, dtype=z.dtype)
-
-    # (B, E, T-rf+1, rf) view of all windows
-    z_unf = z.unfold(dimension=2, size=rf, step=1)
-
-    for b in range(B):
-        pos_b = positions[b]                                   # (C,)
-        uniq_b, inv_b = torch.unique(pos_b, sorted=True, return_inverse=True)
-        wins_b = z_unf[b, :, uniq_b].permute(1, 0, 2).contiguous()  # (U_b, E, rf)
-
-        if stop_grad_input:
-            with torch.no_grad():
-                wins_b = wins_b.clone()                        # detach from z graph
-
-        ctx_b = ctx[b].unsqueeze(0).expand(wins_b.shape[0], -1)    # (U_b, C)
-        g_b = activations_per_batch_fn(wins_b, ctx_b).squeeze(-1)  # (U_b, C)
-        out[b] = g_b[inv_b, torch.arange(channels, device=device)]
     return out
 
 # -------------------------------------------------------------------------------- #
@@ -1026,13 +976,10 @@ class MalConvClassifier(Classifier):
             z = self.filmer(z, g)  # (B, T, E)
             return z
 
-        recompute = None
-        if self.training:
-            recompute = partial(self.backbone.recompute, preprocess, (x, g) if g is not None else (x,))
+        ts = (x, g) if g is not None else (x,)
 
-        z = preprocess(x, g)              # (B, T, E)
-        z = self.backbone(z, recompute)   # (B, D)
-        z = self.head(z)                  # (B, M)
+        z = self.backbone(preprocess=preprocess, ts=ts)  # (B, D)
+        z = self.head(z)                                 # (B, M)
 
         check_tensor(z, (x.shape[0], self.head.num_classes), FLOATS)
         return z
@@ -1163,18 +1110,13 @@ class HierarchicalMalConvClassifier(HierarchicalClassifier):
             if x[i] is None:
                 continue
 
-            def preprocess(x: Optional[Tensor], g: Optional[Tensor] = None) -> Tensor:
-                if x is None:  raise TypeError()
+            def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
                 z = self.embeddings[i](x)  # (B, T, E)
                 z = self.filmers[i](z, g)  # (B, T, E)
                 return z
 
-            recompute = None
-            if self.training:
-                recompute = partial(self.backbones[i].recompute, preprocess, (x[i], g[i]) if g is not None else (x[i],))  # type: ignore
-
-            z = preprocess(x[i], g[i])           # (B, T, E)
-            z = self.backbones[i](z, recompute)  # (B, C)
+            ts: tuple[Tensor, ...] = (x[i], g[i]) if g[i] is not None else (x[i],)  # type: ignore[assignment]
+            z = self.backbones[i](preprocess=preprocess, ts=ts)  # (B, C)
             zs.append(z)
 
         z = torch.stack(zs, dim=1)  # (B, sum(C))
