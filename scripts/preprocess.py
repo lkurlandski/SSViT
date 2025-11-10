@@ -56,7 +56,7 @@ from src.binanal import HierarchicalLevel
 from src.binanal import LEVEL_STRUCTURE_MAP
 from src.fileio import read_files_asynch
 from src.simpledb import CreateSimpleDB
-from src.simpledb import CreateSimpleDBSample
+from src.simpledb import Sample
 from src.simpledb import SimpleDB
 
 
@@ -71,7 +71,7 @@ def preprocess_portable_executable(buffer: bytes) -> dict[str, Any]:
 
     pe, size = _parse_pe_and_get_size(buffer)
 
-    guider = CharacteristicGuider(pe, size)
+    guider = CharacteristicGuider(pe, size, which_characteristics=list(lief.PE.Section.CHARACTERISTICS))
     characteristics = guider._get_characteristic_offsets()
     characteristics = {c.name: offs for c, offs in characteristics.items()}
 
@@ -217,7 +217,7 @@ def process_one_shard(
     # Truncate and add to the SimpleDB.
     creator = CreateSimpleDB(outdir / "data" / split, shardsize=-1, samples_per_shard=samples_per_shard, exist_ok=True)
     for sha, lab, buf in zip(sha_batch, lab_batch, buffers):
-        sample = CreateSimpleDBSample(name=sha, data=buf[0:max_length], malware=lab == 1, timestamp=-1, family=None)
+        sample = Sample(name=sha, data=buf[0:max_length], malware=lab == 1, timestamp=-1, family="")
         creator.add(sample)
     # Hacky solution to let multiple creators run in parallel.
     assert creator._cur_meta_df is not None
@@ -385,7 +385,7 @@ def main() -> None:
     shas: dict[str, list[str]] = {}
     labs: dict[str, list[int]] = {}
     for split, file in zip(splits, sfiles):
-        _blob = np.loadtxt(file, dtype=str)  # type: ignore[no-untyped-call]
+        _blob = np.loadtxt(file, dtype=str)
         _shas = _blob[:, 0]
         _labs = _blob[:, 1].astype(int)
         _idx  = np.argsort(_shas)
@@ -408,7 +408,7 @@ def main() -> None:
             iterable: list[tuple] = []  # type: ignore[type-arg]
             for shardidx, (sha_batch_, lab_batch_) in enumerate(zip(sha_batches, lab_batches)):
                 sha_batch = list(sha_batch_)
-                lab_batch = list(lab_batch_)  # type: ignore[call-overload]
+                lab_batch = list(lab_batch_)
                 arg = (outdir, split, shardidx, sha_batch, lab_batch, samples_per_shard, max_length, compress, level)
                 iterable.append(arg)
             t_start = time.time()
@@ -437,10 +437,10 @@ def main() -> None:
         desc = f"Progress ({total} shards)..."
         sha_batches = batched(shas[split], n=samples_per_shard)
         lab_batches = batched(labs[split], n=samples_per_shard)
-        iterable: list[tuple] = []  # type: ignore[type-arg]
+        iterable: list[tuple] = []  # type: ignore[no-redef, type-arg]
         for shardidx, (sha_batch_, lab_batch_) in enumerate(zip(sha_batches, lab_batches)):
             sha_batch = list(sha_batch_)
-            lab_batch = list(lab_batch_)  # type: ignore[call-overload]
+            lab_batch = list(lab_batch_)
             arg = (outdir, split, shardidx, sha_batch, lab_batch, samples_per_shard, max_length, compress, level)
             iterable.append(arg)
         t_start = time.time()
