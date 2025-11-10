@@ -56,6 +56,7 @@ from src.binanal import HierarchicalStructureFine
 from src.binanal import HierarchicalStructureMiddle
 from src.binanal import HierarchicalStructureNone
 from src.binentropy import compute_entropy_rolling_numpy
+from src.binentropy import _check_inputs as check_inputs_for_entropy
 from src.bitpacking import packbits
 from src.bitpacking import unpackbits
 from src.bitpacking import slice_bitpacked_tensor
@@ -307,6 +308,38 @@ class _SemanticGuideOrSemanticGuides(ABC):
 
         return self.__class__(parse, entropy, characteristics)
 
+    def build_allguides(self) -> Optional[Tensor]:
+        # FIXME: this entails some massive copies, so we're going to have to optimize this later.
+
+        avail = [t is not None for t in (self.parse, self.entropy, self.characteristics)]
+
+        # If no guides are available, return None.
+        if not any(avail):
+            return None
+
+        # If only one guide is available, return it directly without any copying.
+        if sum(avail) == 1:
+            if self.parse is not None:
+                return self.parse
+            if self.entropy is not None:
+                return self.entropy
+            if self.characteristics is not None:
+                return self.characteristics
+            raise RuntimeError()
+
+        # Otherwise, concatenate all available guides along the guides axis.
+        dim = self.length_axis + 1
+        gs = [g for g in (self.parse, self.entropy, self.characteristics) if g is not None]
+        gs = [g.unsqueeze(dim=dim) if g.ndim < dim + 1 else g for g in gs]
+        try:
+            allguides = torch.cat(gs, dim=self.length_axis + 1)
+        except Exception:
+            print(f"{dim=} {self.length_axis=} {len(gs)=}")
+            for g in gs:
+                print(g.shape, g.dtype, g.device)
+            raise
+        return allguides
+
 
 class SemanticGuide(_SemanticGuideOrSemanticGuides):
 
@@ -359,6 +392,7 @@ class SemanticGuider:
         do_entropy: bool = False,
         which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS] = tuple(),
         radius: int = 256,
+        stride: int = 1,
         simple: bool = False,
         use_packed: bool = True,
     ) -> None:
@@ -366,6 +400,7 @@ class SemanticGuider:
         self.do_entropy = do_entropy
         self.which_characteristics = which_characteristics
         self.radius = radius
+        self.stride = stride
         self.simple = simple
         self.use_packed = use_packed
 
@@ -403,9 +438,12 @@ class SemanticGuider:
 
     def _get_entropy(self, inputs: Tensor) -> Tensor:
         check_tensor(inputs, (None,), torch.uint8)
+        outdtype = torch.float16
+        if not check_inputs_for_entropy(len(inputs), self.radius, self.stride, errors="pass"):
+            return torch.zeros_like(inputs, dtype=outdtype)
         inputs = inputs.numpy(force=True)
-        entropy = compute_entropy_rolling_numpy(inputs, self.radius)
-        entropy = torch.from_numpy(entropy).to(torch.float16)
+        entropy = compute_entropy_rolling_numpy(inputs, self.radius, self.stride)
+        entropy = torch.from_numpy(entropy).to(outdtype)
         return entropy
 
     def _get_characteristics(self, data: LiefParse | lief.PE.Binary, size: Optional[int]) -> Tensor:
@@ -619,6 +657,10 @@ class _FSampleOrSamples(Generic[F, N, G, S], ABC):
     def characteristics(self) -> Optional[Tensor]:
         return self.guides.characteristics
 
+    @property
+    def allguides(self) -> Optional[Tensor]:
+        return self.guides.build_allguides()
+
     @abstractmethod
     def __len__(self) -> int:
         ...
@@ -769,6 +811,10 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
     @property
     def characteristics(self) -> list[Optional[Tensor]]:
         return [g.characteristics for g in self.guides]
+
+    @property
+    def allguides(self) -> list[Optional[Tensor]]:
+        return [g.build_allguides() for g in self.guides]
 
     @abstractmethod
     def __len__(self) -> int:

@@ -26,6 +26,7 @@ from typing import ContextManager
 from typing import Optional
 from typing import Protocol
 from typing import Self
+from typing import Sequence
 import warnings
 
 import numpy as np
@@ -98,7 +99,7 @@ class Batch(Protocol):
         ...
 
     @property
-    def characteristics(self) -> Any:
+    def allguides(self) -> Any:
         ...
 
 
@@ -658,7 +659,7 @@ class Trainer:
         Send a batch of inputs forward through the model.
         """
         with torch.autocast(self.device.type, dtype=mp_dtype(self.args.mp16, self.device), enabled=self.args.mp16):
-            return self.model(batch.inputs, batch.characteristics)  # type: ignore[no-any-return]
+            return self.model(batch.inputs, batch.allguides)  # type: ignore[no-any-return]
 
     def compute_loss(self, batch: Batch, outputs: Tensor) -> Tensor:
         """

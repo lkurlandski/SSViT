@@ -105,7 +105,7 @@ from src.utils import count_parameters
 def get_model(
     arch: Architecture,
     size: ModelSize,
-    which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS],
+    num_guides: int,
     level: HierarchicalLevel,
 ) -> Classifier | HierarchicalClassifier:
 
@@ -129,7 +129,7 @@ def get_model(
     num_embeddings = 256 + 8
     embedding_dim  = 4 * f
     # FiLM
-    guide_dim      = len(which_characteristics)
+    guide_dim      = num_guides
     guide_hidden   = 4 * f
     # Patcher
     num_patches    = 256
@@ -161,7 +161,7 @@ def get_model(
         Architecture.MCG: MalConvGCG,
     }
 
-    FiLMCls = FiLM if which_characteristics else FiLMNoP
+    FiLMCls = FiLM if num_guides > 0 else FiLMNoP
 
     if level == HierarchicalLevel.NONE:
         embedding = Embedding(num_embeddings, embedding_dim, padding_idx)
@@ -408,7 +408,7 @@ def main() -> None:
     mpdtype = mp_dtype(args.mp16, args.device)
     print(f"{mpdtype=}")
 
-    model = get_model(args.arch, args.size, args.which_characteristics, args.level).to("cpu")
+    model = get_model(args.arch, args.size, len(args.which_characteristics) + (1 if args.do_entropy else 0), args.level).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
     min_lengths = [max(m, min_length) for m in getattr(model, "min_lengths", [min_length])]

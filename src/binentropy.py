@@ -138,15 +138,24 @@ def _compute_discrete_entropy_torch(x: Tensor) -> float:
     return h
 
 
-def _check_inputs(length: int, radius: int, stride: int) -> None:
+def _check_inputs(length: int, radius: int, stride: int, errors: str = "raise") -> bool:
     if radius <= 0:
-        raise ValueError(f"Radius must be positive, got {radius}.")
+        if errors == "raise":
+            raise ValueError(f"Radius must be positive, got {radius}.")
+        return False
     if stride <= 0:
-        raise ValueError(f"Stride must be positive, got {stride}.")
+        if errors == "raise":
+            raise ValueError(f"Stride must be positive, got {stride}.")
+        return False
     if length <= 2 * radius + 1:
-        raise ValueError(f"Input data length {length} is too short for the specified radius {radius}.")
+        if errors == "raise":
+            raise ValueError(f"Input data length {length} is too short for the specified radius {radius}.")
+        return False
     if stride > 2 * radius + 1:
-        raise ValueError(f"Stride {stride} is too large for the specified radius {radius}.")
+        if errors == "raise":
+            raise ValueError(f"Stride {stride} is too large for the specified radius {radius}.")
+        return False
+    return True
 
 
 @nb.jit(**NUMBA_JIT_KWDS)  # type: ignore[misc]
