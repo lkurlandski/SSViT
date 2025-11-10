@@ -448,8 +448,20 @@ class ViT(nn.Module):
 # -------------------------------------------------------------------------------- #
 
 class PreprocessFn(Protocol):
+    """
+    Preprocessing function for MalConv backbones.
+    """
 
     def __call__(self, *parts: Tensor) -> Tensor:
+        """
+        Processes temporal input tensors to produce temporal embeddings.
+
+        Args:
+            parts: input parts, each of shape (B, T, *).
+
+        Returns:
+            z: output tensor of shape (B, T, E).
+        """
         ...
 
 
@@ -927,6 +939,8 @@ def _scatter_g_to_BC(
     """
     out = torch.empty((batch_size, channels), device=to_device, dtype=to_dtype)
     for b, (start, inv, u_b) in enumerate(meta):
+        if not inv.numel() == channels:
+            raise RuntimeError(f"Inverse indices length mismatch: {inv.numel()} vs {channels}")
         g_b = g_all[start:start + u_b]                       # (U_b, C)
         out[b] = g_b[inv, torch.arange(channels, device=to_device)]
     return out
