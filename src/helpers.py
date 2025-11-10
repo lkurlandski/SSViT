@@ -10,19 +10,23 @@ from dataclasses import Field
 from enum import Enum
 import os
 import sys
+from types import GenericAlias
 from typing import Any
 from typing import Literal
 from typing import Optional
 from typing import Self
+from typing import Sequence
 from typing import Union
 from typing import get_type_hints
 from typing import get_args
 from typing import get_origin
 import warnings
 
+import lief
 import torch
 
 from src.binanal import HierarchicalLevel
+from src.binanal import CHARACTERISTICS
 from src.trainer import TrainerArgs
 from src.utils import str_to_bool
 
@@ -40,6 +44,17 @@ class ModelSize(Enum):
     LG = "lg"  # Large
 
 
+def any_to_section_characteristic(s: lief.PE.Section.CHARACTERISTICS | int | str) -> lief.PE.Section.CHARACTERISTICS:
+    if isinstance(s, lief.PE.Section.CHARACTERISTICS):
+        return s
+    elif isinstance(s, int):
+        return lief.PE.Section.CHARACTERISTICS(s)
+    elif isinstance(s, str):
+        return lief.PE.Section.CHARACTERISTICS[s]
+    else:
+        raise TypeError(f"Cannot convert {s!r} to lief.PE.Section.CHARACTERISTICS.")
+
+
 # TODO: figure out how to elegantly combine different dataclasses into a new class.
 # TODO: write an ArgumentParser that takes a dataclass and generates arguments.
 @dataclass
@@ -49,7 +64,7 @@ class MainArgs:
     seed: int = 0
     do_parser: bool = False
     do_entropy: bool = False
-    do_characteristics: bool = False
+    which_characteristics: tuple[lief.PE.Section.CHARACTERISTICS, ...] = tuple()
     level: HierarchicalLevel = HierarchicalLevel.NONE
     tr_num_samples: Optional[int] = None
     vl_num_samples: Optional[int] = None
@@ -63,7 +78,6 @@ class MainArgs:
     vl_batch_size: int = -1
     ts_batch_size: int = -1
     learning_rate: float = 1e-3
-    weight_decay: float = 1e-5
     device: torch.device = torch.device("cpu")
     ddp: bool = False
     fsdp: bool = False
@@ -131,7 +145,18 @@ def create_argument_parser_from_dataclass(*objs: type) -> ArgumentParser:
     for f in allfields:
         # print(f"Adding argument {f.name} of type {f.type} {type(f.type)=} with default {f.default}.")
         argname = f"--{f.name}"
-        if f.type == bool:
+        if (isinstance(f.type, GenericAlias) and isinstance(f.type.__origin__, type) and issubclass(f.type.__origin__, Sequence)):
+            # This is the branch for multiple-value arguments. Its rather limited right now.
+            type_ = f.type.__args__[0]
+            choices = None
+            if isinstance(f.type.__args__[0], type) and issubclass(f.type.__args__[0], Enum):
+                if f.type.__args__[0] is lief.PE.Section.CHARACTERISTICS:
+                    choices = [c for c in CHARACTERISTICS]
+                    type_ = any_to_section_characteristic
+                else:
+                    choices = list(f.type.__args__[0])
+            parser.add_argument(argname, type=type_, nargs="*", choices=choices, default=f.default)
+        elif f.type == bool:
             parser.add_argument(argname, type=str_to_bool, default=f.default)
         elif f.type == Optional[bool]:
             parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else str_to_bool(x), default=f.default)

@@ -105,7 +105,7 @@ from src.utils import count_parameters
 def get_model(
     arch: Architecture,
     size: ModelSize,
-    do_characteristics: bool,
+    which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS],
     level: HierarchicalLevel,
 ) -> Classifier | HierarchicalClassifier:
 
@@ -129,7 +129,7 @@ def get_model(
     num_embeddings = 256 + 8
     embedding_dim  = 4 * f
     # FiLM
-    guide_dim      = len(CharacteristicGuider.CHARACTERISTICS)
+    guide_dim      = len(which_characteristics)
     guide_hidden   = 4 * f
     # Patcher
     num_patches    = 256
@@ -161,7 +161,7 @@ def get_model(
         Architecture.MCG: MalConvGCG,
     }
 
-    FiLMCls = FiLM if do_characteristics else FiLMNoP
+    FiLMCls = FiLM if which_characteristics else FiLMNoP
 
     if level == HierarchicalLevel.NONE:
         embedding = Embedding(num_embeddings, embedding_dim, padding_idx)
@@ -342,7 +342,7 @@ def get_streamer(loader: DataLoader[Any], device: torch.device, num_streams: int
     return streamer
 
 
-def get_padbatch(level: HierarchicalLevel, do_parse: bool,do_entropy: bool, do_characteristics: bool, min_lengths: list[int], batch_size: int) -> FSamples | HSamples:
+def get_padbatch(level: HierarchicalLevel, do_parse: bool,do_entropy: bool, which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS], min_lengths: list[int], batch_size: int) -> FSamples | HSamples:
     """Return a short batch of purely padding samples."""
     file = ["./" + "0" * 64] * batch_size
     name = [Name("0" * 64)] * batch_size
@@ -354,7 +354,7 @@ def get_padbatch(level: HierarchicalLevel, do_parse: bool,do_entropy: bool, do_c
     def get_guides(length: int) -> SemanticGuides:
         parse = torch.zeros((batch_size, length), dtype=torch.bool) if do_parse else None
         entropy = torch.zeros((batch_size, length), dtype=torch.float32) if do_entropy else None
-        characteristics = torch.zeros((batch_size, length, len(CharacteristicGuider.CHARACTERISTICS)), dtype=torch.bool) if do_characteristics else None
+        characteristics = torch.zeros((batch_size, length, len(which_characteristics)), dtype=torch.bool) if which_characteristics else None
         return SemanticGuides(parse, entropy, characteristics).decompress()
 
     def get_structure() -> StructureMaps:
@@ -408,7 +408,7 @@ def main() -> None:
     mpdtype = mp_dtype(args.mp16, args.device)
     print(f"{mpdtype=}")
 
-    model = get_model(args.arch, args.size, args.do_characteristics, args.level).to("cpu")
+    model = get_model(args.arch, args.size, args.which_characteristics, args.level).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
     min_lengths = [max(m, min_length) for m in getattr(model, "min_lengths", [min_length])]
@@ -428,7 +428,7 @@ def main() -> None:
 
     preprocessor = Preprocessor(
         args.do_entropy,
-        args.do_characteristics,
+        args.which_characteristics,
         args.level,
         max_length=args.max_length,
     )
@@ -520,13 +520,13 @@ def main() -> None:
     loss_fn = CrossEntropyLoss()
     print(f"{loss_fn=}")
 
-    optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = lambda params: AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = lambda params: AdamW(params, lr=args.learning_rate)
     print(f"{optimizer_init=}")
 
     scheduler_init: Callable[[Optimizer], LRScheduler] = lambda optim: LambdaLR(optim, lambda _: 1.0)
     print(f"{scheduler_init=}")
 
-    padbatch = get_padbatch(args.level, args.do_parser, args.do_entropy, args.do_characteristics, min_lengths, args.vl_batch_size)
+    padbatch = get_padbatch(args.level, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)
     print(f"{padbatch=}")
 
     stopper: EarlyStopper = EarlyStopper(patience=float("inf"))

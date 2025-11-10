@@ -17,6 +17,7 @@ from torch import Tensor
 from torch import ShortTensor
 from torch import LongTensor
 
+from src.binanal import CHARACTERISTICS
 from src.binanal import HierarchicalStructureNone
 from src.binanal import get_ranges_numpy
 from src.data import Name
@@ -51,15 +52,18 @@ class TestSemanticGuider:
 
     @pytest.mark.parametrize("do_parse", [False, True])
     @pytest.mark.parametrize("do_entropy", [False, True])
-    @pytest.mark.parametrize("do_characteristics", [False, True])
-    def test(self, do_parse: bool, do_entropy: bool, do_characteristics: bool) -> None:
+    @pytest.mark.parametrize("num_characteristics", [0, 1, 2, 3])
+    def test(self, do_parse: bool, do_entropy: bool, num_characteristics: int) -> None:
+        which_characteristics = random.sample(list(CHARACTERISTICS), k=num_characteristics)
         file = FILES[0]
         b = file.read_bytes()
-        guider = SemanticGuider(do_parse=do_parse, do_entropy=do_entropy, do_characteristics=do_characteristics)
+        guider = SemanticGuider(do_parse=do_parse, do_entropy=do_entropy, which_characteristics=which_characteristics)
         sample = guider(b, inputs=torch.frombuffer(b, dtype=torch.uint8))
         assert bool(sample.parse is None) != do_parse
         assert bool(sample.entropy is None) != do_entropy
-        assert bool(sample.characteristics is None) != do_characteristics
+        assert bool(sample.characteristics is None) != (num_characteristics > 0)
+        if num_characteristics > 0:
+            assert sample.characteristics.shape[1] == num_characteristics
 
 
 def indicator_mask_to_ranges(mask: Tensor) -> list[list[tuple[int, int]]]:

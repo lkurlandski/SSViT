@@ -357,14 +357,14 @@ class SemanticGuider:
         self,
         do_parse: bool = False,
         do_entropy: bool = False,
-        do_characteristics: bool = False,
+        which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS] = tuple(),
         radius: int = 256,
         simple: bool = False,
         use_packed: bool = True,
     ) -> None:
         self.do_parse = do_parse
         self.do_entropy = do_entropy
-        self.do_characteristics = do_characteristics
+        self.which_characteristics = which_characteristics
         self.radius = radius
         self.simple = simple
         self.use_packed = use_packed
@@ -389,7 +389,7 @@ class SemanticGuider:
             entropy = self._get_entropy(inputs)
 
         characteristics = None
-        if self.do_characteristics:
+        if self.which_characteristics:
             if data is None:
                 raise ValueError("Data must be provided for characteristics computation.")
             characteristics = self._get_characteristics(data, size)
@@ -409,14 +409,12 @@ class SemanticGuider:
         return entropy
 
     def _get_characteristics(self, data: LiefParse | lief.PE.Binary, size: Optional[int]) -> Tensor:
-        characteristics = CharacteristicGuider(data, size, use_packed=self.use_packed)()
+        characteristics = CharacteristicGuider(data, size, self.use_packed, self.which_characteristics)()
         characteristics = torch.from_numpy(characteristics)
         return characteristics
 
 
 class _StructureMapOrStructureMaps(ABC):
-
-    # FIXME: some of these methods, e.g., `clone`, should return a new instance!
 
     index: list[list[tuple[int, int]]] | list[list[list[tuple[int, int]]]]
     lexicon: Mapping[int, HierarchicalStructure]
@@ -1002,18 +1000,18 @@ class Preprocessor:
 
     def __init__(
         self,
-        do_entropy: bool = True,
-        do_characteristics: bool = True,
+        do_entropy: bool = False,
+        which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS] = tuple(),
         level: HierarchicalLevel | str = HierarchicalLevel.NONE,
         max_length: Optional[int] = None,
         unsafe: bool = False,
     ) -> None:
         self.do_entropy = do_entropy
-        self.do_characteristics = do_characteristics
+        self.which_characteristics = which_characteristics
         self.level = HierarchicalLevel(level)
         self.max_length = max_length
         self.unsafe = unsafe
-        self.guider = SemanticGuider()
+        self.guider = SemanticGuider(do_entropy=do_entropy, which_characteristics=which_characteristics)
         self.partitioner = StructurePartitioner(HierarchicalLevel(level))
 
     def __call__(self, name: str, label: int, data: bytes, meta: pl.DataFrame) -> FSample:
@@ -1034,7 +1032,7 @@ class Preprocessor:
         guides = SemanticGuide(None, None, None)
         if self.do_entropy:
             guides.entropy = self.guider._get_entropy(inputs)
-        if self.do_characteristics:
+        if self.which_characteristics:
             guides.characteristics = self.get_characteristics(meta, size)
         structure = self.get_structure(meta, size)
 
@@ -1058,7 +1056,7 @@ class Preprocessor:
         )
 
         n_sec = len(df_sec)
-        n_chr = len(CharacteristicGuider.CHARACTERISTICS)
+        n_chr = len(self.which_characteristics)
 
         offsets = np.empty(n_sec, dtype=np.int64)
         sizes   = np.empty(n_sec, dtype=np.int64)
@@ -1077,9 +1075,9 @@ class Preprocessor:
             for row2 in df.iter_rows(named=True):
                 c = row2["label"]
                 l = getattr(lief.PE.Section.CHARACTERISTICS, c)
-                if l not in CharacteristicGuider.CHARACTERISTICS:
+                if l not in self.which_characteristics:
                     continue
-                j = CharacteristicGuider.CHARACTERISTICS.index(l)
+                j = self.which_characteristics.index(l)
                 flags[i, j] = 1
 
         x = CharacteristicGuider._get_bit_mask_(size, offsets, sizes, flags)

@@ -14,6 +14,7 @@ from typing import Callable
 from typing import Optional
 from typing import Iterable
 from typing import Self
+from typing import Sequence
 import warnings
 
 import lief
@@ -283,29 +284,63 @@ def _get_size_of_liefparse(data: LiefParse) -> int:
     return sz
 
 
+# List of relevant section characteristics to track.
+# We ignore aligment and reserved (for future use).
+# See https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#section-flags
+CHARACTERISTICS = (
+    # lief.PE.Section.CHARACTERISTICS.TYPE_NO_PAD,               # alignment
+    lief.PE.Section.CHARACTERISTICS.CNT_CODE,
+    lief.PE.Section.CHARACTERISTICS.CNT_INITIALIZED_DATA,
+    lief.PE.Section.CHARACTERISTICS.CNT_UNINITIALIZED_DATA,
+    # lief.PE.Section.CHARACTERISTICS.LNK_OTHER,                 # reserved
+    lief.PE.Section.CHARACTERISTICS.LNK_INFO,
+    lief.PE.Section.CHARACTERISTICS.LNK_REMOVE,
+    lief.PE.Section.CHARACTERISTICS.LNK_COMDAT,
+    lief.PE.Section.CHARACTERISTICS.GPREL,
+    # lief.PE.Section.CHARACTERISTICS.MEM_PURGEABLE,             # reserved
+    # lief.PE.Section.CHARACTERISTICS.MEM_16BIT,                 # reserved
+    # lief.PE.Section.CHARACTERISTICS.MEM_LOCKED,                # reserved
+    # lief.PE.Section.CHARACTERISTICS.MEM_PRELOAD,               # reserved
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_1BYTES,              # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_2BYTES,              # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_4BYTES,              # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_8BYTES,              # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_16BYTES,             # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_32BYTES,             # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_64BYTES,             # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_128BYTES,            # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_256BYTES,            # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_512BYTES,            # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_1024BYTES,           # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_2048BYTES,           # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_4096BYTES,           # alignment
+    # lief.PE.Section.CHARACTERISTICS.ALIGN_8192BYTES,           # alignment
+    lief.PE.Section.CHARACTERISTICS.LNK_NRELOC_OVFL,
+    lief.PE.Section.CHARACTERISTICS.MEM_DISCARDABLE,
+    lief.PE.Section.CHARACTERISTICS.MEM_NOT_CACHED,
+    lief.PE.Section.CHARACTERISTICS.MEM_NOT_PAGED,
+    lief.PE.Section.CHARACTERISTICS.MEM_SHARED,
+    lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
+    lief.PE.Section.CHARACTERISTICS.MEM_READ,
+    lief.PE.Section.CHARACTERISTICS.MEM_WRITE,
+)
+
+
 class CharacteristicGuider:
 
-    CHARACTERISTICS = [
-        lief.PE.Section.CHARACTERISTICS.CNT_CODE,
-        lief.PE.Section.CHARACTERISTICS.CNT_INITIALIZED_DATA,
-        lief.PE.Section.CHARACTERISTICS.CNT_UNINITIALIZED_DATA,
-        lief.PE.Section.CHARACTERISTICS.GPREL,
-        lief.PE.Section.CHARACTERISTICS.LNK_NRELOC_OVFL,
-        lief.PE.Section.CHARACTERISTICS.MEM_DISCARDABLE,
-        lief.PE.Section.CHARACTERISTICS.MEM_NOT_CACHED,
-        lief.PE.Section.CHARACTERISTICS.MEM_NOT_PAGED,
-        lief.PE.Section.CHARACTERISTICS.MEM_SHARED,
-        lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
-        lief.PE.Section.CHARACTERISTICS.MEM_READ,
-        lief.PE.Section.CHARACTERISTICS.MEM_WRITE,
-    ]
-
-    def __init__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None, use_packed: bool = False) -> None:
+    def __init__(
+        self,
+        data: LiefParse | lief.PE.Binary,
+        size: Optional[int] = None,
+        use_packed: bool = False,
+        which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS] = CHARACTERISTICS,
+    ) -> None:
         self.pe, self.size = _parse_pe_and_get_size(data, size)
         self.use_packed = use_packed
+        self.which_characteristics = which_characteristics
 
     def _get_characteristic_offsets(self) -> dict[lief.PE.Section.CHARACTERISTICS, list[tuple[int, int]]]:
-        offsets: dict[lief.PE.Section.CHARACTERISTICS, list[tuple[int, int]]] = {c: [] for c in lief.PE.Section.CHARACTERISTICS}
+        offsets: dict[lief.PE.Section.CHARACTERISTICS, list[tuple[int, int]]] = {c: [] for c in self.which_characteristics}
 
         for section in self.pe.sections:
             offset = section.offset
@@ -315,7 +350,7 @@ class CharacteristicGuider:
             if hi <= lo:
                 continue
 
-            for c in lief.PE.Section.CHARACTERISTICS:
+            for c in self.which_characteristics:
                 if section.has_characteristic(c):
                     offsets[c].append((lo, hi))
 
@@ -323,7 +358,7 @@ class CharacteristicGuider:
 
     def _get_bool_mask(self) -> npt.NDArray[np.bool_]:
         # NOTE: allocating the (T, C) array is quite expensive.
-        x = np.full((self.size, len(self.CHARACTERISTICS)), False, dtype=bool)
+        x = np.full((self.size, len(self.which_characteristics)), False, dtype=bool)
         for section in self.pe.sections:
             offset = section.offset
             size = section.size
@@ -332,7 +367,7 @@ class CharacteristicGuider:
             if hi <= lo:
                 continue
 
-            for i, c in enumerate(self.CHARACTERISTICS):
+            for i, c in enumerate(self.which_characteristics):
                 x[lo:hi, i] |= section.has_characteristic(c)
 
         return x
@@ -349,11 +384,11 @@ class CharacteristicGuider:
         return x
 
     def _get_bit_mask(self) -> npt.NDArray[np.uint8]:
-        x = np.zeros(((self.size + 7) // 8, len(self.CHARACTERISTICS)), dtype=np.uint8)
+        x = np.zeros(((self.size + 7) // 8, len(self.which_characteristics)), dtype=np.uint8)
 
         sections = list(self.pe.sections)
         n_sec = len(sections)
-        K = len(self.CHARACTERISTICS)
+        K = len(self.which_characteristics)
 
         offsets = np.empty(n_sec, dtype=np.int64)
         sizes   = np.empty(n_sec, dtype=np.int64)
@@ -362,7 +397,7 @@ class CharacteristicGuider:
         for s, sec in enumerate(sections):
             offsets[s] = int(getattr(sec, "offset", 0) or 0)
             sizes[s]   = int(getattr(sec, "size",   0) or 0)
-            for i, c in enumerate(self.CHARACTERISTICS):
+            for i, c in enumerate(self.which_characteristics):
                 flags[s, i] = 1 if sec.has_characteristic(c) else 0
 
         _paint_packed_or(x, offsets, sizes, flags, self.size)

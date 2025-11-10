@@ -154,20 +154,22 @@ class TestCharacteristicGuider:
     @pytest.mark.parametrize("input_type", [str, Path, bytes])
     def test_bool(self, file: Path, input_type: type[str | Path | bytes]) -> None:
         data = _path_to_input_type(file, input_type)
-        x = CharacteristicGuider(data, use_packed=False)()
+        guider = CharacteristicGuider(data, use_packed=False)
+        x = guider()
         assert x.ndim == 2
         assert x.shape[0] == os.path.getsize(file)
-        assert x.shape[1] == len(CharacteristicGuider.CHARACTERISTICS)
+        assert x.shape[1] == len(guider.which_characteristics)
         assert np.issubdtype(x.dtype, np.bool_)
 
     @pytest.mark.parametrize("file", FILES)
     @pytest.mark.parametrize("input_type", [str, Path, bytes])
     def test_bit(self, file: Path, input_type: type[str | Path | bytes]) -> None:
         data = _path_to_input_type(file, input_type)
-        x = CharacteristicGuider(data, use_packed=True)()
+        guider = CharacteristicGuider(data, use_packed=True)
+        x = guider()
         assert x.ndim == 2
         assert x.shape[0] == math.ceil(os.path.getsize(file) / 8)
-        assert x.shape[1] == len(CharacteristicGuider.CHARACTERISTICS)
+        assert x.shape[1] == len(guider.which_characteristics)
         assert np.issubdtype(x.dtype, np.uint8)
 
     @pytest.mark.parametrize("file", FILES)
