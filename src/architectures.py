@@ -146,7 +146,7 @@ class FiLM(nn.Module):
     See: Perez "Film: Visual reasoning with a general conditioning layer" AAAI 2018.
     """
 
-    def __init__(self, guide_dim: int, embedding_dim: int, hidden_size: int):
+    def __init__(self, guide_dim: int, embedding_dim: int, hidden_size: int, fp32: bool = False):
         super().__init__()
 
         self.mlp = nn.Sequential(
@@ -158,6 +158,10 @@ class FiLM(nn.Module):
         self.guide_dim = guide_dim
         self.embedding_dim = embedding_dim
         self.hidden_size = hidden_size
+        self.fp32 = fp32
+
+        if self.fp32:
+            raise NotImplementedError()
 
     def forward(self, x: Tensor, g: Tensor) -> Tensor:
         """
