@@ -181,14 +181,18 @@ class _SemanticGuideOrSemanticGuides(ABC):
             characteristics = characteristics.clone()
         return self.__class__(parse, entropy, characteristics)
 
-    def to(self, device: torch.device, non_blocking: bool = False) -> Self:
+    def to(self, device: Optional[torch.device], dtype: Optional[torch.dtype] = None, non_blocking: bool = False) -> Self:
         parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
         if parse is not None:
-            parse = parse.to(device, non_blocking=non_blocking)
+            if self.is_bitpacked and dtype is not None:
+                warnings.warn("Converting bitpacked tensor's dtype.")
+            parse = parse.to(device, dtype, non_blocking=non_blocking)
         if entropy is not None:
-            entropy = entropy.to(device, non_blocking=non_blocking)
+            entropy = entropy.to(device, dtype, non_blocking=non_blocking)
         if characteristics is not None:
-            characteristics = characteristics.to(device, non_blocking=non_blocking)
+            if self.is_bitpacked and dtype is not None:
+                warnings.warn("Converting bitpacked tensor's dtype.")
+            characteristics = characteristics.to(device, dtype, non_blocking=non_blocking)
         return self.__class__(parse, entropy, characteristics)
 
     def pin_memory(self) -> Self:
@@ -738,8 +742,12 @@ class _FSampleOrSamples(Generic[F, N, G, S], ABC):
         structure = self.structure.clone()
         return self.__class__(file, name, label, inputs, guides, structure)
 
-    def finalize(self, device: torch.device) -> Self:
-        return self.to(device, non_blocking=True).decompress()
+    def finalize(self, device: torch.device, ftype: torch.dtype) -> Self:
+        new: Self = self
+        new = new.to(device, non_blocking=True)
+        new = new.decompress()
+        new.guides = new.guides.to(None, ftype)
+        return new
 
 
 class FSample(_FSampleOrSamples[StrPath, Name, SemanticGuide, StructureMap]):
@@ -929,8 +937,12 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
         structure = self.structure.clone()
         return self.__class__(file, name, label, inputs, guides, structure)
 
-    def finalize(self, device: torch.device) -> Self:
-        return self.to(device, non_blocking=True).decompress()
+    def finalize(self, device: torch.device, ftype: torch.dtype) -> Self:
+        new: Self = self
+        new = new.to(device, non_blocking=True)
+        new = new.decompress()
+        new.guides = [g.to(None, ftype) for g in new.guides]
+        return new
 
 
 class HSample(_HSampleOrSamples[StrPath, Name, SemanticGuide, StructureMap]):

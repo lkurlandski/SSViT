@@ -100,7 +100,7 @@ class Batch(Protocol):
         """
         ...
 
-    def finalize(self, device: torch.device) -> Self:
+    def finalize(self, device: torch.device, ftype: torch.dtype) -> Self:
         """
         Finalize the batch for use (e.g., move to device, change data types, etc.).
         """
@@ -365,7 +365,7 @@ class Trainer:
         self.scheduler = scheduler if scheduler is not None else LambdaLR(self.optimizer, lambda _: 1.0)
         self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
         self.device = device if device is not None else next(self.model.parameters()).device
-        self.padbatch = padbatch.finalize(self.device) if padbatch is not None else None
+        self.padbatch = padbatch.finalize(self.device, mp_dtype(self.args.mp16, self.device)) if padbatch is not None else None
         self.monitor = Monitor(device=self.device)
         self.log: list[Mapping[str, int | float]] = []
         self.glbl_step = 0
@@ -497,7 +497,7 @@ class Trainer:
             t_detailed_2 = time.time()
             t_detailed_preps.append(t_detailed_2 - t_detailed_1)
 
-            batch = batch.finalize(self.device)
+            batch = batch.finalize(self.device, mp_dtype(self.args.mp16, self.device))
 
             _syncronize_if_detailed_timing()
             t_detailed_3 = time.time()
@@ -617,7 +617,7 @@ class Trainer:
 
         with torch.no_grad():
             for mini_step, batch in iterable:
-                batch = batch.finalize(self.device)
+                batch = batch.finalize(self.device, mp_dtype(self.args.mp16, self.device))
                 real = mini_step < len(dataloader)
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
