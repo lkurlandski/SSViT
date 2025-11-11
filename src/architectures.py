@@ -179,7 +179,7 @@ class FiLM(nn.Module):
 
         film: Tensor = self.mlp(g)               # (B, T, 2E)
         gamma, beta = film.chunk(2, dim=-1)      # (B, T, E), (B, T, E)
-        z = x * gamma + beta                     # (B, T, E)
+        z = x.to(gamma.dtype) * gamma + beta     # (B, T, E)
 
         check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), FLOATS)
         return z
@@ -596,8 +596,6 @@ class MalConvLowMem(MalConvBase):
         max_vals, pos = _lowmem_max_over_time_streaming(
             preprocess=preprocess,
             ts=ts,
-            to_device=self.conv_1.weight.device,
-            to_dtype=self.conv_1.weight.dtype,
             rf=self.kernel_size,
             first_stride=self.stride,
             chunk_size=self.chunk_size,
@@ -617,8 +615,6 @@ class MalConvLowMem(MalConvBase):
             positions=pos,
             rf=self.kernel_size,
             embedding_dim=self.embedding_dim,
-            to_device=self.conv_1.weight.device,
-            to_dtype=self.conv_1.weight.dtype,
         )
         g_all = self._activations(wins_cat).squeeze(-1)  # (sum_U, C)
         z = _scatter_g_to_BC(
@@ -626,8 +622,6 @@ class MalConvLowMem(MalConvBase):
             meta=meta,
             batch_size=ts[0].shape[0],
             channels=self.channels,
-            to_device=g_all.device,
-            to_dtype=g_all.dtype,
         )
         return z
 
@@ -671,8 +665,6 @@ class MalConvGCG(MalConvBase):
         ctx_max_vals, ctx_pos = _lowmem_max_over_time_streaming(
             preprocess=preprocess,
             ts=ts,
-            to_device=self.ctx_conv.weight.device,
-            to_dtype=self.ctx_conv.weight.dtype,
             rf=self.kernel_size,
             first_stride=self.stride,
             chunk_size=self.chunk_size,
@@ -689,8 +681,6 @@ class MalConvGCG(MalConvBase):
                 positions=ctx_pos,                   # (B, C)
                 rf=self.kernel_size,
                 embedding_dim=self.embedding_dim,
-                to_device=self.ctx_conv.weight.device,
-                to_dtype=self.ctx_conv.weight.dtype,
             )                                       # wins_ctx: (sum_Uc, E, rf)
 
             g_all_ctx = self._ctx_activations(wins_ctx).squeeze(-1)   # (sum_Uc, C)
@@ -699,8 +689,6 @@ class MalConvGCG(MalConvBase):
                 meta=meta_ctx,
                 batch_size=B,
                 channels=self.channels,
-                to_device=g_all_ctx.device,
-                to_dtype=g_all_ctx.dtype,
             )                                       # (B, C)
         else:
             # eval: no grads to preprocess; ctx_max_vals already is global max over time
@@ -711,8 +699,6 @@ class MalConvGCG(MalConvBase):
         main_max_vals, main_pos = _lowmem_max_over_time_streaming(
             preprocess=preprocess,
             ts=ts,
-            to_device=self.conv_1.weight.device,
-            to_dtype=self.conv_1.weight.dtype,
             rf=self.kernel_size,
             first_stride=self.stride,
             chunk_size=self.chunk_size,
@@ -732,8 +718,6 @@ class MalConvGCG(MalConvBase):
             positions=main_pos,                      # (B, C)
             rf=self.kernel_size,
             embedding_dim=self.embedding_dim,
-            to_device=self.conv_1.weight.device,
-            to_dtype=self.conv_1.weight.dtype,
         )                                            # (sum_Um, E, rf)
 
         # Build per-window context tensor aligned with wins_main
@@ -753,8 +737,6 @@ class MalConvGCG(MalConvBase):
             meta=meta_main,
             batch_size=B,
             channels=self.channels,
-            to_device=g_all_main.device,
-            to_dtype=g_all_main.dtype,
         )                                            # (B, C)
         return z
 
@@ -788,8 +770,6 @@ def _lowmem_max_over_time_streaming(
     *,
     preprocess: PreprocessFn,
     ts: Sequence[Tensor],
-    to_device: torch.device,
-    to_dtype: torch.dtype,
     rf: int,
     first_stride: int,
     chunk_size: int,
@@ -806,27 +786,35 @@ def _lowmem_max_over_time_streaming(
     if T < rf:
         raise RuntimeError(f"Input sequence length {T} < receptive field {rf}")
 
-    max_vals = torch.full((B, channels), torch.finfo(to_dtype).min, device=to_device, dtype=to_dtype)
-    max_pos  = torch.zeros((B, channels), device=to_device, dtype=torch.long)
+    device: Optional[torch.device] = None
+    dtype: Optional[torch.dtype] = None
+
+    max_vals: torch.Tensor
+    max_pos: torch.Tensor
 
     step = max(1, chunk_size - overlap)
     start = 0
 
     with torch.no_grad():
         while start < T:
+            # Ensure windows crossing right edge are seen
             end = min(start + chunk_size, T)
-            end_ext = min(end + overlap, T)   # ensure windows crossing right edge are seen
+            end_ext = min(end + overlap, T)
 
-            # Slice originals and run your embedding+FiLM lazily per chunk
+            # Preprocess slice of inputs
             slices = [t[:, start:end_ext] for t in ts]
-            z_chunk = preprocess(*slices)                     # (B, L, E)
-            z_chunk = z_chunk.to(device=to_device, dtype=to_dtype).transpose(1, 2).contiguous()  # (B,E,L)
+            z_chunk = preprocess(*slices)                   # (B, L, E)
+            if dtype is None or device is None:
+                dtype = z_chunk.dtype
+                device = z_chunk.device
+                max_vals = torch.full((B, channels), torch.finfo(dtype).min, device=device, dtype=dtype)
+                max_pos = torch.zeros((B, channels), device=device, dtype=torch.long)
+            z_chunk = z_chunk.transpose(1, 2).contiguous()  # (B, E, L)
 
             if z_chunk.shape[-1] >= rf:
-                g = activations_fn(z_chunk)                   # (B, C, L_out)
+                g = activations_fn(z_chunk)                  # (B, C, L_out)
                 v, idx = g.max(dim=-1)                       # (B, C)
-                pos = start + idx * first_stride             # map back to input indices
-
+                pos = start + idx * first_stride
                 upd = v > max_vals
                 max_vals = torch.where(upd, v, max_vals)
                 max_pos  = torch.where(upd, pos, max_pos)
@@ -840,19 +828,7 @@ def _lowmem_max_over_time_streaming(
 
 
 def _recompute_winners(preprocess: PreprocessFn, ts: Sequence[Tensor], b: int, pos: Tensor, rf: int) -> Tensor:
-    """
-    Recomputation function.
 
-    Args:
-        preprocess:  callable to compute the input tensor.
-        ts:          arguments to `preprocess`
-        b:           batch index
-        pos:         (U,) winning start positions
-        rf:          receptive field
-
-    Returns:
-        z:     Output tensor of shape (U, rf, E), which is a subset of the original input to `forward`.
-    """
     if not isinstance(ts, Sequence):
         raise TypeError(f"`ts` must be a sequence of tensors. Got {type(ts)} instead.")
     if not all(isinstance(t, Tensor) for t in ts):
@@ -896,11 +872,9 @@ def _gather_wins_via_preprocess(
     *,
     preprocess: PreprocessFn,
     ts: Sequence[Tensor],
-    positions: torch.Tensor,   # (B, C)
+    positions: torch.Tensor,
     rf: int,
     embedding_dim: int,
-    to_device: torch.device,
-    to_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, list[tuple[int, torch.Tensor, int]]]:
     """
     For each batch b: unique winner starts (posuniq), call _recompute_winners
@@ -918,14 +892,16 @@ def _gather_wins_via_preprocess(
         z_b = _recompute_winners(preprocess, ts, b, posuniq, rf)  # (U_b, rf, E)
         if z_b.shape[2] != embedding_dim:
             raise RuntimeError(f"preprocess returned wrong E: {z_b.shape[2]} vs {embedding_dim}")
-        z_b = z_b.to(device=to_device, dtype=to_dtype).transpose(1, 2).contiguous()  # (U_b, E, rf)
+        z_b = z_b.transpose(1, 2).contiguous()  # (U_b, E, rf)
         wins_list.append(z_b)
         meta.append((offset, inv, z_b.shape[0]))
         offset += z_b.shape[0]
 
-    wins_cat = (torch.cat(wins_list, dim=0)
-                if wins_list else
-                torch.empty((0, embedding_dim, rf), device=to_device, dtype=to_dtype))
+    if wins_list:
+        wins_cat = torch.cat(wins_list, dim=0)
+    else:
+        wins_cat = torch.empty((0, embedding_dim, rf), device=ts[0].device, dtype=torch.get_default_dtype(),)
+
     return wins_cat, meta
 
 
@@ -935,18 +911,16 @@ def _scatter_g_to_BC(
     meta: list[tuple[int, torch.Tensor, int]],
     batch_size: int,
     channels: int,
-    to_device: torch.device,
-    to_dtype: torch.dtype,
 ) -> torch.Tensor:
     """
     Maps concatenated per-window activations back to (B, C) using meta.
     """
-    out = torch.empty((batch_size, channels), device=to_device, dtype=to_dtype)
+    out = torch.empty((batch_size, channels), device=g_all.device, dtype=g_all.dtype)
     for b, (start, inv, u_b) in enumerate(meta):
         if not inv.numel() == channels:
             raise RuntimeError(f"Inverse indices length mismatch: {inv.numel()} vs {channels}")
         g_b = g_all[start:start + u_b]                       # (U_b, C)
-        out[b] = g_b[inv, torch.arange(channels, device=to_device)]
+        out[b] = g_b[inv, torch.arange(channels, device=g_all.device)]
     return out
 
 # -------------------------------------------------------------------------------- #
