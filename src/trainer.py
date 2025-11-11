@@ -56,6 +56,18 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
+# Enable detailed timing statistics if the environment variable is set. This will muddy the logs
+# with extra timing information, but can help diagnose bottlenecks in the data loading.
+DETAILED_TIMING_STATISTICS = os.environ.get("DETAILED_TIMING_STATISTICS", "0") == "1"
+if DETAILED_TIMING_STATISTICS:
+    warnings.warn("Detailed timing statistics enabled; this may impact performance.", RuntimeWarning)
+
+
+def _syncronize_if_detailed_timing() -> None:
+    if DETAILED_TIMING_STATISTICS:
+        torch.cuda.synchronize()
+
+
 class Batch(Protocol):
     """
     Structural type for a batch of samples.
@@ -449,15 +461,38 @@ class Trainer:
             for k in results:
                 report[k] = results[k].item() / num_samples
             report["tr_time"] = time.time() - t_0
+            report["tr_samples"] = num_samples
+            report["tr_throughput"] = num_samples / report["tr_time"]
             # Clear results container for next cycle before returning and reset the timer.
             results = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
             t_0 = time.time()
             return report
 
+        # For detailed timing, we'll record the time spent preparing data (preprocess, collate, transfer),
+        # time spent doing forward/backward passes (forward, backward), and the time spent stepping the optimizer.
+        t_detailed_1: float  # start of a mini-step
+        t_detailed_2: float  # end of data prep, start of transfer
+        t_detailed_3: float  # end of transfer, start of compute
+        t_detailed_4: float  # end of compute, start of step
+        t_detailed_preps: list[float] = []
+        t_detailed_trans: list[float] = []
+        t_detailed_comps: list[float] = []
+        t_detailed_steps: list[float] = []
+
         mini_step = -1  # mini-step within this epoch
         grda_modl = 0   # gradient accumulation modulo local steps
+        t_detailed_1 = time.time()
         for mini_step, batch in iterable:
+            _syncronize_if_detailed_timing()
+            t_detailed_2 = time.time()
+            t_detailed_preps.append(t_detailed_2 - t_detailed_1)
+
             batch = batch.finalize(self.device)
+
+            _syncronize_if_detailed_timing()
+            t_detailed_3 = time.time()
+            t_detailed_trans.append(t_detailed_3 - t_detailed_2)
+
             # Determine if this is a real or padded batch of data.
             real = mini_step < len(dataloader)
             is_last_real = (mini_step + 1 == len(dataloader))
@@ -475,9 +510,17 @@ class Trainer:
                 scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
 
+            _syncronize_if_detailed_timing()
+            t_detailed_4 = time.time()
+            t_detailed_comps.append(t_detailed_4 - t_detailed_3)
+
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
                 step()
+
+                _syncronize_if_detailed_timing()
+                t_detailed_steps.append(time.time() - t_detailed_4)
+
                 if is_last_real and grda_modl != 0:
                     grda_modl = 0
                 do_log = any(self._due_hooks())
@@ -492,6 +535,8 @@ class Trainer:
                 if do_log:
                     self.monitor.clear()
 
+            t_detailed_1 = time.time()
+
             # Stop if we've reached the maximum number of global steps
             if self.glbl_step >= self.max_steps:
                 self._done = True
@@ -499,6 +544,35 @@ class Trainer:
 
         if mini_step < 0:
             raise RuntimeError(f"[rank {rank()}] empty dataloader.")
+
+        if DETAILED_TIMING_STATISTICS:
+            # Skip the first `gradient_accumulation_steps` mini-steps to allow for warmup.
+            # Then report the detailed timing statistics.
+            # This will not work correctly for edge cases, e.g., distributed training, etc.
+            num_samples = results["num_samples"].item() - (len(batch) * self.args.gradient_accumulation_steps)
+
+            def times_to_stats(times: list[float], skip: int) -> tuple[float, float, float, float, float]:
+                """Convert a list of times to (throughput, min, max, median, average)."""
+                times = times[skip:]
+                return (
+                    float(num_samples / np.sum(times)),
+                    float(np.min(times)),
+                    float(np.max(times)),
+                    float(np.median(times)),
+                    float(np.mean(times)),
+                )
+            t_detailed_preps = np.array(times_to_stats(t_detailed_preps, self.args.gradient_accumulation_steps))
+            t_detailed_trans = np.array(times_to_stats(t_detailed_trans, self.args.gradient_accumulation_steps))
+            t_detailed_comps = np.array(times_to_stats(t_detailed_comps, self.args.gradient_accumulation_steps))
+            t_detailed_steps = np.array(times_to_stats(t_detailed_steps, 1))
+            print(
+                f"[rank {rank()}] Detailed timing statistics for training run ({num_samples=} {mini_step=} glbl_step={self.glbl_step}):\n"
+                f"  phase    throughput minimum maximum median average\n"
+                f"  prepare  {t_detailed_preps[0]:.2f}     {t_detailed_preps[1]:.2f}     {t_detailed_preps[2]:.2f}     {t_detailed_preps[3]:.2f}     {t_detailed_preps[4]:.2f}\n"
+                f"  transfer {t_detailed_trans[0]:.2f}     {t_detailed_trans[1]:.2f}     {t_detailed_trans[2]:.2f}     {t_detailed_trans[3]:.2f}     {t_detailed_trans[4]:.2f}\n"
+                f"  compute  {t_detailed_comps[0]:.2f}     {t_detailed_comps[1]:.2f}     {t_detailed_comps[2]:.2f}     {t_detailed_comps[3]:.2f}     {t_detailed_comps[4]:.2f}\n"
+                f"  optimize {t_detailed_steps[0]:.0f}     {t_detailed_steps[1]:.2f}     {t_detailed_steps[2]:.2f}     {t_detailed_steps[3]:.2f}     {t_detailed_steps[4]:.2f}\n"
+            )
 
         barrier("Trainer::train:after", self.device)
 
@@ -566,6 +640,8 @@ class Trainer:
         for k in results:
             report[k] = results[k].item() / num_samples
         report["vl_time"] = time.time() - t_0
+        report["vl_samples"] = num_samples
+        report["vl_throughput"] = num_samples / report["vl_time"]
 
         if was_training:
             self.model.train()
@@ -803,12 +879,16 @@ class Trainer:
             d["tr_gpu_utl"] = round(results["tr_gpu_utl"], 2)
             d["tr_gpu_mem"] = round(results["tr_gpu_mem"] / (1024 ** 3), 2)
             d["tr_time"] = round(results["tr_time"], 0)
+            d["tr_samples"] = int(results["tr_samples"])
+            d["tr_throughput"] = round(results["tr_throughput"], 2)
         if any(k.startswith("vl_") for k in results):
             d["vl_loss"] = round(results["vl_loss"], 3)
             d["vl_acc"] = round(results["vl_acc"], 3)
             d["vl_gpu_utl"] = round(results["vl_gpu_utl"], 2)
             d["vl_gpu_mem"] = round(results["vl_gpu_mem"] / (1024 ** 3), 2)
             d["vl_time"] = round(results["vl_time"], 0)
+            d["vl_samples"] = int(results["vl_samples"])
+            d["vl_throughput"] = round(results["vl_throughput"], 2)
         print(d)
 
     def to_checkpoint(self, path: str | Path) -> None:
@@ -1016,6 +1096,15 @@ class Monitor:
         "d_to_h",
     )
 
+    SUMMARY: dict[str, Callable[[np.ndarray | list[float]], np.float32]] = {  # type: ignore[type-arg]
+        "cpu_utl": np.mean,
+        "cpu_mem": np.max,
+        "gpu_utl": np.mean,
+        "gpu_mem": np.max,
+        "h_to_d": np.mean,
+        "d_to_h": np.mean,
+    }
+
     def __init__(self, *, device: Optional[torch.device] = None, dindex: Optional[int] = None, interval_s: float = 0.1) -> None:
         if bool(device is None) == bool(dindex is None):
             raise ValueError("Exactly one of `device` or `dindex` must be specified.")
@@ -1057,7 +1146,10 @@ class Monitor:
         return self
 
     def get_report(self, clear: bool = False) -> dict[str, float]:
-        d = {k: float(np.mean(v)) if len(v) > 0 else float("nan") for k, v in self._samples.items()}
+        """
+        Return a summary statistic for each collected metric.
+        """
+        d = {k: float(self.SUMMARY[k](v)) if len(v) > 0 else float("nan") for k, v in self._samples.items()}
         if clear:
             self.clear()
         return d
