@@ -44,6 +44,7 @@ from torch.distributed.checkpoint.state_dict import get_state_dict
 from torch.distributed.checkpoint.state_dict import set_state_dict
 from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.distributed.tensor import DTensor
+from torch import nn
 from torch.nn import Module
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
@@ -66,6 +67,15 @@ if DETAILED_TIMING_STATISTICS:
 def _syncronize_if_detailed_timing() -> None:
     if DETAILED_TIMING_STATISTICS:
         torch.cuda.synchronize()
+
+
+def debug_autocast_dtypes(model: nn.Module) -> None:
+    def hook(mod, inp, out):  # type: ignore[no-untyped-def]
+        if isinstance(out, torch.Tensor):
+            print(f"{mod.__class__.__name__}: in={inp[0].dtype}, out={out.dtype}")
+    for m in model.modules():
+        if isinstance(m, (nn.Conv1d, nn.Linear)):
+            m.register_forward_hook(hook)
 
 
 class Batch(Protocol):
@@ -561,10 +571,10 @@ class Trainer:
                     float(np.median(times)),
                     float(np.mean(times)),
                 )
-            t_detailed_preps = np.array(times_to_stats(t_detailed_preps, self.args.gradient_accumulation_steps))
-            t_detailed_trans = np.array(times_to_stats(t_detailed_trans, self.args.gradient_accumulation_steps))
-            t_detailed_comps = np.array(times_to_stats(t_detailed_comps, self.args.gradient_accumulation_steps))
-            t_detailed_steps = np.array(times_to_stats(t_detailed_steps, 1))
+            t_detailed_preps = list(times_to_stats(t_detailed_preps, self.args.gradient_accumulation_steps))
+            t_detailed_trans = list(times_to_stats(t_detailed_trans, self.args.gradient_accumulation_steps))
+            t_detailed_comps = list(times_to_stats(t_detailed_comps, self.args.gradient_accumulation_steps))
+            t_detailed_steps = list(times_to_stats(t_detailed_steps, 1))
             print(
                 f"[rank {rank()}] Detailed timing statistics for training run ({num_samples=} {mini_step=} glbl_step={self.glbl_step}):\n"
                 f"  phase    throughput minimum maximum median average\n"
