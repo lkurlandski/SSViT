@@ -310,7 +310,7 @@ def main() -> None:
     parser = ArgumentParser()
     args = parser.parse_args()
 
-    outpath = Path("./run/sbatch")
+    outpath = Path("./run")
     outpath.mkdir(exist_ok=True)
     for f in outpath.iterdir():
         if f.is_file():
