@@ -109,14 +109,17 @@ class _SemanticGuideOrSemanticGuides(ABC):
         self.parse = parse
         self.entropy = entropy
         self.characteristics = characteristics
+        self._allguides: Optional[Tensor] = None
 
     @property
     @abstractmethod
     def length_axis(self) -> int:
+        """The axis corresponding to the length of the byte stream."""
         ...
 
     @property
     def is_bitpacked(self) -> bool:
+        """Return True if all boolean tensors are bitpacked, False if none are, else raise."""
         is_bitpacked = [t.dtype == torch.uint8 for t in (self.parse, self.characteristics) if t is not None]
         if all(is_bitpacked):
             return True
@@ -125,6 +128,7 @@ class _SemanticGuideOrSemanticGuides(ABC):
         raise RuntimeError(f"Unexpected tensor dtype state: {is_bitpacked=}")
 
     def is_contiguous(self) -> bool:
+        """Return True if all tensors are contiguous, False if none are, else raise."""
         is_contiguous = [t.is_contiguous() for t in (self.parse, self.entropy, self.characteristics) if t is not None]
         if all(is_contiguous):
             return True
@@ -134,6 +138,7 @@ class _SemanticGuideOrSemanticGuides(ABC):
 
     @property
     def is_cuda(self) -> Optional[bool]:
+        """Return True if all tensors are on CUDA, False if all are on CPU, None if no tensors are present, else raise."""
         is_cuda = [t.is_cuda for t in (self.parse, self.entropy, self.characteristics) if t is not None]
         if len(is_cuda) == 0:
             return None
@@ -144,6 +149,7 @@ class _SemanticGuideOrSemanticGuides(ABC):
         raise RuntimeError(f"Unexpected tensor device state: {is_cuda=}")
 
     def contiguous(self) -> Self:
+        """Return a new instance with all tensors made contiguous."""
         parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
         if parse is not None:
             parse = parse.contiguous()
@@ -154,6 +160,7 @@ class _SemanticGuideOrSemanticGuides(ABC):
         return self.__class__(parse, entropy, characteristics)
 
     def detach(self) -> Self:
+        """Return a new instance with all tensors detached from the computation graph."""
         parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
         if parse is not None:
             parse = parse.detach()
@@ -164,6 +171,7 @@ class _SemanticGuideOrSemanticGuides(ABC):
         return self.__class__(parse, entropy, characteristics)
 
     def record_stream(self, s: torch.cuda.Stream) -> None:
+        """Record the given stream for all tensors."""
         if self.parse is not None:
             self.parse.record_stream(s)
         if self.entropy is not None:
@@ -172,6 +180,7 @@ class _SemanticGuideOrSemanticGuides(ABC):
             self.characteristics.record_stream(s)
 
     def clone(self) -> Self:
+        """Return a new, deeply copied instance."""
         parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
         if parse is not None:
             parse = parse.clone()
@@ -181,21 +190,23 @@ class _SemanticGuideOrSemanticGuides(ABC):
             characteristics = characteristics.clone()
         return self.__class__(parse, entropy, characteristics)
 
-    def to(self, device: Optional[torch.device], dtype: Optional[torch.dtype] = None, non_blocking: bool = False) -> Self:
+    def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None, non_blocking: bool = False) -> Self:
+        """Move to the given device and/or dtype."""
         parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
         if parse is not None:
             if self.is_bitpacked and dtype is not None:
-                warnings.warn("Converting bitpacked tensor's dtype.")
+                raise RuntimeError("Converting bitpacked tensor's dtype.")
             parse = parse.to(device, dtype, non_blocking=non_blocking)
         if entropy is not None:
             entropy = entropy.to(device, dtype, non_blocking=non_blocking)
         if characteristics is not None:
             if self.is_bitpacked and dtype is not None:
-                warnings.warn("Converting bitpacked tensor's dtype.")
+                raise RuntimeError("Converting bitpacked tensor's dtype.")
             characteristics = characteristics.to(device, dtype, non_blocking=non_blocking)
         return self.__class__(parse, entropy, characteristics)
 
     def pin_memory(self) -> Self:
+        """Pin memory for faster transfer to CUDA."""
         parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
         if parse is not None:
             if parse.is_cuda:
@@ -212,30 +223,27 @@ class _SemanticGuideOrSemanticGuides(ABC):
         return self.__class__(parse, entropy, characteristics)
 
     def compress(self) -> Self:
+        """Bitpack boolean tensors to uint8."""
         parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
         if parse is not None and parse.dtype == torch.bool:
             parse = packbits(parse, axis=self.length_axis)
-        if entropy is not None and entropy.dtype != torch.float16:
-            entropy = entropy.to(torch.float16)
         if characteristics is not None and characteristics.dtype == torch.bool:
             characteristics = packbits(characteristics, axis=self.length_axis)
         return self.__class__(parse, entropy, characteristics)
 
     def decompress(self) -> Self:
+        """Unpack uint8 tensors to boolean."""
         parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
         if parse is not None:
             if parse.dtype == torch.uint8:
                 parse = unpackbits(parse, axis=self.length_axis)
-            parse = parse.to(torch.float32)
-        if entropy is not None and entropy.dtype != torch.float32:
-            entropy = entropy.to(torch.float32)
         if characteristics is not None:
             if characteristics.dtype == torch.uint8:
                 characteristics = unpackbits(characteristics, axis=self.length_axis)
-            characteristics = characteristics.to(torch.float32)
         return self.__class__(parse, entropy, characteristics)
 
     def trim(self, length: Optional[int]) -> Self:
+        """Return a copy excluding regions outside of length."""
         parse, entropy, characteristics = self.parse, self.entropy, self.characteristics
 
         if length is None:
@@ -263,9 +271,7 @@ class _SemanticGuideOrSemanticGuides(ABC):
 
     def select(self, *, mask: Optional[Tensor] = None, idx: Optional[Tensor] = None, ranges: Optional[list[tuple[int, int]]] = None) -> Self:
         """
-        Select a subset of the data along the length axis.
-
-        NOTE: if data is bitpacked, the selectors are assumed to correspond to the unpacked data.
+        Select a subset of the data along the length axis using selectors that correspond to the full length.
         """
         if mask is not None:
             check_tensor(mask, (None,), torch.bool)
@@ -312,8 +318,8 @@ class _SemanticGuideOrSemanticGuides(ABC):
 
         return self.__class__(parse, entropy, characteristics)
 
-    def build_allguides(self) -> Optional[Tensor]:
-        # FIXME: this entails some massive copies, so we're going to have to optimize this later.
+    def _build_allguides(self) -> Optional[Tensor]:
+        """Concatenate all available guides along the guides axis."""
 
         avail = [t is not None for t in (self.parse, self.entropy, self.characteristics)]
 
@@ -343,6 +349,15 @@ class _SemanticGuideOrSemanticGuides(ABC):
                 print(g.shape, g.dtype, g.device)
             raise
         return allguides
+
+    def build_allguides(self) -> None:
+        """Build and cache allguides."""
+        self._allguides = self._build_allguides()
+
+    @property
+    def allguides(self) -> Optional[Tensor]:
+        """Concatenate all available guides along the guides axis, caching the result."""
+        return self._allguides
 
 
 class SemanticGuide(_SemanticGuideOrSemanticGuides):
@@ -663,7 +678,7 @@ class _FSampleOrSamples(Generic[F, N, G, S], ABC):
 
     @property
     def allguides(self) -> Optional[Tensor]:
-        return self.guides.build_allguides()
+        return self.guides.allguides
 
     @abstractmethod
     def __len__(self) -> int:
@@ -727,8 +742,8 @@ class _FSampleOrSamples(Generic[F, N, G, S], ABC):
     def compress(self) -> Self:
         file = deepcopy(self.file)
         name = deepcopy(self.name)
-        label = self.label.to(torch.int16)
-        inputs = self.inputs.to(torch.int16)
+        label = self.label
+        inputs = self.inputs
         guides = self.guides.compress()
         structure = self.structure.clone()
         return self.__class__(file, name, label, inputs, guides, structure)
@@ -736,18 +751,21 @@ class _FSampleOrSamples(Generic[F, N, G, S], ABC):
     def decompress(self) -> Self:
         file = deepcopy(self.file)
         name = deepcopy(self.name)
-        label = self.label.to(torch.int64)
-        inputs = self.inputs.to(torch.int32)
+        label = self.label
+        inputs = self.inputs
         guides = self.guides.decompress()
         structure = self.structure.clone()
         return self.__class__(file, name, label, inputs, guides, structure)
 
-    def finalize(self, device: torch.device, ftype: torch.dtype) -> Self:
-        new: Self = self
-        new = new.to(device, non_blocking=True)
-        new = new.decompress()
-        new.guides = new.guides.to(None, ftype)
-        return new
+    def finalize(self, ftype: torch.dtype, itype: torch.dtype, ltype: torch.dtype) -> Self:
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.to(ltype)
+        inputs = self.inputs.to(itype)
+        guides = self.guides.decompress().to(dtype=ftype)
+        guides.build_allguides()
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
 
 
 class FSample(_FSampleOrSamples[StrPath, Name, SemanticGuide, StructureMap]):
@@ -822,7 +840,7 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
 
     @property
     def allguides(self) -> list[Optional[Tensor]]:
-        return [g.build_allguides() for g in self.guides]
+        return [g.allguides for g in self.guides]
 
     @abstractmethod
     def __len__(self) -> int:
@@ -916,11 +934,11 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
     def compress(self) -> Self:
         file = deepcopy(self.file)
         name = deepcopy(self.name)
-        label = self.label.to(torch.int16)
+        label = self.label
         inputs = []
         guides = []
         for i in range(self.num_structures):
-            inputs.append(self.inputs[i].to(torch.int16))
+            inputs.append(self.inputs[i])
             guides.append(self.guides[i].compress())
         structure = self.structure.clone()
         return self.__class__(file, name, label, inputs, guides, structure)
@@ -928,21 +946,29 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
     def decompress(self) -> Self:
         file = deepcopy(self.file)
         name = deepcopy(self.name)
-        label = self.label.to(torch.int64)
+        label = self.label
         inputs = []
         guides = []
         for i in range(self.num_structures):
-            inputs.append(self.inputs[i].to(torch.int32))
+            inputs.append(self.inputs[i])
             guides.append(self.guides[i].decompress())
         structure = self.structure.clone()
         return self.__class__(file, name, label, inputs, guides, structure)
 
-    def finalize(self, device: torch.device, ftype: torch.dtype) -> Self:
-        new: Self = self
-        new = new.to(device, non_blocking=True)
-        new = new.decompress()
-        new.guides = [g.to(None, ftype) for g in new.guides]
-        return new
+    def finalize(self, ftype: torch.dtype, itype: torch.dtype, ltype: torch.dtype) -> Self:
+        """Finalize the datatypes of the batch."""
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.to(ltype)
+        inputs = []
+        guides = []
+        for i in range(self.num_structures):
+            inputs.append(self.inputs[i].to(itype))
+            guides.append(self.guides[i].decompress().to(dtype=ftype))
+        for g in guides:
+            g.build_allguides()
+        structure = self.structure.clone()
+        return self.__class__(file, name, label, inputs, guides, structure)
 
 
 class HSample(_HSampleOrSamples[StrPath, Name, SemanticGuide, StructureMap]):
@@ -1161,10 +1187,18 @@ class Preprocessor:
 
 class CollateFn:
 
-    def __init__(self, pin_memory: bool, bitpack: bool, min_length: int = 0) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, min_length: int = 0, change_dtype_after_pad: bool = True) -> None:
+        """
+        Args:
+            pin_memory: whether to pin memory of the collated tensors (recommended to use DataLoader(pin_memory=True) instead).
+            bitpack: whether to bitpack the semantic guides if not already bitpacked.
+            min_length: minimum length to pad the inputs to (must be a multiple of `8`).
+            change_dtype_after_pad: controls where the dtype conversion from uint8 to int16 and addition of 1 takes place.
+        """
         self.pin_memory = pin_memory
         self.bitpack = bitpack
         self.min_length = min_length
+        self.change_dtype_after_pad = change_dtype_after_pad
         if self.min_length % 8 != 0:
             raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {min_length}.")
 
@@ -1172,10 +1206,9 @@ class CollateFn:
         file = [s.file for s in batch]
         name = [s.name for s in batch]
         label = torch.stack([s.label for s in batch])
-        inputs = CollateFn.get_padded_inputs([s.inputs for s in batch], self.min_length, self.pin_memory, True)
+        inputs = CollateFn.get_padded_inputs([s.inputs for s in batch], self.min_length, self.pin_memory, self.change_dtype_after_pad)
         guides = [s.guides.compress() if self.bitpack else s.guides for s in batch]
-        min_length_ = int(self.min_length / 8) if (self.bitpack or guides[0].is_bitpacked) else self.min_length
-        guides = SemanticGuides.from_singles(guides, self.pin_memory, min_length_)
+        guides = SemanticGuides.from_singles(guides, self.pin_memory, self.min_length // 8 if guides[0].is_bitpacked else self.min_length)
         structure = [s.structure for s in batch]
         structure = StructureMaps.from_singles(structure, self.pin_memory, self.min_length)
         return FSamples(file, name, label, inputs, guides, structure)
@@ -1186,7 +1219,14 @@ class CollateFn:
     @staticmethod
     def get_padded_inputs(inputs: list[Tensor], min_length: int, pin_memory: bool, change_dtype_after_pad: bool = True) -> Tensor:
         """
-        NOTE: some benchmarks indicate that Tensor.to(torch.int16) is a massive bottleneck. change_dtype_after_pad=True might resolve this.
+        Prepares a batch of "byte" inputs as integers by adding 1 to each byte and padding them to the same length.
+
+        Args:
+            inputs: list of 1D tensors of dtype torch.uint8 representing byte inputs.
+            min_length: minimum length to pad the inputs to.
+            pin_memory: whether to pin memory of the resulting tensor.
+            change_dtype_after_pad: if True, padding is done in uint8 and then adding/converting to int16;
+                if False, conversion/addition to int16 is done first, then padding is applied.
         """
         if not change_dtype_after_pad:
             for i in range(len(inputs)):
@@ -1201,9 +1241,6 @@ class CollateFn:
         inputs_ = inputs_.to(torch.int16)
         for i, l in enumerate(lengths):
             inputs_[i, :l].add_(1)
-        # inputs_.add_(1)
-        # for i, l in enumerate(lengths):
-        #     inputs_[i, l:] = 0
 
         # Memory pinning must take place after dtype conversion, hence, we used pin_memory=False above.
         if pin_memory:
@@ -1214,11 +1251,12 @@ class CollateFn:
 
 class CollateFnHierarchical:
 
-    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None, change_dtype_after_pad: bool = True) -> None:
         self.pin_memory = pin_memory
         self.bitpack = bitpack
         self.num_structures = num_structures
         self.min_lengths = [0] * num_structures if min_lengths is None else min_lengths
+        self.change_dtype_after_pad = change_dtype_after_pad
         if any(l % 8 != 0 for l in self.min_lengths):
             raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {self.min_lengths}.")
         if len(self.min_lengths) != self.num_structures:
@@ -1253,7 +1291,7 @@ class CollateFnHierarchical:
                         raise RuntimeError(f"{i=} {j=} {ranges=} {expected=} x_i_j.shape={tuple(x_i_j.shape)} g_i_j.entropy.shape={tuple(g_i_j.entropy.shape)}")
                 xs.append(x_i_j)
                 gs.append(g_i_j.compress() if self.bitpack else g_i_j)
-            xs = CollateFn.get_padded_inputs(xs, self.min_lengths[i], self.pin_memory)
+            xs = CollateFn.get_padded_inputs(xs, self.min_lengths[i], self.pin_memory, self.change_dtype_after_pad)
             gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8))
             inputs.append(xs)
             guides.append(gs)
@@ -1332,7 +1370,7 @@ class CUDAPrefetcher:
             except StopIteration:
                 raise StopIteration
 
-            return cpu_batch.decompress()
+            return cpu_batch
 
         curr = torch.cuda.current_stream(self.device)
 
@@ -1347,7 +1385,7 @@ class CUDAPrefetcher:
                 return t.to(self.device, non_blocking=True)
 
             dev_batch: FOrHSamples = tree_map(_to, cpu_batch)
-            return dev_batch.decompress()
+            return dev_batch
 
         # Prefetched path: pop one batch whose H2D was done on its stream
         if not self._buf:
@@ -1369,7 +1407,7 @@ class CUDAPrefetcher:
         # Keep the pipeline full
         self._preload(1)
 
-        return dev_batch.decompress()
+        return dev_batch
 
     def __len__(self) -> int:
         return len(self.loader)
@@ -1437,7 +1475,7 @@ class StreamlessCUDAPrefetcher:
         except StopIteration:
             raise StopIteration
 
-        return cpu_batch.to(self.device).decompress()
+        return cpu_batch.to(self.device)
 
     def __len__(self) -> int:
         return len(self.loader)
