@@ -1069,8 +1069,8 @@ class IterableSimpleDBDataset(IterableDataset[FSample]):
             return self.shards
         if len(self.shards) < worker_info.num_workers:
             raise ValueError(f"Number of shards ({len(self.shards)}) is less than number of workers ({worker_info.num_workers}).")
-        per_worker = math.ceil(len(self.shards) / worker_info.num_workers)
-        return list(list(batched(self.shards, per_worker))[worker_info.id])
+        batches = np.array_split(list(self.shards), worker_info.num_workers)
+        return batches[worker_info.id].tolist()
 
     def _get_local_seed(self) -> int:
         if (worker_info := get_worker_info()) is None:
