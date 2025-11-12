@@ -289,7 +289,8 @@ def worker_init_fn(worker_id: int) -> None:
         raise RuntimeError("worker_init_fn called outside of worker process.")
     lief.logging.set_level(lief.logging.LEVEL.OFF)
     org_num_threads = torch.get_num_threads()
-    new_num_threads = get_optimal_num_worker_threads(info.num_workers, ngpu=local_world_size())
+    if (new_num_threads := int(os.environ.get("PTW_NUM_THREADS", "-1"))) < 1:
+        new_num_threads = get_optimal_num_worker_threads(info.num_workers, ngpu=local_world_size())
     torch.set_num_threads(new_num_threads)
     print(f"Worker {worker_id} of {info.num_workers} using {org_num_threads} --> {torch.get_num_threads()} threads.")
 
@@ -437,8 +438,8 @@ def main() -> None:
     root = Path("./data")
     print(f"{root=}")
 
-    tr_datadb = SimpleDB(root / "data" / "tr")
-    ts_datadb = SimpleDB(root / "data" / "ts")
+    tr_datadb = SimpleDB(root / "data" / "tr", check=True)
+    ts_datadb = SimpleDB(root / "data" / "ts", check=True)
     print(f"{tr_datadb=}")
     print(f"{ts_datadb=}")
 
