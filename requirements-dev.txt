@@ -1,11 +1,7 @@
 isort
 mypy
-pandas
 pyinstrument
-pylint
 pytest
 pytest-xdist
 ruff
-scalene
-scipy
 types-tqdm
