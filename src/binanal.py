@@ -356,6 +356,38 @@ class CharacteristicGuider:
 
         return offsets
 
+    @staticmethod
+    def _get_bool_mask_(
+        size: int,
+        offsets: npt.ArrayLike,
+        sizes: npt.ArrayLike,
+        flags: npt.ArrayLike,
+        mask: Optional[npt.NDArray[np.bool_]] = None,
+    ) -> npt.NDArray[np.bool_]:
+        offsets = np.array(offsets)
+        sizes = np.array(sizes)
+        flags = np.array(flags)
+        if not np.issubdtype(offsets.dtype, np.integer) or not offsets.ndim == 1:
+            raise TypeError(f"Expected 1D integer dtype for offsets, got {offsets.dtype} and {offsets.shape}.")
+        if not np.issubdtype(sizes.dtype, np.integer) or not sizes.ndim == 1:
+            raise TypeError(f"Expected 1D integer dtype for sizes, got {sizes.dtype} and {sizes.shape}.")
+        if not (np.issubdtype(flags.dtype, np.integer) or np.issubdtype(flags.dtype, np.bool_)) or not flags.ndim == 2:
+            raise TypeError(f"Expected 2D integer/bool dtype for flags, got {flags.dtype} and {flags.shape}.")
+        offsets = offsets.astype(np.int64, copy=False)
+        sizes = sizes.astype(np.int64, copy=False)
+        flags = flags.astype(np.uint8, copy=False)
+
+        if mask is None:
+            mask = np.full((size, flags.shape[1]), False, dtype=bool)
+
+        for i in range(offsets.shape[0]):
+            o = offsets[i]
+            s = sizes[i]
+            j = flags[i]
+            mask[o:s,j] = 1.0
+
+        return mask
+
     def _get_bool_mask(self) -> npt.NDArray[np.bool_]:
         # NOTE: allocating the (T, C) array is quite expensive.
         x = np.full((self.size, len(self.which_characteristics)), False, dtype=bool)
