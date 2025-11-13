@@ -283,7 +283,7 @@ class _SemanticGuideOrSemanticGuides(ABC):
             if self.parse is not None:
                 return self.parse
             if self.entropy is not None:
-                return self.entropy
+                return self.entropy.unsqueeze(-1)
             if self.characteristics is not None:
                 return self.characteristics
             raise RuntimeError()
