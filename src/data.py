@@ -72,7 +72,7 @@ from src.utils import pad_sequence
 StrPath = str | os.PathLike[str]
 
 
-PAD_TO_MULTIPLE_OF = 8
+PAD_TO_MULTIPLE_OF = 64
 if PAD_TO_MULTIPLE_OF % 8 != 0:
     raise ValueError("PAD_TO_MULTIPLE_OF must be a multiple of 8.")
 
