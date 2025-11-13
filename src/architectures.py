@@ -606,7 +606,7 @@ class MalConvLowMem(MalConvBase):
             return max_vals
 
         # Training: recompute only the winners to let grads flow upstream
-        wins_cat, meta = _gather_wins_via_preprocess(
+        wins_cat, meta = _gather_wins_via_preprocess_batched(
             preprocess=preprocess,
             ts=ts,
             positions=pos,
@@ -903,6 +903,62 @@ def _gather_wins_via_preprocess(
     else:
         wins_cat = torch.empty((0, embedding_dim, rf), device=ts[0].device, dtype=torch.get_default_dtype(),)
 
+    return wins_cat, meta
+
+
+def _gather_wins_via_preprocess_batched(
+    *,
+    preprocess: PreprocessFn,
+    ts: Sequence[Tensor],               # (B, T, *)
+    positions: torch.Tensor,            # (B, C)
+    rf: int,
+    embedding_dim: int,
+) -> tuple[torch.Tensor, list[tuple[int, torch.Tensor, int]]]:
+    B, T = ts[0].shape[:2]
+    device = ts[0].device
+
+    posuniq_list, inv_list, u_counts = [], [], []
+    for b in range(B):
+        pos_b = positions[b]
+        posuniq_b, inv_b = torch.unique(pos_b, sorted=True, return_inverse=True)
+        posuniq_list.append(posuniq_b)
+        inv_list.append(inv_b)
+        u_counts.append(int(posuniq_b.numel()))
+
+    sum_U = int(sum(u_counts))
+    if sum_U == 0:
+        wins_empty = ts[0].new_empty((0, rf) + tuple(ts[0].shape[2:]))
+        z = preprocess(*([wins_empty] * len(ts)))            # (0, rf, E)
+        return z.transpose(1, 2).contiguous(), [(0, torch.empty(0, device=device, dtype=torch.long), 0) for _ in range(B)]
+
+    arange_rf = torch.arange(rf, device=device, dtype=torch.int32)
+    batch_ix_chunks, time_ix_chunks = [], []
+    offset = 0
+    meta: list[tuple[int, torch.Tensor, int]] = []
+
+    for b, posuniq_b in enumerate(posuniq_list):
+        U_b = int(posuniq_b.numel())
+        time_ix_b  = (posuniq_b.to(torch.int32).unsqueeze(1) + arange_rf.unsqueeze(0))  # (U_b, rf)
+        batch_ix_b = torch.full_like(time_ix_b, b, dtype=torch.int32)                    # (U_b, rf)
+        time_ix_chunks.append(time_ix_b)
+        batch_ix_chunks.append(batch_ix_b)
+        # NOTE: meta matches your original scatter: (start, inv, u_b)
+        meta.append((offset, inv_list[b].to(torch.long), U_b))
+        offset += U_b
+
+    batch_ix = torch.cat(batch_ix_chunks, dim=0).long()  # (ΣU, rf)
+    time_ix  = torch.cat(time_ix_chunks,  dim=0).long()  # (ΣU, rf)
+
+    wins: list[Tensor] = []
+    for t in ts:
+        wins.append(t[batch_ix, time_ix, ...].contiguous())  # (ΣU, rf, *)
+
+    # No inner autocast needed if your outer loop already set it
+    z = preprocess(*wins)                                     # (ΣU, rf, E)
+    if z.shape[-1] != embedding_dim:
+        raise RuntimeError(f"preprocess returned wrong E: {z.shape[-1]} vs {embedding_dim}")
+
+    wins_cat = z.transpose(1, 2).contiguous()                 # (ΣU, E, rf)
     return wins_cat, meta
 
 
