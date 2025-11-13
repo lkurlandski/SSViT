@@ -490,7 +490,7 @@ class MalConvBase(nn.Module, ABC):
         channels: int = 128,
         kernel_size: int = 512,
         stride: int = 512,
-        chunk_size: int = 64_000,
+        chunk_size: int = 2 ** 16,
         overlap: Optional[int] = None,
     ) -> None:
         super().__init__()
@@ -577,16 +577,13 @@ class MalConvLowMem(MalConvBase):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
-        self.conv_1 = nn.Conv1d(self.embedding_dim, self.channels, self.kernel_size, self.stride)
-        self.conv_2 = nn.Conv1d(self.embedding_dim, self.channels, self.kernel_size, self.stride)
+        self.conv = nn.Conv1d(self.embedding_dim, 2 * self.channels, self.kernel_size, self.stride)
         self.sigmoid = nn.Sigmoid()
         self.pool = nn.AdaptiveMaxPool1d(1)
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
         z = z.transpose(1, 2)        # (B, E, T)
-        c_1 = self.conv_1(z)         # (B, C, S - 1)
-        c_2 = self.conv_2(z)         # (B, C, S - 1)
-        g = c_1 * self.sigmoid(c_2)  # (B, C, S - 1)
+        g = self._activations(z)     # (B, C, S - 1)
         z = self.pool(g)             # (B, C, 1)
         z = z.squeeze(-1)            # (B, C)
         return z
@@ -626,8 +623,9 @@ class MalConvLowMem(MalConvBase):
         return z
 
     def _activations(self, z: torch.Tensor) -> torch.Tensor:
-        c1 = self.conv_1(z)
-        c2 = self.conv_2(z)
+        # Uses a fused convolution instead of two convs.
+        c = self.conv(z)                        # (B, 2C, S - 1)
+        c1, c2 = c.split(self.channels, dim=1)  # (B, C, S - 1), (B, C, S - 1)
         return c1 * self.sigmoid(c2)
 
 
@@ -827,7 +825,7 @@ def _lowmem_max_over_time_streaming(
     return max_vals, max_pos
 
 
-def _recompute_winners(preprocess: PreprocessFn, ts: Sequence[Tensor], b: int, pos: Tensor, rf: int) -> Tensor:
+def _recompute_winners(preprocess: PreprocessFn, ts: Sequence[Tensor], b: int, pos: Tensor, rf: int, rng: Optional[Tensor] = None) -> Tensor:
 
     if not isinstance(ts, Sequence):
         raise TypeError(f"`ts` must be a sequence of tensors. Got {type(ts)} instead.")
@@ -835,6 +833,8 @@ def _recompute_winners(preprocess: PreprocessFn, ts: Sequence[Tensor], b: int, p
         raise TypeError(f"All elements of `ts` must be tensors. Got {[type(t) for t in ts]} instead.")
     if not all(t.dim() >= 2 for t in ts):
         raise ValueError(f"All tensors in `ts` must have at least 2 dimensions. Got {[t.dim() for t in ts]} instead.")
+
+    rng = torch.arange(rf, device=pos.device) if rng is None else rng
 
     # Handle degenerate case of no winners cleanly.
     if pos.numel() == 0:
@@ -854,7 +854,6 @@ def _recompute_winners(preprocess: PreprocessFn, ts: Sequence[Tensor], b: int, p
         t_b = t[b]  # (T, *)
 
         # Build (U, rf) start indices: pos + [0..rf-1]
-        rng = torch.arange(rf, device=pos.device)
         idx = pos.to(t_b.device).unsqueeze(1) + rng.unsqueeze(0)  # (U, rf)
 
         # Advanced indexing along the first dim yields (U, rf, *) for any tail
@@ -886,10 +885,12 @@ def _gather_wins_via_preprocess(
     meta: list[tuple[int, torch.Tensor, int]] = []
     offset = 0
 
+    rng = torch.arange(rf, device=ts[0].device)
+
     for b in range(B):
         pos_b = positions[b]  # (C,)
         posuniq, inv = torch.unique(pos_b, sorted=True, return_inverse=True)  # (U_b,), (C,)
-        z_b = _recompute_winners(preprocess, ts, b, posuniq, rf)  # (U_b, rf, E)
+        z_b = _recompute_winners(preprocess, ts, b, posuniq, rf, rng)  # (U_b, rf, E)
         if z_b.shape[2] != embedding_dim:
             raise RuntimeError(f"preprocess returned wrong E: {z_b.shape[2]} vs {embedding_dim}")
         z_b = z_b.transpose(1, 2).contiguous()  # (U_b, E, rf)
