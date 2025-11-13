@@ -94,11 +94,24 @@ class Batch(Protocol):
     thus does not free GPU memory as expected. Therefore, we wind up with extra batches on
     the GPU. CUDA, being asynchronous, does not free the memory from the previous Batch until
     the next-next batch. So we wind up with three batches on the GPU at once instead of just one.
+
+    The proper pattern for effectively using this batch interface is as follows:
+        - Initialize low-precision tensors on the CPU
+        - Transfer them over the the GPU with Batch.to(device, non_blocking=True)
+        - Cast them to the desired dtypes with Batch.finalize(ftype, itype, ltype)
+        - Access the tensors with Batch.get_label(), Batch.get_inputs(), and Batch.get_guides()
+           This stage should NOT involve any copies or computations (to keep profiling sane).
     """
 
     def __len__(self) -> int:
         """
         Return the number of samples in the batch.
+        """
+        ...
+
+    def clone(self) -> Self:
+        """
+        Return a deep copy of the batch.
         """
         ...
 
@@ -114,22 +127,22 @@ class Batch(Protocol):
         """
         ...
 
-    def clone(self) -> Self:
+    def get_label(self) -> Tensor:
         """
-        Return a deep copy of the batch.
+        Access the labels tensor, which should have been finalized in `finalize` (no copy/compute).
         """
         ...
 
-    @property
-    def label(self) -> Tensor:
+    def get_inputs(self) -> Tensor | Sequence[Tensor]:
+        """
+        Access the inputs tensor(s), which should have been finalized in `finalize` (no copy/compute).
+        """
         ...
 
-    @property
-    def inputs(self) -> Any:
-        ...
-
-    @property
-    def allguides(self) -> Any:
+    def get_guides(self) -> Optional[Tensor] | Sequence[Optional[Tensor]]:
+        """
+        Access the guides tensor(s), which should have been finalized in `finalize` (no copy/compute).
+        """
         ...
 
 
@@ -634,7 +647,7 @@ class Trainer:
                 if real:
                     results["num_samples"] += len(batch)
                     results["vl_loss"] += loss * len(batch)
-                    alllabels.append(batch.label)
+                    alllabels.append(batch.get_label())
                     alllogits.append(outputs)
 
         if mini_step < 0:
@@ -755,14 +768,14 @@ class Trainer:
         Send a batch of inputs forward through the model.
         """
         with torch.autocast(self.device.type, dtype=self.mp_dtype, enabled=self.args.mp16):
-            return self.model(batch.inputs, batch.allguides)  # type: ignore[no-any-return]
+            return self.model(batch.get_inputs(), batch.get_guides())  # type: ignore[no-any-return]
 
     def compute_loss(self, batch: Batch, outputs: Tensor) -> Tensor:
         """
         Compute the loss over a batch of examples.
         """
         with torch.autocast(self.device.type, dtype=self.mp_dtype, enabled=self.args.mp16):
-            return self.loss_fn(outputs, batch.label)  # type: ignore[no-any-return]
+            return self.loss_fn(outputs, batch.get_label())  # type: ignore[no-any-return]
 
     def reduce_results(self, results: dict[str, Tensor], check: bool = True) -> dict[str, Tensor]:
         """

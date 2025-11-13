@@ -68,6 +68,7 @@ from src.binanal import HierarchicalStructure
 from src.binanal import CharacteristicGuider
 from src.data import SemanticGuides
 from src.data import StructureMaps
+from src.data import Inputs
 from src.data import IterableSimpleDBDataset
 from src.data import CollateFn
 from src.data import CollateFnHierarchical
@@ -349,8 +350,10 @@ def get_padbatch(level: HierarchicalLevel, do_parse: bool,do_entropy: bool, whic
     name = [Name("0" * 64)] * batch_size
     label = torch.zeros(batch_size, dtype=torch.int64)
 
-    def get_inputs(length: int) -> torch.Tensor:
-        return torch.zeros((batch_size, length), dtype=torch.int32)
+    def get_inputs(length: int) -> Inputs:
+        inputsids = torch.zeros((batch_size, length), dtype=torch.int32)
+        lengths = torch.tensor([length] * batch_size, dtype=torch.int32)
+        return Inputs(inputsids, lengths)
 
     def get_guides(length: int) -> SemanticGuides:
         parse = torch.zeros((batch_size, length), dtype=torch.bool) if do_parse else None

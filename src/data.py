@@ -269,55 +269,6 @@ class _SemanticGuideOrSemanticGuides(ABC):
 
         return self.__class__(parse, entropy, characteristics)
 
-    def select(self, *, mask: Optional[Tensor] = None, idx: Optional[Tensor] = None, ranges: Optional[list[tuple[int, int]]] = None) -> Self:
-        """
-        Select a subset of the data along the length axis using selectors that correspond to the full length.
-        """
-        if mask is not None:
-            check_tensor(mask, (None,), torch.bool)
-        if idx is not None:
-            check_tensor(idx, (None,), (torch.int32, torch.int64))
-
-        def slice_normal_optional_tensor(t: Optional[Tensor]) -> Optional[Tensor]:
-            if t is None:
-                return None
-            if mask is not None:
-                return t[mask]
-            if idx is not None:
-                return t[idx]
-            if ranges is not None:
-                if len(ranges) > 0:
-                    return torch.cat([t[lo:hi] for lo, hi in ranges], dim=self.length_axis)
-                return t.new_empty(t.shape[: self.length_axis] + (0,) + t.shape[self.length_axis + 1 :])
-            raise RuntimeError("unreachable")
-
-        def slice_bitpacked_optional_tensor(t: Optional[Tensor]) -> Optional[Tensor]:
-            if t is None:
-                return None
-            return slice_bitpacked_tensor(t, mask=mask, idx=idx, ranges=ranges, bigchunks=True, axis=self.length_axis)
-
-
-        selectors = [mask is not None, idx is not None, ranges is not None]
-        if sum(selectors) != 1:
-            raise ValueError("exactly one of mask, idx, or ranges must be provided")
-
-        entropy = slice_normal_optional_tensor(self.entropy)
-
-        if not self.is_bitpacked:
-            parse = slice_normal_optional_tensor(self.parse)
-            characteristics = slice_normal_optional_tensor(self.characteristics)
-            return self.__class__(parse, entropy, characteristics)
-
-        # The bitpacked data may be padded to a multiple of 8, so we may need to pad the mask.
-        # Entropy has already been sliced above, so we need not worry about a length mismatch.
-        if mask is not None and len(mask) % 8 != 0:
-            mask = torch.nn.functional.pad(mask, (0, 8 - (mask.size(0) % 8)), "constant", False)
-
-        parse = slice_bitpacked_optional_tensor(self.parse)
-        characteristics = slice_bitpacked_optional_tensor(self.characteristics)
-
-        return self.__class__(parse, entropy, characteristics)
-
     def _build_allguides(self) -> Optional[Tensor]:
         """Concatenate all available guides along the guides axis."""
 
@@ -365,6 +316,54 @@ class SemanticGuide(_SemanticGuideOrSemanticGuides):
     @property
     def length_axis(self) -> int:
         return 0
+
+    def select(self, *, mask: Optional[Tensor] = None, idx: Optional[Tensor] = None, ranges: Optional[list[tuple[int, int]]] = None) -> Self:
+        """
+        Select a subset of the data along the length axis using selectors that correspond to the full length.
+        """
+
+        if mask is not None:
+            check_tensor(mask, (None,), torch.bool)
+        if idx is not None:
+            check_tensor(idx, (None,), (torch.int32, torch.int64))
+        if sum([mask is not None, idx is not None, ranges is not None]) != 1:
+            raise ValueError("exactly one of mask, idx, or ranges must be provided")
+
+        def slice_normal_optional_tensor(t: Optional[Tensor]) -> Optional[Tensor]:
+            if t is None:
+                return None
+            if mask is not None:
+                return t[mask]
+            if idx is not None:
+                return t[idx]
+            if ranges is not None:
+                if len(ranges) > 0:
+                    return torch.cat([t[lo:hi] for lo, hi in ranges], dim=self.length_axis)
+                return t.new_empty(t.shape[: self.length_axis] + (0,) + t.shape[self.length_axis + 1 :])
+            raise RuntimeError("unreachable")
+
+        def slice_bitpacked_optional_tensor(t: Optional[Tensor]) -> Optional[Tensor]:
+            if t is None:
+                return None
+            return slice_bitpacked_tensor(t, mask=mask, idx=idx, ranges=ranges, bigchunks=True, axis=self.length_axis)
+
+
+        entropy = slice_normal_optional_tensor(self.entropy)
+
+        if not self.is_bitpacked:
+            parse = slice_normal_optional_tensor(self.parse)
+            characteristics = slice_normal_optional_tensor(self.characteristics)
+            return self.__class__(parse, entropy, characteristics)
+
+        # The bitpacked data may be padded to a multiple of 8, so we may need to pad the mask.
+        # Entropy has already been sliced above, so we need not worry about a length mismatch.
+        if mask is not None and len(mask) % 8 != 0:
+            mask = torch.nn.functional.pad(mask, (0, 8 - (mask.size(0) % 8)), "constant", False)
+
+        parse = slice_bitpacked_optional_tensor(self.parse)
+        characteristics = slice_bitpacked_optional_tensor(self.characteristics)
+
+        return self.__class__(parse, entropy, characteristics)
 
 
 class SemanticGuides(_SemanticGuideOrSemanticGuides):
@@ -629,18 +628,159 @@ class StructurePartitioner:
         return StructureMap(index, lexicon)
 
 
+class _InputOrInputs(ABC):
+    inputids: Tensor
+    lengths: Tensor
+
+    def __init__(self, inputids: Tensor, lengths: Tensor) -> None:
+        self.inputids = inputids
+        self.lengths = lengths
+        self.verify_inputs()
+
+    def size(self, dim: int) -> int:
+        return self.inputids.size(dim)
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.inputids.shape
+
+    @property
+    def finalized(self) -> bool:
+        return self.inputids.dtype != torch.uint8
+
+    @abstractmethod
+    def verify_inputs(self) -> None:
+        ...
+
+    @property
+    @abstractmethod
+    def length_axis(self) -> int:
+        """The axis corresponding to the length of the byte stream."""
+        ...
+
+    @abstractmethod
+    def finalize(self, itype: torch.dtype) -> Self:
+        """
+        Convert the inputids to the given data type and increment all non-padding ids by 1.
+        """
+        ...
+
+    def is_contiguous(self) -> bool:
+        return self.inputids.is_contiguous()
+
+    @property
+    def is_cuda(self) -> bool:
+        return self.inputids.is_cuda
+
+    def contiguous(self) -> Self:
+        inputids = self.inputids.contiguous()
+        lengths = self.lengths.clone()
+        return self.__class__(inputids, lengths)
+
+    def detach(self) -> Self:
+        inputids = self.inputids.detach()
+        lengths = self.lengths.clone()
+        return self.__class__(inputids, lengths)
+
+    def record_stream(self, s: torch.cuda.Stream) -> None:
+        self.inputids.record_stream(s)
+        self.lengths.clone()
+
+    def clone(self) -> Self:
+        inputids = self.inputids.clone()
+        lengths = self.lengths.clone()
+        return self.__class__(inputids, lengths)
+
+    def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None, non_blocking: bool = False) -> Self:
+        inputids = self.inputids.to(device, dtype, non_blocking=non_blocking)
+        lengths = self.lengths.clone()
+        return self.__class__(inputids, lengths)
+
+    def pin_memory(self) -> Self:
+        if self.inputids.is_cuda:
+            raise RuntimeError("Cannot pin memory of a CUDA tensor.")
+        inputids = self.inputids.pin_memory()
+        lengths = self.lengths.clone()
+        return self.__class__(inputids, lengths)
+
+
+class Input(_InputOrInputs):
+
+    def verify_inputs(self) -> None:
+        check_tensor(self.inputids, (None,), (torch.uint8, torch.int16, torch.int32, torch.int64))
+        check_tensor(self.lengths, tuple(), (torch.int32, torch.int64))
+
+    @property
+    def length_axis(self) -> int:
+        return 0
+
+    def finalize(self, itype: torch.dtype) -> Self:
+        inputids = self.inputids.to(itype)
+        lengths = self.lengths.clone()
+        inputids[: lengths].add_(1)
+        return self.__class__(inputids, lengths)
+
+    def select(self, *, mask: Optional[Tensor] = None, idx: Optional[Tensor] = None, ranges: Optional[list[tuple[int, int]]] = None) -> Self:
+        if mask is not None:
+            check_tensor(mask, (None,), torch.bool)
+        if idx is not None:
+            check_tensor(idx, (None,), (torch.int32, torch.int64))
+        if sum([mask is not None, idx is not None, ranges is not None]) != 1:
+            raise ValueError("exactly one of mask, idx, or ranges must be provided")
+
+        def slice_tensor(t: Tensor) -> Tensor:
+            if mask is not None:
+                return t[mask]
+            if idx is not None:
+                return t[idx]
+            if ranges is not None:
+                if len(ranges) > 0:
+                    return torch.cat([t[lo:hi] for lo, hi in ranges], dim=self.length_axis)
+                return t.new_empty(t.shape[: self.length_axis] + (0,) + t.shape[self.length_axis + 1 :])
+            raise RuntimeError("unreachable")
+
+        inputids = slice_tensor(self.inputids)
+        lengths = torch.tensor(inputids.size(self.length_axis), torch.int64)
+        return self.__class__(inputids, lengths)
+
+
+class Inputs(_InputOrInputs):
+
+    def verify_inputs(self) -> None:
+        check_tensor(self.inputids, (self.lengths.shape[0], None), (torch.uint8, torch.int16, torch.int32, torch.int64))
+        check_tensor(self.lengths, (None,), (torch.int32, torch.int64))
+
+    @property
+    def length_axis(self) -> int:
+        return 1
+
+    def finalize(self, itype: torch.dtype) -> Self:
+        inputids = self.inputids.to(itype)
+        lengths = self.lengths.clone()
+        for i, l in enumerate(lengths):
+            inputids[i, :l].add_(1)
+        return self.__class__(inputids, lengths)
+
+    @classmethod
+    def from_singles(cls, inputs: Sequence[Input], pin_memory: bool = False, min_length: int = 0) -> Inputs:
+        inputids = pad_sequence([i.inputids for i in inputs], True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
+        lengths = torch.stack([i.lengths for i in inputs], dim=0)
+        return cls(inputids, lengths)
+
+
 F = TypeVar("F")                                        # file
 N = TypeVar("N")                                        # name
+I = TypeVar("I", bound=_InputOrInputs)                  # inputs
 G = TypeVar("G", bound=_SemanticGuideOrSemanticGuides)  # guides
 S = TypeVar("S", bound=_StructureMapOrStructureMaps)    # structures
 
 
-class _FSampleOrSamples(Generic[F, N, G, S], ABC):
+class _FSampleOrSamples(Generic[F, N, I, G, S], ABC):
 
     file: F
     name: N
     label: Tensor
-    inputs: Tensor
+    inputs: I
     guides: G
     structure: S
 
@@ -649,7 +789,7 @@ class _FSampleOrSamples(Generic[F, N, G, S], ABC):
         file: F,
         name: N,
         label: Tensor,
-        inputs: Tensor,
+        inputs: I,
         guides: G,
         structure: S,
     ) -> None:
@@ -661,7 +801,7 @@ class _FSampleOrSamples(Generic[F, N, G, S], ABC):
         self.structure = structure
         self.verify_inputs()
 
-    def __iter__(self) -> Iterator[F | N | Tensor | Tensor | G | S]:
+    def __iter__(self) -> Iterator[F | N | Tensor | I | G | S]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
 
     @property
@@ -676,8 +816,13 @@ class _FSampleOrSamples(Generic[F, N, G, S], ABC):
     def characteristics(self) -> Optional[Tensor]:
         return self.guides.characteristics
 
-    @property
-    def allguides(self) -> Optional[Tensor]:
+    def get_label(self) -> Tensor:
+        return self.label
+
+    def get_inputs(self) -> Tensor:
+        return self.inputs.inputids
+
+    def get_guides(self) -> Optional[Tensor]:
         return self.guides.allguides
 
     @abstractmethod
@@ -761,34 +906,32 @@ class _FSampleOrSamples(Generic[F, N, G, S], ABC):
         file = deepcopy(self.file)
         name = deepcopy(self.name)
         label = self.label.to(ltype)
-        inputs = self.inputs.to(itype)
+        inputs = self.inputs.finalize(itype)
         guides = self.guides.decompress().to(dtype=ftype)
         guides.build_allguides()
         structure = self.structure.clone()
         return self.__class__(file, name, label, inputs, guides, structure)
 
 
-class FSample(_FSampleOrSamples[StrPath, Name, SemanticGuide, StructureMap]):
+class FSample(_FSampleOrSamples[StrPath, Name, Input, SemanticGuide, StructureMap]):
 
     def __len__(self) -> int:
         return 1
 
     def verify_inputs(self) -> None:
         check_tensor(self.label, (), (torch.int16, torch.int32, torch.int64))
-        check_tensor(self.inputs, (None,), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
-class FSamples(_FSampleOrSamples[Sequence[StrPath], Sequence[Name], SemanticGuides, StructureMaps]):
+class FSamples(_FSampleOrSamples[Sequence[StrPath], Sequence[Name], Inputs, SemanticGuides, StructureMaps]):
 
     def __len__(self) -> int:
         return len(self.file)
 
     def verify_inputs(self) -> None:
         check_tensor(self.label, (None,), (torch.int16, torch.int32, torch.int64))
-        check_tensor(self.inputs, (self.label.shape[0], None), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
-class _HSampleOrSamples(Generic[F, N, G, S], ABC):
+class _HSampleOrSamples(Generic[F, N, I, G, S], ABC):
     """
     A similar container as _FSampleOrSamples, but specifically for hierarchical models.
     The main difference is that the guides and structure are lists, one per hierarchical structure.
@@ -798,7 +941,7 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
     file: F
     name: N
     label: Tensor
-    inputs: Sequence[Tensor]
+    inputs: Sequence[I]
     guides: Sequence[G]
     structure: S
 
@@ -807,7 +950,7 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
         file: F,
         name: N,
         label: Tensor,
-        inputs: Sequence[Tensor],
+        inputs: Sequence[I],
         guides: Sequence[G],
         structure: S,
     ) -> None:
@@ -819,7 +962,7 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
         self.structure = structure
         self.verify_inputs()
 
-    def __iter__(self) -> Iterator[F | N | Tensor | Sequence[Tensor] | Sequence[G] | S]:
+    def __iter__(self) -> Iterator[F | N | Tensor | Sequence[I] | Sequence[G] | S]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure))
 
     @property
@@ -838,8 +981,13 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
     def characteristics(self) -> list[Optional[Tensor]]:
         return [g.characteristics for g in self.guides]
 
-    @property
-    def allguides(self) -> list[Optional[Tensor]]:
+    def get_label(self) -> Tensor:
+        return self.label
+
+    def get_inputs(self) -> list[Tensor]:
+        return [i.inputids for i in self.inputs]
+
+    def get_guides(self) -> list[Optional[Tensor]]:
         return [g.allguides for g in self.guides]
 
     @abstractmethod
@@ -873,7 +1021,7 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
             if not self.label.is_cuda:
                 return False
 
-        raise RuntimeError(f"Unexpected tensor device state with some components on GPU and some not.")
+        raise RuntimeError("Unexpected tensor device state with some components on GPU and some not.")
 
     def record_stream(self, s: torch.cuda.Stream) -> None:
         self.label.record_stream(s)
@@ -963,7 +1111,7 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
         inputs = []
         guides = []
         for i in range(self.num_structures):
-            inputs.append(self.inputs[i].to(itype))
+            inputs.append(self.inputs[i].finalize(itype))
             guides.append(self.guides[i].decompress().to(dtype=ftype))
         for g in guides:
             g.build_allguides()
@@ -971,7 +1119,7 @@ class _HSampleOrSamples(Generic[F, N, G, S], ABC):
         return self.__class__(file, name, label, inputs, guides, structure)
 
 
-class HSample(_HSampleOrSamples[StrPath, Name, SemanticGuide, StructureMap]):
+class HSample(_HSampleOrSamples[StrPath, Name, Input, SemanticGuide, StructureMap]):
 
     def __len__(self) -> int:
         return 1
@@ -979,11 +1127,9 @@ class HSample(_HSampleOrSamples[StrPath, Name, SemanticGuide, StructureMap]):
     def verify_inputs(self) -> None:
         super().verify_inputs()
         check_tensor(self.label, (), (torch.int16, torch.int32, torch.int64))
-        for inp in self.inputs:
-            check_tensor(inp, (None,), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
-class HSamples(_HSampleOrSamples[Sequence[StrPath], Sequence[Name], SemanticGuides, StructureMaps]):
+class HSamples(_HSampleOrSamples[Sequence[StrPath], Sequence[Name], Inputs, SemanticGuides, StructureMaps]):
 
     def __len__(self) -> int:
         return len(self.file)
@@ -991,8 +1137,6 @@ class HSamples(_HSampleOrSamples[Sequence[StrPath], Sequence[Name], SemanticGuid
     def verify_inputs(self) -> None:
         super().verify_inputs()
         check_tensor(self.label, (None,), (torch.int16, torch.int32, torch.int64))
-        for inp in self.inputs:
-            check_tensor(inp, (self.label.shape[0], None), (torch.uint8, torch.int16, torch.int32, torch.int64))
 
 
 FOrHSample  = FSample | HSample
@@ -1070,7 +1214,8 @@ class IterableSimpleDBDataset(IterableDataset[FSample]):
         if len(self.shards) < worker_info.num_workers:
             raise ValueError(f"Number of shards ({len(self.shards)}) is less than number of workers ({worker_info.num_workers}).")
         batches = np.array_split(list(self.shards), worker_info.num_workers)
-        return batches[worker_info.id].tolist()
+        local_shards: list[int] = batches[worker_info.id].tolist()
+        return local_shards
 
     def _get_local_seed(self) -> int:
         if (worker_info := get_worker_info()) is None:
@@ -1112,12 +1257,15 @@ class Preprocessor:
         file = ""
         name = Name(name)
         label = torch.tensor(label, dtype=torch.int64)
-        inputs = torch.frombuffer(buffer, dtype=torch.uint8)
-        guides = SemanticGuide(None, None, None)
-        if self.do_entropy:
-            guides.entropy = self.guider._get_entropy(inputs)
-        if self.which_characteristics:
-            guides.characteristics = self.get_characteristics(meta, size)
+        inputs = Input(
+            torch.frombuffer(buffer, dtype=torch.uint8),
+            torch.tensor(size, dtype=torch.int64),
+        )
+        guides = SemanticGuide(
+            None,
+            self.guider._get_entropy(inputs.inputids) if self.do_entropy else None,
+            self.get_characteristics(meta, size) if self.which_characteristics else None,
+        )
         structure = self.get_structure(meta, size)
 
         return FSample(
@@ -1206,7 +1354,7 @@ class CollateFn:
         file = [s.file for s in batch]
         name = [s.name for s in batch]
         label = torch.stack([s.label for s in batch])
-        inputs = CollateFn.get_padded_inputs([s.inputs for s in batch], self.min_length, self.pin_memory, self.change_dtype_after_pad)
+        inputs = Inputs.from_singles([s.inputs for s in batch], self.pin_memory, self.min_length)
         guides = [s.guides.compress() if self.bitpack else s.guides for s in batch]
         guides = SemanticGuides.from_singles(guides, self.pin_memory, self.min_length // 8 if guides[0].is_bitpacked else self.min_length)
         structure = [s.structure for s in batch]
@@ -1215,38 +1363,6 @@ class CollateFn:
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, min_length={self.min_length})"
-
-    @staticmethod
-    def get_padded_inputs(inputs: list[Tensor], min_length: int, pin_memory: bool, change_dtype_after_pad: bool = True) -> Tensor:
-        """
-        Prepares a batch of "byte" inputs as integers by adding 1 to each byte and padding them to the same length.
-
-        Args:
-            inputs: list of 1D tensors of dtype torch.uint8 representing byte inputs.
-            min_length: minimum length to pad the inputs to.
-            pin_memory: whether to pin memory of the resulting tensor.
-            change_dtype_after_pad: if True, padding is done in uint8 and then adding/converting to int16;
-                if False, conversion/addition to int16 is done first, then padding is applied.
-        """
-        if not change_dtype_after_pad:
-            for i in range(len(inputs)):
-                inputs[i] = inputs[i].to(torch.int16)
-                inputs[i].add_(1)
-            inputs_ = pad_sequence(inputs, True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
-            return inputs_
-
-        lengths = [inp.size(0) for inp in inputs]
-
-        inputs_ = pad_sequence(inputs, True, 0, "right", False, PAD_TO_MULTIPLE_OF, min_length)
-        inputs_ = inputs_.to(torch.int16)
-        for i, l in enumerate(lengths):
-            inputs_[i, :l].add_(1)
-
-        # Memory pinning must take place after dtype conversion, hence, we used pin_memory=False above.
-        if pin_memory:
-            inputs_ = inputs_.pin_memory()
-
-        return inputs_
 
 
 class CollateFnHierarchical:
@@ -1274,7 +1390,7 @@ class CollateFnHierarchical:
             gs = []
             for j in range(len(batch)):
                 ranges = batch[j].structure.index[i]
-                x_i_j = torch.cat([batch[j].inputs[lo:hi] for lo, hi in ranges] + [torch.tensor([], dtype=batch[j].inputs.dtype)])
+                x_i_j = batch[j].inputs.select(ranges=ranges)
                 g_i_j = batch[j].guides.select(ranges=ranges)
                 # TODO: remove these checks.
                 if g_i_j.parse is not None:
@@ -1291,7 +1407,7 @@ class CollateFnHierarchical:
                         raise RuntimeError(f"{i=} {j=} {ranges=} {expected=} x_i_j.shape={tuple(x_i_j.shape)} g_i_j.entropy.shape={tuple(g_i_j.entropy.shape)}")
                 xs.append(x_i_j)
                 gs.append(g_i_j.compress() if self.bitpack else g_i_j)
-            xs = CollateFn.get_padded_inputs(xs, self.min_lengths[i], self.pin_memory, self.change_dtype_after_pad)
+            xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i])
             gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8))
             inputs.append(xs)
             guides.append(gs)
