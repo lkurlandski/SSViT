@@ -673,7 +673,7 @@ class MalConvGCG(MalConvBase):
 
         if self.training:
             # recompute winners so gradients flow back through preprocess (Embedding+FiLM)
-            wins_ctx, meta_ctx = _gather_wins_via_preprocess(
+            wins_ctx, meta_ctx = _gather_wins_via_preprocess_batched(
                 preprocess=preprocess,
                 ts=ts,
                 positions=ctx_pos,                   # (B, C)
@@ -710,7 +710,7 @@ class MalConvGCG(MalConvBase):
             return main_max_vals                     # (B, C)
 
         # Training: recompute only winner windows (like MalConvLowMem) with autograd on
-        wins_main, meta_main = _gather_wins_via_preprocess(
+        wins_main, meta_main = _gather_wins_via_preprocess_batched(
             preprocess=preprocess,
             ts=ts,
             positions=main_pos,                      # (B, C)
