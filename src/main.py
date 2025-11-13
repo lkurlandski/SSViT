@@ -441,8 +441,8 @@ def main() -> None:
     root = Path("./data")
     print(f"{root=}")
 
-    tr_datadb = SimpleDB(root / "data" / "tr", check=True)
-    ts_datadb = SimpleDB(root / "data" / "ts", check=True)
+    tr_datadb = SimpleDB(root / "data" / "tr", check=False)
+    ts_datadb = SimpleDB(root / "data" / "ts", check=False)
     print(f"{tr_datadb=}")
     print(f"{ts_datadb=}")
 
