@@ -264,6 +264,7 @@ class ScriptBuilder:
             f"--max_length {self.config.max_length}",
             f"--seed {self.config.seed}",
             f"--num_workers {self.config.num_workers}",
+            f"--pin_memory {True if self.config.num_workers > 0 else False}",
             f"--gradient_accumulation_steps {self.config.gradient_accumulation_steps}",
             f"--tr_batch_size {self.config.batch_size}",
             f"--vl_batch_size {self.config.batch_size}",
