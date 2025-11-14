@@ -50,11 +50,11 @@ def seed_everything(seed: int) -> None:
 def num_available_cpus(logical: bool = False) -> int:
     if "SLURM_CPUS_PER_TASK" in os.environ:
         warnings.warn("num_available_cpus does not yet support SLURM.")
-        # raise NotImplementedError("num_available_cpus does not yet support SLURM.")
-    return int(psutil.cpu_count(logical=False))
+    return int(psutil.cpu_count(logical=logical))
 
 
-def get_optimal_num_workers(ncpu: int = num_available_cpus(), ngpu: int = 1) -> int:
+def get_optimal_num_workers(ncpu: Optional[int] = None, ngpu: int = 1) -> int:
+    ncpu = ncpu if ncpu is not None else num_available_cpus()
     ngpu = max(1, ngpu)
     if ncpu <= 0:
         raise RuntimeError(f"Number of CPU cores ({ncpu}) must be greater than 0.")
@@ -63,7 +63,8 @@ def get_optimal_num_workers(ncpu: int = num_available_cpus(), ngpu: int = 1) -> 
     return max(0, ncpu // ngpu - 1)
 
 
-def get_optimal_num_worker_threads(num_workers: int = 0, ncpu: int = num_available_cpus(), ngpu: int = 1) -> int:
+def get_optimal_num_worker_threads(num_workers: int = 0, ncpu: Optional[int] = None, ngpu: int = 1) -> int:
+    ncpu = ncpu if ncpu is not None else num_available_cpus()
     ngpu = max(1, ngpu)
     if ncpu <= 0:
         raise RuntimeError(f"Number of CPU cores ({ncpu}) must be greater than 0.")
