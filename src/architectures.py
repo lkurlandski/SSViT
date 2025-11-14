@@ -375,6 +375,45 @@ class PatchEncoder(nn.Module):
         raise RuntimeError("This should never happen.")
 
 
+class ConvPatchEncoder(nn.Module):
+    """
+    An optimized patch encoder for fixed-size patches.
+
+    Rather than splitting the sequence into patches and convolving each patch separately,
+    this module linearly maps each patch into an output embedding via a 1D convolution.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, patch_size: int, num_patches: Optional[int] = None) -> None:
+        super().__init__()
+        if num_patches is not None:
+            warnings.warn("ConvPatchEncoder ignores num_patches; only patch_size is used.")
+        self.patch_size = patch_size
+        self.proj = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+
+    def forward(self, z: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input tensor of shape (B, T, E).
+        Returns:
+            Output tensor of shape (B, N, C).
+        """
+        B, T, E = z.shape
+        P = self.patch_size
+
+        if T % P != 0:
+            z = torch.cat([z, z.new_zeros(B, P - (T % P), E)], dim=1)
+
+        z = z.permute(0, 2, 1)      # (B, E, T')
+        z = self.proj(z)            # (B, C, N)
+        z = z.permute(0, 2, 1)      # (B, N, C)
+        return z
+
+
 class ViT(nn.Module):
     """
     Vision Transformer.
