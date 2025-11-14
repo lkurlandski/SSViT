@@ -4,6 +4,7 @@ Create large batches of experiments.
 
 from argparse import ArgumentParser
 from itertools import product
+import math
 from pathlib import Path
 import sys
 from typing import Any
@@ -114,11 +115,11 @@ class Configuration:
 
     @property
     def batch_size(self) -> int:
-        return 64
+        return 256
 
     @property
     def num_workers(self) -> int:
-        return 4
+        return 8
 
     @property
     def num_threads_per_worker(self) -> int:
@@ -126,15 +127,11 @@ class Configuration:
 
     @property
     def learning_rate(self) -> float:
-        return 1e-4
+        return 1e-3
 
     @property
     def device(self) -> str:
         return "cuda"
-
-    @property
-    def ddp(self) -> bool:
-        return True
 
     @property
     def mp16(self) -> bool:
@@ -150,19 +147,19 @@ class Configuration:
 
     @property
     def eval_epochs(self) -> float:
-        return 0.25
+        return 0.50
 
     @property
     def chpt_epochs(self) -> float:
-        return 0.25
+        return 0.50
 
     @property
     def schd_epochs(self) -> float:
-        return 1
+        return 1.0
 
     @property
     def logg_epochs(self) -> float:
-        return 0.25
+        return 0.50
 
 
 class Requirements:
@@ -180,14 +177,41 @@ class Requirements:
     @property
     def time(self) -> int:
         """Return the number of seconds required for the job (configure)."""
-        print(f"WARNING ({str(self.config)}): using fixed time requirement of 1 hour.")
-        return 3600
+        tr_throughput = None
+        vl_throughput = None
+
+        if self.config.arch == Architecture.MCG:
+            if self.config.max_length == 1 * 10**6:
+                if self.config.batch_size == 256:
+                    tr_throughput = 175
+                    vl_throughput = 200
+
+        if self.config.arch == Architecture.MC2:
+            if self.config.max_length == 1 * 10**6:
+                if self.config.batch_size == 256:
+                    tr_throughput = 275
+                    vl_throughput = 300
+
+        if tr_throughput is None or vl_throughput is None:
+            print(f"WARNING ({str(self.config)}): using fixed throughput of 100 samples/second.")
+            tr_throughput = 100
+            vl_throughput = 100
+
+        tr_samples = 2339771 * self.config.max_epochs
+        vl_samples = 539882  * self.config.max_epochs / self.config.eval_epochs
+
+        tr_seconds = tr_samples / tr_throughput
+        vl_seconds = vl_samples / tr_throughput
+
+        seconds = tr_seconds + vl_seconds
+        seconds += 0.10 * seconds + 0.25 * 3600
+
+        return int(seconds)
 
     @property
     def mem(self) -> int:
         """Return the number of bytes required for the job (configure)."""
-        print(f"WARNING ({str(self.config)}): using fixed memory requirement of 16 GB.")
-        return 32 * 10**9
+        return 64 * self.gpus_per_node * 2**30
 
     @property
     def nodes(self) -> int:
@@ -233,9 +257,10 @@ class ScriptBuilder:
             f"#SBATCH --nodes={self.reqs.nodes}",
             f"#SBATCH --gpus-per-node=a100:{self.reqs.gpus_per_node}",
             f"#SBATCH --ntasks-per-node={self.reqs.ntasks_per_node}",
+            f"#SBATCH --cpus-per-task={self.reqs.cpus_per_task}",
             f"#SBATCH --job-name={str(self.config)}",
-            f"#SBATCH --time={self.reqs.time}",
-            f"#SBATCH --mem={self.reqs.mem}",
+            f"#SBATCH --time={self.fmt_time(self.reqs.time)}",
+            f"#SBATCH --mem={self.fmt_mem(self.reqs.mem)}",
         ])
 
         environment = "\n".join([
@@ -244,15 +269,19 @@ class ScriptBuilder:
 
         variables = "\n".join([
             f"export OMP_NUM_THREADS={self.reqs.omp_num_threads}",
+            f"export PTW_NUM_THREADS={self.reqs.omp_num_threads}",
         ])
 
-        command = " \\\n".join([
+        torchrun = " \\\n".join([
             "torchrun",
             "--no-python",
             "--standalone",
             "--start-method 'forkserver'",
             f"--nnodes {self.reqs.nodes}",
             f"--nproc-per-node {self.reqs.gpus_per_node}",
+        ])
+
+        command = " \\\n".join([
             "python",
             "src/main.py",
             f"--outdir {self.config.get_outdir(self.reqs.gpus_per_node * self.reqs.nodes)}",
@@ -271,7 +300,7 @@ class ScriptBuilder:
             f"--ts_batch_size {self.config.batch_size}",
             f"--learning_rate {self.config.learning_rate}",
             f"--device {self.config.device}",
-            f"--ddp {self.config.ddp}",
+            f"--ddp {self.reqs.gpus_per_node > 1}",
             f"--mp16 {self.config.mp16}",
             f"--tf32 {self.config.tf32}",
             f"--max_epochs {self.config.max_epochs}",
@@ -280,6 +309,8 @@ class ScriptBuilder:
             f"--schd_epochs {self.config.schd_epochs}",
             f"--logg_epochs {self.config.logg_epochs}",
         ])
+
+        command = torchrun + "\n" + command if self.reqs.gpus_per_node > 1 else command
 
         script = ""
         script += shebang + "\n\n"
@@ -290,14 +321,40 @@ class ScriptBuilder:
 
         return script
 
+    @staticmethod
+    def fmt_time(s: float, r: int = 60) -> str:
+        s = int(math.ceil(s / r) * r)
+        days = s // (24 * 3600)
+        s %= (24 * 3600)
+        hours = s // 3600
+        s %= 3600
+        minutes = s // 60
+        s %= 60
+        return f"{int(days):02d}-{int(hours):02d}:{int(minutes):02d}:{int(s):02d}"
+
+    @staticmethod
+    def fmt_mem(b: int) -> str:
+        return f"{round(b / 2**30)}G"
+
 
 def config_fiter(config: Configuration) -> bool:
     """Return True if the configuration should be run, False otherwise."""
+    chars = (
+        lief.PE.Section.CHARACTERISTICS.MEM_READ,
+        lief.PE.Section.CHARACTERISTICS.MEM_WRITE,
+        lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
+    )
     if not isinstance(config, Configuration):
         raise TypeError()
+    if config.arch != Architecture.MC2:
+        return False
+    if config.which_characteristics and any(c not in chars for c in config.which_characteristics):
+        return False
     if config.arch == Architecture.MCV:
         return False
-    if config.size != ModelSize.SM:
+    if config.arch == Architecture.VIT:
+        return False
+    if config.size != ModelSize.MD:
         return False
     if config.level != HierarchicalLevel.NONE:
         return False
@@ -322,7 +379,7 @@ def main() -> None:
         [s for s in ModelSize],
         [l for l in HierarchicalLevel],
         [True, False],
-        [(c,) for c in CHARACTERISTICS],
+        [tuple()] + [(c,) for c in CHARACTERISTICS],
         [1000000],
         [0],
     )

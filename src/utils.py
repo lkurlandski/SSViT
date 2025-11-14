@@ -49,7 +49,8 @@ def seed_everything(seed: int) -> None:
 
 def num_available_cpus(logical: bool = False) -> int:
     if "SLURM_CPUS_PER_TASK" in os.environ:
-        raise NotImplementedError("num_available_cpus does not yet support SLURM.")
+        warnings.warn("num_available_cpus does not yet support SLURM.")
+        # raise NotImplementedError("num_available_cpus does not yet support SLURM.")
     return int(psutil.cpu_count(logical=False))
 
 
