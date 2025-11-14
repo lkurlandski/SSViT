@@ -198,6 +198,9 @@ class FiLMNoP(nn.Module):
         if g is not None:
             raise ValueError(f"Expected g to be None, got {type(g)} instead.")
 
+        if torch.is_autocast_enabled():
+            x = x.to(torch.get_autocast_gpu_dtype())
+
         return x
 
 # -------------------------------------------------------------------------------- #
@@ -431,13 +434,13 @@ class ViT(nn.Module):
         if self.pooling == "cls":  # T <-- T + 1
             assert self.cls_token is not None
             t = self.cls_token.expand(x.shape[0], -1, -1)  # (B, 1, E)
-            x = torch.cat((t, x), dim=1)  # (B, T, E)
+            x = torch.cat((t.to(x.dtype), x), dim=1)  # (B, T, E)
         z = self.posencoder(x)            # (B, T, E)
         z = self.proj(z)                  # (B, T, D)
         z = self.transformer(z)           # (B, T, D)
         if self.pooling == "cls":
             z = z[:, 0, :].unsqueeze(1)   # (B, 1, D)
-        z = z.mean(dim=1)                 # (B, D)
+        z = z.mean(dim=1).to(x.dtype)     # (B, D)
 
         check_tensor(z, (x.shape[0], self.d_model), FLOATS)
         return z
