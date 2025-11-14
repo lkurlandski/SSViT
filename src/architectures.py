@@ -315,7 +315,7 @@ class PatchEncoder(nn.Module):
         C = self.out_channels
         S = math.floor((T - self.kernel_size) / self.stride + 1)  # noqa
 
-        z = self.split_patches(z, P)  # (B,  N, P, E)
+        z = self.split_patches(z, P, N)  # (B,  N, P, E)
         z = z.reshape(B * N, P, E)    # (BN, P, E)
         z = z.permute(0, 2, 1)        # (BN, E, P)
         z = self.conv(z)              # (BN, C, S)
@@ -326,21 +326,21 @@ class PatchEncoder(nn.Module):
         return z
 
     @staticmethod
-    def split_patches(z: Tensor, patch_size: int) -> Tensor:
+    def split_patches(z: Tensor, patch_size: int, num_patches: int) -> Tensor:
         """
         Args:
             z: Input tensor of shape (B, T, E).
         Returns:
             Output tensor of shape (B, N, P, E).
         """
-        if z.shape[1] <= patch_size:
-            return z.unsqueeze(1)
+        B, T, E = z.shape
+        P, N = patch_size, num_patches
 
-        patches = torch.split(z.permute(1, 0, 2), patch_size)  # N x (P, B, E)
-        patches = pad_sequence(patches, batch_first=True)      # (N, P, B, E)
-        patches = patches.permute(2, 0, 1, 3)                  # (B, N, P, E)
+        if T < (total := N * P):
+            z = torch.cat([z, z.new_zeros(B, total - T, E)], dim=1)
 
-        return patches
+        z = z.view(B, N, P, E)
+        return z
 
     @staticmethod
     def patch_dims(seq_length: int, patch_size: Optional[int], num_patches: Optional[int]) -> tuple[int, int]:
