@@ -469,6 +469,64 @@ class PreprocessFn(Protocol):
         ...
 
 
+class GatedConvolution(nn.Module):
+    """
+    Gated Convolution.
+
+    See: Dauphin "Language modeling with gated convolutional networks" ICML 2017.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int, fuse: bool = False) -> None:
+        super().__init__()
+        self.out_channels = out_channels
+        self.in_channels = in_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.fuse = fuse
+
+        self.conv: nn.Module
+        self.conv_1: nn.Module
+        self.conv_2: nn.Module
+        self._forward: Callable[[Tensor], Tensor]
+
+        if fuse:
+            self.conv = nn.Conv1d(in_channels, 2 * out_channels, kernel_size, stride)
+            self.conv_1 = nn.Identity()
+            self.conv_2 = nn.Identity()
+            self._forward = self._forward_fuse
+        else:
+            self.conv = nn.Identity()
+            self.conv_1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride)
+            self.conv_2 = nn.Conv1d(in_channels, out_channels, kernel_size, stride)
+            self._forward = self._forward_orig
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, z: Tensor) -> Tensor:
+        """
+        Args:
+            z: Input tensor of shape (B, E, T).
+        Returns:
+            Output tensor of shape (B, C, S).
+        """
+        check_tensor(z, (None, self.in_channels, None), FLOATS)
+        g = self._forward(z)
+        check_tensor(g, (z.shape[0], self.out_channels, None), FLOATS)
+        return g
+
+    def _forward_orig(self, z: Tensor) -> Tensor:
+        c_1: Tensor = self.conv_1(z) # (B, C, S - 1)
+        c_2: Tensor = self.conv_2(z) # (B, C, S - 1)
+        g = c_1 * self.sigmoid(c_2)  # (B, C, S - 1)
+        return g
+
+    def _forward_fuse(self, z: Tensor) -> Tensor:
+        c: Tensor = self.conv(z)                      # (B, 2C, S - 1)
+        c_1, c_2 = c.split(self.out_channels, dim=1)  # type: ignore[no-untyped-call]
+        g = c_1 * self.sigmoid(c_2)                   # (B, C, S - 1)
+        return g
+
+
 class MalConvBase(nn.Module, ABC):
     """
     Base class of MalConv backbones.
@@ -481,6 +539,7 @@ class MalConvBase(nn.Module, ABC):
     channels: int
     kernel_size: int
     stride: int
+    fuse: bool
     chunk_size: int
     overlap: int
 
@@ -490,6 +549,7 @@ class MalConvBase(nn.Module, ABC):
         channels: int = 128,
         kernel_size: int = 512,
         stride: int = 512,
+        fuse: bool = True,
         chunk_size: int = 2 ** 16,
         overlap: Optional[int] = None,
     ) -> None:
@@ -498,6 +558,7 @@ class MalConvBase(nn.Module, ABC):
         self.channels = channels
         self.kernel_size = kernel_size
         self.stride = stride
+        self.fuse = fuse
         self.chunk_size = chunk_size
         self.overlap = kernel_size - stride if overlap is None else overlap
 
@@ -553,16 +614,12 @@ class MalConv(MalConvBase):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
-        self.conv_1 = nn.Conv1d(self.embedding_dim, self.channels, self.kernel_size, self.stride)
-        self.conv_2 = nn.Conv1d(self.embedding_dim, self.channels, self.kernel_size, self.stride)
-        self.sigmoid = nn.Sigmoid()
+        self.gconv = GatedConvolution(self.embedding_dim, self.channels, self.kernel_size, self.stride, self.fuse)
         self.pool = nn.AdaptiveMaxPool1d(1)
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
         z = z.transpose(1, 2)        # (B, E, T)
-        c_1 = self.conv_1(z)         # (B, C, S - 1)
-        c_2 = self.conv_2(z)         # (B, C, S - 1)
-        g = c_1 * self.sigmoid(c_2)  # (B, C, S - 1)
+        g = self.gconv(z)            # (B, C, S - 1)
         z = self.pool(g)             # (B, C, 1)
         z = z.squeeze(-1)            # (B, C)
         return z
@@ -577,13 +634,12 @@ class MalConvLowMem(MalConvBase):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
-        self.conv = nn.Conv1d(self.embedding_dim, 2 * self.channels, self.kernel_size, self.stride)
-        self.sigmoid = nn.Sigmoid()
+        self.gconv = GatedConvolution(self.embedding_dim, self.channels, self.kernel_size, self.stride, self.fuse)
         self.pool = nn.AdaptiveMaxPool1d(1)
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
         z = z.transpose(1, 2)        # (B, E, T)
-        g = self._activations(z)     # (B, C, S - 1)
+        g = self.gconv(z)            # (B, C, S - 1)
         z = self.pool(g)             # (B, C, 1)
         z = z.squeeze(-1)            # (B, C)
         return z
@@ -598,7 +654,7 @@ class MalConvLowMem(MalConvBase):
             chunk_size=self.chunk_size,
             overlap=self.overlap,
             channels=self.channels,
-            activations_fn=self._activations,
+            activations_fn=self.gconv,
         )
 
         # Inference: pooled output is already done
@@ -613,7 +669,7 @@ class MalConvLowMem(MalConvBase):
             rf=self.kernel_size,
             embedding_dim=self.embedding_dim,
         )
-        g_all = self._activations(wins_cat).squeeze(-1)  # (sum_U, C)
+        g_all = self.gconv(wins_cat).squeeze(-1)  # (sum_U, C)
         z = _scatter_g_to_BC(
             g_all=g_all,
             meta=meta,
@@ -622,17 +678,14 @@ class MalConvLowMem(MalConvBase):
         )
         return z
 
-    def _activations(self, z: torch.Tensor) -> torch.Tensor:
-        # Uses a fused convolution instead of two convs.
-        c = self.conv(z)                        # (B, 2C, S - 1)
-        c1, c2 = c.split(self.channels, dim=1)  # (B, C, S - 1), (B, C, S - 1)
-        return c1 * self.sigmoid(c2)
-
 
 class MalConvGCG(MalConvBase):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
+        if self.fuse:
+            warnings.warn("Fused convolutions are not yet implemented for MalConvGCG; setting `fuse=False`.")
+            self.fuse = False
         # Context path (no gating)
         self.ctx_conv  = nn.Conv1d(self.embedding_dim, 2 * self.channels, self.kernel_size, self.stride)
         self.ctx_share = nn.Conv1d(self.channels, self.channels, 1)
