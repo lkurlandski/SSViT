@@ -55,6 +55,7 @@ from src.architectures import MalConvLowMem
 from src.architectures import MalConvGCG
 from src.architectures import ViT
 from src.architectures import PatchEncoder
+from src.architectures import ConvPatchEncoder
 from src.architectures import Classifier
 from src.architectures import MalConvClassifier
 from src.architectures import ViTClassifier
@@ -62,10 +63,8 @@ from src.architectures import HierarchicalClassifier
 from src.architectures import HierarchicalMalConvClassifier
 from src.architectures import HierarchicalViTClassifier
 from src.binanal import HierarchicalLevel
-from src.binanal import CharacteristicGuider
 from src.binanal import LEVEL_STRUCTURE_MAP
 from src.binanal import HierarchicalStructure
-from src.binanal import CharacteristicGuider
 from src.data import SemanticGuides
 from src.data import StructureMaps
 from src.data import Inputs
@@ -133,8 +132,8 @@ def get_model(
     guide_dim      = num_guides
     guide_hidden   = 4 * f
     # Patcher
-    num_patches    = 256
-    patch_size     = None
+    num_patches    = None
+    patch_size     = 4096
     # MalConv
     mcnv_channels  = 128
     mcnv_kernel    = 512
@@ -144,6 +143,7 @@ def get_model(
     vit_nhead      = 2 * f
     vit_feedfrwd   = 4 * vit_d_model
     vit_layers     = 2 * f
+
     # Head
     num_classes    = 2
     clf_hidden     = 64 * f
@@ -163,16 +163,17 @@ def get_model(
     }
 
     FiLMCls = FiLM if num_guides > 0 else FiLMNoP
+    PathEncoderCls = ConvPatchEncoder if patch_size is not None else PatchEncoder
+    MalConvCls = arch_to_malconv_backbone[arch] if arch != Architecture.VIT else MalConvBase
 
     if level == HierarchicalLevel.NONE:
         embedding = Embedding(num_embeddings, embedding_dim, padding_idx)
         filmer = FiLMCls(guide_dim, embedding_dim, guide_hidden)
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            MalConvCls = arch_to_malconv_backbone[arch]
             backbone_ = MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
             return MalConvClassifier(embedding, filmer, backbone_, head)
         if arch in (Architecture.VIT,):
-            patcher = PatchEncoder(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
+            patcher = PathEncoderCls(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
             backbone = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
             return ViTClassifier(embedding, filmer, patcher, backbone, head)
 
@@ -187,7 +188,6 @@ def get_model(
             for _ in range(num_structures)
         ]
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            MalConvCls = arch_to_malconv_backbone[arch]
             backbones = [
                 MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
                 for _ in range(num_structures)
@@ -195,7 +195,7 @@ def get_model(
             return HierarchicalMalConvClassifier(embeddings, filmers, backbones, head)
         if arch in (Architecture.VIT,):
             patchers = [
-                PatchEncoder(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
+                PathEncoderCls(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
                 for _ in range(num_structures)
             ]
             backbone = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
@@ -212,7 +212,6 @@ def get_model(
             for _ in range(num_structures)
         ]
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            MalConvCls = arch_to_malconv_backbone[arch]
             backbones = [
                 MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
                 for _ in range(num_structures)
@@ -220,7 +219,7 @@ def get_model(
             return HierarchicalMalConvClassifier(embeddings, filmers, backbones, head)
         if arch in (Architecture.VIT,):
             patchers = [
-                PatchEncoder(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
+                PathEncoderCls(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
                 for _ in range(num_structures)
             ]
             backbone = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
@@ -237,7 +236,6 @@ def get_model(
             for _ in range(num_structures)
         ]
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            MalConvCls = arch_to_malconv_backbone[arch]
             backbones = [
                 MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
                 for _ in range(num_structures)
@@ -245,7 +243,7 @@ def get_model(
             return HierarchicalMalConvClassifier(embeddings, filmers, backbones, head)
         if arch in (Architecture.VIT,):
             patchers = [
-                PatchEncoder(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
+                PathEncoderCls(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
                 for _ in range(num_structures)
             ]
             backbone = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
@@ -334,14 +332,13 @@ def get_streamer(loader: DataLoader[Any], device: torch.device, num_streams: int
     """If multiple streams in use, wrap a DataLoader with a CUDAPrefetcher and warmup its workers."""
     if num_streams < 0:
         raise ValueError(f"`num_streams` must be non-negative, got {num_streams}.")
+    if loader.persistent_workers:
+        iter(loader)
     if num_streams == 0:
         return loader
     if num_streams == 1:
         return StreamlessCUDAPrefetcher(loader, device)
-    streamer = CUDAPrefetcher(loader, device, num_streams)
-    if loader.persistent_workers:
-        streamer.warmup(0)
-    return streamer
+    return CUDAPrefetcher(loader, device, num_streams)
 
 
 def get_padbatch(level: HierarchicalLevel, do_parse: bool,do_entropy: bool, which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS], min_lengths: list[int], batch_size: int) -> FSamples | HSamples:
