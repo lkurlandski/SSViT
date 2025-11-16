@@ -525,6 +525,8 @@ class GatedConvolution(nn.Module):
         self.kernel_size = kernel_size
         self.stride = stride
         self.fuse = fuse
+        if self.fuse:
+            raise NotImplementedError("GatedConvolution(..., fuse=True) is not implemented correctly.")
 
         self.conv: nn.Module
         self.conv_1: nn.Module
