@@ -593,7 +593,7 @@ class MalConvBase(nn.Module, ABC):
         channels: int = 128,
         kernel_size: int = 512,
         stride: int = 512,
-        fuse: bool = True,
+        fuse: bool = False,
         chunk_size: int = 2 ** 16,
         overlap: Optional[int] = None,
     ) -> None:
