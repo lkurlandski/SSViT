@@ -624,7 +624,7 @@ class MalConvBase(nn.Module, ABC):
         stride: int = 512,
         chunk_size: int = 2 ** 16,
         overlap: Optional[int] = None,
-        fp32: bool = False,
+        fp32: bool = True,
     ) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
