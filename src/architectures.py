@@ -567,7 +567,7 @@ class GatedConvolution(nn.Module):
         return g
 
     @torch.no_grad()
-    def forward_functional(self, z: Tensor) -> Tensor:  # FIXME
+    def forward_functional(self, z: Tensor, fp32: bool = False) -> Tensor:
         """
         Functional version of `GatedConvolution.forward` without auto-grad.
 
@@ -584,7 +584,10 @@ class GatedConvolution(nn.Module):
         w2 = self.conv_2.weight.detach()
         b2 = self.conv_2.bias.detach() if self.conv_2.bias is not None else None
 
-        z = z.to(w1.dtype)
+        if fp32:
+            z = z.to(torch.float32)
+            if any(w_b.dtype != torch.float32 for w_b in filter(lambda w_b: w_b is not None, [w1, w2, b1, b2])):
+                warnings.warn("Some weights and/or biases are not in float32, which is unexpected, when `fp32=True`.")
 
         c_1 = F.conv1d(z, w1, b1, **_get_conv_kwds(self.conv_1))
         c_2 = F.conv1d(z, w2, b2, **_get_conv_kwds(self.conv_2))
@@ -611,6 +614,7 @@ class MalConvBase(nn.Module, ABC):
     stride: int
     chunk_size: int
     overlap: int
+    fp32: bool
 
     def __init__(
         self,
@@ -620,6 +624,7 @@ class MalConvBase(nn.Module, ABC):
         stride: int = 512,
         chunk_size: int = 2 ** 16,
         overlap: Optional[int] = None,
+        fp32: bool = False,
     ) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -628,6 +633,7 @@ class MalConvBase(nn.Module, ABC):
         self.stride = stride
         self.chunk_size = chunk_size
         self.overlap = kernel_size - stride if overlap is None else overlap
+        self.fp32 = fp32
 
     @property
     def min_length(self) -> int:
@@ -726,7 +732,7 @@ class MalConvLowMem(MalConvBase):
             chunk_size=self.chunk_size,
             overlap=self.overlap,
             channels=self.channels,
-            activations_fn=self.gconv.forward_functional,
+            activations_fn=partial(self.gconv.forward_functional, fp32=self.fp32),
             # activations_fn=self.gconv,  # WARN: this causes silent gradient disconnection!
         )
         assert max_vals.requires_grad is False
@@ -826,7 +832,7 @@ class GCGBlock(nn.Module):
         return out
 
     @torch.no_grad()
-    def forward_functional(self, z: Tensor, gct: Tensor) -> Tensor:
+    def forward_functional(self, z: Tensor, gct: Tensor, fp32: bool = False) -> Tensor:
         """
         Functional version for low-memory streaming scans.
         """
@@ -842,8 +848,11 @@ class GCGBlock(nn.Module):
         wp = self.gct_proj.weight.detach()
         bp = self.gct_proj.bias.detach() if self.gct_proj.bias is not None else None
 
-        z   = z.to(w1.dtype)
-        gct = gct.to(wp.dtype)
+        if fp32:
+            z = z.to(torch.float32)
+            gct = gct.to(torch.float32)
+            if any(w_b.dtype != torch.float32 for w_b in filter(lambda w_b: w_b is not None, [w1, w2, wp, b1, b2, bp])):
+                warnings.warn("Some weights and/or biases are not in float32, which is unexpected, when `fp32=True`.")
 
         h = F.conv1d(z, w1, b1, **_get_conv_kwds(self.conv_1))
         h = F.glu(h, dim=1)
@@ -901,7 +910,7 @@ class ContextBlock(nn.Module):
         return x
 
     @torch.no_grad()
-    def forward_functional(self, z: Tensor) -> Tensor:
+    def forward_functional(self, z: Tensor, fp32: bool = False) -> Tensor:
         """
         Functional version for low-memory streaming scans.
         """
@@ -912,7 +921,10 @@ class ContextBlock(nn.Module):
         w_sh  = self.share.weight.detach()
         b_sh  = self.share.bias.detach() if self.share.bias is not None else None
 
-        z = z.to(w_ctx.dtype)
+        if fp32:
+            z = z.to(torch.float32)
+            if any(w_b.dtype != torch.float32 for w_b in filter(lambda w_b: w_b is not None, [w_ctx, w_sh, b_ctx, b_sh])):
+                warnings.warn("Some weights and/or biases are not in float32, which is unexpected, when `fp32=True`.")
 
         x = F.conv1d(z, w_ctx, b_ctx, **_get_conv_kwds(self.conv))
         x = F.glu(x, dim=1)
@@ -961,7 +973,7 @@ class MalConvGCG(MalConvBase):
             chunk_size=self.chunk_size,
             overlap=self.overlap,
             channels=self.channels,
-            activations_fn=self.ctx_block.forward_functional,
+            activations_fn=partial(self.ctx_block.forward_functional, fp32=self.fp32),
         )
         assert ctx_max_vals.requires_grad is False
         assert not torch.is_grad_enabled() or not any(self.ctx_block.check_grad_connected(ctx_max_vals.sum()))
@@ -1012,7 +1024,7 @@ class MalConvGCG(MalConvBase):
             chunk_size=self.chunk_size,
             overlap=self.overlap,
             channels=self.channels,
-            activations_fn=partial(self.main_block.forward_functional, gct=gct.detach()),
+            activations_fn=partial(self.main_block.forward_functional, gct=gct.detach(), fp32=self.fp32),
         )
         assert main_max_vals.requires_grad is False
         assert not torch.is_grad_enabled() or not any(self.main_block.check_grad_connected(main_max_vals.sum()))
