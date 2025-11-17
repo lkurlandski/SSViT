@@ -22,9 +22,11 @@ Notations (ViT):
     L: Number of layers
 """
 
+from __future__ import annotations
 from abc import ABC
 from abc import abstractmethod
 from collections.abc import Sequence
+from functools import partial
 import math
 import sys
 from typing import Any
@@ -518,32 +520,14 @@ class GatedConvolution(nn.Module):
     See: Dauphin "Language modeling with gated convolutional networks" ICML 2017.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int, fuse: bool = False) -> None:
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int) -> None:
         super().__init__()
         self.out_channels = out_channels
         self.in_channels = in_channels
         self.kernel_size = kernel_size
         self.stride = stride
-        self.fuse = fuse
-        if self.fuse:
-            raise NotImplementedError("GatedConvolution(..., fuse=True) is not implemented correctly.")
-
-        self.conv: nn.Module
-        self.conv_1: nn.Module
-        self.conv_2: nn.Module
-        self._forward: Callable[[Tensor], Tensor]
-
-        if fuse:
-            self.conv = nn.Conv1d(in_channels, 2 * out_channels, kernel_size, stride)
-            self.conv_1 = nn.Identity()
-            self.conv_2 = nn.Identity()
-            self._forward = self._forward_fuse
-        else:
-            self.conv = nn.Identity()
-            self.conv_1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride)
-            self.conv_2 = nn.Conv1d(in_channels, out_channels, kernel_size, stride)
-            self._forward = self._forward_orig
-
+        self.conv_1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride)
+        self.conv_2 = nn.Conv1d(in_channels, out_channels, kernel_size, stride)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, z: Tensor) -> Tensor:
@@ -554,21 +538,60 @@ class GatedConvolution(nn.Module):
             Output tensor of shape (B, C, S).
         """
         check_tensor(z, (None, self.in_channels, None), FLOATS)
-        g = self._forward(z)
-        check_tensor(g, (z.shape[0], self.out_channels, None), FLOATS)
-        return g
-
-    def _forward_orig(self, z: Tensor) -> Tensor:
         c_1: Tensor = self.conv_1(z) # (B, C, S - 1)
         c_2: Tensor = self.conv_2(z) # (B, C, S - 1)
         g = c_1 * self.sigmoid(c_2)  # (B, C, S - 1)
+        check_tensor(g, (z.shape[0], self.out_channels, None), FLOATS)
         return g
 
-    def _forward_fuse(self, z: Tensor) -> Tensor:
-        c: Tensor = self.conv(z)                      # (B, 2C, S - 1)
-        c_1, c_2 = c.split(self.out_channels, dim=1)  # type: ignore[no-untyped-call]
-        g = c_1 * self.sigmoid(c_2)                   # (B, C, S - 1)
+    @torch.no_grad()
+    def forward_functional(gconv: GatedConvolution, z: Tensor) -> Tensor:
+        """
+        Functional version of `GatedConvolution.forward` without auto-grad.
+
+        It is unclear whether or not using `torch.no_grad()` at the top-level
+        definition is strictly nessecary or whether using `torch.no_grad()` inside
+        the function as a context manager (with boolean on/off control) would suffice.
+        Since we only this this function for the low-memory computation when we need
+        it detached from auto-grad, the former is acceptable for now.
+        """
+        conv_1, conv_2 = gconv.conv_1, gconv.conv_2
+
+        check_tensor(z, (None, conv_1.in_channels, None), FLOATS)
+
+        w1 = conv_1.weight.detach()
+        b1 = conv_1.bias.detach() if conv_1.bias is not None else None
+        w2 = conv_2.weight.detach()
+        b2 = conv_2.bias.detach() if conv_2.bias is not None else None
+
+        z = z.to(w1.dtype)
+
+        c_1 = F.conv1d(z, w1, b1, stride=conv_1.stride, padding=conv_1.padding,
+            dilation=conv_1.dilation, groups=conv_1.groups)
+        c_2 = F.conv1d(z, w2, b2, stride=conv_2.stride, padding=conv_2.padding,
+            dilation=conv_2.dilation, groups=conv_2.groups)
+        g = c_1 * torch.sigmoid(c_2)
+
+        check_tensor(g, (z.shape[0], conv_1.out_channels, None), FLOATS)
+
         return g
+
+    def check_grad_connected(self, x: Tensor) -> tuple[bool, bool]:
+        """
+        Check if a tensor is connected to the gradients of the convolutional weights.
+        """
+        if not torch.is_grad_enabled():
+            raise RuntimeError("Gradients are not enabled.")
+        if not x.requires_grad:
+            return False, False
+
+        grads = torch.autograd.grad(
+            x,
+            [self.conv_1.weight, self.conv_2.weight],
+            retain_graph=True,
+            allow_unused=True,
+        )
+        return (grads[0] is not None, grads[1] is not None)
 
 
 class MalConvBase(nn.Module, ABC):
@@ -583,7 +606,6 @@ class MalConvBase(nn.Module, ABC):
     channels: int
     kernel_size: int
     stride: int
-    fuse: bool
     chunk_size: int
     overlap: int
 
@@ -593,7 +615,6 @@ class MalConvBase(nn.Module, ABC):
         channels: int = 128,
         kernel_size: int = 512,
         stride: int = 512,
-        fuse: bool = False,
         chunk_size: int = 2 ** 16,
         overlap: Optional[int] = None,
     ) -> None:
@@ -602,7 +623,6 @@ class MalConvBase(nn.Module, ABC):
         self.channels = channels
         self.kernel_size = kernel_size
         self.stride = stride
-        self.fuse = fuse
         self.chunk_size = chunk_size
         self.overlap = kernel_size - stride if overlap is None else overlap
 
@@ -658,7 +678,7 @@ class MalConv(MalConvBase):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
-        self.gconv = GatedConvolution(self.embedding_dim, self.channels, self.kernel_size, self.stride, self.fuse)
+        self.gconv = GatedConvolution(self.embedding_dim, self.channels, self.kernel_size, self.stride)
         self.pool = nn.AdaptiveMaxPool1d(1)
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
@@ -678,7 +698,7 @@ class MalConvLowMem(MalConvBase):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
-        self.gconv = GatedConvolution(self.embedding_dim, self.channels, self.kernel_size, self.stride, self.fuse)
+        self.gconv = GatedConvolution(self.embedding_dim, self.channels, self.kernel_size, self.stride)
         self.pool = nn.AdaptiveMaxPool1d(1)
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
@@ -690,6 +710,11 @@ class MalConvLowMem(MalConvBase):
 
     def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
 
+        # Gather the max-pooled activations across the temporal dimension streaming without autograd.
+        # It is critical here that we pass a separate, purely functional `activations_fn` with autograd disabled.
+        # If autograd is enabled externally, i.e., in the training loop, naively passing in `self.gconv`
+        # will cause PyTorch to severe the gradient flow from `self.gconv` weights and they will not be updated
+        # during training. Its unclear why exactly this happens, but the solution is straightforward enough.
         max_vals, pos = _lowmem_max_over_time_streaming(
             preprocess=preprocess,
             ts=ts,
@@ -698,14 +723,18 @@ class MalConvLowMem(MalConvBase):
             chunk_size=self.chunk_size,
             overlap=self.overlap,
             channels=self.channels,
-            activations_fn=self.gconv,
+            activations_fn=partial(GatedConvolution.forward_functional, self.gconv),
+            # activations_fn=self.gconv,  # WARN: this causes silent gradient disconnection!
         )
+        assert max_vals.requires_grad is False
+        assert not torch.is_grad_enabled() or not any(self.gconv.check_grad_connected(max_vals.sum()))
+        assert all(p.requires_grad for name, p in self.named_parameters() if "gconv" in name)
 
-        # Inference: pooled output is already done
+        # If conducting inference, simply return the max-pooled activations.
         if not self.training:
             return max_vals
 
-        # Training: recompute only the winners to let grads flow upstream
+        # If conducting training, recompute only the winner windows (with autograd).
         wins_cat, meta = _gather_wins_via_preprocess_batched(
             preprocess=preprocess,
             ts=ts,
@@ -713,13 +742,28 @@ class MalConvLowMem(MalConvBase):
             rf=self.kernel_size,
             embedding_dim=self.embedding_dim,
         )
-        g_all = self.gconv(wins_cat).squeeze(-1)  # (sum_U, C)
+        assert wins_cat.requires_grad is True
+        assert not any(self.gconv.check_grad_connected(wins_cat.sum()))
+        assert all(p.requires_grad for name, p in self.named_parameters() if "gconv" in name)
+
+        # Run the winner windows through the convolutional layers (with autograd).
+        g_all: Tensor = self.gconv(wins_cat)
+        g_all = g_all.squeeze(-1)
+        assert g_all.requires_grad is True
+        assert all(self.gconv.check_grad_connected(g_all.sum()))
+        assert all(p.requires_grad for name, p in self.named_parameters() if "gconv" in name)
+
+        # Scatter the per-window activations back to per-batch activations.
         z = _scatter_g_to_BC(
             g_all=g_all,
             meta=meta,
             batch_size=ts[0].shape[0],
             channels=self.channels,
         )
+        assert z.requires_grad is True
+        assert all(self.gconv.check_grad_connected(z.sum()))
+        assert all(p.requires_grad for name, p in self.named_parameters() if "gconv" in name)
+
         return z
 
 
@@ -727,9 +771,6 @@ class MalConvGCG(MalConvBase):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
-        if self.fuse:
-            warnings.warn("Fused convolutions are not yet implemented for MalConvGCG; setting `fuse=False`.")
-            self.fuse = False
         # Context path (no gating)
         self.ctx_conv  = nn.Conv1d(self.embedding_dim, 2 * self.channels, self.kernel_size, self.stride)
         self.ctx_share = nn.Conv1d(self.channels, self.channels, 1)
@@ -920,87 +961,6 @@ def _lowmem_max_over_time_streaming(
 
     max_pos.clamp_(0, max(0, T - rf))
     return max_vals, max_pos
-
-
-def _recompute_winners(preprocess: PreprocessFn, ts: Sequence[Tensor], b: int, pos: Tensor, rf: int, rng: Optional[Tensor] = None) -> Tensor:
-
-    if not isinstance(ts, Sequence):
-        raise TypeError(f"`ts` must be a sequence of tensors. Got {type(ts)} instead.")
-    if not all(isinstance(t, Tensor) for t in ts):
-        raise TypeError(f"All elements of `ts` must be tensors. Got {[type(t) for t in ts]} instead.")
-    if not all(t.dim() >= 2 for t in ts):
-        raise ValueError(f"All tensors in `ts` must have at least 2 dimensions. Got {[t.dim() for t in ts]} instead.")
-
-    rng = torch.arange(rf, device=pos.device) if rng is None else rng
-
-    # Handle degenerate case of no winners cleanly.
-    if pos.numel() == 0:
-        wins = [t.new_empty((0, rf) + tuple(t.shape[2:])) for t in ts]
-        z = preprocess(*wins)
-        z = z.contiguous()
-        check_tensor(z, (0, rf, None))
-        return z
-
-    # Select this sample's winning windows and preprocess them.
-    # This needs to be done index-by-index to avoid massive tensor expansion.
-    wins = []
-    for t in ts:
-        if t.shape[1] < rf:
-            raise RuntimeError(f"Sequence too short: T={t.shape[1]} < rf={rf}")
-
-        t_b = t[b]  # (T, *)
-
-        # Build (U, rf) start indices: pos + [0..rf-1]
-        idx = pos.to(t_b.device).unsqueeze(1) + rng.unsqueeze(0)  # (U, rf)
-
-        # Advanced indexing along the first dim yields (U, rf, *) for any tail
-        w = t_b[idx]
-        wins.append(w.contiguous())
-
-    z = preprocess(*wins)                        # (U, rf, None)
-    z = z.contiguous()
-
-    check_tensor(z, (wins[0].shape[0] if len(wins) > 0 else None, rf, None), FLOATS)
-    return z
-
-
-def _gather_wins_via_preprocess(
-    *,
-    preprocess: PreprocessFn,
-    ts: Sequence[Tensor],
-    positions: torch.Tensor,
-    rf: int,
-    embedding_dim: int,
-) -> tuple[torch.Tensor, list[tuple[int, torch.Tensor, int]]]:
-    """
-    For each batch b: unique winner starts (posuniq), call _recompute_winners
-    to get (U_b, rf, E), cast & transpose, and concatenate to (sum_U, E, rf).
-    Return the meta needed for scattering back.
-    """
-    B = positions.shape[0]
-    wins_list: list[torch.Tensor] = []
-    meta: list[tuple[int, torch.Tensor, int]] = []
-    offset = 0
-
-    rng = torch.arange(rf, device=ts[0].device)
-
-    for b in range(B):
-        pos_b = positions[b]  # (C,)
-        posuniq, inv = torch.unique(pos_b, sorted=True, return_inverse=True)  # (U_b,), (C,)
-        z_b = _recompute_winners(preprocess, ts, b, posuniq, rf, rng)  # (U_b, rf, E)
-        if z_b.shape[2] != embedding_dim:
-            raise RuntimeError(f"preprocess returned wrong E: {z_b.shape[2]} vs {embedding_dim}")
-        z_b = z_b.transpose(1, 2).contiguous()  # (U_b, E, rf)
-        wins_list.append(z_b)
-        meta.append((offset, inv, z_b.shape[0]))
-        offset += z_b.shape[0]
-
-    if wins_list:
-        wins_cat = torch.cat(wins_list, dim=0)
-    else:
-        wins_cat = torch.empty((0, embedding_dim, rf), device=ts[0].device, dtype=torch.get_default_dtype(),)
-
-    return wins_cat, meta
 
 
 def _gather_wins_via_preprocess_batched(
