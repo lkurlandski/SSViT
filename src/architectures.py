@@ -513,6 +513,28 @@ class PreprocessFn(Protocol):
         ...
 
 
+def _get_conv_kwds(conv: nn.Conv1d) -> dict[str, Any]:
+    return {
+        "stride": conv.stride,
+        "padding": conv.padding,
+        "dilation": conv.dilation,
+        "groups": conv.groups,
+    }
+
+
+def _check_grad_connected(outputs: Tensor, inputs: Tensor | list[Tensor]) -> list[bool]:
+    """
+    Check if a tensor is connected to the gradients of the convolutional weights.
+    """
+    if not torch.is_grad_enabled():
+        raise RuntimeError("Gradients are not enabled.")
+    inputs = [inputs] if isinstance(inputs, Tensor) else inputs
+    if not outputs.requires_grad:
+        return [False for _ in inputs]
+    grads = torch.autograd.grad(outputs, inputs, retain_graph=True, allow_unused=True)
+    return [grad is not None for grad in grads]
+
+
 class GatedConvolution(nn.Module):
     """
     Gated Convolution.
@@ -545,7 +567,7 @@ class GatedConvolution(nn.Module):
         return g
 
     @torch.no_grad()
-    def forward_functional(gconv: GatedConvolution, z: Tensor) -> Tensor:
+    def forward_functional(self, z: Tensor) -> Tensor:  # FIXME
         """
         Functional version of `GatedConvolution.forward` without auto-grad.
 
@@ -555,43 +577,24 @@ class GatedConvolution(nn.Module):
         Since we only this this function for the low-memory computation when we need
         it detached from auto-grad, the former is acceptable for now.
         """
-        conv_1, conv_2 = gconv.conv_1, gconv.conv_2
+        check_tensor(z, (None, self.conv_1.in_channels, None), FLOATS)
 
-        check_tensor(z, (None, conv_1.in_channels, None), FLOATS)
-
-        w1 = conv_1.weight.detach()
-        b1 = conv_1.bias.detach() if conv_1.bias is not None else None
-        w2 = conv_2.weight.detach()
-        b2 = conv_2.bias.detach() if conv_2.bias is not None else None
+        w1 = self.conv_1.weight.detach()
+        b1 = self.conv_1.bias.detach() if self.conv_1.bias is not None else None
+        w2 = self.conv_2.weight.detach()
+        b2 = self.conv_2.bias.detach() if self.conv_2.bias is not None else None
 
         z = z.to(w1.dtype)
 
-        c_1 = F.conv1d(z, w1, b1, stride=conv_1.stride, padding=conv_1.padding,
-            dilation=conv_1.dilation, groups=conv_1.groups)
-        c_2 = F.conv1d(z, w2, b2, stride=conv_2.stride, padding=conv_2.padding,
-            dilation=conv_2.dilation, groups=conv_2.groups)
+        c_1 = F.conv1d(z, w1, b1, **_get_conv_kwds(self.conv_1))
+        c_2 = F.conv1d(z, w2, b2, **_get_conv_kwds(self.conv_2))
         g = c_1 * torch.sigmoid(c_2)
 
-        check_tensor(g, (z.shape[0], conv_1.out_channels, None), FLOATS)
-
+        check_tensor(g, (z.shape[0], self.conv_1.out_channels, None), FLOATS)
         return g
 
     def check_grad_connected(self, x: Tensor) -> tuple[bool, bool]:
-        """
-        Check if a tensor is connected to the gradients of the convolutional weights.
-        """
-        if not torch.is_grad_enabled():
-            raise RuntimeError("Gradients are not enabled.")
-        if not x.requires_grad:
-            return False, False
-
-        grads = torch.autograd.grad(
-            x,
-            [self.conv_1.weight, self.conv_2.weight],
-            retain_graph=True,
-            allow_unused=True,
-        )
-        return (grads[0] is not None, grads[1] is not None)
+        return tuple(_check_grad_connected(x, [self.conv_1.weight, self.conv_2.weight]))  # type: ignore[return-value]
 
 
 class MalConvBase(nn.Module, ABC):
@@ -723,7 +726,7 @@ class MalConvLowMem(MalConvBase):
             chunk_size=self.chunk_size,
             overlap=self.overlap,
             channels=self.channels,
-            activations_fn=partial(GatedConvolution.forward_functional, self.gconv),
+            activations_fn=self.gconv.forward_functional,
             # activations_fn=self.gconv,  # WARN: this causes silent gradient disconnection!
         )
         assert max_vals.requires_grad is False
@@ -767,37 +770,189 @@ class MalConvLowMem(MalConvBase):
         return z
 
 
+class GCGBlock(nn.Module):
+    """
+    Gated Convolution with Global Context (GCG) block.
+    """
+
+    def __init__(self, embedding_dim: int, channels: int, kernel_size: int, stride: int) -> None:
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.conv_1 = nn.Conv1d(embedding_dim, 2 * channels, kernel_size, stride)
+        self.conv_2 = nn.Conv1d(channels, channels, 1)
+        self.gct_proj = nn.Linear(channels, channels)
+
+    def forward(self, z: Tensor, gct: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input tensor of shape (B, E, T).
+            gct: Global context tensor of shape (B, C).
+        Returns:
+            Output tensor of shape (B, C, S).
+        """
+        B, T = z.shape[0], z.shape[2]
+        E, C = self.embedding_dim, self.channels
+        check_tensor(z, (B, E, T), FLOATS)
+        check_tensor(gct, (B, C), FLOATS)
+
+        # TODO: comment
+        h: Tensor
+        h = self.conv_1(z)                  # (B, 2C, T')
+        h = F.glu(h, dim=1)                 # (B, C,  T')
+        h = self.conv_2(h)                  # (B, C,  T')
+        h = F.leaky_relu(h)                 # (B, C,  T')
+        h = h.transpose(1, 2).contiguous()  # (B, T', C)
+        T_ = h.shape[1]
+
+        # Project global context.
+        q = self.gct_proj(gct)  # (B, C)
+        q = torch.tanh(q)       # (B, C)
+        q = q.unsqueeze(2)      # (B, C, 1)
+
+        # TODO: comment
+        t = h.reshape(1, B * C, T_)   # (1, BC, T')
+        g = F.conv1d(t, q, groups=B)  # (1, B, T')
+        g = g.view(B, 1, T_)          # (B, 1, T')
+        g = torch.sigmoid(g)          # (B, 1, T')
+
+        # TODO: comment
+        out = (h * g.transpose(1, 2)).contiguous()  # (B, T', C)
+        out = out.transpose(1, 2).contiguous()      # (B, C, T')
+
+        check_tensor(out, (B, C, T_), FLOATS)
+        return out
+
+    @torch.no_grad()
+    def forward_functional(self, z: Tensor, gct: Tensor) -> Tensor:
+        """
+        Functional version for low-memory streaming scans.
+        """
+        B, T = z.shape[0], z.shape[2]
+        E, C = self.embedding_dim, self.channels
+        check_tensor(z, (B, E, T), FLOATS)
+        check_tensor(gct, (B, C), FLOATS)
+
+        w1 = self.conv_1.weight.detach()
+        b1 = self.conv_1.bias.detach() if self.conv_1.bias is not None else None
+        w2 = self.conv_2.weight.detach()
+        b2 = self.conv_2.bias.detach() if self.conv_2.bias is not None else None
+        wp = self.gct_proj.weight.detach()
+        bp = self.gct_proj.bias.detach() if self.gct_proj.bias is not None else None
+
+        z   = z.to(w1.dtype)
+        gct = gct.to(wp.dtype)
+
+        h = F.conv1d(z, w1, b1, **_get_conv_kwds(self.conv_1))
+        h = F.glu(h, dim=1)
+        h = F.conv1d(h, w2, b2, **_get_conv_kwds(self.conv_2))
+        h = F.leaky_relu(h)
+        h = h.transpose(1, 2).contiguous()
+        T_ = h.shape[1]
+
+        q = F.linear(gct, wp, bp)
+        q = torch.tanh(q)
+        q = q.unsqueeze(2)
+
+        t = h.reshape(1, B * C, T_)
+        gates = F.conv1d(t, q, groups=B)
+        gates = gates.view(B, 1, T_)
+        gates = torch.sigmoid(gates)
+
+        out = (h * gates.transpose(1, 2)).contiguous()
+        out = out.transpose(1, 2).contiguous()
+
+        check_tensor(out, (B, C, T_), FLOATS)
+        return out
+
+    def check_grad_connected(self, x: Tensor) -> tuple[bool, bool, bool]:
+        return tuple(_check_grad_connected(x, [self.conv_1.weight, self.conv_2.weight, self.gct_proj.weight]))  # type: ignore[return-value]
+
+
+class ContextBlock(nn.Module):
+    """
+    Context subnetwork for MalConvGCG.
+    """
+
+    def __init__(self, embedding_dim: int, channels: int, kernel_size: int, stride: int) -> None:
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.conv = nn.Conv1d(embedding_dim, 2 * channels, kernel_size, stride)
+        self.share = nn.Conv1d(channels, channels, 1)
+
+    def forward(self, z: Tensor) -> Tensor:
+        """
+        Args:
+            z: input tensor of shape (B, E, T).
+        Returns:
+            Output tensor of shape (B, C, T').
+        """
+        check_tensor(z, (None, self.embedding_dim, None), FLOATS)
+        x = self.conv(z)     # (B, 2C, T')
+        x = F.glu(x, dim=1)  # (B, C,  T')
+        x = self.share(x)    # (B, C,  T')
+        x = F.leaky_relu(x)  # (B, C,  T')
+        check_tensor(x, (z.shape[0], self.channels, None), FLOATS)
+        return x
+
+    @torch.no_grad()
+    def forward_functional(self, z: Tensor) -> Tensor:
+        """
+        Functional version for low-memory streaming scans.
+        """
+        check_tensor(z, (None, self.embedding_dim, None), FLOATS)
+
+        w_ctx = self.conv.weight.detach()
+        b_ctx = self.conv.bias.detach() if self.conv.bias is not None else None
+        w_sh  = self.share.weight.detach()
+        b_sh  = self.share.bias.detach() if self.share.bias is not None else None
+
+        z = z.to(w_ctx.dtype)
+
+        x = F.conv1d(z, w_ctx, b_ctx, **_get_conv_kwds(self.conv))
+        x = F.glu(x, dim=1)
+        x = F.conv1d(x, w_sh, b_sh, **_get_conv_kwds(self.share))
+        x = F.leaky_relu(x)
+
+        check_tensor(x, (z.shape[0], self.channels, None), FLOATS)
+        return x
+
+    def check_grad_connected(self, x: Tensor) -> tuple[bool, bool]:
+        return tuple(_check_grad_connected(x, [self.conv.weight, self.share.weight]))  # type: ignore[return-value]
+
+
 class MalConvGCG(MalConvBase):
 
     def __init__(self, *args: Any, **kwds: Any) -> None:
         super().__init__(*args, **kwds)
-        # Context path (no gating)
-        self.ctx_conv  = nn.Conv1d(self.embedding_dim, 2 * self.channels, self.kernel_size, self.stride)
-        self.ctx_share = nn.Conv1d(self.channels, self.channels, 1)
-        # Main path (with gating)
-        self.conv_1 = nn.Conv1d(self.embedding_dim, 2 * self.channels, self.kernel_size, self.stride)
-        self.conv_2 = nn.Conv1d(self.channels, self.channels, 1)
-        self.gct_proj = nn.Linear(self.channels, self.channels)
+        self.ctx_block  = ContextBlock(self.embedding_dim, self.channels, self.kernel_size, self.stride)
+        self.main_block = GCGBlock(self.embedding_dim, self.channels, self.kernel_size, self.stride)
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
         z = z.transpose(1, 2).contiguous()  # (B, E, T)
-
-        # ---------------- Context path: compute gct (B, C) ----------------
-        ctx_map = self._ctx_activations(z)          # (B, C, T_ctx)
-        gct, _ = ctx_map.max(dim=-1)                # (B, C)
-
-        # ---------------- Main path: GCG gating over full seq -------------
-        main_map = self._main_activations(z, gct)   # (B, C, T_main)
-
-        # Global max over time (temporal max pooling)
-        z, _ = main_map.max(dim=-1)                      # (B, C)
-
+        ctx_map = self.ctx_block(z)         # (B, C, T')
+        gct = ctx_map.max(dim=-1)[0]        # (B, C)
+        main_map = self.main_block(z, gct)  # (B, C, T')
+        z = main_map.max(dim=-1)[0]         # (B, C)
         return z
 
     def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
-        B = ts[0].shape[0]
+        # The steps taken here are quite similar to those in MalConvLowMem.forward_streaming,
+        # but with two separate streaming scans: one for the context path and one for the main path.
+        # See MalConvLowMem.forward_streaming for comment about what is going on.
 
-        # ------------------------- Context path: gct (B, C) -------------------------
+        batch_size = ts[0].shape[0]
+
+        # ------------------------------------------------------------------
+        # -------------------------- Context Path --------------------------
+        # ------------------------------------------------------------------
+
+        # Get the streamed maxima of the context path.
         ctx_max_vals, ctx_pos = _lowmem_max_over_time_streaming(
             preprocess=preprocess,
             ts=ts,
@@ -806,32 +961,49 @@ class MalConvGCG(MalConvBase):
             chunk_size=self.chunk_size,
             overlap=self.overlap,
             channels=self.channels,
-            activations_fn=self._ctx_activations,   # (B,E,L) -> (B,C,L_out)
+            activations_fn=self.ctx_block.forward_functional,
         )
+        assert ctx_max_vals.requires_grad is False
+        assert not torch.is_grad_enabled() or not any(self.ctx_block.check_grad_connected(ctx_max_vals.sum()))
+        assert all(p.requires_grad for name, p in self.named_parameters() if "ctx_block" in name)
 
-        if self.training:
-            # recompute winners so gradients flow back through preprocess (Embedding+FiLM)
+        # Get the global context tensor, gct, from the context path.
+        gct: Tensor  # (B, C)
+        if not self.training:
+            gct = ctx_max_vals
+        else:
             wins_ctx, meta_ctx = _gather_wins_via_preprocess_batched(
                 preprocess=preprocess,
                 ts=ts,
-                positions=ctx_pos,                   # (B, C)
+                positions=ctx_pos,
                 rf=self.kernel_size,
                 embedding_dim=self.embedding_dim,
-            )                                       # wins_ctx: (sum_Uc, E, rf)
+            )
+            assert wins_ctx.requires_grad is True
+            assert not torch.is_grad_enabled() or not any(self.ctx_block.check_grad_connected(wins_ctx.sum()))
+            assert all(p.requires_grad for name, p in self.named_parameters() if "ctx_block" in name)
 
-            g_all_ctx = self._ctx_activations(wins_ctx).squeeze(-1)   # (sum_Uc, C)
+            g_all_ctx: Tensor = self.ctx_block(wins_ctx)
+            g_all_ctx = g_all_ctx.squeeze(-1)
+            assert g_all_ctx.requires_grad is True
+            assert not torch.is_grad_enabled() or all(self.ctx_block.check_grad_connected(g_all_ctx.sum()))
+            assert all(p.requires_grad for name, p in self.named_parameters() if "ctx_block" in name)
+
             gct = _scatter_g_to_BC(
                 g_all=g_all_ctx,
                 meta=meta_ctx,
-                batch_size=B,
+                batch_size=batch_size,
                 channels=self.channels,
-            )                                       # (B, C)
-        else:
-            # eval: no grads to preprocess; ctx_max_vals already is global max over time
-            gct = ctx_max_vals                      # (B, C)
+            )
+            assert gct.requires_grad is True
+            assert not torch.is_grad_enabled() or all(self.ctx_block.check_grad_connected(gct.sum()))
+            assert all(p.requires_grad for name, p in self.named_parameters() if "ctx_block" in name)
 
-        # ------------------------- Main path: gated activations -------------------------
-        # Streaming scan uses gct as a fixed per-batch context (no-grad during scan).
+        # ------------------------------------------------------------------
+        # --------------------------- Main Path ----------------------------
+        # ------------------------------------------------------------------
+
+        # Get the streamed maxima of the main path.
         main_max_vals, main_pos = _lowmem_max_over_time_streaming(
             preprocess=preprocess,
             ts=ts,
@@ -840,63 +1012,62 @@ class MalConvGCG(MalConvBase):
             chunk_size=self.chunk_size,
             overlap=self.overlap,
             channels=self.channels,
-            activations_fn=lambda z_chunk: self._main_activations(z_chunk, gct),
+            activations_fn=partial(self.main_block.forward_functional, gct=gct.detach()),
         )
+        assert main_max_vals.requires_grad is False
+        assert not torch.is_grad_enabled() or not any(self.main_block.check_grad_connected(main_max_vals.sum()))
+        assert all(p.requires_grad for name, p in self.named_parameters() if "main_block" in name)
 
-        # Inference: global pooled output is just the max over time on main path
+        # If conducting inference, simply return the max-pooled activations.
         if not self.training:
-            return main_max_vals                     # (B, C)
+            return main_max_vals
 
-        # Training: recompute only winner windows (like MalConvLowMem) with autograd on
+        # If conducting training, recompute only the winner windows (with autograd).
+        if not torch.is_grad_enabled():
+            raise RuntimeError("Gradients are not enabled but the model is in training mode.")
         wins_main, meta_main = _gather_wins_via_preprocess_batched(
             preprocess=preprocess,
             ts=ts,
-            positions=main_pos,                      # (B, C)
+            positions=main_pos,
             rf=self.kernel_size,
             embedding_dim=self.embedding_dim,
-        )                                            # (sum_Um, E, rf)
+        )
+        assert wins_main.requires_grad is True
+        assert not any(self.main_block.check_grad_connected(wins_main.sum()))
+        assert all(p.requires_grad for name, p in self.named_parameters() if "main_block" in name)
 
-        # Build per-window context tensor aligned with wins_main
-        ctx_per_win = []
-        for (start, inv, u_b), b in zip(meta_main, range(B)):
+        # Build per-window context aligned with wins_main.
+        ctx_per_win: list[Tensor] = []
+        for (_, _, u_b), b in zip(meta_main, range(batch_size)):
             if u_b == 0:
                 continue
-            ctx_per_win.append(gct[b].unsqueeze(0).expand(u_b, -1))  # (U_b, C)
-        ctx_cat = (torch.cat(ctx_per_win, dim=0)
-                   if ctx_per_win else
-                   gct.new_empty((0, self.channels)))                 # (sum_Um, C)
+            ctx_per_win.append(gct[b].unsqueeze(0).expand(u_b, -1))
+        if ctx_per_win:
+            ctx_cat = torch.cat(ctx_per_win, dim=0)
+        else:
+            ctx_cat = gct.new_empty((0, self.channels))
+        assert ctx_cat.shape[0] == wins_main.shape[0]
 
-        g_all_main = self._main_activations(wins_main, ctx_cat).squeeze(-1)  # (sum_Um, C)
+        # Main-path recomputation with full autograd graph.
+        g_all_main: Tensor = self.main_block(wins_main, ctx_cat)
+        g_all_main = g_all_main.squeeze(-1)
+        assert g_all_main.requires_grad is True
+        assert all(self.main_block.check_grad_connected(g_all_main.sum()))
+        assert all(p.requires_grad for name, p in self.named_parameters() if "main_block" in name)
 
+        # Scatter per-window activations back to per-(B,C) features.
         z = _scatter_g_to_BC(
             g_all=g_all_main,
             meta=meta_main,
-            batch_size=B,
+            batch_size=batch_size,
             channels=self.channels,
-        )                                            # (B, C)
+        )
+        assert z.requires_grad is True
+        assert all(self.ctx_block.check_grad_connected(z.sum()))
+        assert all(self.main_block.check_grad_connected(z.sum()))
+        assert all(p.requires_grad for name, p in self.named_parameters() if "main_block" in name)
+
         return z
-
-    def _ctx_activations(self, z: Tensor) -> Tensor:
-        """
-        Context subnetwork activations on a chunk.
-        z: (B, E, T_chunk) -> (B, C, T_out)
-        """
-        x = F.glu(self.ctx_conv(z), dim=1)
-        x = F.leaky_relu(self.ctx_share(x))
-        return x
-
-    def _main_activations(self, z: Tensor, gct: Tensor) -> Tensor:
-        """
-        Main subnetwork activations with GCG gating on a chunk.
-        z:   (B, E, T_chunk)
-        gct: (B, C)
-        ->   (B, C, T_out)
-        """
-        h = F.glu(self.conv_1(z), dim=1)
-        h = F.leaky_relu(self.conv_2(h))
-        q = torch.tanh(self.gct_proj(gct))           # (B, C)
-        gate = torch.sigmoid((h * q.unsqueeze(-1)).sum(dim=1, keepdim=True))  # (B, 1, T)
-        return h * gate
 
 # -------------------------------------------------------------------------------- #
 # MalConv Helpers
