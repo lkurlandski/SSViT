@@ -275,7 +275,7 @@ class FiLMNoP(nn.Module):
             raise ValueError(f"Expected g to be None, got {type(g)} instead.")
 
         if torch.is_autocast_enabled():
-            x = x.to(torch.get_autocast_gpu_dtype())
+            x = x.to(torch.get_autocast_dtype(x.device.type))
 
         return x
 
@@ -288,7 +288,7 @@ class FiLMNoP(nn.Module):
             raise ValueError(f"Expected g to be None, got {type(g)} instead.")
 
         if torch.is_autocast_enabled():
-            x = x.to(torch.get_autocast_gpu_dtype())
+            x = x.to(torch.get_autocast_dtype(x.device.type))
 
         return x
 
