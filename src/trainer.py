@@ -572,7 +572,6 @@ class Trainer:
         t_detailed_steps: list[float] = []  # time to step
         ####################################
 
-
         mini_step = -1  # mini-step within this epoch
         grda_modl = 0   # gradient accumulation modulo local steps
         for mini_step, batch in iterable:
@@ -604,11 +603,14 @@ class Trainer:
 
             if rank() == 0 and self.glbl_step == 0:
                 flush()
+                print(f"{'-' * 20} Parameter Summary After First Backward {'-' * 20}")
                 print_parameter_summary(self.model, spaces=2)
+                print(f"{'-' * 80}")
             if not ALLOW_PARAM_GRAD_NONE and any(param.grad is None for param in self.model.parameters()):
-                if rank() == 0 and self.glbl_step != 0:
-                    flush()
-                    print_parameter_summary(self.model, spaces=2)
+                flush()
+                print(f"{'-' * 20} Parameter Summary After Step {self.glbl_step:09} {'-' * 20}")
+                print_parameter_summary(self.model, spaces=2)
+                print(f"{'-' * 80}")
                 raise RuntimeError("Some of the parameters have no gradients.")
 
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
@@ -618,16 +620,16 @@ class Trainer:
 
                 if is_last_real and grda_modl != 0:
                     grda_modl = 0
-                do_log = any(self._due_hooks())
+                do_logg = any(self._due_hooks())
                 do_eval = self._due_hooks()[0]
                 # Freeing up memory before running the validation cycle seems to keep GPU memory usage lower
                 # across all subsequent training and validation phases (yes, both of them). Why? Don't know!
                 if do_eval:
                     del batch, outputs, loss
                     gc.collect()
-                self.run_due_hooks(report() if do_log else None)
+                self.run_due_hooks(report() if do_logg else None)
                 self.model.train()
-                if do_log:
+                if do_logg:
                     self.monitor.clear()
 
             # Stop if we've reached the maximum number of global steps
