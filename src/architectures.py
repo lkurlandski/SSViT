@@ -86,6 +86,52 @@ def get_model_input_lengths(model: nn.Module) -> tuple[int, int]:
     return lo, hi
 
 
+class LowMemoryNetworkMixin(nn.Module, ABC):
+    """
+    Mixin for neural networks supporting low-memory paths.
+    """
+
+    def forward(self, z: Optional[Tensor] = None, preprocess: Optional[PreprocessFn] = None, ts: Optional[Sequence[Tensor]] = None) -> Tensor:
+        """
+        Dispatches to either `forward_embeddings` or `forward_streaming` based on provided inputs.
+
+        Args:
+            z: input tensor of shape (B, T, E) (`forward_embeddings`).
+            preprocess: callable to compute the input tensor (`forward_streaming`).
+            ts: optional tensor arguments of shape (B, T, *) for `preprocess` (`forward_streaming`).
+
+        Returns:
+            Output tensor of shape (B, ...).
+        """
+        self.check_inputs(z, ts)
+
+        if z is not None:
+            z = self.forward_embeddings(z)
+        elif preprocess is not None and ts is not None:
+            if DISABLE_LOW_MEMORY_PATHS:
+                z = self.forward_embeddings(preprocess(*ts))
+            else:
+                z = self.forward_streaming(preprocess=preprocess, ts=ts)
+        else:
+            raise ValueError("Either `z` or both `preprocess` and `ts` must be provided.")
+
+        self.check_output(z)
+        return z
+
+    @abstractmethod
+    def forward_embeddings(self, z: Tensor) -> Tensor:
+        """Dense, memory intensive path."""
+
+    @abstractmethod
+    def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
+        """Streaming, low-memory path."""
+
+    def check_inputs(self, z: Optional[Tensor] = None, ts: Optional[Sequence[Tensor]] = None) -> None:
+        """Validate the inputs to `forward`."""
+
+    def check_output(self, z: Tensor) -> None:
+        """Validate the output of `forward`."""
+
 # -------------------------------------------------------------------------------- #
 # Other
 # -------------------------------------------------------------------------------- #
@@ -769,8 +815,8 @@ class ViT(nn.Module):
         d_model: int = 256,
         nhead: int = 1,
         dim_feedforward: int = -1,
-        activation: str = "gelu",
         num_layers: int = 1,
+        activation: str = "gelu",
         norm: Optional[str] = "rms",
         pooling: Literal["mean", "cls"] = "cls",
     ) -> None:
