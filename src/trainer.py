@@ -222,10 +222,10 @@ class TrainerArgs:
     eval_steps: Optional[int] = None
     chpt_epochs: Optional[float] = 1.0
     chpt_steps: Optional[int] = None
-    schd_epochs: Optional[float] = 1.0
-    schd_steps: Optional[int] = None
     logg_epochs: Optional[float] = 1.0
     logg_steps: Optional[int] = None
+    schd_epochs: Optional[float] = None
+    schd_steps: Optional[int] = 1
 
     def __post_init__(self) -> None:
         if (self.max_epochs is not None) == (self.max_steps is not None):
@@ -340,6 +340,49 @@ def _binary_auroc_compute_jit(
         torch.trapz(cum_tp, cum_fp).double() / factor,
     )
     return auroc
+
+
+# Source: torcheval.metrics.functional.classification.precision_recall_curve
+@torch.jit.script
+def _compute_for_each_class(
+    input: torch.Tensor,
+    target: torch.Tensor,
+    pos_label: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    threshold, indices = input.sort(descending=True)
+    mask = F.pad(threshold.diff(dim=0) != 0, [0, 1], value=1.0)
+    num_tp = (target[indices] == pos_label).cumsum(0)[mask]
+    num_fp = (1 - (target[indices] == pos_label).long()).cumsum(0)[mask]
+    precision = (num_tp / (num_tp + num_fp)).flip(0)
+    recall = (num_tp / num_tp[-1]).flip(0)
+    threshold = threshold[mask].flip(0)
+
+    # The last precision and recall values are 1.0 and 0.0 without a corresponding threshold.
+    # This ensures that the graph starts on the y-axis.
+    precision = torch.cat([precision, precision.new_ones(1)])
+    recall = torch.cat([recall, recall.new_zeros(1)])
+
+    # If recalls are NaNs, set NaNs to 1.0s.
+    if torch.isnan(recall[0]):
+        recall = torch.nan_to_num(recall, 1.0)
+
+    return precision, recall, threshold
+
+
+# Source: torcheval.metrics.functional.tensor_utils
+def _riemann_integral(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return -torch.sum((x[1:] - x[:-1]) * y[:-1])
+
+
+# Source: torcheval.metrics.functional.classification.auprc
+@torch.jit.script
+def _binary_auprc_compute_jit(
+    input: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+
+    p, r, t = _compute_for_each_class(input, target, 1)
+    return _riemann_integral(r, p)
 
 
 def flush() -> None:
@@ -748,16 +791,19 @@ class Trainer:
             report |= self.evaluate()
             report |= {f"vl_{k}": v for k, v in self.get_monitor_report().items()}
 
-        # If scheduled, save a checkpoint.
-        if do_chpt:
-            self.to_checkpoint(self.args.outdir / f"checkpoint-{self.glbl_step}")
-
         # If scheduled, step the LR scheduler.
         if do_schd:
             self.scheduler.step()
 
-        # Update console and log files.
-        self._update_cons(report)
+        # If scheduled, save a checkpoint.
+        if do_chpt:
+            self.to_checkpoint(self.args.outdir / f"checkpoint-{self.glbl_step}")
+
+        # If scheduled, update the console.
+        if do_logg:
+            self._update_cons(report)
+
+        # Always update the log.
         self._update_logs(report)
 
         # Advance schedules that fired.
@@ -831,6 +877,7 @@ class Trainer:
         rec = tp / (tp + fn).clamp_min_(1)
         f_1 = 2 * pre * rec / (pre + rec).clamp_min_(1)
         roc = _binary_auroc_compute_jit(probs, labels)
+        prc = _binary_auprc_compute_jit(probs, labels)
 
         return {
             "acc": acc,
@@ -838,6 +885,7 @@ class Trainer:
             "rec": rec,
             "f-1": f_1,
             "roc": roc,
+            "prc": prc,
         }
 
     def _dataloader_lengths(self, dataloader: Collection[Batch] | DataLoader[Batch]) -> list[int]:
@@ -934,7 +982,7 @@ class Trainer:
             d["tr_throughput"] = round(results["tr_throughput"], 2)
         if any(k.startswith("vl_") for k in results):
             d["vl_loss"] = round(results["vl_loss"], 3)
-            d["vl_acc"] = round(results["vl_acc"], 3)
+            d["vl_roc"] = round(results["vl_roc"], 3)
             d["vl_gpu_utl"] = round(results["vl_gpu_utl"], 2)
             d["vl_gpu_mem"] = round(results["vl_gpu_mem"] / (1024 ** 3), 2)
             d["vl_time"] = round(results["vl_time"], 0)
@@ -952,6 +1000,7 @@ class Trainer:
             ├── meta.json
             ├── args.pickle
             ├── log.pickle
+            ├── log.jsonl
             ├── stopper.pickle
             ├── rng-cpu.pt
             ├── rng-gpu.pt
@@ -980,6 +1029,13 @@ class Trainer:
             # Pickled objects
             Path(path / "args.pickle").write_bytes(pickle.dumps(self.args))
             Path(path / "log.pickle").write_bytes(pickle.dumps(self.log))
+            with open(path / "log.jsonl", "w") as fp:
+                for entry in self.log:
+                    try:
+                        line = json.dumps(entry)
+                    except Exception as err:
+                        line = json.dumps({"error": f"Could not serialize log entry: {err}"})
+                    fp.write(line + "\n")
             Path(path / "stopper.pickle").write_bytes(pickle.dumps(self.stopper))
             # Torch objects
             torch.save(torch.random.get_rng_state(), path / "rng-cpu.pt")
