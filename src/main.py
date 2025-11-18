@@ -38,6 +38,9 @@ from torch.optim import Optimizer
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LinearLR
+from torch.optim.lr_scheduler import SequentialLR
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
@@ -274,6 +277,20 @@ def get_model(
 
 
     raise NotImplementedError(f"{level} {arch}")
+
+
+def get_lr_scheduler(optimizer: Optimizer, lr_beg: float, lr_max: float, lr_min: float, total_steps: int, warmup_steps: int) -> SequentialLR:
+    if optimizer.state_dict()["param_groups"][0]["lr"] != lr_max:
+        raise ValueError("Optimizer learning rate does not match base_lr.")
+
+    # Linearly increase from `lr_beg` to `lr_max` over `warmup_steps`.
+    warmup_scheduler = LinearLR(optimizer, lr_beg / lr_max, 1.0, warmup_steps)
+    # Cosine decay from `lr_max` to `lr_min` over the remaining steps.
+    cosine_scheduler = CosineAnnealingLR(optimizer, total_steps - warmup_steps, lr_min)
+    # Chain the two schedulers together.
+    scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], [warmup_steps])
+
+    return scheduler
 
 
 class SupportsFullyShard(Protocol):
@@ -522,6 +539,11 @@ def main() -> None:
         tr_shards = tr_shards[rank()::world_size()]
         ts_shards = ts_shards[rank()::world_size()]
 
+    if args.num_workers > len(tr_shards):
+        warnings.warn(f"More workers requested ({args.num_workers}) than tr shards ({len(tr_shards)}). Number of workers will be reduced to {len(tr_shards)}.")
+    if args.num_workers > len(ts_shards):
+        warnings.warn(f"More workers requested ({args.num_workers}) than ts shards ({len(ts_shards)}). Number of workers will be reduced to {len(ts_shards)}.")
+
     tr_dataset = IterableSimpleDBDataset(tr_datadb, tr_metadb, preprocessor, tr_shards, shuffle=True)
     ts_dataset = IterableSimpleDBDataset(ts_datadb, ts_metadb, preprocessor, ts_shards, shuffle=False)
     print(f"{tr_dataset=}")
@@ -530,8 +552,8 @@ def main() -> None:
     collate_fn = get_collate_fn(args.level, min_lengths)
     print(f"{collate_fn=}")
 
-    tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
-    ts_loader = get_loader(ts_dataset, args.ts_batch_size, False, None, None, args.num_workers, collate_fn, args.pin_memory, args.prefetch_factor)
+    tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, min(args.num_workers, len(tr_shards)), collate_fn, args.pin_memory, args.prefetch_factor)
+    ts_loader = get_loader(ts_dataset, args.ts_batch_size, False, None, None, min(args.num_workers, len(ts_shards)), collate_fn, args.pin_memory, args.prefetch_factor)
     print(f"tr_loader=DataLoader(pin_memory={tr_loader.pin_memory}, num_workers={tr_loader.num_workers}, prefetch_factor={tr_loader.prefetch_factor})")
     print(f"ts_loader=DataLoader(pin_memory={ts_loader.pin_memory}, num_workers={ts_loader.num_workers}, prefetch_factor={ts_loader.prefetch_factor})")
 
@@ -546,10 +568,28 @@ def main() -> None:
     loss_fn = CrossEntropyLoss()
     print(f"{loss_fn=}")
 
-    optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = partial(AdamW, lr=args.learning_rate)
+    optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = partial(AdamW, lr=args.learning_rate, weight_decay=args.weight_decay)
     print(f"{optimizer_init=}")
 
-    scheduler_init: Callable[[Optimizer], LRScheduler] = partial(LambdaLR, lr_lambda=lambda _: 1.0)
+    # TODO: these computations are all elgantly handled within the Trainer,
+    # but we have to repeat them here, which is kind of a pain.
+    if args.max_steps is not None:
+        total_steps = args.max_steps
+        warmup_steps = int(total_steps * 0.05)
+    elif args.max_epochs is not None:
+        steps_per_epoch = len(tr_loader) // args.gradient_accumulation_steps
+        total_steps = int(args.max_epochs * steps_per_epoch)
+        warmup_steps = steps_per_epoch
+    else:
+        raise ValueError("Either `max_steps` or `max_epochs` must be specified.")
+    scheduler_init: Callable[[Optimizer], LRScheduler] = partial(get_lr_scheduler,
+        lr_beg=0.1 * args.learning_rate,
+        lr_max=args.learning_rate,
+        lr_min=0.01 * args.learning_rate,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+    )
+    # scheduler_init: Callable[[Optimizer], LRScheduler] = partial(LambdaLR, lr_lambda=lambda _: 1.0)
     print(f"{scheduler_init=}")
 
     padbatch = get_padbatch(args.level, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)
