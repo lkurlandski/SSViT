@@ -63,7 +63,11 @@ from tqdm import tqdm
 # performance significantly. Nonetheless, they give a rough idea of where time is being spent.
 DETAILED_TIMING_STATISTICS = os.environ.get("DETAILED_TIMING_STATISTICS", "0") == "1"
 if DETAILED_TIMING_STATISTICS:
-    warnings.warn("Detailed timing statistics enabled; this may impact performance.", RuntimeWarning)
+    warnings.warn("Detailed timing statistics enabled; this may impact performance.")
+
+ALLOW_PARAM_GRAD_NONE = os.environ.get("ALLOW_PARAM_GRAD_NONE", "0") == "1"
+if ALLOW_PARAM_GRAD_NONE:
+    warnings.warn("Allowing parameters with no gradients; some weights may not be updated.")
 
 
 def _syncronize_if_detailed_timing() -> None:
@@ -385,6 +389,15 @@ def flush() -> None:
     print("", flush=True, end="")
 
 
+def print_parameter_summary(model: nn.Module, spaces: int = 0) -> None:
+    for name, param in model.named_parameters():
+        grad = param.grad
+        if grad is None:
+            print(f"{' ' * spaces}param {name} grad: None")
+        else:
+            print(f"{' ' * spaces}param {name} grad: {grad.dtype} {tuple(grad.shape)} {grad.device} {grad.sum().item():.4f}")
+
+
 class Trainer:
     """
     Trainer class for training models with PyTorch.
@@ -513,7 +526,9 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
             scaler.step(self.optimizer)
             scaler.update()
+            warnings.filterwarnings("ignore")
             self.scheduler.step()
+            warnings.resetwarnings()
             self.optimizer.zero_grad()
             self.glbl_step += 1
 
@@ -587,15 +602,14 @@ class Trainer:
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
             t_detailed_log(t_detailed_comps)
 
-            if self.glbl_step == 0 and rank() == 0:
+            if rank() == 0 and self.glbl_step == 0:
                 flush()
-                print(f"[rank {rank()}] parameter check:")
-                for name, param in self.model.named_parameters():
-                    grad = param.grad
-                    if grad is None:
-                        print(f"  param {name} grad: None")
-                    else:
-                        print(f"  param {name} grad: {grad.dtype} {tuple(grad.shape)} {grad.device} {grad.sum().item():.4f}")
+                print_parameter_summary(self.model, spaces=2)
+            if not ALLOW_PARAM_GRAD_NONE and any(param.grad is None for param in self.model.parameters()):
+                if rank() == 0 and self.glbl_step != 0:
+                    flush()
+                    print_parameter_summary(self.model, spaces=2)
+                raise RuntimeError("Some of the parameters have no gradients.")
 
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
