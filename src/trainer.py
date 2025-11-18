@@ -224,8 +224,6 @@ class TrainerArgs:
     chpt_steps: Optional[int] = None
     logg_epochs: Optional[float] = 1.0
     logg_steps: Optional[int] = None
-    schd_epochs: Optional[float] = None
-    schd_steps: Optional[int] = 1
 
     def __post_init__(self) -> None:
         if (self.max_epochs is not None) == (self.max_steps is not None):
@@ -234,8 +232,6 @@ class TrainerArgs:
             raise ValueError("At most one of `eval_epochs` or `eval_steps` may be specified.")
         if (self.chpt_epochs is not None) and (self.chpt_steps is not None):
             raise ValueError("At most one of `chpt_epochs` or `chpt_steps` may be specified.")
-        if (self.schd_epochs is not None) and (self.schd_steps is not None):
-            raise ValueError("At most one of `schd_epochs` or `schd_steps` may be specified.")
         if (self.logg_epochs is not None) and (self.logg_steps is not None):
             raise ValueError("At most one of `logg_epochs` or `logg_steps` may be specified.")
 
@@ -439,7 +435,6 @@ class Trainer:
         self.glbl_step = 0
         self._next_eval_step: Optional[int] = None
         self._next_chpt_step: Optional[int] = None
-        self._next_schd_step: Optional[int] = None
         self._next_logg_step: Optional[int] = None
         self._done: bool = False
 
@@ -473,14 +468,12 @@ class Trainer:
             self._next_eval_step = self.glbl_step + self.eval_steps
         if self.chpt_steps is not None:
             self._next_chpt_step = self.glbl_step + self.chpt_steps
-        if self.schd_steps is not None:
-            self._next_schd_step = self.glbl_step + self.schd_steps
         if self.logg_steps is not None:
             self._next_logg_step = self.glbl_step + self.logg_steps
 
         # Conduct an initial validation and checkpointing on the naked model.
         if self.glbl_step == 0:
-            self.run_due_hooks(None, do_eval=True, do_chpt=True, do_schd=False, do_logg=True)
+            self.run_due_hooks(None, do_eval=True, do_chpt=True, do_logg=True)
 
         # Continuously train the model on the training set until finished.
         while not self._done:
@@ -520,6 +513,7 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
             scaler.step(self.optimizer)
             scaler.update()
+            self.scheduler.step()
             self.optimizer.zero_grad()
             self.glbl_step += 1
 
@@ -739,12 +733,11 @@ class Trainer:
         barrier("Trainer::evaluate:after", self.device)
         return report
 
-    def _due_hooks(self) -> tuple[bool, bool, bool, bool]:
+    def _due_hooks(self) -> tuple[bool, bool, bool]:
         do_eval = self._next_eval_step is not None and self.glbl_step >= self._next_eval_step
         do_chpt = self._next_chpt_step is not None and self.glbl_step >= self._next_chpt_step
-        do_schd = self._next_schd_step is not None and self.glbl_step >= self._next_schd_step
         do_logg = self._next_logg_step is not None and self.glbl_step >= self._next_logg_step
-        return do_eval, do_chpt, do_schd, do_logg
+        return do_eval, do_chpt, do_logg
 
     def run_due_hooks(
         self,
@@ -752,7 +745,6 @@ class Trainer:
         *,
         do_eval: Optional[bool] = None,
         do_chpt: Optional[bool] = None,
-        do_schd: Optional[bool] = None,
         do_logg: Optional[bool] = None,
     ) -> None:
         """
@@ -762,21 +754,19 @@ class Trainer:
             tr_report: Optional dictionary of training statistics to include in the report.
             do_eval: If True, run validation even if not scheduled.
             do_chpt: If True, save a checkpoint even if not scheduled.
-            do_schd: If True, step the LR scheduler even if not scheduled.
             do_logg: If True, update the console and log files even if not scheduled.
 
         NOTE: the schedules are only advanced if fired organically, not via the `do_*` arguments.
         NOTE: logging will occur if any hook fires, but will not advance the logging schedule.
         """
-        due_eval, due_chpt, due_schd, due_logg = self._due_hooks()
+        due_eval, due_chpt, due_logg = self._due_hooks()
 
         do_eval = do_eval if do_eval is not None else due_eval
         do_chpt = do_chpt if do_chpt is not None else due_chpt
-        do_schd = do_schd if do_schd is not None else due_schd
         do_logg = do_logg if do_logg is not None else due_logg
 
         # If no hooks are scheduled, exit prematurely.
-        if not (do_eval or do_chpt or do_schd or do_logg):
+        if not (do_eval or do_chpt or do_logg):
             return
 
         # Otherwise, assemble report to log.
@@ -790,10 +780,6 @@ class Trainer:
             self.monitor.clear()
             report |= self.evaluate()
             report |= {f"vl_{k}": v for k, v in self.get_monitor_report().items()}
-
-        # If scheduled, step the LR scheduler.
-        if do_schd:
-            self.scheduler.step()
 
         # If scheduled, save a checkpoint.
         if do_chpt:
@@ -811,8 +797,6 @@ class Trainer:
             self._next_eval_step += self.eval_steps  # type: ignore[operator]
         if due_chpt:
             self._next_chpt_step += self.chpt_steps  # type: ignore[operator]
-        if due_schd:
-            self._next_schd_step += self.schd_steps  # type: ignore[operator]
         if due_logg:
             self._next_logg_step += self.logg_steps  # type: ignore[operator]
 
@@ -941,12 +925,6 @@ class Trainer:
         return self._epochs_to_steps(self.args.chpt_epochs)
 
     @property
-    def schd_steps(self) -> Optional[int]:
-        if self.args.schd_steps is not None:
-            return max(1, self.args.schd_steps)
-        return self._epochs_to_steps(self.args.schd_epochs)
-
-    @property
     def logg_steps(self) -> Optional[int]:
         if self.args.logg_steps is not None:
             return max(1, self.args.logg_steps)
@@ -1022,7 +1000,6 @@ class Trainer:
                 "glbl_step": self.glbl_step,
                 "_next_eval_step": self._next_eval_step,
                 "_next_chpt_step": self._next_chpt_step,
-                "_next_schd_step": self._next_schd_step,
                 "_next_logg_step": self._next_logg_step,
             }
             Path(path / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -1118,7 +1095,6 @@ class Trainer:
         glbl_step = meta["glbl_step"]
         _next_eval_step = meta["_next_eval_step"]
         _next_chpt_step = meta["_next_chpt_step"]
-        _next_schd_step = meta["_next_schd_step"]
         _next_logg_step = meta["_next_logg_step"]
         args = pickle.loads((path / "args.pickle").read_bytes())
         log = pickle.loads((path / "log.pickle").read_bytes())
@@ -1173,7 +1149,6 @@ class Trainer:
         trainer.glbl_step = glbl_step
         trainer._next_eval_step = _next_eval_step
         trainer._next_chpt_step = _next_chpt_step
-        trainer._next_schd_step = _next_schd_step
         trainer._next_logg_step = _next_logg_step
         trainer.log = log
 
