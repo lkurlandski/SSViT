@@ -66,6 +66,7 @@ def any_to_section_characteristic(s: lief.PE.Section.CHARACTERISTICS | int | str
 @dataclass
 class MainArgs:
     arch: Architecture = Architecture.MCV
+    parch: PatcherArchitecture = PatcherArchitecture.MEM
     size: ModelSize = ModelSize.SM
     seed: int = 0
     do_parser: bool = False
