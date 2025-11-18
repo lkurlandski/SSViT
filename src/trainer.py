@@ -342,6 +342,10 @@ def _binary_auroc_compute_jit(
     return auroc
 
 
+def flush() -> None:
+    print("", flush=True, end="")
+
+
 class Trainer:
     """
     Trainer class for training models with PyTorch.
@@ -545,6 +549,16 @@ class Trainer:
                 scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
             t_detailed_log(t_detailed_comps)
+
+            if self.glbl_step == 0 and rank() == 0:
+                flush()
+                print(f"[rank {rank()}] parameter check:")
+                for name, param in self.model.named_parameters():
+                    grad = param.grad
+                    if grad is None:
+                        print(f"  param {name} grad: None")
+                    else:
+                        print(f"  param {name} grad: {grad.dtype} {tuple(grad.shape)} {grad.device} {grad.sum().item():.4f}")
 
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
@@ -926,6 +940,7 @@ class Trainer:
             d["vl_time"] = round(results["vl_time"], 0)
             d["vl_samples"] = int(results["vl_samples"])
             d["vl_throughput"] = round(results["vl_throughput"], 2)
+        flush()
         print(d)
 
     def to_checkpoint(self, path: str | Path) -> None:
