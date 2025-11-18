@@ -238,6 +238,28 @@ class FiLM(nn.Module):
         check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), FLOATS)
         return z
 
+    @torch.no_grad()
+    def forward_functional(self, x: Tensor, g: Tensor) -> Tensor:
+        """
+        Functional version for low-memory streaming scans.
+        """
+        lin1: nn.Linear = self.mlp[0]  # type: ignore[assignment]
+        lin2: nn.Linear = self.mlp[2]  # type: ignore[assignment]
+        if not isinstance(lin1, nn.Linear) or not isinstance(lin2, nn.Linear):
+            raise RuntimeError("FiLM.forward_functional only supports the standard MLP structure.")
+
+        w1 = lin1.weight.detach()
+        b1 = lin1.bias.detach() if lin1.bias is not None else None
+        w2 = lin2.weight.detach()
+        b2 = lin2.bias.detach() if lin2.bias is not None else None
+
+        film = F.linear(F.relu(F.linear(g, w1, b1)), w2, b2)
+        gamma, beta = film.chunk(2, dim=-1)
+        z = x.to(gamma.dtype) * gamma + beta
+
+        check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), FLOATS)
+        return z
+
 
 class FiLMNoP(nn.Module):
     """
@@ -249,6 +271,19 @@ class FiLMNoP(nn.Module):
 
     def forward(self, x: Tensor, g: Literal[None]) -> Tensor:
         check_tensor(x, (None, None, None), FLOATS)
+        if g is not None:
+            raise ValueError(f"Expected g to be None, got {type(g)} instead.")
+
+        if torch.is_autocast_enabled():
+            x = x.to(torch.get_autocast_gpu_dtype())
+
+        return x
+
+    @torch.no_grad()
+    def forward_functional(self, x: Tensor, g: Literal[None]) -> Tensor:
+        """
+        Functional version for low-memory streaming scans.
+        """
         if g is not None:
             raise ValueError(f"Expected g to be None, got {type(g)} instead.")
 
@@ -1644,7 +1679,7 @@ class MalConvClassifier(Classifier):
 
         def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
             z = self.embedding(x)  # (B, T, E)
-            z = self.filmer(z, g)  # (B, T, E)
+            z = self.filmer(z, g) if torch.is_grad_enabled() else self.filmer.forward_functional(z, g)  # type: ignore[arg-type]
             return z
 
         ts = (x, g) if g is not None else (x,)
@@ -1677,7 +1712,7 @@ class ViTClassifier(Classifier):
 
         def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
             z = self.embedding(x)  # (B, T, E)
-            z = self.filmer(z, g)  # (B, T, E)
+            z = self.filmer(z, g) if torch.is_grad_enabled() else self.filmer.forward_functional(z, g)  # type: ignore[arg-type]
             return z
 
         ts = (x, g) if g is not None else (x,)
@@ -1787,7 +1822,7 @@ class HierarchicalMalConvClassifier(HierarchicalClassifier):
 
             def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
                 z = self.embeddings[i](x)  # (B, T, E)
-                z = self.filmers[i](z, g)  # (B, T, E)
+                z = self.filmers[i](z, g) if torch.is_grad_enabled() else self.filmers[i].forward_functional(z, g)  # type: ignore[operator]
                 return z
 
             ts: tuple[Tensor, ...] = (x[i], g[i]) if g[i] is not None else (x[i],)  # type: ignore[assignment]
