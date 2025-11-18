@@ -456,11 +456,12 @@ class SemanticGuider:
 
     def _get_entropy(self, inputs: Tensor) -> Tensor:
         check_tensor(inputs, (None,), torch.uint8)
-        outdtype = torch.float16
+        outdtype = torch.bfloat16  # TODO: this presumes we'll be using a bloat16-compatible GPU; make configurable later
         if not check_inputs_for_entropy(len(inputs), self.radius, self.stride, errors="pass"):
             return torch.zeros_like(inputs, dtype=outdtype)
         inputs = inputs.numpy(force=True)
         entropy = compute_entropy_rolling_numpy(inputs, self.radius, self.stride)
+        entropy = (entropy - 0) / (8 - 0)  # Normalize to [0, 1]
         entropy = torch.from_numpy(entropy).to(outdtype)
         return entropy
 
