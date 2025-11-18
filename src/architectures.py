@@ -28,6 +28,7 @@ from abc import abstractmethod
 from collections.abc import Sequence
 from functools import partial
 import math
+import os
 import sys
 from typing import Any
 from typing import Callable
@@ -65,6 +66,11 @@ ACTVS: dict[str, Callable[[Tensor], Tensor]] = {
 
 FLOATS = (torch.bfloat16, torch.float16, torch.float32)  # Commonly used for training and evaluating models.
 INTEGERS = (torch.int32, torch.int64)                    # Used for indices compatible with nn.Embedding.
+
+
+DISABLE_LOW_MEMORY_PATHS = os.environ.get("DISABLE_LOW_MEMORY_PATHS", "0") == "1"
+if DISABLE_LOW_MEMORY_PATHS:
+    print("[WARN] Low-memory paths are disabled via DISABLE_LOW_MEMORY_PATHS=1")
 
 
 def get_model_input_lengths(model: nn.Module) -> tuple[int, int]:
@@ -206,7 +212,7 @@ class FiLMNoP(nn.Module):
         return x
 
 # -------------------------------------------------------------------------------- #
-# ViT
+# Positional Encodings
 # -------------------------------------------------------------------------------- #
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -258,6 +264,72 @@ class SinusoidalPositionalEncoding(nn.Module):
         check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), FLOATS)
 
         return z
+
+# -------------------------------------------------------------------------------- #
+# Patch Encoders
+# -------------------------------------------------------------------------------- #
+
+class PatchEncoderBase(nn.Module, ABC):
+
+    def __init__(self, in_channels: int, out_channels: int, num_patches: Optional[int], patch_size: Optional[int]) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self._num_patches = num_patches
+        self._patch_size = patch_size
+
+    @property
+    def num_patches(self) -> Optional[int]:
+        return self._num_patches
+
+    @property
+    def patch_size(self) -> Optional[int]:
+        return self._patch_size
+
+    def forward(self, z: Optional[Tensor] = None, preprocess: Optional[PreprocessFn] = None, ts: Optional[Sequence[Tensor]] = None) -> Tensor:
+        """
+        Args:
+            z: input tensor of shape (B, T, E). If provided, will invoke the `forward_embeddings` method.
+            preprocess: callable to compute the input tensor. If provided, will invoke the `forward_streaming` method.
+            ts: arguments to `preprocess`, each of shape (B, T, *). If provided, will invoke the `forward_streaming` method.
+
+        Returns:
+            Output tensor of shape (B, N, C).
+        """
+        if z is not None:
+            check_tensor(z, (None, None, self.in_channels), FLOATS)
+            if z.shape[1] < self.min_length:
+                raise RuntimeError(f"Input sequence length {z.shape[1]} is less than the minimum required length {self.min_length}.")
+            z = self.forward_embeddings(z)
+
+        elif preprocess is not None and ts is not None:
+            for t in ts:
+                if t.shape[0] != ts[0].shape[0]:
+                    raise TensorError(t, (ts[0].shape[0], ts[0].shape[1], None), None)
+                if t.shape[1] != ts[0].shape[1]:
+                    raise TensorError(t, (ts[0].shape[0], ts[0].shape[1], None), None)
+                if t.shape[1] < self.min_length:
+                    raise RuntimeError(f"Input sequence length {t.shape[1]} is less than the minimum required length {self.min_length}.")
+            z = self.forward_streaming(preprocess=preprocess, ts=ts)
+
+        else:
+            raise ValueError("Either `z` or both `preprocess` and `ts` must be provided.")
+
+        # FIXME: check the patch dimension (below)
+        check_tensor(z, (z.shape[0], None, self.out_channels), FLOATS)
+        return z
+
+    @property
+    def min_length(self) -> int:
+        return 1
+
+    @abstractmethod
+    def forward_embeddings(self, z: Tensor) -> Tensor:
+        ...
+
+    @abstractmethod
+    def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
+        ...
 
 
 class PatchEncoder(nn.Module):
@@ -415,6 +487,270 @@ class ConvPatchEncoder(nn.Module):
         z = z.permute(0, 2, 1)      # (B, N, C)
         return z
 
+
+class PatchEncoderLowMem(PatchEncoderBase):
+    """
+    Patch encoder with constant activation memory in sequence length T.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_patches: Optional[int],
+        patch_size: Optional[int],
+        *,
+        kernel_size: int = 64,
+        stride: int = 64,
+        chunk_size: int = 2**16,
+        overlap: Optional[int] = None,
+        fp32: bool = True,
+    ) -> None:
+        super().__init__(in_channels, out_channels, num_patches, patch_size)
+
+        if num_patches is None or patch_size is not None:
+            raise ValueError("PatchEncoderLowMem requires `num_patches` > 0 and `patch_size` = None.")
+
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.chunk_size = chunk_size
+        self.overlap = kernel_size - stride if overlap is None else overlap
+        self.fp32 = fp32
+
+        self.gconv = GatedConvolution(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+        )
+
+    @property
+    def num_patches(self) -> int:
+        assert self._num_patches is not None
+        return self._num_patches
+
+    @property
+    def patch_size(self) -> None:
+        assert self._patch_size is None
+        return self._patch_size
+
+    @property
+    def min_length(self) -> int:
+        return self.kernel_size
+
+    def forward_embeddings(self, z: Tensor) -> Tensor:
+        B, T = z.shape[0], z.shape[1]
+        E, C = self.in_channels, self.out_channels
+        P = (T + self.num_patches - 1) // self.num_patches
+        N = (T + P - 1) // P
+
+        p = z.new_zeros(B, max(N * P - T, 0), E)  # (B, N*P - T, E)
+        z = torch.cat([z, p], dim=1)              # (B, N*P, E)
+        z = z.view(B, N, P, E)                    # (B, N, P, E)
+        z = z.view(B * N, P, E).permute(0, 2, 1)  # (BN, E, P)
+        g: Tensor = self.gconv(z)                 # (BN, C, S)
+        g, _ = g.max(dim=-1)                      # (BN, C)
+        g = g.view(B, N, C)                       # (B, N, C)
+
+        return g
+
+    def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
+        B, T = ts[0].shape[0], ts[0].shape[1]
+        E, C = self.in_channels, self.out_channels
+        P = (T + self.num_patches - 1) // self.num_patches
+        N = (T + P - 1) // P
+
+        max_vals, pos = _lowmem_patchwise_max_over_time_streaming(
+            preprocess=preprocess,
+            ts=ts,
+            rf=self.kernel_size,
+            first_stride=self.stride,
+            chunk_size=self.chunk_size,
+            overlap=self.overlap,
+            channels=C,
+            num_patches=self.num_patches,
+            activations_fn=partial(self.gconv.forward_functional, fp32=self.fp32),
+        )
+
+        if not self.training:
+            return max_vals
+
+        positions_flat = pos.view(B, N * C)
+        wins_cat, meta = _gather_wins_via_preprocess_batched(
+            preprocess=preprocess,
+            ts=ts,
+            positions=positions_flat,
+            rf=self.kernel_size,
+            embedding_dim=E,
+        )
+
+        g_all: Tensor = self.gconv(wins_cat)
+        g_all = g_all.squeeze(-1)
+
+        z = _scatter_g_to_BNC(
+            g_all=g_all,
+            meta=meta,
+            batch_size=B,
+            num_patches=self.num_patches,
+            channels=C,
+        )
+
+        return z
+
+
+def _lowmem_patchwise_max_over_time_streaming(
+    *,
+    preprocess: PreprocessFn,
+    ts: Sequence[Tensor],
+    rf: int,
+    first_stride: int,
+    chunk_size: int,
+    overlap: int,
+    channels: int,
+    num_patches: int,
+    activations_fn: Callable[[Tensor], Tensor],  # (B,E,L)->(B,C,L_out)
+) -> tuple[Tensor, Tensor]:
+    """
+    Streaming version: never materializes (B,T,E). Returns
+      max_vals: (B, N, C)
+      max_pos:  (B, N, C)
+    with memory O(B · N · C), independent of T.
+
+    Patches are defined by *input*-space indices:
+      patch_size = ceil(T / num_patches)
+      patch j covers [j * patch_size, (j+1) * patch_size)
+    """
+
+    if not ts or any(t.shape[0] != ts[0].shape[0] for t in ts):
+        raise ValueError("All tensors in `ts` must share batch dim.")
+    B, T = ts[0].shape[0], ts[0].shape[1]
+    if T < rf:
+        raise RuntimeError(f"Input sequence length {T} < receptive field {rf}")
+
+    patch_size = (T + num_patches - 1) // num_patches
+
+    device: Optional[torch.device] = None
+    dtype: Optional[torch.dtype] = None
+
+    max_vals: torch.Tensor
+    max_pos: torch.Tensor
+
+    step = max(1, chunk_size - overlap)
+    start = 0
+
+    with torch.no_grad():
+        while start < T:
+            end = min(start + chunk_size, T)
+            end_ext = min(end + overlap, T)
+
+            # Preprocess slice of inputs: (B, L, *) -> (B, L, E)
+            slices = [t[:, start:end_ext] for t in ts]
+            z_chunk = preprocess(*slices)                   # (B, L, E)
+
+            if dtype is None or device is None:
+                dtype = z_chunk.dtype
+                device = z_chunk.device
+                max_vals = torch.full(
+                    (B, num_patches, channels),
+                    torch.finfo(dtype).min,
+                    device=device,
+                    dtype=dtype,
+                )
+                max_pos = torch.zeros(
+                    (B, num_patches, channels),
+                    device=device,
+                    dtype=torch.long,
+                )
+
+            z_chunk = z_chunk.transpose(1, 2).contiguous()  # (B, E, L)
+
+            if z_chunk.shape[-1] >= rf:
+                g = activations_fn(z_chunk)                 # (B, C, L_out)
+                B_, C_, L_out = g.shape
+                assert B_ == B and C_ == channels
+
+                idx = torch.arange(L_out, device=device)        # (L_out,)
+                pos = start + idx * first_stride                # (L_out,) input start indices
+                # Map each conv output position to a patch index
+                patch_idx = torch.div(pos, patch_size, rounding_mode="floor")
+                patch_idx.clamp_(0, num_patches - 1)
+
+                # For each patch, update maxima
+                for j in range(num_patches):
+                    mask = (patch_idx == j)                    # (L_out,)
+                    if not mask.any():
+                        continue
+
+                    g_j = g[..., mask]                         # (B, C, L_j)
+                    v_j, idx_j_local = g_j.max(dim=-1)         # (B, C)
+
+                    pos_candidates = pos[mask]                 # (L_j,)
+                    # Map local argmax indices to global positions (B,C)
+                    pos_j = pos_candidates[idx_j_local]        # (B, C)
+
+                    cur_v = max_vals[:, j, :]                  # (B, C)
+                    cur_p = max_pos[:, j, :]
+
+                    upd = v_j > cur_v
+                    max_vals[:, j, :] = torch.where(upd, v_j, cur_v)
+                    max_pos[:, j, :]  = torch.where(upd, pos_j, cur_p)
+
+            if end == T:
+                break
+            start += step
+
+    # Clamp positions to valid window starts
+    max_pos.clamp_(0, max(0, T - rf))
+    return max_vals, max_pos
+
+
+def _scatter_g_to_BNC(
+    *,
+    g_all: torch.Tensor,                                     # (sum_U, C)
+    meta: list[tuple[int, torch.Tensor, int]],
+    batch_size: int,
+    num_patches: int,
+    channels: int,
+) -> torch.Tensor:
+    """
+    Maps concatenated per-window activations back to (B, N, C) using meta.
+
+    meta[b] = (start, inv_flat, U_b) where:
+      - start:   offset into g_all for sample b
+      - inv_flat: (N * C,) tensor mapping each (patch, channel) to a unique
+                  window index in [0, U_b).
+      - U_b:     number of unique windows for sample b.
+
+    g_all[start:start + U_b] has shape (U_b, C). For each (patch j, channel c),
+    we want g_all_b[ inv_flat[j*C + c], c ].
+    """
+    out = torch.empty(
+        (batch_size, num_patches, channels),
+        device=g_all.device,
+        dtype=g_all.dtype,
+    )
+
+    for b, (start, inv_flat, u_b) in enumerate(meta):
+        if inv_flat.numel() != num_patches * channels:
+            raise RuntimeError(
+                f"Inverse indices length mismatch for batch {b}: "
+                f"{inv_flat.numel()} vs {num_patches * channels}"
+            )
+
+        g_b = g_all[start:start + u_b]     # (U_b, C)
+        inv = inv_flat.view(num_patches, channels)  # (N, C)
+
+        # Build per-patch/channel indices
+        row_idx = inv                                  # (N, C)
+        col_idx = torch.arange(channels, device=g_all.device).view(1, -1)
+        col_idx = col_idx.expand(num_patches, -1)      # (N, C)
+        out[b] = g_b[row_idx, col_idx]                 # (N, C)
+
+    return out
+
+# -------------------------------------------------------------------------------- #
+# ViT
+# -------------------------------------------------------------------------------- #
 
 class ViT(nn.Module):
     """
@@ -1281,7 +1617,7 @@ class MalConvClassifier(Classifier):
 
 class ViTClassifier(Classifier):
 
-    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, patcher: PatchEncoder, backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, patcher: PatchEncoderBase, backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__()
 
         self.embedding = embedding
@@ -1293,11 +1629,15 @@ class ViTClassifier(Classifier):
     def forward(self, x: Tensor, g: Optional[Tensor]) -> Tensor:
         self._check_forward_inputs(x, g)
 
-        z = self.embedding(x)  # (B, T, E)
-        z = self.filmer(z, g)  # (B, T, E)
-        z = self.patcher(z)    # (B, N, E')
-        z = self.backbone(z)   # (B, D)
-        z = self.head(z)       # (B, M)
+        def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
+            z = self.embedding(x)  # (B, T, E)
+            z = self.filmer(z, g)  # (B, T, E)
+            return z
+
+        ts = (x, g) if g is not None else (x,)
+        z = self.patcher(preprocess=preprocess, ts=ts)  # (B, N, E')
+        z = self.backbone(z)                            # (B, D)
+        z = self.head(z)                                # (B, M)
 
         check_tensor(z, (x.shape[0], self.head.num_classes), FLOATS)
         return z
