@@ -461,9 +461,10 @@ class SemanticGuider:
             return torch.zeros_like(inputs, dtype=outdtype)
         inputs = inputs.numpy(force=True)
         entropy = compute_entropy_rolling_numpy(inputs, self.radius, self.stride)
-        entropy = (entropy - 0) / (8 - 0)  # Normalize to [0, 1]
-        entropy = torch.from_numpy(entropy).to(outdtype)
-        return entropy
+        # entropy = (entropy - 0) / (8 - 0)  # Normalize to [0, 1]
+        entropy = torch.from_numpy(entropy)
+        entropy = (entropy > 7)  # FIXME: temporary hack to binarize entropy
+        return entropy.to(outdtype)
 
     def _get_characteristics(self, data: LiefParse | lief.PE.Binary, size: Optional[int]) -> Tensor:
         characteristics = CharacteristicGuider(data, size, self.use_packed, self.which_characteristics)()
