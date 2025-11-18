@@ -22,6 +22,12 @@ from src.helpers import Architecture
 from src.helpers import ModelSize
 
 
+# ruff: noqa: F541
+
+
+DEBUG = False
+
+
 def fixed_width_string(string: Any, width: int, char: str = " ", left: bool = False) -> str:
     string = str(string)
     if left:
@@ -104,6 +110,7 @@ class Configuration:
             f"max_length--{self.max_length}",
             f"batch_size--{self.batch_size * self.gradient_accumulation_steps * world_size}",
             f"learning_rate--{self.learning_rate}",
+            f"weight_decay--{self.weight_decay}",
             f"max_epochs--{self.max_epochs}",
             f"seed--{self.seed}",
         ]
@@ -130,6 +137,10 @@ class Configuration:
         return 1e-3
 
     @property
+    def weight_decay(self) -> float:
+        return 1e-4
+
+    @property
     def device(self) -> str:
         return "cuda"
 
@@ -147,19 +158,15 @@ class Configuration:
 
     @property
     def eval_epochs(self) -> float:
-        return 0.50
+        return 1.0
 
     @property
     def chpt_epochs(self) -> float:
-        return 0.50
-
-    @property
-    def schd_epochs(self) -> float:
         return 1.0
 
     @property
     def logg_epochs(self) -> float:
-        return 0.50
+        return 1.0
 
 
 class Requirements:
@@ -299,6 +306,7 @@ class ScriptBuilder:
             f"--vl_batch_size {self.config.batch_size}",
             f"--ts_batch_size {self.config.batch_size}",
             f"--learning_rate {self.config.learning_rate}",
+            f"--weight_decay {self.config.weight_decay}",
             f"--device {self.config.device}",
             f"--ddp {self.reqs.gpus_per_node > 1}",
             f"--mp16 {self.config.mp16}",
@@ -306,9 +314,15 @@ class ScriptBuilder:
             f"--max_epochs {self.config.max_epochs}",
             f"--eval_epochs {self.config.eval_epochs}",
             f"--chpt_epochs {self.config.chpt_epochs}",
-            f"--schd_epochs {self.config.schd_epochs}",
             f"--logg_epochs {self.config.logg_epochs}",
         ])
+
+        if DEBUG:
+            command += " \\\n" + " \\\n".join([
+                f"--tr_num_samples 4096",
+                f"--vl_num_samples 1024",
+                f"--ts_num_samples 1024",
+            ])
 
         command = torchrun + "\n" + command if self.reqs.gpus_per_node > 1 else command
 
@@ -339,34 +353,39 @@ class ScriptBuilder:
 
 def config_fiter(config: Configuration) -> bool:
     """Return True if the configuration should be run, False otherwise."""
-    chars = (
-        lief.PE.Section.CHARACTERISTICS.MEM_READ,
-        lief.PE.Section.CHARACTERISTICS.MEM_WRITE,
-        lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
-    )
     if not isinstance(config, Configuration):
         raise TypeError()
-    if config.arch != Architecture.MC2:
+
+    # Reject illegal or redundant configurations.
+    if config.arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG) and config.size == ModelSize.LG:
         return False
-    if config.which_characteristics and any(c not in chars for c in config.which_characteristics):
-        return False
-    if config.arch == Architecture.MCV:
-        return False
-    if config.arch == Architecture.VIT:
-        return False
-    if config.size != ModelSize.MD:
-        return False
+
+    # Reject configurations for debug mode.
+    if DEBUG:
+        if config.size != ModelSize.SM:
+            return False
+        if config.max_length != 1000000:
+            return False
+
+    # Custom filtering logic.
     if config.level != HierarchicalLevel.NONE:
+        return False
+    if config.arch != Architecture.MC2:
         return False
     if config.do_entropy and config.which_characteristics:
         return False
+
     return True
 
 
 def main() -> None:
 
-    parser = ArgumentParser()
+    parser = ArgumentParser(description="Create large batches of experiments.")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
+
+    global DEBUG
+    DEBUG = args.debug
 
     outpath = Path("./run")
     outpath.mkdir(exist_ok=True)
