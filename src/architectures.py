@@ -968,7 +968,7 @@ class GatedConvolution(nn.Module):
 
         if fp32:
             z = z.to(torch.float32)
-            if any(w_b.dtype != torch.float32 for w_b in filter(lambda w_b: w_b is not None, [w1, w2, b1, b2])):
+            if any(w_b.dtype != torch.float32 for w_b in [w1, w2, b1, b2] if w_b is not None):
                 warnings.warn("Some weights and/or biases are not in float32, which is unexpected, when `fp32=True`.")
 
         c_1 = F.conv1d(z, w1, b1, **_get_conv_kwds(self.conv_1))
@@ -1233,7 +1233,7 @@ class GCGBlock(nn.Module):
         if fp32:
             z = z.to(torch.float32)
             gct = gct.to(torch.float32)
-            if any(w_b.dtype != torch.float32 for w_b in filter(lambda w_b: w_b is not None, [w1, w2, wp, b1, b2, bp])):
+            if any(w_b.dtype != torch.float32 for w_b in [w1, w2, wp, b1, b2, bp] if w_b is not None):
                 warnings.warn("Some weights and/or biases are not in float32, which is unexpected, when `fp32=True`.")
 
         h = F.conv1d(z, w1, b1, **_get_conv_kwds(self.conv_1))
@@ -1305,7 +1305,7 @@ class ContextBlock(nn.Module):
 
         if fp32:
             z = z.to(torch.float32)
-            if any(w_b.dtype != torch.float32 for w_b in filter(lambda w_b: w_b is not None, [w_ctx, w_sh, b_ctx, b_sh])):
+            if any(w_b.dtype != torch.float32 for w_b in [w_ctx, w_sh, b_ctx, b_sh] if w_b is not None):
                 warnings.warn("Some weights and/or biases are not in float32, which is unexpected, when `fp32=True`.")
 
         x = F.conv1d(z, w_ctx, b_ctx, **_get_conv_kwds(self.conv))
