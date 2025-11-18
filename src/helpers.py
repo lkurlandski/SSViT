@@ -44,6 +44,12 @@ class ModelSize(Enum):
     LG = "lg"  # Large
 
 
+class PatcherArchitecture(Enum):
+    BAS = "bas"      # Basic
+    CNV = "cnv"      # Convolutional
+    MEM = "mem"      # Low-Memory
+
+
 def any_to_section_characteristic(s: lief.PE.Section.CHARACTERISTICS | int | str) -> lief.PE.Section.CHARACTERISTICS:
     if isinstance(s, lief.PE.Section.CHARACTERISTICS):
         return s
