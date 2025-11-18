@@ -546,10 +546,10 @@ def main() -> None:
     loss_fn = CrossEntropyLoss()
     print(f"{loss_fn=}")
 
-    optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = lambda params: AdamW(params, lr=args.learning_rate)
+    optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = partial(AdamW, lr=args.learning_rate)
     print(f"{optimizer_init=}")
 
-    scheduler_init: Callable[[Optimizer], LRScheduler] = lambda optim: LambdaLR(optim, lambda _: 1.0)
+    scheduler_init: Callable[[Optimizer], LRScheduler] = partial(LambdaLR, lr_lambda=lambda _: 1.0)
     print(f"{scheduler_init=}")
 
     padbatch = get_padbatch(args.level, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)
