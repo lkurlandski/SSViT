@@ -54,8 +54,10 @@ from src.architectures import MalConv
 from src.architectures import MalConvLowMem
 from src.architectures import MalConvGCG
 from src.architectures import ViT
+from src.architectures import PatchEncoderBase
 from src.architectures import PatchEncoder
 from src.architectures import ConvPatchEncoder
+from src.architectures import PatchEncoderLowMem
 from src.architectures import Classifier
 from src.architectures import MalConvClassifier
 from src.architectures import ViTClassifier
@@ -83,6 +85,7 @@ from src.helpers import create_argument_parser_from_dataclass
 from src.helpers import flatten_dataclasses
 from src.helpers import _MTArgs
 from src.helpers import Architecture
+from src.helpers import PatcherArchitecture
 from src.helpers import ModelSize
 from src.helpers import MainArgs
 from src.simpledb import SimpleDB
@@ -107,17 +110,32 @@ def get_model(
     size: ModelSize,
     num_guides: int,
     level: HierarchicalLevel,
+    parch: PatcherArchitecture,
 ) -> Classifier | HierarchicalClassifier:
+    """
+    Get a pre-configured classification model for the given settings.
 
-    f = None
-    if size == ModelSize.SM:
-        f = 1
-    if size == ModelSize.MD:
-        f = 2
-    if size == ModelSize.LG:
-        f = 4
-    if f is None:
-        raise ValueError(f"{size}")
+    The model's hyperparameters have been chosen based on prior work and
+        were selected to facilitate good tensor core utilization on modern GPUs
+        (i.e., using multiples of 8 and ideally 64, where possible).
+
+    The `size` parameter controls the overall model size. Note that the Embedding,
+        FiLM, and Head components are not impacted directly by this parameter.
+        `ModelSize.SM` will produce a very small model suitable for testing/debugging.
+        The other sizes, e.g., `ModelSize.LG`, will increase the size of the ViT
+        backbone (if applicable), but do not affect the MalConv backbone because
+        this architecture has already been extensively tuned by previous authors.
+
+    Args:
+        arch: The architecture type.
+        size: The model size.
+        num_guides: The number of semantic guides.
+        level: The hierarchical level.
+        parch: The patcher architecture (for ViT only).
+
+    Returns:
+        The model.
+    """
 
     HierarchicalStructureCls: type[HierarchicalStructure] = LEVEL_STRUCTURE_MAP[level]
     num_structures = len(HierarchicalStructureCls)
@@ -126,128 +144,134 @@ def get_model(
 
     # Embedding
     padding_idx    = 0
-    num_embeddings = 256 + 8
-    embedding_dim  = 4 * f
+    num_embeddings = 384
+    embedding_dim  = 8
+
     # FiLM
-    guide_dim      = num_guides
-    guide_hidden   = 4 * f
-    # Patcher
-    num_patches    = None
-    patch_size     = 4096
+    guide_dim    = num_guides
+    guide_hidden = 8
+    FiLMCls: type[FiLM | FiLMNoP]
+    if num_guides > 0:
+        FiLMCls = FiLM
+    else:
+        FiLMCls = FiLMNoP
+
     # MalConv
-    mcnv_channels  = 128
-    mcnv_kernel    = 512
-    mcnv_stride    = 512
+    if size == ModelSize.SM:
+        mcnv_channels = 64
+        mcnv_kernel   = 1024
+        mcnv_stride   = 1024
+    else:
+        mcnv_channels = 256 if arch == Architecture.MCG else 128
+        mcnv_kernel   = 256 if arch == Architecture.MCG else 512
+        mcnv_stride   = 64 if  arch == Architecture.MCG else 512
+    MalConvCls: type[MalConvBase]
+    if arch == Architecture.MCV:
+        MalConvCls = MalConv
+    elif arch == Architecture.MC2:
+        MalConvCls = MalConvLowMem
+    elif arch == Architecture.MCG:
+        MalConvCls = MalConvGCG
+    else:
+        MalConvCls = MalConvBase  # type: ignore[type-abstract]
+
+    # Patch Encoder
+    if size == ModelSize.SM:
+        num_patches = 256
+        patch_size  = None
+    else:
+        num_patches = 1024
+        patch_size  = None
+    PatchEncoderCls: type[PatchEncoderBase]
+    if parch == PatcherArchitecture.BAS:
+        PatchEncoderCls = PatchEncoder
+    elif parch == PatcherArchitecture.CNV:
+        PatchEncoderCls = ConvPatchEncoder
+    elif parch == PatcherArchitecture.MEM:
+        PatchEncoderCls = PatchEncoderLowMem
+    else:
+        PatchEncoderCls = PatchEncoderBase
+
     # ViT
-    vit_d_model    = 128 * f
-    vit_nhead      = 2 * f
-    vit_feedfrwd   = 4 * vit_d_model
-    vit_layers     = 2 * f
+    if size == ModelSize.SM:
+        vit_d_model  = 64
+        vit_nhead    = 1
+        vit_feedfrwd = 128
+        vit_layers   = 1
+    elif size == ModelSize.MD:
+        vit_d_model  = 256
+        vit_nhead    = 4
+        vit_feedfrwd = 512
+        vit_layers   = 4
+    elif size == ModelSize.LG:
+        vit_d_model  = 512
+        vit_nhead    = 8
+        vit_feedfrwd = 1024
+        vit_layers   = 8
 
     # Head
+    clf_input_size = vit_d_model if arch == Architecture.VIT else mcnv_channels
     num_classes    = 2
-    clf_hidden     = 64 * f
+    clf_hidden     = 256
     clf_layers     = 2
-    if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-        clf_input_size = mcnv_channels
-    elif arch in (Architecture.VIT,):
-        clf_input_size = vit_d_model
-    else:
-        raise NotImplementedError(f"{arch}")
     head = ClassifificationHead(clf_input_size, num_classes, clf_hidden, clf_layers)
-
-    arch_to_malconv_backbone: dict[Architecture, type[MalConvBase]] = {
-        Architecture.MCV: MalConv,
-        Architecture.MC2: MalConvLowMem,
-        Architecture.MCG: MalConvGCG,
-    }
-
-    FiLMCls = FiLM if num_guides > 0 else FiLMNoP
-    PathEncoderCls = ConvPatchEncoder if patch_size is not None else PatchEncoder
-    MalConvCls = arch_to_malconv_backbone[arch] if arch != Architecture.VIT else MalConvBase
 
     if level == HierarchicalLevel.NONE:
         embedding = Embedding(num_embeddings, embedding_dim, padding_idx)
         filmer = FiLMCls(guide_dim, embedding_dim, guide_hidden)
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            backbone_ = MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
-            return MalConvClassifier(embedding, filmer, backbone_, head)
+            malconv = MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
+            return MalConvClassifier(embedding, filmer, malconv, head)
         if arch in (Architecture.VIT,):
-            patcher = PathEncoderCls(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
-            backbone = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
-            return ViTClassifier(embedding, filmer, patcher, backbone, head)
+            patcher = PatchEncoderCls(embedding_dim, vit_d_model, num_patches, patch_size)
+            transformer = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers)
+            return ViTClassifier(embedding, filmer, patcher, transformer, head)
 
     if level == HierarchicalLevel.COARSE:
-        # TODO: configure hyperparameters.
-        embeddings = [
-            Embedding(num_embeddings, embedding_dim, padding_idx)
-            for _ in range(num_structures)
-        ]
-        filmers = [
-            FiLMCls(guide_dim, embedding_dim, guide_hidden)
-            for _ in range(num_structures)
-        ]
+        embeddings = [Embedding(num_embeddings, embedding_dim, padding_idx)
+            for _ in range(num_structures)]
+        filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden)
+            for _ in range(num_structures)]
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            backbones = [
-                MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
-                for _ in range(num_structures)
-            ]
-            return HierarchicalMalConvClassifier(embeddings, filmers, backbones, head)
+            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
+                for _ in range(num_structures)]
+            return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
         if arch in (Architecture.VIT,):
-            patchers = [
-                PathEncoderCls(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
-                for _ in range(num_structures)
-            ]
-            backbone = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
-            return HierarchicalViTClassifier(embeddings, filmers, patchers, backbone, head)
+            patchers = [PatchEncoderCls(embedding_dim, vit_d_model, num_patches, patch_size)
+                for _ in range(num_structures)]
+            transformers = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
+            return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
 
     if level == HierarchicalLevel.MIDDLE:
-        # TODO: configure hyperparameters.
-        embeddings = [
-            Embedding(num_embeddings, embedding_dim, padding_idx)
-            for _ in range(num_structures)
-        ]
-        filmers = [
-            FiLMCls(guide_dim, embedding_dim, guide_hidden)
-            for _ in range(num_structures)
-        ]
+        embeddings = [Embedding(num_embeddings, embedding_dim, padding_idx)
+            for _ in range(num_structures)]
+        filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden)
+            for _ in range(num_structures)]
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            backbones = [
-                MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
-                for _ in range(num_structures)
-            ]
-            return HierarchicalMalConvClassifier(embeddings, filmers, backbones, head)
+            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
+                for _ in range(num_structures)]
+            return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
         if arch in (Architecture.VIT,):
-            patchers = [
-                PathEncoderCls(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
-                for _ in range(num_structures)
-            ]
-            backbone = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
-            return HierarchicalViTClassifier(embeddings, filmers, patchers, backbone, head)
+            patchers = [PatchEncoderCls(embedding_dim, vit_d_model, num_patches, patch_size)
+                for _ in range(num_structures)]
+            transformers = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
+            return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
 
     if level == HierarchicalLevel.FINE:
-        # TODO: configure hyperparameters.
-        embeddings = [
-            Embedding(num_embeddings, embedding_dim, padding_idx)
-            for _ in range(num_structures)
-        ]
-        filmers = [
-            FiLMCls(guide_dim, embedding_dim, guide_hidden)
-            for _ in range(num_structures)
-        ]
+        embeddings = [Embedding(num_embeddings, embedding_dim, padding_idx)
+            for _ in range(num_structures)]
+        filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden)
+            for _ in range(num_structures)]
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            backbones = [
-                MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
-                for _ in range(num_structures)
-            ]
-            return HierarchicalMalConvClassifier(embeddings, filmers, backbones, head)
+            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
+                for _ in range(num_structures)]
+            return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
         if arch in (Architecture.VIT,):
-            patchers = [
-                PathEncoderCls(embedding_dim, vit_d_model, num_patches=num_patches, patch_size=patch_size)
-                for _ in range(num_structures)
-            ]
-            backbone = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
-            return HierarchicalViTClassifier(embeddings, filmers, patchers, backbone, head)
+            patchers = [PatchEncoderCls(embedding_dim, vit_d_model, num_patches, patch_size)
+                for _ in range(num_structures)]
+            transformers = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
+            return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
+
 
     raise NotImplementedError(f"{level} {arch}")
 
@@ -409,7 +433,8 @@ def main() -> None:
     mpdtype = mp_dtype(args.mp16, args.device)
     print(f"{mpdtype=}")
 
-    model = get_model(args.arch, args.size, len(args.which_characteristics) + (1 if args.do_entropy else 0), args.level).to("cpu")
+    num_guides = len(args.which_characteristics) + (1 if args.do_entropy else 0)
+    model = get_model(args.arch, args.size, num_guides, args.level, args.parch).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
     min_lengths = [max(m, min_length) for m in getattr(model, "min_lengths", [min_length])]
