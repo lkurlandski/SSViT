@@ -85,6 +85,7 @@ class MainArgs:
     vl_batch_size: int = -1
     ts_batch_size: int = -1
     learning_rate: float = 1e-3
+    weight_decay: float = 1e-2
     device: torch.device = torch.device("cpu")
     ddp: bool = False
     fsdp: bool = False
