@@ -152,7 +152,7 @@ def get_model(
 
     # FiLM
     guide_dim    = num_guides
-    guide_hidden = 8
+    guide_hidden = 64
     FiLMCls: type[FiLM | FiLMNoP]
     if num_guides > 0:
         FiLMCls = FiLM
@@ -573,13 +573,15 @@ def main() -> None:
 
     # TODO: these computations are all elgantly handled within the Trainer,
     # but we have to repeat them here, which is kind of a pain.
+    # TODO: we should really just make this a CLI argument.
     if args.max_steps is not None:
         total_steps = args.max_steps
-        warmup_steps = int(total_steps * 0.05)
+        warmup_steps = int(total_steps * 0.10)
     elif args.max_epochs is not None:
         steps_per_epoch = len(tr_loader) // args.gradient_accumulation_steps
         total_steps = int(args.max_epochs * steps_per_epoch)
-        warmup_steps = steps_per_epoch
+        # Warm up for either one epoch or 10% of training --- whichever is smaller.
+        warmup_steps = min(steps_per_epoch, 0.10 * total_steps)
     else:
         raise ValueError("Either `max_steps` or `max_epochs` must be specified.")
     scheduler_init: Callable[[Optimizer], LRScheduler] = partial(get_lr_scheduler,
