@@ -1,7 +1,9 @@
 isort
+matplotlib
 mypy
 pyinstrument
 pytest
 pytest-xdist
 ruff
+scikit-learn
 types-tqdm
