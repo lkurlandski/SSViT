@@ -111,6 +111,7 @@ class Configuration:
             f"batch_size--{self.batch_size * self.gradient_accumulation_steps * world_size}",
             f"learning_rate--{self.learning_rate}",
             f"weight_decay--{self.weight_decay}",
+            f"warmup_ratio--{self.warmup_ratio}",
             f"label_smoothing--{self.label_smoothing}",
             f"max_epochs--{self.max_epochs}",
             f"seed--{self.seed}",
@@ -140,6 +141,10 @@ class Configuration:
     @property
     def weight_decay(self) -> float:
         return 1e-4
+
+    @property
+    def warmup_ratio(self) -> float:
+        return 0.10
 
     @property
     def label_smoothing(self) -> float:
@@ -333,6 +338,7 @@ class ScriptBuilder:
             f"--ts_batch_size {self.config.batch_size}",
             f"--learning_rate {self.config.learning_rate}",
             f"--weight_decay {self.config.weight_decay}",
+            f"--warmup_ratio {self.config.warmup_ratio}",
             f"--label_smoothing {self.config.label_smoothing}",
             f"--device {self.config.device}",
             f"--ddp {self.reqs.gpus_per_node > 1}",
