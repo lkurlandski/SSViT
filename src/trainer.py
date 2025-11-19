@@ -983,6 +983,7 @@ class Trainer:
             d["vl_samples"] = int(results["vl_samples"])
             d["vl_throughput"] = round(results["vl_throughput"], 2)
         flush()
+        print()
         print(d)
 
     def to_checkpoint(self, path: str | Path) -> None:
