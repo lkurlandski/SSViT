@@ -977,12 +977,14 @@ class Trainer:
         if any(k.startswith("vl_") for k in results):
             d["vl_loss"] = round(results["vl_loss"], 3)
             d["vl_roc"] = round(results["vl_roc"], 3)
+            d["vl_prc"] = round(results["vl_prc"], 3)
             d["vl_gpu_utl"] = round(results["vl_gpu_utl"], 2)
             d["vl_gpu_mem"] = round(results["vl_gpu_mem"] / (1024 ** 3), 2)
             d["vl_time"] = round(results["vl_time"], 0)
             d["vl_samples"] = int(results["vl_samples"])
             d["vl_throughput"] = round(results["vl_throughput"], 2)
         flush()
+        print()
         print(d)
 
     def to_checkpoint(self, path: str | Path) -> None:

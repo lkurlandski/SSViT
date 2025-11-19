@@ -152,7 +152,7 @@ def get_model(
 
     # FiLM
     guide_dim    = num_guides
-    guide_hidden = 8
+    guide_hidden = 64
     FiLMCls: type[FiLM | FiLMNoP]
     if num_guides > 0:
         FiLMCls = FiLM
@@ -279,9 +279,12 @@ def get_model(
     raise NotImplementedError(f"{level} {arch}")
 
 
-def get_lr_scheduler(optimizer: Optimizer, lr_beg: float, lr_max: float, lr_min: float, total_steps: int, warmup_steps: int) -> SequentialLR:
+def get_lr_scheduler(optimizer: Optimizer, lr_beg: float, lr_max: float, lr_min: float, total_steps: int, warmup_steps: int) -> LRScheduler:
     if optimizer.state_dict()["param_groups"][0]["lr"] != lr_max:
         raise ValueError("Optimizer learning rate does not match base_lr.")
+
+    if warmup_steps == 0:
+        return CosineAnnealingLR(optimizer, total_steps, lr_min)
 
     # Linearly increase from `lr_beg` to `lr_max` over `warmup_steps`.
     warmup_scheduler = LinearLR(optimizer, lr_beg / lr_max, 1.0, warmup_steps)
@@ -565,30 +568,29 @@ def main() -> None:
     rargs = TrainerArgs.from_dict(args.to_dict())
     print(f"{rargs=}")
 
-    loss_fn = CrossEntropyLoss()
+    loss_fn = CrossEntropyLoss(label_smoothing=args.label_smoothing)
     print(f"{loss_fn=}")
 
     optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = partial(AdamW, lr=args.learning_rate, weight_decay=args.weight_decay)
     print(f"{optimizer_init=}")
 
-    # TODO: these computations are all elgantly handled within the Trainer,
-    # but we have to repeat them here, which is kind of a pain.
     if args.max_steps is not None:
         total_steps = args.max_steps
-        warmup_steps = int(total_steps * 0.05)
-    elif args.max_epochs is not None:
-        steps_per_epoch = len(tr_loader) // args.gradient_accumulation_steps
-        total_steps = int(args.max_epochs * steps_per_epoch)
-        warmup_steps = steps_per_epoch
-    else:
-        raise ValueError("Either `max_steps` or `max_epochs` must be specified.")
+    if args.max_epochs is not None:
+        total_steps = int(args.max_epochs * len(tr_loader) // args.gradient_accumulation_steps)
+    lr_beg = 0.1 * args.learning_rate
+    lr_max = args.learning_rate
+    lr_min = 0.01 * args.learning_rate
+    warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler_init: Callable[[Optimizer], LRScheduler] = partial(get_lr_scheduler,
-        lr_beg=0.1 * args.learning_rate,
-        lr_max=args.learning_rate,
-        lr_min=0.01 * args.learning_rate,
+        lr_beg=lr_beg,
+        lr_max=lr_max,
+        lr_min=lr_min,
         total_steps=total_steps,
         warmup_steps=warmup_steps,
     )
+    print(f"scheduler I : [{0:06}, {warmup_steps:06}] {lr_beg} --> {lr_max}")
+    print(f"scheduler II: [{warmup_steps:06}, {total_steps:06}] {lr_max} --> {lr_min}")
     # scheduler_init: Callable[[Optimizer], LRScheduler] = partial(LambdaLR, lr_lambda=lambda _: 1.0)
     print(f"{scheduler_init=}")
 
