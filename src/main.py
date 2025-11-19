@@ -182,9 +182,15 @@ def get_model(
     if size == ModelSize.SM:
         num_patches = 256
         patch_size  = None
+        if parch == PatcherArchitecture.CNV:
+            patch_size = 2 ** 20 // num_patches
+            num_patches = None
     else:
         num_patches = 1024
         patch_size  = None
+        if parch == PatcherArchitecture.CNV:
+            patch_size = 2 ** 20 // num_patches
+            num_patches = None
     PatchEncoderCls: type[PatchEncoderBase]
     if parch == PatcherArchitecture.BAS:
         PatchEncoderCls = PatchEncoder
