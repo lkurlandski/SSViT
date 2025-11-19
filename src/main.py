@@ -565,7 +565,7 @@ def main() -> None:
     rargs = TrainerArgs.from_dict(args.to_dict())
     print(f"{rargs=}")
 
-    loss_fn = CrossEntropyLoss()
+    loss_fn = CrossEntropyLoss(label_smoothing=args.label_smoothing)
     print(f"{loss_fn=}")
 
     optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = partial(AdamW, lr=args.learning_rate, weight_decay=args.weight_decay)
