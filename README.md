@@ -9,6 +9,14 @@ source env/bin/activate
 uv pip install -r requirements.txt [-r requirements-dev.txt]
 ```
 
+Note that pandas v2.3.3 has a bug that causes segmentation faults when reading some CSV files. For example:
+```python
+import pandas as pd
+file = "./data/data/tr/size/size-0000572.csv"
+pd.read_csv(file, engine='c')
+```
+will segmentation fault 100% of the time.
+
 ## Tests
 
 ```
