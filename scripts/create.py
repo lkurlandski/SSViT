@@ -169,6 +169,27 @@ class Configuration:
         return 1.0
 
 
+# Classifier throughput in samples/second on NVIDIA A100. Measurements taken using
+# maximum sequence length of 1_000_000 and a physical batch size of 256 samples.
+# (Architecture, do_entropy, do_characteristics) : (vl_throughput, tr_throughout)
+THROUGHPUTS = {
+    (Architecture.MCV, False, False) : None,
+    (Architecture.MCV, False, True)  : None,
+    (Architecture.MCV, True,  False) : None,
+    (Architecture.MCV, True,  True)  : None,
+
+    (Architecture.MC2, False, False) : (750, 550),
+    (Architecture.MC2, False, True)  : (560, 425),
+    (Architecture.MC2, True,  False) : (375, 325),
+    (Architecture.MC2, True,  True)  : None,
+
+    (Architecture.MCG, False, False) : None,
+    (Architecture.MCG, False, True)  : None,
+    (Architecture.MCG, True,  False) : None,
+    (Architecture.MCG, True,  True)  : None,
+}
+
+
 class Requirements:
     """
     Compute resource requirements for a job given its configuration.
@@ -184,25 +205,25 @@ class Requirements:
     @property
     def time(self) -> int:
         """Return the number of seconds required for the job (configure)."""
-        tr_throughput = None
-        vl_throughput = None
+        key = (self.config.arch, self.config.do_entropy, bool(self.config.which_characteristics))
 
-        if self.config.arch == Architecture.MCG:
-            if self.config.max_length == 1 * 10**6:
-                if self.config.batch_size == 256:
-                    tr_throughput = 175
-                    vl_throughput = 200
+        if key == (Architecture.MC2, False, False):
+            return 20 * 3600
+        if key == (Architecture.MC2, False, True):
+            return 24 * 3600
+        if key == (Architecture.MC2, True, False):
+            return 28 * 3600
 
-        if self.config.arch == Architecture.MC2:
-            if self.config.max_length == 1 * 10**6:
-                if self.config.batch_size == 256:
-                    tr_throughput = 275
-                    vl_throughput = 300
-
-        if tr_throughput is None or vl_throughput is None:
-            print(f"WARNING ({str(self.config)}): using fixed throughput of 100 samples/second.")
+        if THROUGHPUTS.get(key) is not None:
+            tr_throughput = THROUGHPUTS[key][0]
+            vl_throughput = THROUGHPUTS[key][1]
+        else:
+            print(f"WARNING ({str(self.config)}): throughput benchmark not found.")
             tr_throughput = 100
             vl_throughput = 100
+
+        tr_throughput = tr_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
+        vl_throughput = vl_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
 
         tr_samples = 2339771 * self.config.max_epochs
         vl_samples = 539882  * self.config.max_epochs / self.config.eval_epochs
@@ -365,6 +386,9 @@ def config_fiter(config: Configuration) -> bool:
         if config.size != ModelSize.SM:
             return False
         if config.max_length != 1000000:
+            return False
+    else:
+        if config.size == ModelSize.SM:
             return False
 
     # Custom filtering logic.
