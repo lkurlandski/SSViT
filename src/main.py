@@ -60,6 +60,7 @@ from src.architectures import ViT
 from src.architectures import PatchEncoderBase
 from src.architectures import PatchEncoder
 from src.architectures import ConvPatchEncoder
+from src.architectures import HierarchicalConvPatchEncoder
 from src.architectures import PatchEncoderLowMem
 from src.architectures import Classifier
 from src.architectures import MalConvClassifier
@@ -179,23 +180,30 @@ def get_model(
         MalConvCls = MalConvBase  # type: ignore[type-abstract]
 
     # Patch Encoder
+    num_patches: Optional[int] = None
+    patch_size:  Optional[int] = None
     if size == ModelSize.SM:
-        num_patches = 256
-        patch_size  = None
-        if parch == PatcherArchitecture.CNV:
-            patch_size = 2 ** 20 // num_patches
-            num_patches = None
+        patcher_channels = 16
+        num_patches      = 64
+        patch_size       = None
+    elif size == ModelSize.MD:
+        patcher_channels = 32
+        num_patches      = 128
+        patch_size       = None
     else:
-        num_patches = 1024
-        patch_size  = None
-        if parch == PatcherArchitecture.CNV:
-            patch_size = 2 ** 20 // num_patches
-            num_patches = None
+        patcher_channels = 64
+        num_patches      = 256
+        patch_size       = None
+    if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV):
+        patch_size  = 2 ** 22 // num_patches
+        num_patches = None
     PatchEncoderCls: type[PatchEncoderBase]
     if parch == PatcherArchitecture.BAS:
         PatchEncoderCls = PatchEncoder
     elif parch == PatcherArchitecture.CNV:
         PatchEncoderCls = ConvPatchEncoder
+    elif parch == PatcherArchitecture.HCV:
+        PatchEncoderCls = HierarchicalConvPatchEncoder
     elif parch == PatcherArchitecture.MEM:
         PatchEncoderCls = PatchEncoderLowMem
     else:
@@ -232,8 +240,8 @@ def get_model(
             malconv = MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
             return MalConvClassifier(embedding, filmer, malconv, head)
         if arch in (Architecture.VIT,):
-            patcher = PatchEncoderCls(embedding_dim, vit_d_model, num_patches, patch_size)
-            transformer = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers)
+            patcher = PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
+            transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers)
             return ViTClassifier(embedding, filmer, patcher, transformer, head)
 
     if level == HierarchicalLevel.COARSE:
@@ -246,9 +254,9 @@ def get_model(
                 for _ in range(num_structures)]
             return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
         if arch in (Architecture.VIT,):
-            patchers = [PatchEncoderCls(embedding_dim, vit_d_model, num_patches, patch_size)
+            patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
                 for _ in range(num_structures)]
-            transformers = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
+            transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
             return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
 
     if level == HierarchicalLevel.MIDDLE:
@@ -261,9 +269,9 @@ def get_model(
                 for _ in range(num_structures)]
             return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
         if arch in (Architecture.VIT,):
-            patchers = [PatchEncoderCls(embedding_dim, vit_d_model, num_patches, patch_size)
+            patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
                 for _ in range(num_structures)]
-            transformers = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
+            transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
             return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
 
     if level == HierarchicalLevel.FINE:
@@ -276,9 +284,9 @@ def get_model(
                 for _ in range(num_structures)]
             return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
         if arch in (Architecture.VIT,):
-            patchers = [PatchEncoderCls(embedding_dim, vit_d_model, num_patches, patch_size)
+            patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
                 for _ in range(num_structures)]
-            transformers = ViT(vit_d_model, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
+            transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
             return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
 
 
