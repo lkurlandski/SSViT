@@ -3,6 +3,8 @@ Create large batches of experiments.
 """
 
 from argparse import ArgumentParser
+from itertools import chain
+from itertools import combinations
 from itertools import product
 import math
 from pathlib import Path
@@ -108,7 +110,7 @@ class Configuration:
             f"entropy--{self.do_entropy}",
             f"characteristics--{'_'.join(sorted([str(c.name) for c in self.which_characteristics]))}",
             f"max_length--{self.max_length}",
-            f"batch_size--{self.batch_size * self.gradient_accumulation_steps * world_size}",
+            f"batch_size--{self.batch_size * world_size}",
             f"learning_rate--{self.learning_rate}",
             f"weight_decay--{self.weight_decay}",
             f"warmup_ratio--{self.warmup_ratio}",
@@ -120,11 +122,30 @@ class Configuration:
 
     @property
     def gradient_accumulation_steps(self) -> int:
-        return 1
+        return self.batch_size // self.per_device_batch_size
 
     @property
     def batch_size(self) -> int:
         return 256
+
+    @property
+    def per_device_batch_size(self) -> int:
+        # TODO: this needs to be refined a bit, especially for longer sequences, but for now
+        # the goal is to not constantly OOM on an A100 40GB.
+        if self.arch == Architecture.MCV:
+            return 64
+        if self.arch == Architecture.MC2:
+            return 256
+        if self.arch == Architecture.MCG:
+            return 128
+        if self.arch == Architecture.VIT:
+            if self.size == ModelSize.SM:
+                return 256
+            if self.size == ModelSize.MD:
+                return 128
+            if self.size == ModelSize.LG:
+                return 64
+        raise NotImplementedError(f"ERROR ({str(self)}): batch size not defined for this configuration.")
 
     @property
     def num_workers(self) -> int:
@@ -148,7 +169,7 @@ class Configuration:
 
     @property
     def label_smoothing(self) -> float:
-        return 0.05
+        return 0.01
 
     @property
     def device(self) -> str:
@@ -161,6 +182,10 @@ class Configuration:
     @property
     def tf32(self) -> bool:
         return True
+
+    @property
+    def stopper_patience(self) -> int:
+        return 2
 
     @property
     def max_epochs(self) -> float:
@@ -180,23 +205,28 @@ class Configuration:
 
 
 # Classifier throughput in samples/second on NVIDIA A100. Measurements taken using
-# maximum sequence length of 1_000_000 and a physical batch size of 256 samples.
+# maximum sequence length of 1_000_000 and a logical batch size of 256 samples.
 # (Architecture, do_entropy, do_characteristics) : (vl_throughput, tr_throughout)
 THROUGHPUTS = {
-    (Architecture.MCV, False, False) : None,
-    (Architecture.MCV, False, True)  : None,
-    (Architecture.MCV, True,  False) : None,
-    (Architecture.MCV, True,  True)  : None,
+    (Architecture.MCV, ModelSize.MD, False, False) : None,
+    (Architecture.MCV, ModelSize.MD, False, True)  : None,
+    (Architecture.MCV, ModelSize.MD, True,  False) : None,
+    (Architecture.MCV, ModelSize.MD, True,  True)  : None,
 
-    (Architecture.MC2, False, False) : (750, 550),
-    (Architecture.MC2, False, True)  : (560, 425),
-    (Architecture.MC2, True,  False) : (375, 325),
-    (Architecture.MC2, True,  True)  : None,
+    (Architecture.MC2, ModelSize.MD, False, False) : (675, 450),  # NOTE: phys batch size 256
+    (Architecture.MC2, ModelSize.MD, False, True)  : (425, 325),  # NOTE: phys batch size 256
+    (Architecture.MC2, ModelSize.MD, True,  False) : (375, 300),  # NOTE: phys batch size 256
+    (Architecture.MC2, ModelSize.MD, True,  True)  : (300, 275),  # NOTE: phys batch size 256 TODO: refine on RC
 
-    (Architecture.MCG, False, False) : None,
-    (Architecture.MCG, False, True)  : None,
-    (Architecture.MCG, True,  False) : None,
-    (Architecture.MCG, True,  True)  : None,
+    (Architecture.MCG, ModelSize.MD, False, False) : (250, 150),  # NOTE: phys batch size 256 TODO: refine on RC
+    (Architecture.MCG, ModelSize.MD, False, True)  : (150, 100),  # NOTE: phys batch size 256 TODO: refine on RC
+    (Architecture.MCG, ModelSize.MD, True,  False) : (150, 100),  # NOTE: phys batch size 256 TODO: refine on RC
+    (Architecture.MCG, ModelSize.MD, True,  True)  : (150, 100),  # NOTE: phys batch size 256 TODO: refine on RC
+
+    (Architecture.VIT, ModelSize.MD, False, False) : (550, 350),  # NOTE: phys batch size 128 TODO: refine on RC
+    (Architecture.VIT, ModelSize.MD, False, True)  : (275, 225),  # NOTE: phys batch size 128 TODO: refine on RC
+    (Architecture.VIT, ModelSize.MD, True,  False) : (250, 225),  # NOTE: phys batch size 128 TODO: refine on RC
+    (Architecture.VIT, ModelSize.MD, True,  True)  : (225, 225),  # NOTE: phys batch size 128 TODO: refine on RC
 }
 
 
@@ -215,14 +245,7 @@ class Requirements:
     @property
     def time(self) -> int:
         """Return the number of seconds required for the job (configure)."""
-        key = (self.config.arch, self.config.do_entropy, bool(self.config.which_characteristics))
-
-        if key == (Architecture.MC2, False, False):
-            return 20 * 3600
-        if key == (Architecture.MC2, False, True):
-            return 24 * 3600
-        if key == (Architecture.MC2, True, False):
-            return 28 * 3600
+        key = (self.config.arch, self.config.size, self.config.do_entropy, bool(self.config.which_characteristics))
 
         if THROUGHPUTS.get(key) is not None:
             tr_throughput = THROUGHPUTS[key][0]
@@ -333,13 +356,16 @@ class ScriptBuilder:
             f"--num_workers {self.config.num_workers}",
             f"--pin_memory {True if self.config.num_workers > 0 else False}",
             f"--gradient_accumulation_steps {self.config.gradient_accumulation_steps}",
-            f"--tr_batch_size {self.config.batch_size}",
-            f"--vl_batch_size {self.config.batch_size}",
-            f"--ts_batch_size {self.config.batch_size}",
+            f"--tr_batch_size {self.config.per_device_batch_size}",
+            f"--vl_batch_size {self.config.per_device_batch_size}",
+            f"--ts_batch_size {self.config.per_device_batch_size}",
             f"--learning_rate {self.config.learning_rate}",
             f"--weight_decay {self.config.weight_decay}",
             f"--warmup_ratio {self.config.warmup_ratio}",
             f"--label_smoothing {self.config.label_smoothing}",
+            f"--stopper_patience {self.config.stopper_patience}",
+            f"--stopper_metric {'vl_roc'}",
+            f"--stopper_mode {'max'}",
             f"--device {self.config.device}",
             f"--ddp {self.reqs.gpus_per_node > 1}",
             f"--mp16 {self.config.mp16}",
@@ -389,11 +415,7 @@ def config_fiter(config: Configuration) -> bool:
     if not isinstance(config, Configuration):
         raise TypeError()
 
-    # Reject illegal or redundant configurations.
-    if config.arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG) and config.size == ModelSize.LG:
-        return False
-
-    # Reject configurations for debug mode.
+    # Debug
     if DEBUG:
         if config.size != ModelSize.SM:
             return False
@@ -403,12 +425,31 @@ def config_fiter(config: Configuration) -> bool:
         if config.size == ModelSize.SM:
             return False
 
-    # Custom filtering logic.
+    # Architecture
+    if config.arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG) and config.size == ModelSize.LG:
+        return False
+    if config.arch == Architecture.MCV:
+        return False
+    if config.size != ModelSize.MD:
+        return False
+
+    # Structure
     if config.level != HierarchicalLevel.NONE:
         return False
-    if config.arch != Architecture.MC2:
+
+    # Semantics
+    CHARS = (
+        lief.PE.Section.CHARACTERISTICS.MEM_READ,
+        lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
+        lief.PE.Section.CHARACTERISTICS.CNT_CODE,
+    )
+    if len(config.which_characteristics) > 0 and any(c not in CHARS for c in config.which_characteristics):
         return False
-    if config.do_entropy and config.which_characteristics:
+    if len(config.which_characteristics) not in (0, 1, len(CHARS)):
+        return False
+    if config.do_entropy and len(config.which_characteristics) not in (0, len(CHARS)):
+        return False
+    if not config.do_entropy and len(config.which_characteristics) == len(CHARS):
         return False
 
     return True
@@ -434,7 +475,7 @@ def main() -> None:
         [s for s in ModelSize],
         [l for l in HierarchicalLevel],
         [True, False],
-        [tuple()] + [(c,) for c in CHARACTERISTICS],
+        chain.from_iterable(combinations(CHARACTERISTICS, r) for r in range(len(CHARACTERISTICS) + 1)),
         [1000000],
         [0],
     )
@@ -451,6 +492,11 @@ def main() -> None:
         allconfigs.add(str(config))
 
         reqs = Requirements(config)
+
+        if reqs.gpus_per_node * reqs.nodes > 1 and config.gradient_accumulation_steps > 1:
+            warnings.warn(f"WARNING ({str(config)}): requested gradient accumulation ({config.gradient_accumulation_steps}) "
+                f"with multi-GPU training ({reqs.gpus_per_node * reqs.nodes}). Logical batch size will be "
+                f"{config.batch_size * reqs.gpus_per_node * reqs.nodes} samples.")
 
         outdir = config.get_outdir(reqs.gpus_per_node * reqs.nodes)
         if str(outdir) in alloutdirs:
