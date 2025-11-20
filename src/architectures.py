@@ -132,6 +132,22 @@ class LowMemoryNetworkMixin(nn.Module, ABC):
     def check_output(self, z: Tensor) -> None:
         """Validate the output of `forward`."""
 
+
+class LowMemoryPreprocessorMixin(nn.Module, ABC):
+    """
+    Mixin for neural networks that can be used before a low-memory network.
+    """
+
+    @abstractmethod
+    def forward(self, *args: Any, **kwds: Any) -> Any:
+        """Forward method of the network."""
+
+    @abstractmethod
+    @torch.no_grad()
+    def forward_functional(self, *args: Any, **kwds: Any) -> Any:
+        """Fully functional interface to the network with aggressive gradient detachment."""
+
+
 # -------------------------------------------------------------------------------- #
 # Other
 # -------------------------------------------------------------------------------- #
@@ -367,6 +383,10 @@ class PatchEncoderBase(nn.Module, ABC):
     def patch_size(self) -> Optional[int]:
         return self._patch_size
 
+    @property
+    def min_length(self) -> int:
+        return 0
+
     def forward(self, z: Optional[Tensor] = None, preprocess: Optional[PreprocessFn] = None, ts: Optional[Sequence[Tensor]] = None) -> Tensor:
         """
         Args:
@@ -396,44 +416,33 @@ class PatchEncoderBase(nn.Module, ABC):
         else:
             raise ValueError("Either `z` or both `preprocess` and `ts` must be provided.")
 
-        # FIXME: check the patch dimension (below)
-        check_tensor(z, (z.shape[0], None, self.out_channels), FLOATS)
+        check_tensor(z, (z.shape[0], self.num_patches, self.out_channels), FLOATS)
         return z
-
-    @property
-    def min_length(self) -> int:
-        return 1
 
     @abstractmethod
     def forward_embeddings(self, z: Tensor) -> Tensor:
         ...
 
-    @abstractmethod
     def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
-        ...
+        return self.forward_embeddings(preprocess(*ts))
 
 
-class PatchEncoder(nn.Module):
+class PatchEncoder(PatchEncoderBase):
     """
-    Breaks a sequence into patches and convolves them fixed-size kernels.
-
-    NOTE: `N` refers to the number of patches for a sequence of particular length
-        which is often less than PatchEncoder.num_patches.
+    Breaks a sequence into patches and encodes them via convolution.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 64, stride: int = 64, *, patch_size: Optional[int], num_patches: Optional[int]) -> None:
-        """
-        Args:
-            in_channels: Number of input channels.
-            out_channels: Number of output channels.
-            kernel_size: Size of the convolutional kernel.
-            stride: Stride of the convolutional kernel.
-            patch_size: Size of each patch. The sequence will broken into patch(es) of this size
-                with at most one smaller patch if necessary.
-            num_patches: Number of patches. The sequence will be broken into up into this many patches of equal size
-                with at most one smaller patch if necessary.
-        """
-        super().__init__()
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_patches: Optional[int],
+        patch_size: Optional[int],
+        *,
+        kernel_size: int = 64,
+        stride: int = 64,
+    ) -> None:
+        super().__init__(in_channels, out_channels, num_patches, patch_size)
 
         if bool(patch_size is None) == bool(num_patches is None):
             raise ValueError(f"Exactly one of patch_size or num_patches must be specified. Got {patch_size=} and {num_patches=}.")
@@ -441,23 +450,21 @@ class PatchEncoder(nn.Module):
         if patch_size is not None and patch_size < kernel_size:
             raise ValueError(f"Patch size must be greater than or equal to kernel size. Got {patch_size=} and {kernel_size=}.")
 
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride)
-        self.pool = nn.AdaptiveMaxPool1d(1)
-
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-        self.in_channels = in_channels
-        self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.stride = stride
 
-    def forward(self, z: Tensor) -> Tensor:
-        """
-        Args:
-            x: Input tensor of shape (B, T, E).
-        Returns:
-            Output tensor of shape (B, N, C).
-        """
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride)
+        self.pool = nn.AdaptiveMaxPool1d(1)
+
+    @property
+    def min_length(self) -> int:
+        if self.patch_size is not None:
+            return max(self.kernel_size, self.patch_size)
+        if self.num_patches is not None:
+            return self.num_patches * self.kernel_size
+        raise RuntimeError("This should never happen.")
+
+    def forward_embeddings(self, z: Tensor) -> Tensor:
         check_tensor(z, (None, None, None), FLOATS)
         if z.shape[1] < self.min_length:
             raise RuntimeError(f"Input sequence length {z.shape[1]} is less than the minimum required length {self.min_length}.")
@@ -521,28 +528,27 @@ class PatchEncoder(nn.Module):
 
         raise RuntimeError("This should never happen.")
 
-    @property
-    def min_length(self) -> int:
-        if self.patch_size is not None:
-            return max(self.kernel_size, self.patch_size)
-        if self.num_patches is not None:
-            return self.num_patches * self.kernel_size
-        raise RuntimeError("This should never happen.")
 
-
-class ConvPatchEncoder(nn.Module):
+class ConvPatchEncoder(PatchEncoderBase):
     """
-    An optimized patch encoder for fixed-size patches.
-
-    Rather than splitting the sequence into patches and convolving each patch separately,
-    this module linearly maps each patch into an output embedding via a 1D convolution.
+    Breaks a sequence into fixed-sized patches and encodes them via convolution.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, patch_size: int, num_patches: Optional[int] = None) -> None:
-        super().__init__()
-        if num_patches is not None:
-            warnings.warn("ConvPatchEncoder ignores num_patches; only patch_size is used.")
-        self.patch_size = patch_size
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_patches: Optional[int],
+        patch_size: Optional[int],
+    ) -> None:
+        super().__init__(in_channels, out_channels, num_patches, patch_size)
+
+        if num_patches is not None or patch_size is None:
+            raise ValueError("PatchEncoderLowMem requires `num_patches` > 0 and `patch_size` = None.")
+
+        self.kernel_size = patch_size
+        self.stride = patch_size
+
         self.proj = nn.Conv1d(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -550,28 +556,146 @@ class ConvPatchEncoder(nn.Module):
             stride=patch_size,
         )
 
-    def forward(self, z: Tensor) -> Tensor:
-        """
-        Args:
-            x: Input tensor of shape (B, T, E).
-        Returns:
-            Output tensor of shape (B, N, C).
-        """
+    @property
+    def num_patches(self) -> None:
+        assert self._num_patches is None
+        return self._num_patches
+
+    @property
+    def patch_size(self) -> int:
+        assert self._patch_size is not None
+        return self._patch_size
+
+    @property
+    def min_length(self) -> int:
+        return self.kernel_size
+
+    def forward_embeddings(self, z: Tensor) -> Tensor:
         B, T, E = z.shape
         P = self.patch_size
-
-        if T % P != 0:
-            z = torch.cat([z, z.new_zeros(B, P - (T % P), E)], dim=1)
-
+        p = z.new_zeros(B, P - (T % P), E) if T % P != 0 else z.new_zeros(B, 0, E)
+        z = torch.cat([z, p], dim=1)
         z = z.permute(0, 2, 1)      # (B, E, T')
         z = self.proj(z)            # (B, C, N)
         z = z.permute(0, 2, 1)      # (B, N, C)
         return z
 
 
+def compute_factors(n: int) -> list[tuple[int, int]]:
+    """
+    Finds all factors of a given positive integer.
+    """
+    factors = []
+    for i in range(1, n + 1):
+        if n % i == 0:
+            factors.append((i, int(n / i)))
+    return factors
+
+
+def functional_forward(z: Tensor, *, module: nn.Module, fp32: bool = False) -> Tensor:
+
+    def check(components: list[Optional[Tensor]]) -> None:
+        components = [w_b for w_b in components if w_b is not None]
+        if any(w_b.dtype != torch.float32 for w_b in components):
+            warnings.warn("Some weights and/or biases are not in float32, which is unexpected, when `fp32=True`.")
+
+    if isinstance(module, nn.Conv1d):
+        w = module.weight.detach()
+        b = module.bias.detach() if module.bias is not None else None
+
+        if fp32:
+            z = z.to(torch.float32)
+            check([w, b])
+
+        z = F.conv1d(z, w, b, **_get_conv_kwds(module))
+
+        return z
+
+    raise NotImplementedError(f"functional_forward does not support {type(module)} yet.")
+
+
+class HierarchicalConvPatchEncoder(PatchEncoderBase):
+    """
+    Two-stage hierarchical convolutional patch encoder.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_patches: Optional[int],
+        patch_size: Optional[int],
+        *,
+        hidden_channels: Optional[int] = None,
+        s1: Optional[int] = None,
+        s2: Optional[int] = None,
+        activation: Optional[str] = "leaky_relu",
+    ) -> None:
+        super().__init__(in_channels, out_channels, num_patches, patch_size)
+
+        if num_patches is not None or patch_size is None:
+            raise ValueError("PatchEncoderLowMem requires `num_patches` > 0 and `patch_size` = None.")
+
+        if s1 is None and s2 is None:
+            factors = compute_factors(patch_size)
+            s1, s2 = min(factors, key=lambda x: abs(x[0] - x[1]))
+            if patch_size != s1 * s2:
+                raise RuntimeError(f"`s1` and `s2` must be a factorization of `patch_size`. Got {patch_size=} {s1=} {s2=} {s1*s2=}.")
+        elif s1 is None and s2 is not None:
+            if patch_size % s2 != 0:
+                raise ValueError(f"`patch_size` must be divisible by `s1`. Got {patch_size=} {s1=} {s2=}.")
+            s1 = patch_size // s2
+        elif s1 is not None and s2 is None:
+            if patch_size % s1 != 0:
+                raise ValueError(f"`patch_size` must be divisible by `s1`. Got {patch_size=} {s1=} {s2=}.")
+            s2 = patch_size // s1
+        elif s1 is not None and s2 is not None:
+            if patch_size != s1 * s2:
+                raise ValueError(f"`s1` and `s2` must be a factorization of `patch_size`. Got {patch_size=} {s1=} {s2=} {s1*s2=}.")
+
+        hidden_channels = hidden_channels if hidden_channels is not None else out_channels
+
+        assert s1 is not None
+        assert s2 is not None
+        assert hidden_channels is not None
+        self.conv_1 = nn.Conv1d(in_channels, hidden_channels, kernel_size=s1, stride=s1)
+        self.conv_2 = nn.Conv1d(hidden_channels, out_channels, kernel_size=s2, stride=s2)
+        self.actvfn = ACTVS[activation] if activation is not None else nn.Identity()
+
+    @property
+    def num_patches(self) -> None:
+        assert self._num_patches is None
+        return self._num_patches
+
+    @property
+    def patch_size(self) -> int:
+        assert self._patch_size is not None
+        return self._patch_size
+
+    @property
+    def min_length(self) -> int:
+        return self.patch_size
+
+    def forward_embeddings(self, z: Tensor) -> Tensor:
+        B, T, E = z.shape
+        P = self.patch_size
+
+        # Pad T up to a multiple of P
+        p = z.new_zeros(B, P - (T % P), E) if T % P != 0 else z.new_zeros(B, 0, E)
+        z = torch.cat([z, p], dim=1)  # (B, T', E)
+
+        z = z.permute(0, 2, 1)  # (B, E, T')
+        z = self.conv_1(z)      # (B, H, T'')
+        z = self.actvfn(z)      # (B, H, T'')
+        z = self.conv_2(z)      # (B, C, N)
+        z = z.permute(0, 2, 1)  # (B, N, C)
+
+        return z
+
+
 class PatchEncoderLowMem(PatchEncoderBase):
     """
-    Patch encoder with constant activation memory in sequence length T.
+    Breaks a sequence into a fixed number of patches and encodes them via constant memory convolution.
     """
 
     def __init__(
@@ -598,7 +722,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
         self.overlap = kernel_size - stride if overlap is None else overlap
         self.fp32 = fp32
 
-        self.gconv = GatedConvolution(
+        self.conv = nn.Conv1d(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
@@ -629,7 +753,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
         z = torch.cat([z, p], dim=1)              # (B, N*P, E)
         z = z.view(B, N, P, E)                    # (B, N, P, E)
         z = z.view(B * N, P, E).permute(0, 2, 1)  # (BN, E, P)
-        g: Tensor = self.gconv(z)                 # (BN, C, S)
+        g: Tensor = self.conv(z)                  # (BN, C, S)
         g, _ = g.max(dim=-1)                      # (BN, C)
         g = g.view(B, N, C)                       # (B, N, C)
 
@@ -650,7 +774,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
             overlap=self.overlap,
             channels=C,
             num_patches=self.num_patches,
-            activations_fn=partial(self.gconv.forward_functional, fp32=self.fp32),
+            activations_fn=partial(functional_forward, module=self.conv, fp32=self.fp32),
         )
 
         if not self.training:
@@ -665,7 +789,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
             embedding_dim=E,
         )
 
-        g_all: Tensor = self.gconv(wins_cat)
+        g_all: Tensor = self.conv(wins_cat)
         g_all = g_all.squeeze(-1)
 
         z = _scatter_g_to_BNC(
@@ -838,8 +962,6 @@ class ViT(nn.Module):
     Vision Transformer.
 
     See: Dosovitskiy "An image is worth 16x16 words: Transformers for image recognition at scale" ICLR 2021.
-
-    # FIXME: remove proj; upscaling the embeddings should be done outside of ViT, e.g., in PatchEncoder.
     """
 
     cls_token: Optional[nn.Parameter]
@@ -1857,7 +1979,7 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         and feeds the encoded patches to a shared ViT backbone followed by a classification head.
     """
 
-    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoder], backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(patchers)):

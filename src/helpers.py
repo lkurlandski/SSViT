@@ -47,6 +47,7 @@ class ModelSize(Enum):
 class PatcherArchitecture(Enum):
     BAS = "bas"      # Basic
     CNV = "cnv"      # Convolutional
+    HCV = "hcv"      # Hierarchical Convolutional
     MEM = "mem"      # Low-Memory
 
 
