@@ -251,7 +251,7 @@ class TrainerArgs:
 class EarlyStopper:
 
     def __init__(self, patience: int | float = 0, threshold: float = 0.0001, lower_is_worse: bool = False) -> None:
-        self.patience = patience
+        self.patience = patience if patience >= 0 else float("inf")
         self.threshold = threshold
         self.lower_is_worse = lower_is_worse
         self.best = -float("inf") if lower_is_worse else float("inf")
