@@ -581,6 +581,118 @@ class ConvPatchEncoder(PatchEncoderBase):
         return z
 
 
+def compute_factors(n: int) -> list[tuple[int, int]]:
+    """
+    Finds all factors of a given positive integer.
+    """
+    factors = []
+    for i in range(1, n + 1):
+        if n % i == 0:
+            factors.append((i, int(n / i)))
+    return factors
+
+
+def functional_forward(z: Tensor, *, module: nn.Module, fp32: bool = False) -> Tensor:
+
+    def check(components: list[Optional[Tensor]]) -> None:
+        components = [w_b for w_b in components if w_b is not None]
+        if any(w_b.dtype != torch.float32 for w_b in components):
+            warnings.warn("Some weights and/or biases are not in float32, which is unexpected, when `fp32=True`.")
+
+    if isinstance(module, nn.Conv1d):
+        w = module.weight.detach()
+        b = module.bias.detach() if module.bias is not None else None
+
+        if fp32:
+            z = z.to(torch.float32)
+            check([w, b])
+
+        z = F.conv1d(z, w, b, **_get_conv_kwds(module))
+
+        return z
+
+    raise NotImplementedError(f"functional_forward does not support {type(module)} yet.")
+
+
+class HierarchicalConvPatchEncoder(PatchEncoderBase):
+    """
+    Two-stage hierarchical convolutional patch encoder.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_patches: Optional[int],
+        patch_size: Optional[int],
+        *,
+        hidden_channels: Optional[int] = None,
+        s1: Optional[int] = None,
+        s2: Optional[int] = None,
+        activation: Optional[str] = "leaky_relu",
+    ) -> None:
+        super().__init__(in_channels, out_channels, num_patches, patch_size)
+
+        if num_patches is not None or patch_size is None:
+            raise ValueError("PatchEncoderLowMem requires `num_patches` > 0 and `patch_size` = None.")
+
+        if s1 is None and s2 is None:
+            factors = compute_factors(patch_size)
+            s1, s2 = min(factors, key=lambda x: abs(x[0] - x[1]))
+            if patch_size != s1 * s2:
+                raise RuntimeError(f"`s1` and `s2` must be a factorization of `patch_size`. Got {patch_size=} {s1=} {s2=} {s1*s2=}.")
+        elif s1 is None and s2 is not None:
+            if patch_size % s2 != 0:
+                raise ValueError(f"`patch_size` must be divisible by `s1`. Got {patch_size=} {s1=} {s2=}.")
+            s1 = patch_size // s2
+        elif s1 is not None and s2 is None:
+            if patch_size % s1 != 0:
+                raise ValueError(f"`patch_size` must be divisible by `s1`. Got {patch_size=} {s1=} {s2=}.")
+            s2 = patch_size // s1
+        elif s1 is not None and s2 is not None:
+            if patch_size != s1 * s2:
+                raise ValueError(f"`s1` and `s2` must be a factorization of `patch_size`. Got {patch_size=} {s1=} {s2=} {s1*s2=}.")
+
+        hidden_channels = hidden_channels if hidden_channels is not None else out_channels
+
+        assert s1 is not None
+        assert s2 is not None
+        assert hidden_channels is not None
+        self.conv_1 = nn.Conv1d(in_channels, hidden_channels, kernel_size=s1, stride=s1)
+        self.conv_2 = nn.Conv1d(hidden_channels, out_channels, kernel_size=s2, stride=s2)
+        self.actvfn = ACTVS[activation] if activation is not None else nn.Identity()
+
+    @property
+    def num_patches(self) -> None:
+        assert self._num_patches is None
+        return self._num_patches
+
+    @property
+    def patch_size(self) -> int:
+        assert self._patch_size is not None
+        return self._patch_size
+
+    @property
+    def min_length(self) -> int:
+        return self.patch_size
+
+    def forward_embeddings(self, z: Tensor) -> Tensor:
+        B, T, E = z.shape
+        P = self.patch_size
+
+        # Pad T up to a multiple of P
+        p = z.new_zeros(B, P - (T % P), E) if T % P != 0 else z.new_zeros(B, 0, E)
+        z = torch.cat([z, p], dim=1)  # (B, T', E)
+
+        z = z.permute(0, 2, 1)  # (B, E, T')
+        z = self.conv_1(z)      # (B, H, T'')
+        z = self.actvfn(z)      # (B, H, T'')
+        z = self.conv_2(z)      # (B, C, N)
+        z = z.permute(0, 2, 1)  # (B, N, C)
+
+        return z
+
+
 class PatchEncoderLowMem(PatchEncoderBase):
     """
     Breaks a sequence into a fixed number of patches and encodes them via constant memory convolution.
@@ -610,7 +722,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
         self.overlap = kernel_size - stride if overlap is None else overlap
         self.fp32 = fp32
 
-        self.gconv = GatedConvolution(
+        self.conv = nn.Conv1d(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
@@ -641,7 +753,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
         z = torch.cat([z, p], dim=1)              # (B, N*P, E)
         z = z.view(B, N, P, E)                    # (B, N, P, E)
         z = z.view(B * N, P, E).permute(0, 2, 1)  # (BN, E, P)
-        g: Tensor = self.gconv(z)                 # (BN, C, S)
+        g: Tensor = self.conv(z)                  # (BN, C, S)
         g, _ = g.max(dim=-1)                      # (BN, C)
         g = g.view(B, N, C)                       # (B, N, C)
 
@@ -662,7 +774,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
             overlap=self.overlap,
             channels=C,
             num_patches=self.num_patches,
-            activations_fn=partial(self.gconv.forward_functional, fp32=self.fp32),
+            activations_fn=partial(functional_forward, module=self.conv, fp32=self.fp32),
         )
 
         if not self.training:
@@ -677,7 +789,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
             embedding_dim=E,
         )
 
-        g_all: Tensor = self.gconv(wins_cat)
+        g_all: Tensor = self.conv(wins_cat)
         g_all = g_all.squeeze(-1)
 
         z = _scatter_g_to_BNC(
@@ -850,8 +962,6 @@ class ViT(nn.Module):
     Vision Transformer.
 
     See: Dosovitskiy "An image is worth 16x16 words: Transformers for image recognition at scale" ICLR 2021.
-
-    # FIXME: remove proj; upscaling the embeddings should be done outside of ViT, e.g., in PatchEncoder.
     """
 
     cls_token: Optional[nn.Parameter]
