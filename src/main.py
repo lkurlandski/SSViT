@@ -611,7 +611,7 @@ def main() -> None:
     padbatch = get_padbatch(args.level, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)
     print(f"{padbatch=}")
 
-    stopper: EarlyStopper = EarlyStopper(patience=float("inf"))
+    stopper: EarlyStopper = EarlyStopper(args.stopper_patience, args.stopper_threshold, args.stopper_mode)
     print(f"{stopper=}")
 
     checkpoint = None

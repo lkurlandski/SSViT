@@ -23,6 +23,7 @@ import time
 from typing import Any
 from typing import Callable
 from typing import ContextManager
+from typing import Literal
 from typing import Optional
 from typing import Protocol
 from typing import Self
@@ -215,8 +216,10 @@ def barrier(tag: str = "", device: Optional[torch.device] = None) -> None:
 class TrainerArgs:
     outdir: Path = Path("./output/tmp")
     disable_tqdm: bool = False
-    metric: str = "vl_loss"
-    lower_is_worse: bool = False
+    stopper_metric: str = "vl_loss"
+    stopper_mode: str = "min"
+    stopper_threshold: float = 0.0
+    stopper_patience: float = float("inf")
     max_norm: float = 1.0
     gradient_accumulation_steps: int = 1
     mp16: bool = False
@@ -238,6 +241,8 @@ class TrainerArgs:
             raise ValueError("At most one of `chpt_epochs` or `chpt_steps` may be specified.")
         if (self.logg_epochs is not None) and (self.logg_steps is not None):
             raise ValueError("At most one of `logg_epochs` or `logg_steps` may be specified.")
+        if self.stopper_mode not in ("min", "max"):  # TODO: add Literal support to the argparser.
+            raise ValueError("`stopper_mode` must be 'min' or 'max'.")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
@@ -249,31 +254,83 @@ class TrainerArgs:
 
 
 class EarlyStopper:
+    """
+    Stateful class to support early stopping conditions.
 
-    def __init__(self, patience: int | float = 0, threshold: float = 0.0001, lower_is_worse: bool = False) -> None:
-        self.patience = patience if patience >= 0 else float("inf")
+    Args:
+        patience: Number of steps with no improvement after which stopping will be triggered.
+            If `patience` is 0, the stopper will signal to stop if `step()` is called without improvement.
+            If patience is N, the stopper won't signal to stop until `step()` has been called N times
+            without improvement; if the N+1-th call to `step()` also shows no improvement, then the stopper
+            will signal to stop. If patience is `float('inf')`, the stopper will never signal to stop.
+        threshold: Minimum change in the monitored metric to qualify as an improvement.
+            If `threshold` is 0, any improvement in the monitored metric will qualify.
+            If `threshold` is positive, the monitored metric must improve by at least `threshold`.
+            If `threshold` is negative, the monitored metric must "improve" by at least `-threshold`,
+            i.e., it may actually worsen by up to `-threshold` and still count as an improvement.
+        mode: Determines whether an increase or decrease is considered an improvement.
+            If `mode` is "max", an increase in the monitored metric is considered an improvement.
+            If `mode` is "min", a decrease in the monitored metric is considered an improvement.
+
+    Usage:
+        >>> stopper = EarlyStopper(patience=2, threshold=0.001, mode="max")
+        >>> stopper = stopper.step(0.5)
+        >>> stopper = stopper.step(0.6)
+        >>> stopper = stopper.step(0.6005)  # No improvement; count := 1  <=  patience
+        >>> stopper = stopper.step(0.6010)  # No improvement; count := 2  <=  patience
+        >>> stopper = stopper.step(0.6011)  # Improvement;    count := 0  <=  patience
+        >>> stopper = stopper.step(0.6)     # No improvement; count := 1  <=  patience
+        >>> stopper = stopper.step(0.6)     # No improvement; count := 2  <=  patience
+        >>> stopper = stopper.step(0.6)     # No improvement; count := 3  >   patience
+        >>> print(stopper.stop)             # True
+        >>> stopper = stopper.step(0.7)     # Raises RuntimeError
+    """
+
+    def __init__(self, patience: int | float = float("inf"), threshold: float = 0.0, mode: Literal["min", "max"] = "min") -> None:
+        if patience < 0:
+            raise ValueError("`patience` must be >= 0")
+        if mode not in ("min", "max"):
+            raise ValueError("`mode` must be 'min' or 'max'")
+
+        self.patience = patience
         self.threshold = threshold
-        self.lower_is_worse = lower_is_worse
-        self.best = -float("inf") if lower_is_worse else float("inf")
-        self.current = -1.0
-        self.count = 0
+        self.mode = mode
 
-    def step(self, val: float) -> Self:
-        self.current = val
-        if self.lower_is_worse and (self.current > self.best + self.threshold):
-            self.best = self.current
-            self.count = 0
-        elif not self.lower_is_worse and (self.current < self.best - self.threshold):
-            self.best = self.current
-            self.count = 0
+        self.best: Optional[float] = None
+        self.num_bad_steps = 0
+        self._stop = False
+
+    def step(self, value: float) -> Self:
+        if self._stop:
+            raise RuntimeError("Early stopping already triggered.")
+
+        # Set the baseline the first time step() is called.
+        if self.best is None:
+            self.best = value
+            self.num_bad_steps = 0
+            return self
+
+        improved: Optional[bool] = None
+        if self.mode == "min":  # Improvement means "sufficiently smaller".
+            improved = value < self.best - self.threshold
+        if self.mode == "max":  # Improvement means "sufficiently larger".
+            improved = value > self.best + self.threshold
+        if improved is None:
+            raise RuntimeError("This should never happen.")
+
+        if improved:
+            self.best = value
+            self.num_bad_steps = 0
+        else:
+            self.num_bad_steps += 1
+            if self.num_bad_steps > self.patience:
+                self._stop = True
+
         return self
 
     @property
     def stop(self) -> bool:
-        if self.current == self.best:
-            return False
-        self.count += 1
-        return self.count >= self.patience
+        return self._stop
 
 
 def mp_dtype(mp16: bool, device: torch.device) -> torch.dtype:
@@ -819,8 +876,9 @@ class Trainer:
         # Handle early stopping (only if validation is orgnanically scheduled).
         if self.stopper is not None:
             if due_eval:
-                self.stopper.step(report[f"{self.args.metric}"])
+                self.stopper.step(report[f"{self.args.stopper_metric}"])
             if self.stopper.stop:
+                print("Early stopping triggered.")
                 self._done = True
 
     def forward(self, batch: Batch) -> Tensor:
