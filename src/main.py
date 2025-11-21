@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import time
 from typing import cast
 from typing import Any
 from typing import Callable
@@ -392,6 +393,8 @@ def get_streamer(loader: DataLoader[Any], device: torch.device, num_streams: int
         raise ValueError(f"`num_streams` must be non-negative, got {num_streams}.")
     if loader.persistent_workers:
         iter(loader)
+        time.sleep(loader.num_workers * 0.5)
+        print("", end="", flush=True)
     if num_streams == 0:
         return loader
     if num_streams == 1:
