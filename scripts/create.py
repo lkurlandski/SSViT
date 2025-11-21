@@ -161,7 +161,7 @@ class Configuration:
 
     @property
     def weight_decay(self) -> float:
-        return 1e-4
+        return 5e-4
 
     @property
     def warmup_ratio(self) -> float:
@@ -169,7 +169,7 @@ class Configuration:
 
     @property
     def label_smoothing(self) -> float:
-        return 0.01
+        return 0.025
 
     @property
     def device(self) -> str:
