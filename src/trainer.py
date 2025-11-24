@@ -243,6 +243,8 @@ class TrainerArgs:
             raise ValueError("At most one of `logg_epochs` or `logg_steps` may be specified.")
         if self.stopper_mode not in ("min", "max"):  # TODO: add Literal support to the argparser.
             raise ValueError("`stopper_mode` must be 'min' or 'max'.")
+        if self.stopper_patience < 0:
+            self.stopper_patience = float("inf")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
