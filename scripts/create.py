@@ -216,17 +216,17 @@ THROUGHPUTS = {
     (Architecture.MC2, ModelSize.MD, False, False) : (675, 450),  # NOTE: phys batch size 256
     (Architecture.MC2, ModelSize.MD, False, True)  : (425, 325),  # NOTE: phys batch size 256
     (Architecture.MC2, ModelSize.MD, True,  False) : (375, 300),  # NOTE: phys batch size 256
-    (Architecture.MC2, ModelSize.MD, True,  True)  : (300, 275),  # NOTE: phys batch size 256 TODO: refine on RC
+    (Architecture.MC2, ModelSize.MD, True,  True)  : (300, 270),  # NOTE: phys batch size 256
 
-    (Architecture.MCG, ModelSize.MD, False, False) : (250, 150),  # NOTE: phys batch size 256 TODO: refine on RC
+    (Architecture.MCG, ModelSize.MD, False, False) : (275, 120),  # NOTE: phys batch size 256
     (Architecture.MCG, ModelSize.MD, False, True)  : (150, 100),  # NOTE: phys batch size 256 TODO: refine on RC
     (Architecture.MCG, ModelSize.MD, True,  False) : (150, 100),  # NOTE: phys batch size 256 TODO: refine on RC
-    (Architecture.MCG, ModelSize.MD, True,  True)  : (150, 100),  # NOTE: phys batch size 256 TODO: refine on RC
+    (Architecture.MCG, ModelSize.MD, True,  True)  : (160,  90),  # NOTE: phys batch size 256
 
-    (Architecture.VIT, ModelSize.MD, False, False) : (550, 350),  # NOTE: phys batch size 128 TODO: refine on RC
+    (Architecture.VIT, ModelSize.MD, False, False) : (450, 350),  # NOTE: phys batch size 128
     (Architecture.VIT, ModelSize.MD, False, True)  : (275, 225),  # NOTE: phys batch size 128 TODO: refine on RC
     (Architecture.VIT, ModelSize.MD, True,  False) : (250, 225),  # NOTE: phys batch size 128 TODO: refine on RC
-    (Architecture.VIT, ModelSize.MD, True,  True)  : (225, 225),  # NOTE: phys batch size 128 TODO: refine on RC
+    (Architecture.VIT, ModelSize.MD, True,  True)  : (275, 225),  # NOTE: phys batch size 128
 }
 
 
