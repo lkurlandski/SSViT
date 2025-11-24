@@ -110,7 +110,7 @@ criterion = nn.CrossEntropyLoss()
 #optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
 optimizer = optim.Adam(model.parameters())
 
-for epoch in tqdm(range(EPOCHS)):
+for epoch in tqdm(range(1, EPOCHS + 1)):
     
     preds = []
     truths = []
