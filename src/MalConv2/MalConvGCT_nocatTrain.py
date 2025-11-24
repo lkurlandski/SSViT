@@ -27,6 +27,21 @@ from sklearn.metrics import roc_auc_score
 
 import argparse
 
+import json
+import sys
+from pathlib import Path
+from sklearn.metrics import average_precision_score as prc_auc_score
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from src.data import IterableSimpleDBDataset
+from src.data import CollateFn
+from src.data import Preprocessor
+from src.data import MetadataDB
+from src.main import get_collate_fn
+from src.main import get_loader
+from src.main import get_streamer
+from src.utils import seed_everything
+from src.simpledb import SimpleDB
+
 #Check if the input is a valid directory
 def dir_path(string):
     if os.path.isdir(string):
@@ -48,12 +63,6 @@ parser.add_argument('--max_len', type=int, default=16000000, help='Maximum lengt
 
 parser.add_argument('--gpus', nargs='+', type=int)
 
-
-parser.add_argument('mal_train', type=dir_path, help='Path to directory containing malware files for training')
-parser.add_argument('ben_train', type=dir_path, help='Path to directory containing benign files for training')
-parser.add_argument('mal_test', type=dir_path, help='Path to directory containing malware files for testing')
-parser.add_argument('ben_test', type=dir_path, help='Path to directory containing benign files for testing')
-
 args = parser.parse_args()
 
 GPUS = args.gpus
@@ -68,55 +77,33 @@ MAX_FILE_LEN = args.max_len
 
 BATCH_SIZE = args.batch_size
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+seed_everything(0)
+preprocessor = Preprocessor(max_length=args.max_len)
+root = Path("./data")
+tr_datadb = SimpleDB(root / "data" / "tr", check=False)
+ts_datadb = SimpleDB(root / "data" / "ts", check=False)
+tr_metadb = MetadataDB(root / "meta" / "tr")
+ts_metadb = MetadataDB(root / "meta" / "ts")
+tr_shards = list(range(len(tr_datadb.files_data)))
+ts_shards = list(range(len(ts_datadb.files_data)))
+tr_dataset = IterableSimpleDBDataset(tr_datadb, tr_metadb, preprocessor, tr_shards, shuffle=True)
+ts_dataset = IterableSimpleDBDataset(ts_datadb, ts_metadb, preprocessor, ts_shards, shuffle=False)
+collate_fn = CollateFn(False, False)
+tr_loader = get_loader(tr_dataset, BATCH_SIZE, True,  None, None, 0, collate_fn, True, 1)
+ts_loader = get_loader(ts_dataset, BATCH_SIZE, False, None, None, 0, collate_fn, True, 1)
+tr_streamer = get_streamer(tr_loader, device, num_streams=0)
+ts_streamer = get_streamer(ts_loader, device, num_streams=0)
+train_loader = tr_streamer
+test_loader = ts_streamer
 
-
-whole_dataset = BinaryDataset(args.ben_train, args.mal_train, sort_by_size=True, max_len=MAX_FILE_LEN )
-test_dataset = BinaryDataset(args.ben_test, args.mal_test, sort_by_size=True, max_len=MAX_FILE_LEN )
-
-loader_threads = max(multiprocessing.cpu_count()-4, multiprocessing.cpu_count()//2+1)
-
-train_loader = DataLoader(whole_dataset, batch_size=BATCH_SIZE, num_workers=loader_threads, collate_fn=pad_collate_func, 
-                        sampler=RandomChunkSampler(whole_dataset,BATCH_SIZE))
-
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, num_workers=loader_threads, collate_fn=pad_collate_func, 
-                        sampler=RandomChunkSampler(test_dataset,BATCH_SIZE))
-
-if GPUS is None:#use ALL of them! (Default) 
-    device_str = "cuda:0"
-else:
-    if GPUS[0] < 0:
-        device_str = "cpu"
-    else:
-        device_str = "cuda:{}".format(GPUS[0])
-    
-
-device = torch.device(device_str if torch.cuda.is_available() else "cpu")
 
 model = MalConvGCT(channels=NUM_CHANNELS, window_size=FILTER_SIZE, stride=FILTER_STRIDE, embd_size=EMBD_SIZE, low_mem=False).to(device)
 
-base_name = "nocat_{}_channels_{}_filterSize_{}_stride_{}_embdSize_{}".format(
-        type(model).__name__,
-        NUM_CHANNELS,
-        FILTER_SIZE,
-        FILTER_STRIDE,
-        EMBD_SIZE,
-    )
-
-if NON_NEG:
-    base_name = "NonNeg_" + base_name
-
-if GPUS is None or len(GPUS) > 1:
-    model = nn.DataParallel(model, device_ids=GPUS)
-
-if not os.path.exists(base_name):
-    os.makedirs(base_name)
-file_name = os.path.join(base_name, base_name)
-    
-
-headers = ['epoch', 'train_acc', 'train_auc', 'test_acc', 'test_auc']
-
-csv_log_out = open(file_name + ".csv", 'w')
-csv_log_out.write(",".join(headers) + "\n")
+logfile = Path("./tmp/raff/mcg/results.jsonl")
+logfile.parent.mkdir(parents=True, exist_ok=True)
+if logfile.exists():
+    raise FileExistsError(logfile)
 
 criterion = nn.CrossEntropyLoss()
 #optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
@@ -135,7 +122,11 @@ for epoch in tqdm(range(EPOCHS)):
     epoch_stats = {'epoch':epoch}
 
     model.train()
-    for inputs, labels in tqdm(train_loader):
+    for batch in tqdm(train_loader):
+
+        batch = batch.to(device, non_blocking=True)
+        batch = batch.finalize(ftype=torch.float32, itype=torch.int64, ltype=torch.int64)
+        inputs, labels = batch.get_inputs(), batch.get_label()
 
         #inputs, labels = inputs.to(device), labels.to(device)
         #Keep inputs on CPU, the model will load chunks of input onto device as needed
@@ -170,45 +161,31 @@ for epoch in tqdm(range(EPOCHS)):
 
     #print("Training Accuracy: {}".format(train_correct*100.0/train_total))
     
-    epoch_stats['train_acc'] = train_correct*1.0/train_total
-    epoch_stats['train_auc'] = roc_auc_score(truths, preds)
+    epoch_stats['tr_loss'] = running_loss / train_total
+    epoch_stats['tr_acc'] = train_correct*1.0/train_total
+    epoch_stats['tr_auc'] = roc_auc_score(truths, preds)
+    epoch_stats['tr_prc'] = prc_auc_score(truths, preds)
     #epoch_stats['train_loss'] = roc_auc_score(truths, preds)
-    
-    #Save the model and current state!
-    model_path = os.path.join(base_name, "epoch_{}.checkpoint".format(epoch))
 
-    
-    #Have to handle model state special if multi-gpu was used
-    if type(model).__name__ is "DataParallel":
-        mstd = model.module.state_dict()
-    else:
-        mstd = model.state_dict()
-    
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': mstd,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'channels': NUM_CHANNELS,
-        'filter_size': FILTER_SIZE,
-        'stride': FILTER_STRIDE,
-        'embd_dim': EMBD_SIZE,
-        'non_neg': NON_NEG,
-    }, model_path)
-    
-    
     #Test Set Eval
     model.eval()
     eval_train_correct = 0
     eval_train_total = 0
+    running_loss = 0.0
     
     preds = []
     truths = []
     with torch.no_grad():
-        for inputs, labels in tqdm(test_loader):
+        for batch in tqdm(test_loader):
 
+            batch = batch.to(device, non_blocking=True)
+            batch = batch.finalize(ftype=torch.float32, itype=torch.int64, ltype=torch.int64)
+            inputs, labels = batch.get_inputs(), batch.get_label()
             inputs, labels = inputs.to(device), labels.to(device)
 
             outputs, penultimate_activ, conv_active  = model(inputs)
+            loss = criterion(outputs, labels)
+            running_loss += loss.item()
 
             _, predicted = torch.max(outputs.data, 1)
 
@@ -218,16 +195,10 @@ for epoch in tqdm(range(EPOCHS)):
             eval_train_total += labels.size(0)
             eval_train_correct += (predicted == labels).sum().item()
 
-    epoch_stats['test_acc'] = eval_train_correct*1.0/eval_train_total
-    epoch_stats['test_auc'] = roc_auc_score(truths, preds)
+    epoch_stats['vl_loss'] = running_loss / eval_train_total
+    epoch_stats['vl_acc'] = eval_train_correct*1.0/eval_train_total
+    epoch_stats['vl_auc'] = roc_auc_score(truths, preds)
+    epoch_stats['vl_prc'] = prc_auc_score(truths, preds)
     
-    csv_log_out.write(",".join([str(epoch_stats[h]) for h in headers]) + "\n")
-    csv_log_out.flush()
-    
-    
-    
-csv_log_out.close()
-    
-
-
-
+    with open(logfile, 'a') as fp:
+        fp.write(f"{json.dumps(epoch_stats)}\n")
