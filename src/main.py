@@ -171,6 +171,9 @@ def get_model(
         FiLMCls = FiLMNoP
 
     # MalConv
+    # The concept of overlap, as described in the paper, is different to how its
+    # implemented in the codebase. Here, we match the codebase (no overlap).
+    mcnv_overlap = 0
     if size == ModelSize.SM:
         mcnv_channels = 64
         mcnv_kernel   = 1024
@@ -253,7 +256,7 @@ def get_model(
         embedding = Embedding(num_embeddings, embedding_dim, padding_idx)
         filmer = FiLMCls(guide_dim, embedding_dim, guide_hidden)
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            malconv = MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
+            malconv = MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap)
             return MalConvClassifier(embedding, filmer, malconv, head)
         if arch in (Architecture.VIT,):
             patcher = PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
@@ -266,7 +269,7 @@ def get_model(
         filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden)
             for _ in range(num_structures)]
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
+            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap)
                 for _ in range(num_structures)]
             return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
         if arch in (Architecture.VIT,):
@@ -281,7 +284,7 @@ def get_model(
         filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden)
             for _ in range(num_structures)]
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
+            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap)
                 for _ in range(num_structures)]
             return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
         if arch in (Architecture.VIT,):
@@ -296,7 +299,7 @@ def get_model(
         filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden)
             for _ in range(num_structures)]
         if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride)
+            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap)
                 for _ in range(num_structures)]
             return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
         if arch in (Architecture.VIT,):
