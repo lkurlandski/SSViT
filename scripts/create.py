@@ -337,6 +337,7 @@ class ScriptBuilder:
             f"export OMP_NUM_THREADS={self.reqs.omp_num_threads}",
             f"export PTW_NUM_THREADS={self.reqs.omp_num_threads}",
             f"export RAFF={'1' if self.config.raff else '0'}",
+            f"export ALLOW_PARAM_GRAD_NONE={'1' if self.config.raff and self.config.arch == Architecture.MCG else '0'}",
         ])
 
         torchrun = " \\\n".join([
