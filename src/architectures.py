@@ -1876,7 +1876,7 @@ class RaffClassifier(Classifier):
                 layers=1,
                 embd_size=8,
                 log_stride=None,
-                low_mem=True,
+                low_mem=False,  # NOTE: `low_mem=True` engages an utterly broken gradient checkpointing system.
             )  # type: ignore[no-untyped-call]
 
         else:
