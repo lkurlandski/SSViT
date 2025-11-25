@@ -39,6 +39,7 @@ from src.data import MetadataDB
 from src.main import get_collate_fn
 from src.main import get_loader
 from src.main import get_streamer
+from src.trainer import print_parameter_summary
 from src.utils import seed_everything
 from src.simpledb import SimpleDB
 
@@ -140,6 +141,12 @@ for epoch in tqdm(range(1, EPOCHS + 1)):
         loss = loss #+ decov_lambda*(decov_penalty(penultimate_activ) + decov_penalty(conv_active))
     #     loss = loss + decov_lambda*(decov_penalty(conv_active))
         loss.backward()
+        # Log parameter summary after first batch of first two epochs.
+        if (epoch == 1 or epoch == 2) and train_total == 0:
+            print(f"{'-' * 20} Parameter Summary {'-' * 20}")
+            print_parameter_summary(model, spaces=2)
+            print(f"{'-' * 80}")
+
         optimizer.step()
         if NON_NEG:
             for p in model.parameters():
