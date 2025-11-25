@@ -237,11 +237,17 @@ def get_model(
         vit_layers   = 8
 
     # Head
-    clf_input_size = vit_d_model if arch == Architecture.VIT else mcnv_channels
     num_classes    = 2
-    clf_hidden     = 256
     clf_layers     = 2
-    head = ClassifificationHead(clf_input_size, num_classes, clf_hidden, clf_layers)
+    if arch == Architecture.VIT:
+        clf_input_size = vit_d_model
+        clf_hidden     = 256
+        clf_dropout    = 0.1
+    else:
+        clf_input_size = mcnv_channels
+        clf_hidden     = mcnv_channels
+        clf_dropout    = 0.0
+    head = ClassifificationHead(clf_input_size, num_classes, clf_hidden, clf_layers, clf_dropout)
 
     if level == HierarchicalLevel.NONE:
         embedding = Embedding(num_embeddings, embedding_dim, padding_idx)
