@@ -48,6 +48,7 @@ from torch.utils.data import Sampler
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "MalConv2"))
 
 from src.architectures import get_model_input_lengths
 from src.architectures import ClassifificationHead
@@ -69,6 +70,7 @@ from src.architectures import ViTClassifier
 from src.architectures import HierarchicalClassifier
 from src.architectures import HierarchicalMalConvClassifier
 from src.architectures import HierarchicalViTClassifier
+from src.architectures import RaffClassifier
 from src.binanal import HierarchicalLevel
 from src.binanal import LEVEL_STRUCTURE_MAP
 from src.binanal import HierarchicalStructure
@@ -141,6 +143,13 @@ def get_model(
     Returns:
         The model.
     """
+    if os.environ.get("RAFF", "0") == "1":
+        if arch == Architecture.MC2:
+            return RaffClassifier(gcg=False)
+        if arch == Architecture.MCG:
+            return RaffClassifier(gcg=True)
+        if arch == Architecture.MCV:
+            warnings.warn("RaffClassifier does not support MCV; defaulting to MalConv.")
 
     HierarchicalStructureCls: type[HierarchicalStructure] = LEVEL_STRUCTURE_MAP[level]
     num_structures = len(HierarchicalStructureCls)
@@ -608,7 +617,7 @@ def main() -> None:
     )
     print(f"scheduler I : [{0:06}, {warmup_steps:06}] {lr_beg} --> {lr_max}")
     print(f"scheduler II: [{warmup_steps:06}, {total_steps:06}] {lr_max} --> {lr_min}")
-    # scheduler_init: Callable[[Optimizer], LRScheduler] = partial(LambdaLR, lr_lambda=lambda _: 1.0)
+    scheduler_init: Callable[[Optimizer], LRScheduler] = partial(LambdaLR, lr_lambda=lambda _: 1.0)
     print(f"{scheduler_init=}")
 
     padbatch = get_padbatch(args.level, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)

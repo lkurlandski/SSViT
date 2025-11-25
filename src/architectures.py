@@ -47,6 +47,9 @@ from src.utils import check_tensor
 from src.utils import TensorError
 from src.utils import pad_sequence
 
+from src.MalConv2.MalConv import MalConv as RaffMalConvLowMem
+from src.MalConv2.MalConvGCT_nocat import MalConvGCT as RaffMalConvGCG
+
 
 # mypy: disable-error-code=no-any-return
 
@@ -729,6 +732,9 @@ class PatchEncoderLowMem(PatchEncoderBase):
             stride=stride,
         )
 
+        if self.overlap < self.kernel_size / 2:
+            warnings.warn(f"Overlap {self.overlap} is less than half the kernel size {self.kernel_size}/2.")
+
     @property
     def num_patches(self) -> int:
         assert self._num_patches is not None
@@ -1173,6 +1179,9 @@ class MalConvBase(nn.Module, ABC):
         self.chunk_size = chunk_size
         self.overlap = kernel_size - stride if overlap is None else overlap
         self.fp32 = fp32
+
+        if self.overlap < self.kernel_size / 2:
+            warnings.warn(f"Overlap {self.overlap} is less than half the kernel size {self.kernel_size}/2.")
 
     @property
     def min_length(self) -> int:
@@ -1849,6 +1858,49 @@ class ViTClassifier(Classifier):
         fully_shard([self.embedding, self.filmer, self.patcher], **kwds)
         self.backbone.fully_shard(**kwds)
         fully_shard(self, **kwds | {"reshard_after_forward": False})
+
+
+class RaffClassifier(Classifier):
+
+    model: RaffMalConvGCG | RaffMalConvLowMem
+
+    def __init__(self, gcg: bool) -> None:
+        super().__init__()
+
+        if gcg:
+            self.model = RaffMalConvGCG(
+                out_size=2,
+                channels=256,
+                window_size=256,
+                stride=64,
+                layers=1,
+                embd_size=8,
+                log_stride=None,
+                low_mem=True,
+            )  # type: ignore[no-untyped-call]
+
+        else:
+            self.model = RaffMalConvLowMem(
+                out_size=2,
+                channels=128,
+                window_size=512,
+                stride=512,
+                embd_size=8,
+                log_stride=None,
+            )  # type: ignore[no-untyped-call]
+
+    def forward(self, x: Tensor, g: Optional[Tensor]) -> Tensor:
+        self._check_forward_inputs(x, g)
+        if g is not None:
+            raise NotImplementedError("RaffClassifier does not support conditioning.")
+
+        z = self.model(x)[0]  # (B, M)
+
+        check_tensor(z, (x.shape[0], 2), FLOATS)
+        return z
+
+    def fully_shard(self, **kwds: Any) -> None:
+        raise NotImplementedError("RaffClassifier does not support sharding.")
 
 # -------------------------------------------------------------------------------- #
 # Hierarchical Classifiers

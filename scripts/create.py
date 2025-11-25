@@ -41,6 +41,7 @@ class Configuration:
 
     def __init__(
         self,
+        raff: bool,
         arch: Architecture,
         size: ModelSize,
         level: HierarchicalLevel,
@@ -56,6 +57,7 @@ class Configuration:
         self.which_characteristics = which_characteristics
         self.max_length = max_length
         self.seed = seed
+        self.raff = raff
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Configuration):
@@ -70,6 +72,7 @@ class Configuration:
     def __repr__(self) -> str:
         return (
             f"Configuration("
+            f"  raff={self.raff},\n"
             f"  arch={self.arch},\n"
             f"  size={self.size},\n"
             f"  level={self.level},\n"
@@ -82,6 +85,7 @@ class Configuration:
 
     def __str__(self) -> str:
         return (
+            f"{'raff' if self.raff else 'kurl'}-"
             f"{fixed_width_string(self.arch.value, 3, '_')}-"
             f"{fixed_width_string(self.size.value, 3, '_')}-"
             f"{fixed_width_string(self.level.value, 3, '_')}-"
@@ -104,6 +108,7 @@ class Configuration:
 
     def get_outdir(self, world_size: int = 1) -> Path:
         parts = [
+            f"raff--{self.raff}",
             f"arch--{self.arch.value}",
             f"size--{self.size.value}",
             f"level--{self.level.value}",
@@ -118,15 +123,15 @@ class Configuration:
             f"max_epochs--{self.max_epochs}",
             f"seed--{self.seed}",
         ]
-        return Path("./output").joinpath(*parts)
+        return Path(f"./output").joinpath(*parts)
 
     @property
     def gradient_accumulation_steps(self) -> int:
-        return self.batch_size // self.per_device_batch_size
+        return max(self.batch_size // self.per_device_batch_size, 1)
 
     @property
     def batch_size(self) -> int:
-        return 256
+        return 128
 
     @property
     def per_device_batch_size(self) -> int:
@@ -161,15 +166,15 @@ class Configuration:
 
     @property
     def weight_decay(self) -> float:
-        return 5e-4
+        return 0.00
 
     @property
     def warmup_ratio(self) -> float:
-        return 0.10
+        return 0.00
 
     @property
     def label_smoothing(self) -> float:
-        return 0.025
+        return 0.00
 
     @property
     def device(self) -> str:
@@ -177,31 +182,31 @@ class Configuration:
 
     @property
     def mp16(self) -> bool:
-        return True
+        return False
 
     @property
     def tf32(self) -> bool:
-        return True
+        return False
 
     @property
     def stopper_patience(self) -> int:
-        return 2
+        return -1
 
     @property
     def max_epochs(self) -> float:
-        return 10
+        return 5
 
     @property
     def eval_epochs(self) -> float:
-        return 1.0
+        return 0.50
 
     @property
     def chpt_epochs(self) -> float:
-        return 1.0
+        return 0.50
 
     @property
     def logg_epochs(self) -> float:
-        return 1.0
+        return 0.50
 
 
 # Classifier throughput in samples/second on NVIDIA A100. Measurements taken using
@@ -331,6 +336,7 @@ class ScriptBuilder:
         variables = "\n".join([
             f"export OMP_NUM_THREADS={self.reqs.omp_num_threads}",
             f"export PTW_NUM_THREADS={self.reqs.omp_num_threads}",
+            f"export RAFF={'1' if self.config.raff else '0'}",
         ])
 
         torchrun = " \\\n".join([
@@ -356,9 +362,9 @@ class ScriptBuilder:
             f"--num_workers {self.config.num_workers}",
             f"--pin_memory {True if self.config.num_workers > 0 else False}",
             f"--gradient_accumulation_steps {self.config.gradient_accumulation_steps}",
-            f"--tr_batch_size {self.config.per_device_batch_size}",
-            f"--vl_batch_size {self.config.per_device_batch_size}",
-            f"--ts_batch_size {self.config.per_device_batch_size}",
+            f"--tr_batch_size {min(self.config.per_device_batch_size, self.config.batch_size)}",
+            f"--vl_batch_size {min(self.config.per_device_batch_size, self.config.batch_size)}",
+            f"--ts_batch_size {min(self.config.per_device_batch_size, self.config.batch_size)}",
             f"--learning_rate {self.config.learning_rate}",
             f"--weight_decay {self.config.weight_decay}",
             f"--warmup_ratio {self.config.warmup_ratio}",
@@ -416,19 +422,21 @@ def config_fiter(config: Configuration) -> bool:
         raise TypeError()
 
     # Debug
-    if DEBUG:
-        if config.size != ModelSize.SM:
-            return False
-        if config.max_length != 1000000:
-            return False
-    else:
-        if config.size == ModelSize.SM:
-            return False
+    # if DEBUG:
+    #     if config.size != ModelSize.SM:
+    #         return False
+    #     if config.max_length != 1000000:
+    #         return False
+    # else:
+    #     if config.size == ModelSize.SM:
+    #         return False
 
     # Architecture
     if config.arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG) and config.size == ModelSize.LG:
         return False
     if config.arch == Architecture.MCV:
+        return False
+    if config.arch == Architecture.VIT:
         return False
     if config.size != ModelSize.MD:
         return False
@@ -438,18 +446,7 @@ def config_fiter(config: Configuration) -> bool:
         return False
 
     # Semantics
-    CHARS = (
-        lief.PE.Section.CHARACTERISTICS.MEM_READ,
-        lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
-        lief.PE.Section.CHARACTERISTICS.CNT_CODE,
-    )
-    if len(config.which_characteristics) > 0 and any(c not in CHARS for c in config.which_characteristics):
-        return False
-    if len(config.which_characteristics) not in (0, 1, len(CHARS)):
-        return False
-    if config.do_entropy and len(config.which_characteristics) not in (0, len(CHARS)):
-        return False
-    if not config.do_entropy and len(config.which_characteristics) == len(CHARS):
+    if config.do_entropy or len(config.which_characteristics) > 0:
         return False
 
     return True
@@ -471,6 +468,7 @@ def main() -> None:
             f.unlink()
 
     configurations = product(
+        [True, False],
         [a for a in Architecture],
         [s for s in ModelSize],
         [l for l in HierarchicalLevel],
