@@ -719,7 +719,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
         self.kernel_size = kernel_size
         self.stride = stride
         self.chunk_size = chunk_size
-        self.overlap = kernel_size - stride if overlap is None else overlap
+        self.overlap = kernel_size // 2 if overlap is None else overlap
         self.fp32 = fp32
 
         self.conv = nn.Conv1d(
@@ -728,6 +728,9 @@ class PatchEncoderLowMem(PatchEncoderBase):
             kernel_size=kernel_size,
             stride=stride,
         )
+
+        if self.overlap < self.kernel_size / 2:
+            warnings.warn(f"Overlap {self.overlap} is less than half the kernel size {self.kernel_size}. Pooling may be impacted windowing issues.")
 
     @property
     def num_patches(self) -> int:
@@ -1171,8 +1174,11 @@ class MalConvBase(nn.Module, ABC):
         self.kernel_size = kernel_size
         self.stride = stride
         self.chunk_size = chunk_size
-        self.overlap = kernel_size - stride if overlap is None else overlap
+        self.overlap = self.kernel_size // 2 if overlap is None else overlap
         self.fp32 = fp32
+
+        if self.overlap < self.kernel_size / 2:
+            warnings.warn(f"Overlap {self.overlap} is less than half the kernel size {self.kernel_size}. Pooling may be impacted windowing issues.")
 
     @property
     def min_length(self) -> int:
