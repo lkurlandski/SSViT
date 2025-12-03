@@ -462,7 +462,9 @@ def config_fiter(config: Configuration) -> bool:
         return False
     if config.arch == Architecture.MCV:
         return False
-    if config.size != ModelSize.LG:
+    if config.arch in (Architecture.VIT,) and config.size != ModelSize.LG:
+        return False
+    if config.size == ModelSize.SM:
         return False
 
     # Structure
