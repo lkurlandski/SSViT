@@ -51,6 +51,12 @@ class PatcherArchitecture(Enum):
     MEM = "mem"      # Low-Memory
 
 
+class Scheduler(Enum):
+    NONE = "none"  # Fixed learning rate
+    CUST = "cust"  # Custom schduler
+    OCLR = "oclr"  # One Cycle Learning Rate
+
+
 def any_to_section_characteristic(s: lief.PE.Section.CHARACTERISTICS | int | str) -> lief.PE.Section.CHARACTERISTICS:
     if isinstance(s, lief.PE.Section.CHARACTERISTICS):
         return s
@@ -85,6 +91,7 @@ class MainArgs:
     tr_batch_size: int = 1
     vl_batch_size: int = -1
     ts_batch_size: int = -1
+    sched: Scheduler = Scheduler.NONE
     learning_rate: float = 1e-3
     warmup_ratio: float = 0.00
     weight_decay: float = 1e-2

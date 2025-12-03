@@ -38,6 +38,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LRScheduler
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.optim.lr_scheduler import LambdaLR
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.optim.lr_scheduler import LinearLR
@@ -89,6 +90,7 @@ from src.data import FOrHSamples
 from src.helpers import create_argument_parser_from_dataclass
 from src.helpers import flatten_dataclasses
 from src.helpers import _MTArgs
+from src.helpers import Scheduler
 from src.helpers import Architecture
 from src.helpers import PatcherArchitecture
 from src.helpers import ModelSize
@@ -108,6 +110,11 @@ from src.utils import num_sort_files
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
 from src.utils import count_parameters
+
+
+STRICT_RAFF_MATCH = os.environ.get("STRICT_RAFF_MATCH", "0") == "1"
+if STRICT_RAFF_MATCH:
+    warnings.warn("STRICT_RAFF_MATCH is enabled. MalConv models will match the original Raff et al. implementation more closely.")
 
 
 def get_model(
@@ -162,9 +169,7 @@ def get_model(
         FiLMCls = FiLMNoP
 
     # MalConv
-    # The concept of overlap, as described in the paper, is different to how its
-    # implemented in the codebase. Here, we match the codebase (no overlap).
-    mcnv_overlap = 0
+    mcnv_overlap = 0 if STRICT_RAFF_MATCH else None
     if size == ModelSize.SM:
         mcnv_channels = 64
         mcnv_kernel   = 1024
@@ -231,8 +236,6 @@ def get_model(
         vit_layers   = 8
 
     # Head
-    # To implement the head, we have to decide whether to use the same heads for all models
-    # or to use the MalConv's with the heads used in that paper. Here, we take the latter approach.
     num_classes    = 2
     clf_layers     = 2
     if arch == Architecture.VIT:
@@ -241,8 +244,8 @@ def get_model(
         clf_dropout    = 0.1
     else:
         clf_input_size = mcnv_channels
-        clf_hidden     = mcnv_channels
-        clf_dropout    = 0.0
+        clf_hidden     = mcnv_channels if STRICT_RAFF_MATCH else 256
+        clf_dropout    = 0.0 if STRICT_RAFF_MATCH else 0.1
     head = ClassifificationHead(clf_input_size, num_classes, clf_hidden, clf_layers, clf_dropout)
 
     if level == HierarchicalLevel.NONE:
@@ -604,28 +607,39 @@ def main() -> None:
 
     if args.max_steps is not None:
         total_steps = args.max_steps
-    if args.max_epochs is not None:
+    elif args.max_epochs is not None:
         total_steps = int(args.max_epochs * len(tr_loader) // args.gradient_accumulation_steps)
-    lr_beg = 0.1 * args.learning_rate
-    lr_max = args.learning_rate
-    lr_min = 0.01 * args.learning_rate
-    warmup_steps = int(total_steps * args.warmup_ratio)
-    scheduler_init: Callable[[Optimizer], LRScheduler] = partial(get_lr_scheduler,
-        lr_beg=lr_beg,
-        lr_max=lr_max,
-        lr_min=lr_min,
-        total_steps=total_steps,
-        warmup_steps=warmup_steps,
-    )
-    print(f"scheduler I : [{0:06}, {warmup_steps:06}] {lr_beg} --> {lr_max}")
-    print(f"scheduler II: [{warmup_steps:06}, {total_steps:06}] {lr_max} --> {lr_min}")
-    # scheduler_init: Callable[[Optimizer], LRScheduler] = partial(LambdaLR, lr_lambda=lambda _: 1.0)
-    print(f"{scheduler_init=}")
+    else:
+        raise ValueError("Either `max_steps` or `max_epochs` must be specified.")
+
+    scheduler_init: Callable[[Optimizer], LRScheduler]
+    if args.sched == Scheduler.NONE:
+        scheduler_init = partial(LambdaLR,
+            lr_lambda=lambda _: 1.0,
+        )
+    elif args.sched == Scheduler.OCLR:
+        scheduler_init = partial(OneCycleLR,
+            max_lr=args.learning_rate,
+            total_steps=total_steps,
+            pct_start=0.25,
+            final_div_factor=100000.0,
+        )
+    elif args.sched == Scheduler.CUST:
+        scheduler_init = partial(get_lr_scheduler,
+            lr_beg=0.1 * args.learning_rate,
+            lr_max=args.learning_rate,
+            lr_min=0.01 * args.learning_rate,
+            total_steps=total_steps,
+            warmup_steps= int(total_steps * args.warmup_ratio),
+        )
+    else:
+        raise NotImplementedError(f"{args.sched} scheduler not implemented.")
+    print(f"{args.sched.value}: {scheduler_init=}")
 
     padbatch = get_padbatch(args.level, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)
     print(f"{padbatch=}")
 
-    stopper: EarlyStopper = EarlyStopper(args.stopper_patience, args.stopper_threshold, args.stopper_mode)
+    stopper = EarlyStopper(args.stopper_patience, args.stopper_threshold, args.stopper_mode)  # type: ignore[arg-type]
     print(f"{stopper=}")
 
     checkpoint = None
