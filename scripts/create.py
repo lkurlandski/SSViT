@@ -7,9 +7,11 @@ from itertools import chain
 from itertools import combinations
 from itertools import product
 import math
+import os
 from pathlib import Path
 import sys
 from typing import Any
+from typing import Optional
 import warnings
 
 import lief
@@ -22,6 +24,7 @@ from src.binanal import HierarchicalLevel
 from src.binanal import CHARACTERISTICS
 from src.helpers import Architecture
 from src.helpers import ModelSize
+from src.helpers import Scheduler
 
 
 # ruff: noqa: F541
@@ -103,6 +106,9 @@ class Configuration:
         )
 
     def get_outdir(self, world_size: int = 1) -> Path:
+        root = Path("./output")
+        if DEBUG:
+            root = root / "tmp"
         parts = [
             f"arch--{self.arch.value}",
             f"size--{self.size.value}",
@@ -118,11 +124,11 @@ class Configuration:
             f"max_epochs--{self.max_epochs}",
             f"seed--{self.seed}",
         ]
-        return Path("./output").joinpath(*parts)
+        return root.joinpath(*parts)
 
     @property
     def gradient_accumulation_steps(self) -> int:
-        return self.batch_size // self.per_device_batch_size
+        return max(self.batch_size // self.per_device_batch_size, 1)
 
     @property
     def batch_size(self) -> int:
@@ -130,21 +136,30 @@ class Configuration:
 
     @property
     def per_device_batch_size(self) -> int:
-        # TODO: this needs to be refined a bit, especially for longer sequences, but for now
-        # the goal is to not constantly OOM on an A100 40GB.
+        # I don't really know why, but throughput seems to plateau beyond 256 samples/device.
+        # Unless overridden, cap the per-device batch size at 256.
+        if os.environ.get("USE_MAX_PER_DEVICE_BATCH_SIZE", "0") == "1":
+            return self.max_per_device_batch_size
+        return min(256, self.max_per_device_batch_size)
+
+    @property
+    def max_per_device_batch_size(self) -> int:
         if self.arch == Architecture.MCV:
-            return 64
+            return 64   # O(T)
         if self.arch == Architecture.MC2:
-            return 256
+            return 1024 # O(1)
         if self.arch == Architecture.MCG:
-            return 128
+            return 256  # O(1)
+
+        # Assumes constant-memory encoder. # O(1)
         if self.arch == Architecture.VIT:
-            if self.size == ModelSize.SM:
+            if self.size == ModelSize.SM:  # O(N)
+                return 2048
+            if self.size == ModelSize.MD:  # O(N)
+                return 512
+            if self.size == ModelSize.LG:  # O(N)
                 return 256
-            if self.size == ModelSize.MD:
-                return 128
-            if self.size == ModelSize.LG:
-                return 64
+
         raise NotImplementedError(f"ERROR ({str(self)}): batch size not defined for this configuration.")
 
     @property
@@ -156,20 +171,24 @@ class Configuration:
         return 1
 
     @property
+    def sched(self) -> Scheduler:
+        return Scheduler.OCLR
+
+    @property
     def learning_rate(self) -> float:
-        return 1e-3
+        return 1e-2
 
     @property
     def weight_decay(self) -> float:
-        return 5e-4
+        return 0.00
 
     @property
     def warmup_ratio(self) -> float:
-        return 0.10
+        return 0.00
 
     @property
     def label_smoothing(self) -> float:
-        return 0.025
+        return 0.00
 
     @property
     def device(self) -> str:
@@ -177,7 +196,7 @@ class Configuration:
 
     @property
     def mp16(self) -> bool:
-        return True
+        return False
 
     @property
     def tf32(self) -> bool:
@@ -185,48 +204,66 @@ class Configuration:
 
     @property
     def stopper_patience(self) -> int:
-        return 2
+        return -1
 
     @property
     def max_epochs(self) -> float:
+        if DEBUG:
+            return 1
         return 10
 
     @property
     def eval_epochs(self) -> float:
-        return 1.0
+        if DEBUG:
+            return 1
+        return 0.25
 
     @property
     def chpt_epochs(self) -> float:
-        return 1.0
+        if DEBUG:
+            return 1
+        return 0.25
 
     @property
     def logg_epochs(self) -> float:
-        return 1.0
+        if DEBUG:
+            return 1
+        return 0.25
 
 
 # Classifier throughput in samples/second on NVIDIA A100. Measurements taken using
-# maximum sequence length of 1_000_000 and a logical batch size of 256 samples.
+# a sequence length of 1_000_000 and various logical batch sizes, e.g., 128 and 256.
+# From experiments, throughput appears to scale linearly with batch size, but only
+# up until a certain point, past which it plateaus; therefore, its less critical to
+# consider the exact batch size used in these measurements. By constast, throughput
+# appears to scale almost perfectly linearly (inversely, however) with sequence length.
+# On the whole, these numbers vary wildly and should be taken with a grain of salt.
 # (Architecture, do_entropy, do_characteristics) : (vl_throughput, tr_throughout)
-THROUGHPUTS = {
+THROUGHPUTS: dict[tuple[Architecture, ModelSize, bool, bool], Optional[tuple[float, float]]] = {
     (Architecture.MCV, ModelSize.MD, False, False) : None,
     (Architecture.MCV, ModelSize.MD, False, True)  : None,
     (Architecture.MCV, ModelSize.MD, True,  False) : None,
     (Architecture.MCV, ModelSize.MD, True,  True)  : None,
 
-    (Architecture.MC2, ModelSize.MD, False, False) : (675, 450),  # NOTE: phys batch size 256
-    (Architecture.MC2, ModelSize.MD, False, True)  : (425, 325),  # NOTE: phys batch size 256
-    (Architecture.MC2, ModelSize.MD, True,  False) : (375, 300),  # NOTE: phys batch size 256
-    (Architecture.MC2, ModelSize.MD, True,  True)  : (300, 270),  # NOTE: phys batch size 256
+    (Architecture.MC2, ModelSize.MD, False, False) : (675, 450),
+    (Architecture.MC2, ModelSize.MD, False, True)  : (425, 325),
+    (Architecture.MC2, ModelSize.MD, True,  False) : (375, 300),
+    (Architecture.MC2, ModelSize.MD, True,  True)  : (300, 270),
 
-    (Architecture.MCG, ModelSize.MD, False, False) : (275, 120),  # NOTE: phys batch size 256
-    (Architecture.MCG, ModelSize.MD, False, True)  : (150, 100),  # NOTE: phys batch size 256 TODO: refine on RC
-    (Architecture.MCG, ModelSize.MD, True,  False) : (150, 100),  # NOTE: phys batch size 256 TODO: refine on RC
-    (Architecture.MCG, ModelSize.MD, True,  True)  : (160,  90),  # NOTE: phys batch size 256
+    (Architecture.MCG, ModelSize.MD, False, False) : (275, 120),
+    (Architecture.MCG, ModelSize.MD, False, True)  : (150, 100),
+    (Architecture.MCG, ModelSize.MD, True,  False) : (150, 100),
+    (Architecture.MCG, ModelSize.MD, True,  True)  : (160,  90),
 
-    (Architecture.VIT, ModelSize.MD, False, False) : (450, 350),  # NOTE: phys batch size 128
-    (Architecture.VIT, ModelSize.MD, False, True)  : (275, 225),  # NOTE: phys batch size 128 TODO: refine on RC
-    (Architecture.VIT, ModelSize.MD, True,  False) : (250, 225),  # NOTE: phys batch size 128 TODO: refine on RC
-    (Architecture.VIT, ModelSize.MD, True,  True)  : (275, 225),  # NOTE: phys batch size 128
+    (Architecture.VIT, ModelSize.MD, False, False) : (450, 350),
+    (Architecture.VIT, ModelSize.MD, False, True)  : (275, 225),
+    (Architecture.VIT, ModelSize.MD, True,  False) : (250, 225),
+    (Architecture.VIT, ModelSize.MD, True,  True)  : (275, 225),
+
+    (Architecture.VIT, ModelSize.LG, False, False) : (525, 150),
+    (Architecture.VIT, ModelSize.LG, False, True)  : None,
+    (Architecture.VIT, ModelSize.LG, True,  False) : None,
+    (Architecture.VIT, ModelSize.LG, True,  True)  : None,
 }
 
 
@@ -247,9 +284,9 @@ class Requirements:
         """Return the number of seconds required for the job (configure)."""
         key = (self.config.arch, self.config.size, self.config.do_entropy, bool(self.config.which_characteristics))
 
-        if THROUGHPUTS.get(key) is not None:
-            tr_throughput = THROUGHPUTS[key][0]
-            vl_throughput = THROUGHPUTS[key][1]
+        if (tr_vl_throughputs := THROUGHPUTS.get(key)) is not None:
+            tr_throughput = tr_vl_throughputs[0]
+            vl_throughput = tr_vl_throughputs[1]
         else:
             print(f"WARNING ({str(self.config)}): throughput benchmark not found.")
             tr_throughput = 100
@@ -359,6 +396,7 @@ class ScriptBuilder:
             f"--tr_batch_size {self.config.per_device_batch_size}",
             f"--vl_batch_size {self.config.per_device_batch_size}",
             f"--ts_batch_size {self.config.per_device_batch_size}",
+            f"--sched {self.config.sched.value}",
             f"--learning_rate {self.config.learning_rate}",
             f"--weight_decay {self.config.weight_decay}",
             f"--warmup_ratio {self.config.warmup_ratio}",
@@ -378,9 +416,9 @@ class ScriptBuilder:
 
         if DEBUG:
             command += " \\\n" + " \\\n".join([
-                f"--tr_num_samples 4096",
-                f"--vl_num_samples 1024",
-                f"--ts_num_samples 1024",
+                f"--tr_num_samples 8192",
+                f"--vl_num_samples 8192",
+                f"--ts_num_samples 8192",
             ])
 
         command = torchrun + "\n" + command if self.reqs.gpus_per_node > 1 else command
@@ -417,20 +455,14 @@ def config_fiter(config: Configuration) -> bool:
 
     # Debug
     if DEBUG:
-        if config.size != ModelSize.SM:
-            return False
-        if config.max_length != 1000000:
-            return False
-    else:
-        if config.size == ModelSize.SM:
-            return False
+        ...
 
     # Architecture
     if config.arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG) and config.size == ModelSize.LG:
         return False
     if config.arch == Architecture.MCV:
         return False
-    if config.size != ModelSize.MD:
+    if config.size != ModelSize.LG:
         return False
 
     # Structure
@@ -438,19 +470,21 @@ def config_fiter(config: Configuration) -> bool:
         return False
 
     # Semantics
-    CHARS = (
-        lief.PE.Section.CHARACTERISTICS.MEM_READ,
-        lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
-        lief.PE.Section.CHARACTERISTICS.CNT_CODE,
-    )
-    if len(config.which_characteristics) > 0 and any(c not in CHARS for c in config.which_characteristics):
+    if config.do_entropy or config.which_characteristics:
         return False
-    if len(config.which_characteristics) not in (0, 1, len(CHARS)):
-        return False
-    if config.do_entropy and len(config.which_characteristics) not in (0, len(CHARS)):
-        return False
-    if not config.do_entropy and len(config.which_characteristics) == len(CHARS):
-        return False
+    # CHARS = (
+    #     lief.PE.Section.CHARACTERISTICS.MEM_READ,
+    #     lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
+    #     lief.PE.Section.CHARACTERISTICS.CNT_CODE,
+    # )
+    # if len(config.which_characteristics) > 0 and any(c not in CHARS for c in config.which_characteristics):
+    #     return False
+    # if len(config.which_characteristics) not in (0, 1, len(CHARS)):
+    #     return False
+    # if config.do_entropy and len(config.which_characteristics) not in (0, len(CHARS)):
+    #     return False
+    # if not config.do_entropy and len(config.which_characteristics) == len(CHARS):
+    #     return False
 
     return True
 
@@ -476,7 +510,7 @@ def main() -> None:
         [l for l in HierarchicalLevel],
         [True, False],
         chain.from_iterable(combinations(CHARACTERISTICS, r) for r in range(len(CHARACTERISTICS) + 1)),
-        [1000000],
+        [1000000, 2000000],
         [0],
     )
     configurations = (Configuration(*config) for config in configurations)
