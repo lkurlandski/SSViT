@@ -742,7 +742,7 @@ class Input(_InputOrInputs):
             raise RuntimeError("unreachable")
 
         inputids = slice_tensor(self.inputids)
-        lengths = torch.tensor(inputids.size(self.length_axis), torch.int64)
+        lengths = torch.tensor(inputids.size(self.length_axis), dtype=torch.int64)
         return self.__class__(inputids, lengths)
 
 
