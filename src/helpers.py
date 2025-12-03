@@ -174,7 +174,7 @@ def create_argument_parser_from_dataclass(*objs: type) -> ArgumentParser:
                 else:
                     choices = list(f.type.__args__[0])
             parser.add_argument(argname, type=type_, nargs="*", choices=choices, default=f.default)
-        elif f.type == bool:
+        elif f.type is bool:
             parser.add_argument(argname, type=str_to_bool, default=f.default)
         elif f.type == Optional[bool]:
             parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else str_to_bool(x), default=f.default)
@@ -191,7 +191,7 @@ def create_argument_parser_from_dataclass(*objs: type) -> ArgumentParser:
         elif isinstance(f.type, str):
             # FIXME: this will not handle the special behaviors above!
             type_, _ = _unwrap_optional(alltypes[f.name])
-            if type_ == bool:
+            if type_ is bool:
                 type_ = str_to_bool
             parser.add_argument(argname, type=type_, default=f.default)
         else:
