@@ -10,6 +10,7 @@ from collections.abc import Iterable
 from collections.abc import Mapping
 import contextlib
 from dataclasses import dataclass
+from functools import partial
 import gc
 import hashlib
 import itertools
@@ -1088,11 +1089,11 @@ class Trainer:
 
         # Establish default optimizer and scheduler if not provided (defaults should match __init__).
         if optimizer_init is None:
-            optimizer_init = lambda params: AdamW(params)
+            optimizer_init = AdamW
         if optimizer is None and not is_dcp:
             optimizer = optimizer_init(model.parameters())
         if scheduler_init is None:
-            scheduler_init = lambda optim: LambdaLR(optim, lambda _: 1.0)
+            scheduler_init = partial(LambdaLR, lr_lambda=lambda _: 1.0)
         if scheduler is None and not is_dcp:
             assert optimizer is not None
             scheduler = scheduler_init(optimizer)
