@@ -625,11 +625,6 @@ class Trainer:
                 scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
 
-            if rank() == 0 and self.glbl_step == 0:
-                flush()
-                print(f"{'-' * 20} Parameter Summary After First Backward {'-' * 20}")
-                print_parameter_summary(self.model, spaces=2)
-                print(f"{'-' * 80}")
             if not ALLOW_PARAM_GRAD_NONE and any(param.grad is None for param in self.model.parameters()):
                 flush()
                 print(f"{'-' * 20} Parameter Summary After Step {self.glbl_step:09} {'-' * 20}")
