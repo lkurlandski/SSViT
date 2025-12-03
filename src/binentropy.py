@@ -256,7 +256,8 @@ def _compute_entropy_rolling_numpy_fast(x: npt.NDArray[np.uint8], r: int) -> npt
             s_clogc -= co * log_tbl[co]
             s_clogc -= ci * log_tbl[ci]
             # update counts
-            co -= 1; ci += 1
+            co -= 1
+            ci += 1
             counts[v_out] = co
             counts[v_in]  = ci
             # add new contributions
