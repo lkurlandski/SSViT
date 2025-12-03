@@ -58,22 +58,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
-# Enable detailed timing statistics if the environment variable is set. This will muddy the logs
-# with extra timing information, but can help diagnose bottlenecks in the data loading.
-# Note that these statistics are very biased since they add synchronization points that impact
-# performance significantly. Nonetheless, they give a rough idea of where time is being spent.
-DETAILED_TIMING_STATISTICS = os.environ.get("DETAILED_TIMING_STATISTICS", "0") == "1"
-if DETAILED_TIMING_STATISTICS:
-    warnings.warn("Detailed timing statistics enabled; this may impact performance.")
-
 ALLOW_PARAM_GRAD_NONE = os.environ.get("ALLOW_PARAM_GRAD_NONE", "0") == "1"
 if ALLOW_PARAM_GRAD_NONE:
     warnings.warn("Allowing parameters with no gradients; some weights may not be updated.")
-
-
-def _syncronize_if_detailed_timing() -> None:
-    if DETAILED_TIMING_STATISTICS:
-        torch.cuda.synchronize()
 
 
 def debug_autocast_dtypes(model: nn.Module) -> None:
@@ -614,33 +601,11 @@ class Trainer:
             t_0 = time.time()
             return report
 
-
-        #### DETAILED TIMING STATISTICS ####
-        t_detailed: float = time.time()
-        def t_detailed_log(t_detailed_list: list[float]) -> None:
-            if not DETAILED_TIMING_STATISTICS:
-                return
-            nonlocal t_detailed
-            torch.cuda.synchronize()
-            t_detailed_list.append(time.time() - t_detailed)
-            t_detailed = time.time()
-        t_detailed_preps: list[float] = []  # time to prepare
-        t_detailed_trans: list[float] = []  # time to transfer
-        t_detailed_final: list[float] = []  # time to finalize
-        t_detailed_comps: list[float] = []  # time to compute
-        t_detailed_steps: list[float] = []  # time to step
-        ####################################
-
         mini_step = -1  # mini-step within this epoch
         grda_modl = 0   # gradient accumulation modulo local steps
         for mini_step, batch in iterable:
-            t_detailed_log(t_detailed_preps)
-
             batch = batch.to(self.device, non_blocking=True)
-            t_detailed_log(t_detailed_trans)
-
             batch = batch.finalize(self.mp_dtype, torch.int32, torch.int64)
-            t_detailed_log(t_detailed_final)
 
             # Determine if this is a real or padded batch of data.
             real = mini_step < len(dataloader)
@@ -658,7 +623,6 @@ class Trainer:
                 loss = loss * int(real) / self.args.gradient_accumulation_steps
                 scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
-            t_detailed_log(t_detailed_comps)
 
             if rank() == 0 and self.glbl_step == 0:
                 flush()
@@ -675,7 +639,6 @@ class Trainer:
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
                 step()
-                t_detailed_log(t_detailed_steps)
 
                 if is_last_real and grda_modl != 0:
                     grda_modl = 0
@@ -696,42 +659,8 @@ class Trainer:
                 self._done = True
                 break
 
-            t_detailed = time.time()
-
         if mini_step < 0:
             raise RuntimeError(f"[rank {rank()}] empty dataloader.")
-
-        #### DETAILED TIMING STATISTICS ####
-        def times_to_stats(times: list[float], skip: int) -> tuple[float, float, float, float, float]:
-            """Convert a list of times to (throughput, min, max, median, average).
-            Skip the first `gradient_accumulation_steps` mini-steps to allow for warmup.
-            This will not work correctly for edge cases, e.g., distributed training, etc.
-            """
-            num_samples = results["num_samples"].item() - (len(batch) * self.args.gradient_accumulation_steps)
-            times = times[skip:]
-            return (
-                float(num_samples / np.sum(times)),
-                float(np.min(times)),
-                float(np.max(times)),
-                float(np.median(times)),
-                float(np.mean(times)),
-            )
-        if DETAILED_TIMING_STATISTICS:
-            num_samples = results["num_samples"].item() - (len(batch) * self.args.gradient_accumulation_steps)
-            t_detailed_preps = list(times_to_stats(t_detailed_preps, self.args.gradient_accumulation_steps))
-            t_detailed_trans = list(times_to_stats(t_detailed_trans, self.args.gradient_accumulation_steps))
-            t_detailed_final = list(times_to_stats(t_detailed_final, self.args.gradient_accumulation_steps))
-            t_detailed_comps = list(times_to_stats(t_detailed_comps, self.args.gradient_accumulation_steps))
-            t_detailed_steps = list(times_to_stats(t_detailed_steps, 1))
-            print(
-                f"[rank {rank()}] Detailed timing statistics for training run ({num_samples=} {mini_step=} glbl_step={self.glbl_step}):\n"
-                f"  phase    throughput latency\n"
-                f"  prepare  {t_detailed_preps[0]:.2f}     {t_detailed_preps[4]:.2f}\n"
-                f"  transfer {t_detailed_trans[0]:.2f}     {t_detailed_trans[4]:.2f}\n"
-                f"  finalize {t_detailed_final[0]:.2f}     {t_detailed_final[4]:.2f}\n"
-                f"  compute  {t_detailed_comps[0]:.2f}     {t_detailed_comps[4]:.2f}\n"
-                f"  optimize {t_detailed_steps[0]:.0f}     {t_detailed_steps[4]:.2f}\n"
-            )
 
         barrier("Trainer::train:after", self.device)
 
