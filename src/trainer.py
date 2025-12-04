@@ -58,6 +58,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from src.utils import Timer
+
 
 ALLOW_PARAM_GRAD_NONE = os.environ.get("ALLOW_PARAM_GRAD_NONE", "0") == "1"
 if ALLOW_PARAM_GRAD_NONE:
@@ -548,6 +550,7 @@ class Trainer:
         Train the model on the training set.
         """
         barrier("Trainer::train:before", self.device)
+        timer = Timer()
 
         self.optimizer.zero_grad()
         self.model.train()
@@ -555,7 +558,8 @@ class Trainer:
 
         dataloader = self.tr_loader
         iterable: Iterable[tuple[int, Batch]] = enumerate(dataloader)
-        iterable = tqdm(iterable, "Training...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
+        desc = f"Training Epoch {self.glbl_step // self.steps_per_epoch} of {self.max_steps / self.steps_per_epoch}"
+        iterable = tqdm(iterable, desc, len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
         iterable = iter(iterable)
 
         # If distributed, pad the dataloader so all ranks have the same number of batches.
@@ -579,29 +583,23 @@ class Trainer:
             self.optimizer.zero_grad()
             self.glbl_step += 1
 
-        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
-        t_0: float = time.time()
-        def report() -> dict[str, float]:
-            """Assemble a training report (excluding GPU statistics) and reset the `results` container."""
-            nonlocal results
-            nonlocal t_0
+        def get_report() -> dict[str, float]:
+            """Assemble a training report (excluding GPU statistics)."""
             # Aggregate results across workers and move to CPU.
-            if is_dist():
-                results = self.reduce_results(results)
-            results = {k: results[k].detach().to("cpu") for k in results}
-            num_samples = int(results.pop("num_samples").item())
+            allresults = self.reduce_results(results) if is_dist() else results
+            allresults = {k: allresults[k].detach().to("cpu") for k in allresults}
+            num_samples = int(allresults.pop("num_samples").item())
             # Average statistics over total number of samples.
             report = {}
-            for k in results:
-                report[k] = results[k].item() / num_samples
-            report["tr_time"] = time.time() - t_0
+            for k in allresults:
+                report[k] = allresults[k].item() / num_samples
+            report["tr_time"] = timer.get_elapsed()
             report["tr_samples"] = num_samples
             report["tr_throughput"] = num_samples / report["tr_time"]
-            # Clear results container for next cycle before returning and reset the timer.
-            results = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
-            t_0 = time.time()
             return report
 
+        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
+        timer.start()
         mini_step = -1  # mini-step within this epoch
         grda_modl = 0   # gradient accumulation modulo local steps
         for mini_step, batch in iterable:
@@ -625,6 +623,7 @@ class Trainer:
                 scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
 
+            # Check for parameters with no gradients
             if not ALLOW_PARAM_GRAD_NONE and any(param.grad is None for param in self.model.parameters()):
                 flush()
                 print(f"{'-' * 20} Parameter Summary After Step {self.glbl_step:09} {'-' * 20}")
@@ -634,19 +633,31 @@ class Trainer:
 
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
+                # Take an optimization step
                 step()
-
+                # Adjust `grda_modl` to force a sync on the last real mini-step
                 if is_last_real and grda_modl != 0:
                     grda_modl = 0
+                # Determine what hooks are to be executed.
                 do_logg = any(self._due_hooks())
                 do_eval = self._due_hooks()[0]
-                # Freeing up memory before running the validation cycle seems to keep GPU memory usage lower
-                # across all subsequent training and validation phases (yes, both of them). Why? Don't know!
+                # Free up memory before validation to keep GPU memory usage lower
                 if do_eval:
                     del batch, outputs, loss
                     gc.collect()
-                self.run_due_hooks(report() if do_logg else None)
+                # Prepare a training report and reset the tracking objects
+                if do_logg:
+                    report = get_report()
+                    timer.start()
+                    results = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
+                else:
+                    report = None
+                # Run the due hooks, but pause the timer during their execution
+                timer.pause()
+                self.run_due_hooks(report)
                 self.model.train()
+                timer.resume()
+                # Clear the monitor if logging was performed
                 if do_logg:
                     self.monitor.clear()
 
@@ -658,6 +669,7 @@ class Trainer:
         if mini_step < 0:
             raise RuntimeError(f"[rank {rank()}] empty dataloader.")
 
+        timer.stop()
         barrier("Trainer::train:after", self.device)
 
     def evaluate(self) -> dict[str, float]:
