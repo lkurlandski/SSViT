@@ -622,9 +622,10 @@ def main() -> None:
             max_lr=args.learning_rate,
             total_steps=total_steps,
             pct_start=0.25,
+            div_factor=25.0,
             final_div_factor=100000.0,
         )
-        print(f"scheduler=OneCycleLR({0.25 * args.learning_rate} --> {args.learning_rate} --> {args.learning_rate / 100000.0})")
+        print(f"scheduler=OneCycleLR({(1 / 25.0) * args.learning_rate} --> {args.learning_rate} --> {args.learning_rate / 100000.0})")
     elif args.sched == Scheduler.CUST:
         scheduler_init = partial(get_lr_scheduler,
             lr_beg=0.1 * args.learning_rate,
