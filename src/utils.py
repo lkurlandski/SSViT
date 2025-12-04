@@ -9,9 +9,11 @@ import math
 import os
 from pathlib import Path
 import random
+import time
 from typing import Literal
 from typing import NamedTuple
 from typing import Optional
+from typing import Self
 import warnings
 
 import numpy as np
@@ -148,3 +150,92 @@ def pad_sequence(
         s = s.contiguous() if not s.is_contiguous() else s
         padded[i, :s.shape[0]].copy_(s)
     return padded
+
+
+class Timer:
+    """
+    Simple timer with pause/resume functionality.
+
+    Usage:
+    >>> timer = Timer()
+    >>> timer = timer.start()
+    >>> # ... code to time ...
+    >>> elapsed = timer.get_elapsed()
+    >>> print(f"Elapsed time: {elapsed} seconds")
+    >>> timer.pause()
+    >>> # ... code to not time ...
+    >>> timer.resume()
+    >>> # ... code to time ...
+    >>> timer = timer.stop()
+    >>> elapsed = timer.get_elapsed()
+    >>> print(f"Elapsed time: {elapsed} seconds")
+    """
+
+    def __init__(self, mode: Literal["raise", "warn", "ignore"] = "raise") -> None:
+        self.mode = mode
+        self.t_start: Optional[float] = None
+        self.t_stop: Optional[float] = None
+        self.t_pause: Optional[float] = None
+        self.s_paused: float = 0.0
+
+    def _raise_or_warn_or_ignore(self, msg: str) -> None:
+        if self.mode == "raise":
+            raise RuntimeError(msg)
+        elif self.mode == "warn":
+            warnings.warn(msg)
+        return
+
+    @property
+    def is_started(self) -> bool:
+        return self.t_start is not None
+
+    @property
+    def is_stopped(self) -> bool:
+        return self.t_stop is not None
+
+    @property
+    def is_paused(self) -> bool:
+        return self.t_pause is not None
+
+    def start(self) -> Self:
+        self.t_start = time.time()
+        self.t_stop = None
+        self.t_pause = None
+        self.s_paused = 0.0
+        return self
+
+    def stop(self) -> Self:
+        if not self.is_started:
+            self._raise_or_warn_or_ignore("Stopping a un-started timer.")
+            return self
+        if self.is_stopped:
+            self._raise_or_warn_or_ignore("Stopping a stopped timer.")
+            return self
+        self.t_stop = time.time()
+        return self
+
+    def pause(self) -> Self:
+        if self.is_paused:
+            self._raise_or_warn_or_ignore("Pausing a paused timer.")
+            return self
+        self.t_pause = time.time()
+        return self
+
+    def resume(self) -> Self:
+        if not self.is_paused:
+            self._raise_or_warn_or_ignore("Resuming a non-paused timer.")
+            return self
+        assert self.t_pause is not None
+        self.s_paused += time.time() - self.t_pause
+        self.t_pause = None
+        return self
+
+    def get_elapsed(self) -> float:
+        if not self.is_started:
+            self._raise_or_warn_or_ignore("Clocking a un-started timer.")
+            return float("nan")
+        t_stop = time.time() if not self.is_stopped else self.t_stop
+        s_paused = time.time() - self.t_pause if self.is_paused and self.t_pause is not None else 0.0
+        assert t_stop is not None
+        assert self.t_start is not None
+        return t_stop - self.t_start - (s_paused + self.s_paused)
