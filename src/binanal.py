@@ -766,6 +766,22 @@ LEVEL_STRUCTURE_MAP: dict[HierarchicalLevel, type[HierarchicalStructure]] = {
 }
 
 
+DIRECTORY_STRUCTURES = (
+    HierarchicalStructureCoarse.DIRECTORY,
+    HierarchicalStructureMiddle.DIRECTORY,
+    HierarchicalStructureFine.IDATA,
+    HierarchicalStructureFine.DELAYIMP,
+    HierarchicalStructureFine.EDATA,
+    HierarchicalStructureFine.RESOURCE,
+    HierarchicalStructureFine.TLS,
+    HierarchicalStructureFine.LOADCFG,
+    HierarchicalStructureFine.RELOC,
+    HierarchicalStructureFine.DEBUG,
+    HierarchicalStructureFine.CLR,
+    HierarchicalStructureFine.OTHERDIR,
+)
+
+
 class StructureParser:
 
     _SCN_MEM_EXECUTE = 0x20000000
