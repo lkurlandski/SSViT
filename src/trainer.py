@@ -493,6 +493,7 @@ class Trainer:
         self.device = device if device is not None else next(self.model.parameters()).device
         self.padbatch = padbatch.to(self.device, non_blocking=True).finalize(self.mp_dtype, torch.int32, torch.int64) if padbatch is not None else None
         self.monitor = Monitor(device=self.device)
+        self.scaler = GradScaler(self.device.type, enabled=self.mp_dtype == torch.float16)
         self.log: list[Mapping[str, int | float]] = []
         self.glbl_step = 0
         self._next_eval_step: Optional[int] = None
@@ -554,7 +555,6 @@ class Trainer:
 
         self.optimizer.zero_grad()
         self.model.train()
-        scaler = GradScaler(self.device.type, enabled=self.mp_dtype == torch.float16)
 
         dataloader = self.tr_loader
         iterable: Iterable[tuple[int, Batch]] = enumerate(dataloader)
@@ -570,18 +570,6 @@ class Trainer:
             dist.all_reduce(longest, op=dist.ReduceOp.MAX, group=None)
             padding = itertools.repeat(self.padbatch, int(longest.item() - length.item()))
             iterable = itertools.chain(iterable, enumerate(padding, start=len(dataloader)))
-
-        def step() -> None:
-            """Update the model parameters and increment the global step counter."""
-            scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
-            scaler.step(self.optimizer)
-            scaler.update()
-            warnings.filterwarnings("ignore")
-            self.scheduler.step()
-            warnings.resetwarnings()
-            self.optimizer.zero_grad()
-            self.glbl_step += 1
 
         def get_report() -> dict[str, float]:
             """Assemble a training report (excluding GPU statistics)."""
@@ -620,7 +608,7 @@ class Trainer:
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 loss = loss * int(real) / self.args.gradient_accumulation_steps
-                scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
+                self.scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
 
             # Check for parameters with no gradients
@@ -634,7 +622,8 @@ class Trainer:
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
                 # Take an optimization step
-                step()
+                grad_norm = self.step()
+                results["grad_norm"] += grad_norm.detach()
                 # Adjust `grda_modl` to force a sync on the last real mini-step
                 if is_last_real and grda_modl != 0:
                     grda_modl = 0
@@ -797,11 +786,8 @@ class Trainer:
         if do_chpt:
             self.to_checkpoint(self.args.outdir / f"checkpoint-{self.glbl_step}")
 
-        # If scheduled, update the console.
-        if do_logg:
-            self._update_cons(report)
-
-        # Always update the log.
+        # Always update the log and console.
+        self._update_cons(report)
         self._update_logs(report)
 
         # Advance schedules that fired.
@@ -813,12 +799,11 @@ class Trainer:
             self._next_logg_step += self.logg_steps  # type: ignore[operator]
 
         # Handle early stopping (only if validation is orgnanically scheduled).
-        if self.stopper is not None:
-            if due_eval:
-                self.stopper.step(report[f"{self.args.stopper_metric}"])
-            if self.stopper.stop:
-                print("Early stopping triggered.")
-                self._done = True
+        if due_eval:
+            self.stopper.step(report[f"{self.args.stopper_metric}"])
+        if self.stopper.stop:
+            print("Early stopping triggered.")
+            self._done = True
 
     def forward(self, batch: Batch) -> Tensor:
         """
@@ -833,6 +818,21 @@ class Trainer:
         """
         with torch.autocast(self.device.type, dtype=self.mp_dtype, enabled=self.args.mp16):
             return self.loss_fn(outputs, batch.get_label())  # type: ignore[no-any-return]
+
+    def step(self) -> Tensor:
+        """
+        Take an optimization step and return the norm of gradients.
+        """
+        self.scaler.unscale_(self.optimizer)
+        norm: Tensor = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        warnings.filterwarnings("ignore")
+        self.scheduler.step()
+        warnings.resetwarnings()
+        self.optimizer.zero_grad()
+        self.glbl_step += 1
+        return norm
 
     def reduce_results(self, results: dict[str, Tensor], check: bool = True) -> dict[str, Tensor]:
         """
@@ -965,6 +965,7 @@ class Trainer:
         d["glbl_step"] = int(results["glbl_step"])
         d["lr"] = round(results["lr"], 6)
         if any(k.startswith("tr_") for k in results):
+            d["grad_norm"] = round(results["grad_norm"], 3)
             d["tr_loss"] = round(results["tr_loss"], 3)
             d["tr_gpu_utl"] = round(results["tr_gpu_utl"], 2)
             d["tr_gpu_mem"] = round(results["tr_gpu_mem"] / (1024 ** 3), 2)
