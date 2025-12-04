@@ -50,162 +50,166 @@ def dir_path(string):
     else:
         raise NotADirectoryError(string)
 
-parser = argparse.ArgumentParser(description='Train a MalConv model')
+if __name__ == "__main__":
 
-parser.add_argument('--filter_size', type=int, default=512, help='How wide should the filter be')
-parser.add_argument('--filter_stride', type=int, default=512, help='Filter Stride')
-parser.add_argument('--embd_size', type=int, default=8, help='Size of embedding layer')
-parser.add_argument('--num_channels', type=int, default=128, help='Total number of channels in output')
-parser.add_argument('--epochs', type=int, default=10, help='How many training epochs to perform')
-parser.add_argument('--non-neg', type=bool, default=False, help='Should non-negative training be used')
-parser.add_argument('--batch_size', type=int, default=128, help='Batch size during training')
-#Default is set ot 16 MB! 
-parser.add_argument('--max_len', type=int, default=16000000, help='Maximum length of input file in bytes, at which point files will be truncated')
+    parser = argparse.ArgumentParser(description='Train a MalConv model')
 
-parser.add_argument('--gpus', nargs='+', type=int)
+    parser.add_argument('--filter_size', type=int, default=512, help='How wide should the filter be')
+    parser.add_argument('--filter_stride', type=int, default=512, help='Filter Stride')
+    parser.add_argument('--embd_size', type=int, default=8, help='Size of embedding layer')
+    parser.add_argument('--num_channels', type=int, default=128, help='Total number of channels in output')
+    parser.add_argument('--epochs', type=int, default=10, help='How many training epochs to perform')
+    parser.add_argument('--non-neg', type=bool, default=False, help='Should non-negative training be used')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size during training')
+    parser.add_argument('--num_workers', type=int, default=0, help='Num dataloader workers')
+    #Default is set ot 16 MB! 
+    parser.add_argument('--max_len', type=int, default=16000000, help='Maximum length of input file in bytes, at which point files will be truncated')
 
-args = parser.parse_args()
+    parser.add_argument('--gpus', nargs='+', type=int)
 
-#GPUS = args.gpus
-GPUS = None
+    args = parser.parse_args()
 
-NON_NEG = args.non_neg
-EMBD_SIZE = args.embd_size
-FILTER_SIZE = args.filter_size
-FILTER_STRIDE = args.filter_stride
-NUM_CHANNELS= args.num_channels
-EPOCHS = args.epochs
-MAX_FILE_LEN = args.max_len
+    #GPUS = args.gpus
+    GPUS = None
 
-BATCH_SIZE = args.batch_size
+    NON_NEG = args.non_neg
+    EMBD_SIZE = args.embd_size
+    FILTER_SIZE = args.filter_size
+    FILTER_STRIDE = args.filter_stride
+    NUM_CHANNELS= args.num_channels
+    EPOCHS = args.epochs
+    MAX_FILE_LEN = args.max_len
+    NUM_WORKERS = args.num_workers
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-seed_everything(0)
-preprocessor = Preprocessor(max_length=args.max_len)
-root = Path("./data")
-tr_datadb = SimpleDB(root / "data" / "tr", check=False)
-ts_datadb = SimpleDB(root / "data" / "ts", check=False)
-tr_metadb = MetadataDB(root / "meta" / "tr")
-ts_metadb = MetadataDB(root / "meta" / "ts")
-tr_shards = list(range(len(tr_datadb.files_data)))
-ts_shards = list(range(len(ts_datadb.files_data)))
-tr_dataset = IterableSimpleDBDataset(tr_datadb, tr_metadb, preprocessor, tr_shards, shuffle=True)
-ts_dataset = IterableSimpleDBDataset(ts_datadb, ts_metadb, preprocessor, ts_shards, shuffle=False)
-collate_fn = CollateFn(False, False)
-tr_loader = get_loader(tr_dataset, BATCH_SIZE, True,  None, None, 0, collate_fn, True, 1)
-ts_loader = get_loader(ts_dataset, BATCH_SIZE, False, None, None, 0, collate_fn, True, 1)
-tr_streamer = get_streamer(tr_loader, device, num_streams=0)
-ts_streamer = get_streamer(ts_loader, device, num_streams=0)
-train_loader = tr_streamer
-test_loader = ts_streamer
+    BATCH_SIZE = args.batch_size
 
-
-model = MalConv(channels=NUM_CHANNELS, window_size=FILTER_SIZE, stride=FILTER_STRIDE, embd_size=EMBD_SIZE).to(device)
-
-logfile = Path("./tmp/raff/mc2/results.jsonl")
-logfile.parent.mkdir(parents=True, exist_ok=True)
-if logfile.exists():
-    raise FileExistsError(logfile)
-
-criterion = nn.CrossEntropyLoss()
-#optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
-optimizer = optim.Adam(model.parameters())
-
-for epoch in tqdm(range(1, EPOCHS + 1)):
-    
-    preds = []
-    truths = []
-    running_loss = 0.0
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed_everything(0)
+    preprocessor = Preprocessor(max_length=args.max_len)
+    root = Path("./data")
+    tr_datadb = SimpleDB(root / "data" / "tr", check=False)
+    ts_datadb = SimpleDB(root / "data" / "ts", check=False)
+    tr_metadb = MetadataDB(root / "meta" / "tr")
+    ts_metadb = MetadataDB(root / "meta" / "ts")
+    tr_shards = list(range(len(tr_datadb.files_data)))
+    ts_shards = list(range(len(ts_datadb.files_data)))
+    tr_dataset = IterableSimpleDBDataset(tr_datadb, tr_metadb, preprocessor, tr_shards, shuffle=True)
+    ts_dataset = IterableSimpleDBDataset(ts_datadb, ts_metadb, preprocessor, ts_shards, shuffle=False)
+    collate_fn = CollateFn(False, False)
+    tr_loader = get_loader(tr_dataset, BATCH_SIZE, True,  None, None, NUM_WORKERS, collate_fn, True, 1)
+    ts_loader = get_loader(ts_dataset, BATCH_SIZE, False, None, None, NUM_WORKERS, collate_fn, True, 1)
+    tr_streamer = get_streamer(tr_loader, device, num_streams=0)
+    ts_streamer = get_streamer(ts_loader, device, num_streams=0)
+    train_loader = tr_streamer
+    test_loader = ts_streamer
 
 
-    train_correct = 0
-    train_total = 0
-    
-    epoch_stats = {'epoch':epoch}
+    model = MalConv(channels=NUM_CHANNELS, window_size=FILTER_SIZE, stride=FILTER_STRIDE, embd_size=EMBD_SIZE).to(device)
 
-    model.train()
-    for batch in tqdm(train_loader):
+    logfile = Path("./tmp/raff/mc2/results.jsonl")
+    logfile.parent.mkdir(parents=True, exist_ok=True)
+    if logfile.exists():
+        raise FileExistsError(logfile)
 
-        batch = batch.to(device, non_blocking=True)
-        batch = batch.finalize(ftype=torch.float32, itype=torch.int64, ltype=torch.int64)
-        inputs, labels = batch.get_inputs(), batch.get_label()
+    criterion = nn.CrossEntropyLoss()
+    #optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+    optimizer = optim.Adam(model.parameters())
 
-        #inputs, labels = inputs.to(device), labels.to(device)
-        #Keep inputs on CPU, the model will load chunks of input onto device as needed
-        labels = labels.to(device)
-
-        optimizer.zero_grad()
-
-    #     outputs, penultimate_activ, conv_active = model.forward_extra(inputs)
-        outputs, _, _ = model(inputs)
-        loss = criterion(outputs, labels)
-        loss = loss #+ decov_lambda*(decov_penalty(penultimate_activ) + decov_penalty(conv_active))
-    #     loss = loss + decov_lambda*(decov_penalty(conv_active))
-        loss.backward()
-        # Log parameter summary after first batch of first two epochs.
-        if (epoch == 1 or epoch == 2) and train_total == 0:
-            print(f"{'-' * 20} Parameter Summary {'-' * 20}")
-            print_parameter_summary(model, spaces=2)
-            print(f"{'-' * 80}")
-
-        optimizer.step()
-        if NON_NEG:
-            for p in model.parameters():
-                p.data.clamp_(0)
-
-
-        running_loss += loss.item()
-
-        _, predicted = torch.max(outputs.data, 1)
+    for epoch in tqdm(range(1, EPOCHS + 1)):
         
-        with torch.no_grad():
-            preds.extend(F.softmax(outputs, dim=-1).data[:,1].detach().cpu().numpy().ravel())
-            truths.extend(labels.detach().cpu().numpy().ravel())
-        
-        train_total += labels.size(0)
-        train_correct += (predicted == labels).sum().item()
+        preds = []
+        truths = []
+        running_loss = 0.0
 
-    #print("Training Accuracy: {}".format(train_correct*100.0/train_total))
-    
-    epoch_stats['tr_loss'] = running_loss / train_total
-    epoch_stats['tr_acc'] = train_correct*1.0/train_total
-    epoch_stats['tr_auc'] = roc_auc_score(truths, preds)
-    epoch_stats['tr_prc'] = prc_auc_score(truths, preds)
-    #epoch_stats['train_loss'] = roc_auc_score(truths, preds)
-    
-    #Test Set Eval
-    model.eval()
-    eval_train_correct = 0
-    eval_train_total = 0
-    running_loss = 0.0
-    
-    preds = []
-    truths = []
-    with torch.no_grad():
-        for batch in tqdm(test_loader):
+
+        train_correct = 0
+        train_total = 0
+        
+        epoch_stats = {'epoch':epoch}
+
+        model.train()
+        for batch in tqdm(train_loader):
 
             batch = batch.to(device, non_blocking=True)
             batch = batch.finalize(ftype=torch.float32, itype=torch.int64, ltype=torch.int64)
             inputs, labels = batch.get_inputs(), batch.get_label()
 
-            inputs, labels = inputs.to(device), labels.to(device)
+            #inputs, labels = inputs.to(device), labels.to(device)
+            #Keep inputs on CPU, the model will load chunks of input onto device as needed
+            labels = labels.to(device)
 
+            optimizer.zero_grad()
+
+        #     outputs, penultimate_activ, conv_active = model.forward_extra(inputs)
             outputs, _, _ = model(inputs)
             loss = criterion(outputs, labels)
+            loss = loss #+ decov_lambda*(decov_penalty(penultimate_activ) + decov_penalty(conv_active))
+        #     loss = loss + decov_lambda*(decov_penalty(conv_active))
+            loss.backward()
+            # Log parameter summary after first batch of first two epochs.
+            if (epoch == 1 or epoch == 2) and train_total == 0:
+                print(f"{'-' * 20} Parameter Summary {'-' * 20}")
+                print_parameter_summary(model, spaces=2)
+                print(f"{'-' * 80}")
+
+            optimizer.step()
+            if NON_NEG:
+                for p in model.parameters():
+                    p.data.clamp_(0)
+
+
             running_loss += loss.item()
 
             _, predicted = torch.max(outputs.data, 1)
-
-            preds.extend(F.softmax(outputs, dim=-1).data[:,1].detach().cpu().numpy().ravel())
-            truths.extend(labels.detach().cpu().numpy().ravel())
             
-            eval_train_total += labels.size(0)
-            eval_train_correct += (predicted == labels).sum().item()
+            with torch.no_grad():
+                preds.extend(F.softmax(outputs, dim=-1).data[:,1].detach().cpu().numpy().ravel())
+                truths.extend(labels.detach().cpu().numpy().ravel())
+            
+            train_total += labels.size(0)
+            train_correct += (predicted == labels).sum().item()
 
-    epoch_stats['vl_loss'] = running_loss / eval_train_total
-    epoch_stats['vl_acc'] = eval_train_correct*1.0/eval_train_total
-    epoch_stats['vl_auc'] = roc_auc_score(truths, preds)
-    epoch_stats['vl_prc'] = prc_auc_score(truths, preds)
+        #print("Training Accuracy: {}".format(train_correct*100.0/train_total))
+        
+        epoch_stats['tr_loss'] = running_loss / train_total
+        epoch_stats['tr_acc'] = train_correct*1.0/train_total
+        epoch_stats['tr_auc'] = roc_auc_score(truths, preds)
+        epoch_stats['tr_prc'] = prc_auc_score(truths, preds)
+        #epoch_stats['train_loss'] = roc_auc_score(truths, preds)
+        
+        #Test Set Eval
+        model.eval()
+        eval_train_correct = 0
+        eval_train_total = 0
+        running_loss = 0.0
+        
+        preds = []
+        truths = []
+        with torch.no_grad():
+            for batch in tqdm(test_loader):
 
-    with open(logfile, 'a') as fp:
-        fp.write(f"{json.dumps(epoch_stats)}\n")
+                batch = batch.to(device, non_blocking=True)
+                batch = batch.finalize(ftype=torch.float32, itype=torch.int64, ltype=torch.int64)
+                inputs, labels = batch.get_inputs(), batch.get_label()
+
+                inputs, labels = inputs.to(device), labels.to(device)
+
+                outputs, _, _ = model(inputs)
+                loss = criterion(outputs, labels)
+                running_loss += loss.item()
+
+                _, predicted = torch.max(outputs.data, 1)
+
+                preds.extend(F.softmax(outputs, dim=-1).data[:,1].detach().cpu().numpy().ravel())
+                truths.extend(labels.detach().cpu().numpy().ravel())
+                
+                eval_train_total += labels.size(0)
+                eval_train_correct += (predicted == labels).sum().item()
+
+        epoch_stats['vl_loss'] = running_loss / eval_train_total
+        epoch_stats['vl_acc'] = eval_train_correct*1.0/eval_train_total
+        epoch_stats['vl_auc'] = roc_auc_score(truths, preds)
+        epoch_stats['vl_prc'] = prc_auc_score(truths, preds)
+
+        with open(logfile, 'a') as fp:
+            fp.write(f"{json.dumps(epoch_stats)}\n")
