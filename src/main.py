@@ -615,13 +615,16 @@ def main() -> None:
         scheduler_init = partial(LambdaLR,
             lr_lambda=lambda _: 1.0,
         )
+        print(f"scheduler=LambdaLR({args.learning_rate} --> {args.learning_rate} --> {args.learning_rate})")
     elif args.sched == Scheduler.OCLR:
+        # TODO: it would be nice to simply use the PyTorch defaults or the defaults from the CustomLR scheduler.
         scheduler_init = partial(OneCycleLR,
             max_lr=args.learning_rate,
             total_steps=total_steps,
             pct_start=0.25,
             final_div_factor=100000.0,
         )
+        print(f"scheduler=OneCycleLR({0.25 * args.learning_rate} --> {args.learning_rate} --> {args.learning_rate / 100000.0})")
     elif args.sched == Scheduler.CUST:
         scheduler_init = partial(get_lr_scheduler,
             lr_beg=0.1 * args.learning_rate,
@@ -630,9 +633,10 @@ def main() -> None:
             total_steps=total_steps,
             warmup_steps= int(total_steps * args.warmup_ratio),
         )
+        print(f"scheduler=CustomLR({0.1 * args.learning_rate} --> {args.learning_rate} --> {0.01 * args.learning_rate})")
     else:
         raise NotImplementedError(f"{args.sched} scheduler not implemented.")
-    print(f"{args.sched.value}: {scheduler_init=}")
+    print(f"{scheduler_init=}")
 
     padbatch = get_padbatch(args.level, structures, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)
     print(f"{padbatch=}")
