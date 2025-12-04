@@ -80,6 +80,7 @@ class MainArgs:
     do_entropy: bool = False
     which_characteristics: tuple[lief.PE.Section.CHARACTERISTICS, ...] = tuple()
     level: HierarchicalLevel = HierarchicalLevel.NONE
+    ignore_directory_structures: bool = True
     tr_num_samples: Optional[int] = None
     vl_num_samples: Optional[int] = None
     ts_num_samples: Optional[int] = None
