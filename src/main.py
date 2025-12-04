@@ -72,7 +72,11 @@ from src.architectures import HierarchicalMalConvClassifier
 from src.architectures import HierarchicalViTClassifier
 from src.binanal import HierarchicalLevel
 from src.binanal import LEVEL_STRUCTURE_MAP
+from src.binanal import DIRECTORY_STRUCTURES
 from src.binanal import HierarchicalStructure
+from src.binanal import HierarchicalStructureCoarse
+from src.binanal import HierarchicalStructureMiddle
+from src.binanal import HierarchicalStructureFine
 from src.data import SemanticGuides
 from src.data import StructureMaps
 from src.data import Inputs
@@ -122,6 +126,7 @@ def get_model(
     size: ModelSize,
     num_guides: int,
     level: HierarchicalLevel,
+    structures: list[HierarchicalStructure],
     parch: PatcherArchitecture,
 ) -> Classifier | HierarchicalClassifier:
     """
@@ -143,16 +148,16 @@ def get_model(
         size: The model size.
         num_guides: The number of semantic guides.
         level: The hierarchical level.
+        structures: The hierarchical structures.
         parch: The patcher architecture (for ViT only).
 
     Returns:
         The model.
     """
+    arch = Architecture(arch)
+    level = HierarchicalLevel(level)
 
-    HierarchicalStructureCls: type[HierarchicalStructure] = LEVEL_STRUCTURE_MAP[level]
-    num_structures = len(HierarchicalStructureCls)
-    if num_structures <= 0:
-        raise RuntimeError(f"{level} yielded no structures.")
+    num_structures = len(structures)
 
     # Embedding
     padding_idx    = 0
@@ -248,6 +253,7 @@ def get_model(
         clf_dropout    = 0.0 if STRICT_RAFF_MATCH else 0.1
     head = ClassifificationHead(clf_input_size, num_classes, clf_hidden, clf_layers, clf_dropout)
 
+    # Flat Model
     if level == HierarchicalLevel.NONE:
         embedding = Embedding(num_embeddings, embedding_dim, padding_idx)
         filmer = FiLMCls(guide_dim, embedding_dim, guide_hidden)
@@ -258,54 +264,42 @@ def get_model(
             patcher = PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
             transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers)
             return ViTClassifier(embedding, filmer, patcher, transformer, head)
+        raise NotImplementedError(f"{arch}")
 
-    if level == HierarchicalLevel.COARSE:
-        embeddings = [Embedding(num_embeddings, embedding_dim, padding_idx)
-            for _ in range(num_structures)]
-        filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden)
-            for _ in range(num_structures)]
-        if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap)
-                for _ in range(num_structures)]
-            return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
-        if arch in (Architecture.VIT,):
-            patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
-                for _ in range(num_structures)]
-            transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
-            return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
+    # Hierarchical Model
+    tiny = (
+        HierarchicalStructureCoarse.HEADERS,
+        HierarchicalStructureMiddle.HEADERS,
+        HierarchicalStructureFine.DOS_HEADER,
+        HierarchicalStructureFine.DOS_STUB,
+        HierarchicalStructureFine.COFF_HEADER,
+        HierarchicalStructureFine.OPTN_HEADER,
+        HierarchicalStructureFine.SECTN_TABLE,
+    )
 
-    if level == HierarchicalLevel.MIDDLE:
-        embeddings = [Embedding(num_embeddings, embedding_dim, padding_idx)
-            for _ in range(num_structures)]
-        filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden)
-            for _ in range(num_structures)]
-        if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap)
-                for _ in range(num_structures)]
-            return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
-        if arch in (Architecture.VIT,):
-            patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
-                for _ in range(num_structures)]
-            transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
-            return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
+    def tiny_malconv() -> MalConvBase:
+        return MalConvCls(embedding_dim, mcnv_channels, kernel_size=64, stride=1, overlap=0)
 
-    if level == HierarchicalLevel.FINE:
-        embeddings = [Embedding(num_embeddings, embedding_dim, padding_idx)
-            for _ in range(num_structures)]
-        filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden)
-            for _ in range(num_structures)]
-        if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap)
-                for _ in range(num_structures)]
-            return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
-        if arch in (Architecture.VIT,):
-            patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
-                for _ in range(num_structures)]
-            transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
-            return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
+    def full_malconv() -> MalConvBase:
+        return MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap)
 
+    def tiny_patcher() -> PatchEncoder:
+        return PatchEncoder(embedding_dim, patcher_channels, num_patches=1, patch_size=None, kernel_size=64, stride=1)
 
-    raise NotImplementedError(f"{level} {arch}")
+    def full_patcher() -> PatchEncoderBase:
+        return PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
+
+    embeddings = [Embedding(num_embeddings, embedding_dim, padding_idx) for _ in range(num_structures)]
+    filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden) for _ in range(num_structures)]
+    if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
+        malconvs = [tiny_malconv() if s in tiny else full_malconv() for s in structures]
+        return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
+    if arch in (Architecture.VIT,):
+        patchers = [tiny_patcher() if s in tiny else full_patcher() for s in structures]
+        transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
+        return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
+
+    raise NotImplementedError(f"{arch}")
 
 
 def get_lr_scheduler(optimizer: Optimizer, lr_beg: float, lr_max: float, lr_min: float, total_steps: int, warmup_steps: int) -> LRScheduler:
@@ -349,10 +343,10 @@ def wrap_model_fsdp(model: M, mpdtype: torch.dtype, fsdp_offload: bool) -> M:
     return model
 
 
-def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int]) -> CollateFn | CollateFnHierarchical:
+def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int], structures: list[HierarchicalStructure]) -> CollateFn | CollateFnHierarchical:
     if level == HierarchicalLevel.NONE:
         return CollateFn(False, False, min_lengths[0])
-    return CollateFnHierarchical(False, False, len(LEVEL_STRUCTURE_MAP[level]), min_lengths)
+    return CollateFnHierarchical(False, False, len(structures), min_lengths)
 
 
 def worker_init_fn(worker_id: int) -> None:
@@ -416,7 +410,7 @@ def get_streamer(loader: DataLoader[Any], device: torch.device, num_streams: int
     return CUDAPrefetcher(loader, device, num_streams)
 
 
-def get_padbatch(level: HierarchicalLevel, do_parse: bool,do_entropy: bool, which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS], min_lengths: list[int], batch_size: int) -> FSamples | HSamples:
+def get_padbatch(level: HierarchicalLevel, structures: list[HierarchicalStructure], do_parse: bool, do_entropy: bool, which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS], min_lengths: list[int], batch_size: int) -> FSamples | HSamples:
     """Return a short batch of purely padding samples."""
     file = ["./" + "0" * 64] * batch_size
     name = [Name("0" * 64)] * batch_size
@@ -434,13 +428,12 @@ def get_padbatch(level: HierarchicalLevel, do_parse: bool,do_entropy: bool, whic
         return SemanticGuides(parse, entropy, characteristics).decompress()
 
     def get_structure() -> StructureMaps:
-        index: list[list[tuple[int, int]]] = [[] for _ in LEVEL_STRUCTURE_MAP[level]]
+        index: list[list[tuple[int, int]]] = [[] for _ in structures]
         lexicon = {}
-        for i, s in enumerate(LEVEL_STRUCTURE_MAP[level]):
+        for i, s in enumerate(structures):
             index[i] = [(0, min_lengths[i])]
             lexicon[i] = s
-        index = [deepcopy(index) for _ in range(batch_size)]
-        return StructureMaps(index, lexicon)
+        return StructureMaps([deepcopy(index) for _ in range(batch_size)], lexicon)
 
     structure = get_structure()
 
@@ -484,8 +477,11 @@ def main() -> None:
     mpdtype = mp_dtype(args.mp16, args.device)
     print(f"{mpdtype=}")
 
+    structures = list(LEVEL_STRUCTURE_MAP[args.level])
+    if args.ignore_directory_structures:
+        structures = [s for s in structures if s not in DIRECTORY_STRUCTURES]
     num_guides = len(args.which_characteristics) + (1 if args.do_entropy else 0)
-    model = get_model(args.arch, args.size, num_guides, args.level, args.parch).to("cpu")
+    model = get_model(args.arch, args.size, num_guides, args.level, structures, args.parch).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
     min_lengths = [max(m, min_length) for m in getattr(model, "min_lengths", [min_length])]
@@ -507,7 +503,9 @@ def main() -> None:
         args.do_entropy,
         args.which_characteristics,
         args.level,
+        structures=structures,
         max_length=args.max_length,
+        unsafe=False,
     )
     print(f"{preprocessor=}")
 
@@ -583,7 +581,7 @@ def main() -> None:
     print(f"{tr_dataset=}")
     print(f"{ts_dataset=}")
 
-    collate_fn = get_collate_fn(args.level, min_lengths)
+    collate_fn = get_collate_fn(args.level, min_lengths, structures)
     print(f"{collate_fn=}")
 
     tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, min(args.num_workers, len(tr_shards)), collate_fn, args.pin_memory, args.prefetch_factor)
@@ -636,7 +634,7 @@ def main() -> None:
         raise NotImplementedError(f"{args.sched} scheduler not implemented.")
     print(f"{args.sched.value}: {scheduler_init=}")
 
-    padbatch = get_padbatch(args.level, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)
+    padbatch = get_padbatch(args.level, structures, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)
     print(f"{padbatch=}")
 
     stopper = EarlyStopper(args.stopper_patience, args.stopper_threshold, args.stopper_mode)  # type: ignore[arg-type]
