@@ -42,7 +42,6 @@ from torch.utils.data import Sampler
 from torch.utils.data import get_worker_info
 from torch.utils._pytree import tree_map
 
-from src.binanal import LEVEL_STRUCTURE_MAP
 from src.binanal import _parse_pe_and_get_size
 from src.binanal import _get_size_of_liefparse
 from src.binanal import LiefParse
@@ -601,8 +600,9 @@ class StructurePartitioner:
     Partitions a binary into hierarchical structures.
     """
 
-    def __init__(self, level: HierarchicalLevel = HierarchicalLevel.NONE) -> None:
+    def __init__(self, level: HierarchicalLevel = HierarchicalLevel.NONE, structures: Sequence[HierarchicalStructure] = (HierarchicalStructureNone.ANY,)) -> None:
         self.level = level
+        self.structures = structures
 
     def __call__(self, data: LiefParse | lief.PE.Binary, size: Optional[int] = None) -> StructureMap:
         lexicon: Mapping[int, HierarchicalStructure]
@@ -624,9 +624,10 @@ class StructurePartitioner:
 
         index = []
         lexicon = {}
-        for i, s in enumerate(LEVEL_STRUCTURE_MAP[self.level]):
+        for i, s in enumerate(self.structures):
             index.append(parser(s))
             lexicon[i] = s
+
         return StructureMap(index, lexicon)
 
 
@@ -1110,8 +1111,8 @@ class _HSampleOrSamples(Generic[F, N, I, G, S], ABC):
         file = deepcopy(self.file)
         name = deepcopy(self.name)
         label = self.label.to(ltype)
-        inputs = []
-        guides = []
+        inputs: list[I] = []
+        guides: list[G] = []
         for i in range(self.num_structures):
             inputs.append(self.inputs[i].finalize(itype))
             guides.append(self.guides[i].decompress().to(dtype=ftype))
@@ -1233,17 +1234,19 @@ class Preprocessor:
         self,
         do_entropy: bool = False,
         which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS] = tuple(),
-        level: HierarchicalLevel | str = HierarchicalLevel.NONE,
+        level: HierarchicalLevel = HierarchicalLevel.NONE,
+        structures: Sequence[HierarchicalStructure] = (HierarchicalStructureNone.ANY,),
         max_length: Optional[int] = None,
         unsafe: bool = False,
     ) -> None:
         self.do_entropy = do_entropy
         self.which_characteristics = which_characteristics
-        self.level = HierarchicalLevel(level)
+        self.level = level
+        self.structures = structures
         self.max_length = max_length
         self.unsafe = unsafe
         self.guider = SemanticGuider(do_entropy=do_entropy, which_characteristics=which_characteristics)
-        self.partitioner = StructurePartitioner(HierarchicalLevel(level))
+        self.partitioner = StructurePartitioner(level, structures)
 
     def __call__(self, name: str, label: int, data: bytes, meta: pl.DataFrame) -> FSample:
         mv = memoryview(data)[0:self.max_length]
@@ -1324,7 +1327,7 @@ class Preprocessor:
         )
         lexicon = {}
         index: list[list[tuple[int, int]]] = []
-        for i, structure in enumerate(LEVEL_STRUCTURE_MAP[self.level]):
+        for i, structure in enumerate(self.structures):
             lexicon[i] = structure
             index.append([])
             for row in df.filter(pl.col("label") == structure.name).iter_rows(named=True):
@@ -1388,25 +1391,12 @@ class CollateFnHierarchical:
         inputs = []
         guides = []
         for i in range(self.num_structures):
-            xs = []
-            gs = []
+            xs: list[Input] = []
+            gs: list[SemanticGuide] = []
             for j in range(len(batch)):
                 ranges = batch[j].structure.index[i]
                 x_i_j = batch[j].inputs.select(ranges=ranges)
                 g_i_j = batch[j].guides.select(ranges=ranges)
-                # TODO: remove these checks.
-                if g_i_j.parse is not None:
-                    expected = x_i_j.size(0) if not g_i_j.is_bitpacked else math.ceil(x_i_j.size(0) / 8)
-                    if g_i_j.parse.size(0) != expected:
-                        raise RuntimeError(f"{i=} {j=} {ranges=} {expected=} x_i_j.shape={tuple(x_i_j.shape)} g_i_j.parse.shape={tuple(g_i_j.parse.shape)}")
-                if g_i_j.characteristics is not None:
-                    expected = x_i_j.size(0) if not g_i_j.is_bitpacked else math.ceil(x_i_j.size(0) / 8)
-                    if g_i_j.characteristics.size(0) != expected:
-                        raise RuntimeError(f"{i=} {j=} {ranges=} {expected=} x_i_j.shape={tuple(x_i_j.shape)} g_i_j.characteristics.shape={tuple(g_i_j.characteristics.shape)}")
-                if g_i_j.entropy is not None:
-                    expected = x_i_j.size(0)
-                    if g_i_j.entropy.size(0) != expected:
-                        raise RuntimeError(f"{i=} {j=} {ranges=} {expected=} x_i_j.shape={tuple(x_i_j.shape)} g_i_j.entropy.shape={tuple(g_i_j.entropy.shape)}")
                 xs.append(x_i_j)
                 gs.append(g_i_j.compress() if self.bitpack else g_i_j)
             xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i])
