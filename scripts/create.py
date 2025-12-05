@@ -117,7 +117,7 @@ class Configuration:
             f"characteristics--{'_'.join(sorted([str(c.name) for c in self.which_characteristics]))}",
             f"max_length--{self.max_length}",
             f"batch_size--{self.batch_size * world_size}",
-            f"learning_rate--{self.learning_rate}",
+            f"lr_max--{self.lr_max}",
             f"weight_decay--{self.weight_decay}",
             f"warmup_ratio--{self.warmup_ratio}",
             f"label_smoothing--{self.label_smoothing}",
@@ -175,8 +175,16 @@ class Configuration:
         return Scheduler.OCLR
 
     @property
-    def learning_rate(self) -> float:
-        return 1e-2
+    def lr_max(self) -> float:
+        return 5e-4
+
+    @property
+    def lr_beg(self) -> float:
+        return 0.050 * self.lr_max
+
+    @property
+    def lr_end(self) -> float:
+        return 0.010 * self.lr_max
 
     @property
     def weight_decay(self) -> float:
@@ -397,7 +405,9 @@ class ScriptBuilder:
             f"--vl_batch_size {self.config.per_device_batch_size}",
             f"--ts_batch_size {self.config.per_device_batch_size}",
             f"--sched {self.config.sched.value}",
-            f"--learning_rate {self.config.learning_rate}",
+            f"--lr_max {self.config.lr_max}",
+            f"--lr_beg {self.config.lr_beg}",
+            f"--lr_end {self.config.lr_end}",
             f"--weight_decay {self.config.weight_decay}",
             f"--warmup_ratio {self.config.warmup_ratio}",
             f"--label_smoothing {self.config.label_smoothing}",

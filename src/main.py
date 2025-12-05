@@ -302,17 +302,17 @@ def get_model(
     raise NotImplementedError(f"{arch}")
 
 
-def get_lr_scheduler(optimizer: Optimizer, lr_beg: float, lr_max: float, lr_min: float, total_steps: int, warmup_steps: int) -> LRScheduler:
+def get_lr_scheduler(optimizer: Optimizer, lr_beg: float, lr_max: float, lr_end: float, total_steps: int, warmup_steps: int) -> LRScheduler:
     if optimizer.state_dict()["param_groups"][0]["lr"] != lr_max:
         raise ValueError("Optimizer learning rate does not match base_lr.")
 
     if warmup_steps == 0:
-        return CosineAnnealingLR(optimizer, total_steps, lr_min)
+        return CosineAnnealingLR(optimizer, total_steps, lr_end)
 
     # Linearly increase from `lr_beg` to `lr_max` over `warmup_steps`.
     warmup_scheduler = LinearLR(optimizer, lr_beg / lr_max, 1.0, warmup_steps)
-    # Cosine decay from `lr_max` to `lr_min` over the remaining steps.
-    cosine_scheduler = CosineAnnealingLR(optimizer, total_steps - warmup_steps, lr_min)
+    # Cosine decay from `lr_max` to `lr_end` over the remaining steps.
+    cosine_scheduler = CosineAnnealingLR(optimizer, total_steps - warmup_steps, lr_end)
     # Chain the two schedulers together.
     scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], [warmup_steps])
 
@@ -600,7 +600,7 @@ def main() -> None:
     loss_fn = CrossEntropyLoss(label_smoothing=args.label_smoothing)
     print(f"{loss_fn=}")
 
-    optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = partial(AdamW, lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = partial(AdamW, lr=args.lr_max, weight_decay=args.weight_decay)
     print(f"{optimizer_init=}")
 
     if args.max_steps is not None:
@@ -609,34 +609,37 @@ def main() -> None:
         total_steps = int(args.max_epochs * len(tr_loader) // args.gradient_accumulation_steps)
     else:
         raise ValueError("Either `max_steps` or `max_epochs` must be specified.")
+    warmup_steps = int(total_steps * args.warmup_ratio)
 
     scheduler_init: Callable[[Optimizer], LRScheduler]
     if args.sched == Scheduler.NONE:
         scheduler_init = partial(LambdaLR,
             lr_lambda=lambda _: 1.0,
         )
-        print(f"scheduler=LambdaLR({args.learning_rate} --> {args.learning_rate} --> {args.learning_rate})")
+        print("scheduler=LambdaLR(")
     elif args.sched == Scheduler.OCLR:
-        # TODO: it would be nice to simply use the PyTorch defaults or the defaults from the CustomLR scheduler.
         scheduler_init = partial(OneCycleLR,
-            max_lr=args.learning_rate,
+            max_lr=args.lr_max,
             total_steps=total_steps,
-            pct_start=0.25,
-            div_factor=25.0,
-            final_div_factor=100000.0,
+            pct_start=args.warmup_ratio,
+            div_factor=args.lr_max / args.lr_beg,
+            final_div_factor=args.lr_max / args.lr_end,
         )
-        print(f"scheduler=OneCycleLR({(1 / 25.0) * args.learning_rate} --> {args.learning_rate} --> {args.learning_rate / 100000.0})")
+        print("scheduler=OneCycleLR(")
     elif args.sched == Scheduler.CUST:
         scheduler_init = partial(get_lr_scheduler,
-            lr_beg=0.1 * args.learning_rate,
-            lr_max=args.learning_rate,
-            lr_min=0.01 * args.learning_rate,
+            lr_beg=args.lr_beg,
+            lr_max=args.lr_max,
+            lr_end=args.lr_end,
             total_steps=total_steps,
-            warmup_steps= int(total_steps * args.warmup_ratio),
+            warmup_steps=warmup_steps,
         )
-        print(f"scheduler=CustomLR({0.1 * args.learning_rate} --> {args.learning_rate} --> {0.01 * args.learning_rate})")
+        print("scheduler=CustomLR(")
     else:
         raise NotImplementedError(f"{args.sched} scheduler not implemented.")
+    print(f"  [{0, warmup_steps}] := {args.lr_beg} --> {args.lr_max}")
+    print(f"  [{warmup_steps, total_steps - warmup_steps}] := {args.lr_max} --> {args.lr_end}")
+    print(")")
     print(f"{scheduler_init=}")
 
     padbatch = get_padbatch(args.level, structures, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)

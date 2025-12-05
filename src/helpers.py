@@ -95,7 +95,9 @@ class MainArgs:
     vl_batch_size: int = -1
     ts_batch_size: int = -1
     sched: Scheduler = Scheduler.NONE
-    learning_rate: float = 1e-3
+    lr_beg: float = 1e-5
+    lr_max: float = 1e-3
+    lr_end: float = 1e-6
     warmup_ratio: float = 0.00
     weight_decay: float = 1e-2
     label_smoothing: float = 0.0
@@ -162,7 +164,7 @@ def create_argument_parser_from_dataclass(*objs: type) -> ArgumentParser:
                 return args[0], True
         return t, False
 
-    def _maybe_cast_str(f: Callable, x: str) -> Any:
+    def _maybe_cast_str(f: Callable[[str], Any], x: str) -> Any:
         if x.lower() == "none":
             return None
         return f(x)
