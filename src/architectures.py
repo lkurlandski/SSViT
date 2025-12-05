@@ -977,7 +977,6 @@ class ViT(nn.Module):
         dim_feedforward: int = -1,
         num_layers: int = 1,
         activation: str = "gelu",
-        norm: Optional[str] = "rms",
         pooling: Literal["mean", "cls"] = "cls",
     ) -> None:
         super().__init__()
@@ -987,7 +986,7 @@ class ViT(nn.Module):
         self.posencoder = SinusoidalPositionalEncoding(embedding_dim)
         self.proj = nn.Linear(embedding_dim, d_model)
         layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, activation=ACTVS[activation], batch_first=True)
-        self.transformer = nn.TransformerEncoder(layer, num_layers, norm=NORMS[norm](d_model) if norm is not None else None)
+        self.transformer = nn.TransformerEncoder(layer, num_layers)
 
         if pooling == "cls":
             self.cls_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
@@ -1002,7 +1001,6 @@ class ViT(nn.Module):
         self.activation = activation
         self.nhead = nhead
         self.num_layers = num_layers
-        self.norm = norm
         self.pooling = pooling
 
     def forward(self, x: Tensor) -> Tensor:
@@ -1832,6 +1830,7 @@ class ViTClassifier(Classifier):
         self.embedding = embedding
         self.filmer = filmer
         self.patcher = patcher
+        self.norm = nn.LayerNorm(patcher.out_channels)
         self.backbone = backbone
         self.head = head
 
@@ -1845,6 +1844,7 @@ class ViTClassifier(Classifier):
 
         ts = (x, g) if g is not None else (x,)
         z = self.patcher(preprocess=preprocess, ts=ts)  # (B, N, E')
+        z = self.norm(z)                                # (B, N, E')
         z = self.backbone(z)                            # (B, D)
         z = self.head(z)                                # (B, M)
 
