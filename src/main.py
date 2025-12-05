@@ -166,7 +166,7 @@ def get_model(
 
     # FiLM
     guide_dim    = num_guides
-    guide_hidden = 64
+    guide_hidden = 16
     FiLMCls: type[FiLM | FiLMNoP]
     if num_guides > 0:
         FiLMCls = FiLM
