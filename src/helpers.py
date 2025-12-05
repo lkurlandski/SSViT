@@ -8,10 +8,12 @@ from dataclasses import dataclass
 from dataclasses import fields
 from dataclasses import Field
 from enum import Enum
+from functools import partial
 import os
 import sys
 from types import GenericAlias
 from typing import Any
+from typing import Callable
 from typing import Literal
 from typing import Optional
 from typing import Self
@@ -160,6 +162,11 @@ def create_argument_parser_from_dataclass(*objs: type) -> ArgumentParser:
                 return args[0], True
         return t, False
 
+    def _maybe_cast_str(f: Callable, x: str) -> Any:
+        if x.lower() == "none":
+            return None
+        return f(x)
+
     parser = ArgumentParser()
     for f in allfields:
         # print(f"Adding argument {f.name} of type {f.type} {type(f.type)=} with default {f.default}.")
@@ -178,22 +185,29 @@ def create_argument_parser_from_dataclass(*objs: type) -> ArgumentParser:
         elif f.type is bool:
             parser.add_argument(argname, type=str_to_bool, default=f.default)
         elif f.type == Optional[bool]:
-            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else str_to_bool(x), default=f.default)
+            parser.add_argument(argname, type=partial(_maybe_cast_str, str_to_bool), default=f.default)
         elif f.type == Optional[int]:
-            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else int(x), default=f.default)
+            parser.add_argument(argname, type=partial(_maybe_cast_str, int), default=f.default)
         elif f.type == Optional[float]:
-            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else float(x), default=f.default)
+            parser.add_argument(argname, type=partial(_maybe_cast_str, float), default=f.default)
         elif f.type == Optional[str]:
-            parser.add_argument(argname, type=lambda x: None if x.lower() == "none" else str(x), default=f.default)
+            parser.add_argument(argname, type=partial(_maybe_cast_str, str), default=f.default)
         elif isinstance(f.type, type) and issubclass(f.type, Enum):
             parser.add_argument(argname, type=f.type, choices=list(f.type), default=f.default)
         elif isinstance(f.type, type):
             parser.add_argument(argname, type=f.type, default=f.default)
         elif isinstance(f.type, str):
-            # FIXME: this will not handle the special behaviors above!
-            type_, _ = _unwrap_optional(alltypes[f.name])
+            type_, optional_ = _unwrap_optional(alltypes[f.name])
             if type_ is bool:
                 type_ = str_to_bool
+            elif type_ is int:
+                type_ = int
+            elif type_ is float:
+                type_ = float
+            elif type_ is str:
+                type_ = str
+            if optional_:
+                type_ = partial(_maybe_cast_str, type_)
             parser.add_argument(argname, type=type_, default=f.default)
         else:
             raise ValueError(f"Cannot determine type of field {f}.")
