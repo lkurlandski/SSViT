@@ -411,7 +411,10 @@ class PatchEncoderBase(nn.Module, ABC):
                     raise TensorError(t, (ts[0].shape[0], ts[0].shape[1], None), None)
                 if t.shape[1] < self.min_length:
                     raise RuntimeError(f"Input sequence length {t.shape[1]} is less than the minimum required length {self.min_length}.")
-            z = self.forward_streaming(preprocess=preprocess, ts=ts)
+            if DISABLE_LOW_MEMORY_PATHS:
+                z = self.forward_embeddings(preprocess(*ts))
+            else:
+                z = self.forward_streaming(preprocess=preprocess, ts=ts)
 
         else:
             raise ValueError("Either `z` or both `preprocess` and `ts` must be provided.")
@@ -1206,7 +1209,10 @@ class MalConvBase(nn.Module, ABC):
                     raise TensorError(t, (ts[0].shape[0], ts[0].shape[1], None), None)
                 if t.shape[1] < self.min_length:
                     raise RuntimeError(f"Input sequence length {t.shape[1]} is less than the minimum required length {self.min_length}.")
-            z = self.forward_streaming(preprocess=preprocess, ts=ts)
+            if DISABLE_LOW_MEMORY_PATHS:
+                z = self.forward_embeddings(preprocess(*ts))
+            else:
+                z = self.forward_streaming(preprocess=preprocess, ts=ts)
 
         else:
             raise ValueError("Either `z` or both `preprocess` and `ts` must be provided.")
