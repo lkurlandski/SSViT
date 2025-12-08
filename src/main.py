@@ -481,6 +481,9 @@ def main() -> None:
     if args.ignore_directory_structures:
         structures = [s for s in structures if s not in DIRECTORY_STRUCTURES]
     num_guides = len(args.which_characteristics) + (1 if args.do_entropy else 0)
+    print(f"{structures=}")
+    print(f"{num_guides=}")
+
     model = get_model(args.arch, args.size, num_guides, args.level, structures, args.parch).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
