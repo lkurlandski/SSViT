@@ -213,25 +213,33 @@ class TrainerArgs:
     max_norm: float = 1.0
     gradient_accumulation_steps: int = 1
     mp16: bool = False
-    max_epochs: Optional[float] = 1.0
+    max_epochs: Optional[float] = None
     max_steps: Optional[int] = None
-    eval_epochs: Optional[float] = 1.0
+    eval_epochs: Optional[float] = None
     eval_steps: Optional[int] = None
-    chpt_epochs: Optional[float] = 1.0
+    chpt_epochs: Optional[float] = None
     chpt_steps: Optional[int] = None
-    logg_epochs: Optional[float] = 1.0
+    logg_epochs: Optional[float] = None
     logg_steps: Optional[int] = None
 
     def __post_init__(self) -> None:
-        if (self.max_epochs is not None) == (self.max_steps is not None):
-            raise ValueError("Exactly one of `max_epochs` or `max_steps` must be specified.")
+        if (self.max_epochs is not None) and (self.max_steps is not None):
+            raise ValueError("At most one of `max_epochs` or `max_steps` must be specified.")
+        if self.max_epochs is None and self.max_steps is None:
+            self.max_epochs = 1.0
         if (self.eval_epochs is not None) and (self.eval_steps is not None):
             raise ValueError("At most one of `eval_epochs` or `eval_steps` may be specified.")
+        if self.eval_epochs is None and self.eval_steps is None:
+            self.eval_epochs = 1.0
         if (self.chpt_epochs is not None) and (self.chpt_steps is not None):
             raise ValueError("At most one of `chpt_epochs` or `chpt_steps` may be specified.")
+        if self.chpt_epochs is None and self.chpt_steps is None:
+            self.chpt_epochs = 1.0
         if (self.logg_epochs is not None) and (self.logg_steps is not None):
             raise ValueError("At most one of `logg_epochs` or `logg_steps` may be specified.")
-        if self.stopper_mode not in ("min", "max"):  # TODO: add Literal support to the argparser.
+        if self.logg_epochs is None and self.logg_steps is None:
+            self.logg_epochs = 1.0
+        if self.stopper_mode not in ("min", "max"):
             raise ValueError("`stopper_mode` must be 'min' or 'max'.")
         if self.stopper_patience < 0:
             self.stopper_patience = float("inf")
