@@ -152,13 +152,16 @@ class Configuration:
             return 256  # O(1)
 
         # Assumes constant-memory encoder. # O(1)
+        # TODO: there appears to be large memory fluctuations here.
         if self.arch == Architecture.VIT:
             if self.size == ModelSize.SM:  # O(N)
                 return 2048
             if self.size == ModelSize.MD:  # O(N)
                 return 512
             if self.size == ModelSize.LG:  # O(N)
-                return 256
+                if self.do_entropy or self.which_characteristics:
+                    return 64
+                return 128
 
         raise NotImplementedError(f"ERROR ({str(self)}): batch size not defined for this configuration.")
 
@@ -176,7 +179,9 @@ class Configuration:
 
     @property
     def lr_max(self) -> float:
-        return 5e-4
+        if self.arch == Architecture.VIT:
+            return 5e-4
+        return 1e-3
 
     @property
     def lr_beg(self) -> float:
@@ -188,11 +193,11 @@ class Configuration:
 
     @property
     def weight_decay(self) -> float:
-        return 0.00
+        return 0.0001
 
     @property
     def warmup_ratio(self) -> float:
-        return 0.00
+        return 0.10
 
     @property
     def label_smoothing(self) -> float:
@@ -224,19 +229,19 @@ class Configuration:
     def eval_epochs(self) -> float:
         if DEBUG:
             return 1
-        return 0.25
+        return 0.50
 
     @property
     def chpt_epochs(self) -> float:
         if DEBUG:
             return 1
-        return 0.25
+        return 0.50
 
     @property
     def logg_epochs(self) -> float:
         if DEBUG:
             return 1
-        return 0.25
+        return 0.05
 
 
 # Classifier throughput in samples/second on NVIDIA A100. Measurements taken using
@@ -268,10 +273,10 @@ THROUGHPUTS: dict[tuple[Architecture, ModelSize, bool, bool], Optional[tuple[flo
     (Architecture.VIT, ModelSize.MD, True,  False) : (250, 225),
     (Architecture.VIT, ModelSize.MD, True,  True)  : (275, 225),
 
-    (Architecture.VIT, ModelSize.LG, False, False) : (525, 150),
-    (Architecture.VIT, ModelSize.LG, False, True)  : None,
-    (Architecture.VIT, ModelSize.LG, True,  False) : None,
-    (Architecture.VIT, ModelSize.LG, True,  True)  : None,
+    (Architecture.VIT, ModelSize.LG, False, False) : (325, 150),
+    (Architecture.VIT, ModelSize.LG, False, True)  : (150, 100),
+    (Architecture.VIT, ModelSize.LG, True,  False) : (150, 100),
+    (Architecture.VIT, ModelSize.LG, True,  True)  : (150, 100),
 }
 
 
@@ -476,27 +481,30 @@ def config_fiter(config: Configuration) -> bool:
         return False
     if config.size == ModelSize.SM:
         return False
+    if config.arch != Architecture.VIT:
+        return False
 
     # Structure
     if config.level != HierarchicalLevel.NONE:
         return False
 
     # Semantics
-    if config.do_entropy or config.which_characteristics:
+    CHARS = (
+        lief.PE.Section.CHARACTERISTICS.MEM_READ,
+        lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
+        lief.PE.Section.CHARACTERISTICS.CNT_CODE,
+    )
+    if len(config.which_characteristics) > 0 and any(c not in CHARS for c in config.which_characteristics):
         return False
-    # CHARS = (
-    #     lief.PE.Section.CHARACTERISTICS.MEM_READ,
-    #     lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
-    #     lief.PE.Section.CHARACTERISTICS.CNT_CODE,
-    # )
-    # if len(config.which_characteristics) > 0 and any(c not in CHARS for c in config.which_characteristics):
-    #     return False
-    # if len(config.which_characteristics) not in (0, 1, len(CHARS)):
-    #     return False
-    # if config.do_entropy and len(config.which_characteristics) not in (0, len(CHARS)):
-    #     return False
-    # if not config.do_entropy and len(config.which_characteristics) == len(CHARS):
-    #     return False
+    if len(config.which_characteristics) not in (0, 1, len(CHARS)):
+        return False
+    if config.do_entropy and len(config.which_characteristics) not in (0, len(CHARS)):
+        return False
+    if not config.do_entropy and len(config.which_characteristics) == len(CHARS):
+        return False
+
+    if config.do_entropy and len(config.which_characteristics) == len(CHARS):
+        return False
 
     return True
 
@@ -522,7 +530,7 @@ def main() -> None:
         [l for l in HierarchicalLevel],
         [True, False],
         chain.from_iterable(combinations(CHARACTERISTICS, r) for r in range(len(CHARACTERISTICS) + 1)),
-        [1000000, 2000000],
+        [1000000],
         [0],
     )
     configurations = (Configuration(*config) for config in configurations)
@@ -532,7 +540,7 @@ def main() -> None:
     alloutdirs: set[str] = set()
     allconfigs: set[str] = set()
 
-    for config in tqdm(configurations):
+    for config in tqdm(configurations, disable=True):
         if str(config) in allconfigs:
             raise RuntimeError(f"ERROR ({str(config)}): duplicate configuration detected.")
         allconfigs.add(str(config))
@@ -555,6 +563,7 @@ def main() -> None:
         outfile = (outpath / str(config)).with_suffix(".sh")
         script = builder()
         outfile.write_text(script)
+        print(f"{outfile}")
 
 
 if __name__ == "__main__":
