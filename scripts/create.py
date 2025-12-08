@@ -132,7 +132,7 @@ class Configuration:
 
     @property
     def batch_size(self) -> int:
-        return 256
+        return 1024
 
     @property
     def per_device_batch_size(self) -> int:
@@ -179,8 +179,6 @@ class Configuration:
 
     @property
     def lr_max(self) -> float:
-        if self.arch == Architecture.VIT:
-            return 5e-4
         return 1e-3
 
     @property
@@ -193,7 +191,7 @@ class Configuration:
 
     @property
     def weight_decay(self) -> float:
-        return 0.0001
+        return 0.001
 
     @property
     def warmup_ratio(self) -> float:
