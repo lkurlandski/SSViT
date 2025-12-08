@@ -1849,8 +1849,8 @@ class ViTClassifier(Classifier):
             return z
 
         ts = (x, g) if g is not None else (x,)
-        z = self.patcher(preprocess=preprocess, ts=ts)  # (B, N, E')
-        z = self.norm(z)                                # (B, N, E')
+        z = self.patcher(preprocess=preprocess, ts=ts)  # (B, N, C)
+        z = self.norm(z)                                # (B, N, C)
         z = self.backbone(z)                            # (B, D)
         z = self.head(z)                                # (B, M)
 
@@ -2000,6 +2000,7 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         self.embeddings = nn.ModuleList(embeddings)
         self.filmers = nn.ModuleList(filmers)
         self.patchers = nn.ModuleList(patchers)
+        self.norms = nn.ModuleList([nn.LayerNorm(p.out_channels) for p in patchers])
         self.backbone = backbone
         self.head = head
 
@@ -2019,7 +2020,8 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
                 continue
             z = self.embeddings[i](x[i])  # (B, T, E)
             z = self.filmers[i](z, g[i])  # (B, T, E)
-            z = self.patchers[i](z)       # (B, N, D)
+            z = self.patchers[i](z)       # (B, N, C)
+            z = self.norms[i](z)          # (B, N, C)
             zs.append(z)
 
         z = torch.cat(zs, dim=1)      # (B, sum(N), D)
