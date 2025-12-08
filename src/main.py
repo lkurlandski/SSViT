@@ -487,7 +487,7 @@ def main() -> None:
     model = get_model(args.arch, args.size, num_guides, args.level, structures, args.parch).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
-    min_lengths = [max(m, min_length) for m in getattr(model, "min_lengths", [min_length])]
+    min_lengths = [m for m in getattr(model, "min_lengths", [min_length])]
     print(f"{model=}")
     print(f"{num_parameters=}")
     print(f"{min_length=}")
