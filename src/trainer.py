@@ -588,11 +588,28 @@ class Trainer:
             # Average statistics over total number of samples.
             report = {}
             for k in allresults:
-                report[k] = allresults[k].item() / num_samples
+                # Average these over number of samples.
+                if k in ("tr_loss",):
+                    report[k] = allresults[k].item() / num_samples
+                # Average these over number of processes.
+                elif k in ("grad_norm", "param_delta",):
+                    report[k] = allresults[k].item() / world_size()
+                # Do not average these.
+                elif k in ("num_samples",):
+                    report[k] = allresults[k].item()
+                # Otherwise raise an error.
+                else:
+                    raise KeyError(f"Unknown training metric '{k}' encountered.")
             report["tr_time"] = timer.get_elapsed()
             report["tr_samples"] = num_samples
             report["tr_throughput"] = num_samples / report["tr_time"]
             return report
+
+        # Parmameter delta.
+        flat_params_bef: Tensor
+        flat_params_aft: Tensor
+        with torch.no_grad():
+            flat_params_bef = torch.cat([p.view(-1) for p in self.model.parameters()])
 
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
         timer.start()
@@ -632,6 +649,11 @@ class Trainer:
                 # Take an optimization step
                 grad_norm = self.step()
                 results["grad_norm"] += grad_norm.detach()
+                # Compute parameter delta
+                with torch.no_grad():
+                    flat_params_aft = torch.cat([p.view(-1) for p in self.model.parameters()])
+                results["param_delta"] = (flat_params_aft - flat_params_bef).norm().detach()
+                flat_params_bef = flat_params_aft
                 # Adjust `grda_modl` to force a sync on the last real mini-step
                 if is_last_real and grda_modl != 0:
                     grda_modl = 0
@@ -974,6 +996,7 @@ class Trainer:
         d["lr"] = round(results["lr"], 6)
         if any(k.startswith("tr_") for k in results):
             d["grad_norm"] = round(results["grad_norm"], 3)
+            d["param_delta"] = round(results["param_delta"], 3)
             d["tr_loss"] = round(results["tr_loss"], 3)
             d["tr_gpu_utl"] = round(results["tr_gpu_utl"], 2)
             d["tr_gpu_mem"] = round(results["tr_gpu_mem"] / (1024 ** 3), 2)
@@ -990,7 +1013,8 @@ class Trainer:
             d["vl_samples"] = int(results["vl_samples"])
             d["vl_throughput"] = round(results["vl_throughput"], 2)
         flush()
-        print()
+        if not self.args.disable_tqdm:
+            print()
         print(d)
 
     def to_checkpoint(self, path: str | Path) -> None:
