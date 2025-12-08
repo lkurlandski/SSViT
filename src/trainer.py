@@ -585,15 +585,16 @@ class Trainer:
             allresults = self.reduce_results(results) if is_dist() else results
             allresults = {k: allresults[k].detach().to("cpu") for k in allresults}
             num_samples = int(allresults.pop("num_samples").item())
-            # Average statistics over total number of samples.
+            grad_steps = math.ceil(int(allresults.pop("grad_steps").item()) / world_size())
+            # Average statistics over some period for logging.
             report = {}
             for k in allresults:
                 # Average these over number of samples.
                 if k in ("tr_loss",):
                     report[k] = allresults[k].item() / num_samples
-                # Average these over number of processes.
+                # Average these over number of steps.
                 elif k in ("grad_norm", "param_delta",):
-                    report[k] = allresults[k].item() / world_size()
+                    report[k] = allresults[k].item() / grad_steps
                 # Do not average these.
                 elif k in ("num_samples",):
                     report[k] = allresults[k].item()
@@ -646,13 +647,14 @@ class Trainer:
 
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
+                results["grad_steps"] += 1
                 # Take an optimization step
                 grad_norm = self.step()
                 results["grad_norm"] += grad_norm.detach()
                 # Compute parameter delta
                 with torch.no_grad():
                     flat_params_aft = torch.cat([p.view(-1) for p in self.model.parameters()])
-                results["param_delta"] = (flat_params_aft - flat_params_bef).norm().detach()
+                results["param_delta"] += (flat_params_aft - flat_params_bef).norm().detach()
                 flat_params_bef = flat_params_aft
                 # Adjust `grda_modl` to force a sync on the last real mini-step
                 if is_last_real and grda_modl != 0:
