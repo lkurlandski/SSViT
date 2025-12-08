@@ -997,7 +997,7 @@ class ViT(nn.Module):
         self.posencoder = SinusoidalPositionalEncoding(embedding_dim)
         self.proj = nn.Linear(embedding_dim, d_model)
         layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, activation=ACTVS[activation], batch_first=True, norm_first=True)
-        self.transformer = nn.TransformerEncoder(layer, num_layers, norm=nn.LayerNorm(d_model))
+        self.transformer = nn.TransformerEncoder(layer, num_layers, norm=nn.LayerNorm(d_model), enable_nested_tensor=layer.norm_first is False)
 
         if pooling == "cls":
             self.cls_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
