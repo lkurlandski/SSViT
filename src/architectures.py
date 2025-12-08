@@ -282,8 +282,16 @@ class FiLMNoP(nn.Module):
     No-op FiLM layer that does nothing but check the inputs.
     """
 
-    def __init__(self, *args: Any, **kwds: Any) -> None:
+    def __init__(self, guide_dim: int, embedding_dim: int, hidden_size: int, fp32: bool = False):
         super().__init__()
+
+        self.guide_dim = guide_dim
+        self.embedding_dim = embedding_dim
+        self.hidden_size = hidden_size
+        self.fp32 = fp32
+
+        if self.fp32:
+            raise NotImplementedError()
 
     def forward(self, x: Tensor, g: Literal[None]) -> Tensor:
         check_tensor(x, (None, None, None), FLOATS)
@@ -747,7 +755,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
 
     @property
     def min_length(self) -> int:
-        return self.kernel_size
+        return self.num_patches * self.kernel_size
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
         B, T = z.shape[0], z.shape[1]
@@ -2004,6 +2012,18 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         self.backbone = backbone
         self.head = head
 
+        C_s = [p.out_channels for p in patchers]
+        if not all (c == C_s[0] for c in C_s):
+            raise ValueError("For HierarchicalViT, all patchers must output the same number of channels.")
+        self.C_s: list[int] = C_s
+        self.C = self.C_s[0]
+
+        N_s = [p.num_patches for p in patchers]
+        if any(n is None for n in N_s):
+            raise ValueError("For HierarchicalViT, all patchers must output a fixed number of patches.")
+        self.N_s: list[int] = N_s  # type: ignore[assignment]
+        self.N = sum(self.N_s)
+
     def forward(self, x: list[Optional[Tensor]], g: list[Optional[Tensor]]) -> Tensor:
         """
         Args:
@@ -2014,9 +2034,11 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         """
         self._check_forward_inputs(x, g)
 
-        zs: list[Tensor] = []
+        # Process each structure separately.
+        zs: list[Optional[Tensor]] = []
         for i in range(self.num_structures):
             if x[i] is None:
+                zs.append(None)
                 continue
             z = self.embeddings[i](x[i])  # (B, T, E)
             z = self.filmers[i](z, g[i])  # (B, T, E)
@@ -2024,7 +2046,26 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
             z = self.norms[i](z)          # (B, N, C)
             zs.append(z)
 
-        z = torch.cat(zs, dim=1)      # (B, sum(N), D)
+        # Find a representative encoded patch.
+        for i in range(self.num_structures):
+            if x[i] is not None:
+                B, device, dtype = zs[i].shape[0], zs[i].device, zs[i].dtype  # type: ignore[union-attr]
+                break
+        else:
+            raise RuntimeError("At least one structure must have input.")
+
+        # Fill in missing structures with zeros.
+        for i in range(self.num_structures):
+            if zs[i] is None:
+                zs[i] = torch.zeros((B, self.N_s[i], self.C), device=device, dtype=dtype)
+        assert all(z is not None for z in zs)
+        zs: list[Tensor] = zs  # type: ignore[assignment]
+
+        # Concatenate all encoded patches along patch dimension.
+        z = torch.cat(zs, dim=1)      # (B, Σ(N), C)
+        check_tensor(z, (B, self.N, self.C), FLOATS)
+
+        # Feed concatenated patches to shared ViT backbone and classification head.
         z = self.backbone(z)          # (B, D)
         z = self.head(z)              # (B, M)
 
