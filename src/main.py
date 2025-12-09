@@ -155,7 +155,9 @@ def get_model(
         The model.
     """
     arch = Architecture(arch)
+    size = ModelSize(size)
     level = HierarchicalLevel(level)
+    parch = PatcherArchitecture(parch)
 
     num_structures = len(structures)
 
