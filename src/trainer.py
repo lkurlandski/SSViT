@@ -593,7 +593,7 @@ class Trainer:
                 if k in ("tr_loss",):
                     report[k] = allresults[k].item() / num_samples
                 # Average these over number of steps.
-                elif k in ("grad_norm", "param_delta",):
+                elif k in ("grad_norm", "param_norm", "param_delta",):
                     report[k] = allresults[k].item() / grad_steps
                 # Do not average these.
                 elif k in ("num_samples",):
@@ -654,6 +654,7 @@ class Trainer:
                 # Compute parameter delta
                 with torch.no_grad():
                     flat_params_aft = torch.cat([p.view(-1) for p in self.model.parameters()])
+                results["param_norm"] += flat_params_aft.norm().detach()
                 results["param_delta"] += (flat_params_aft - flat_params_bef).norm().detach()
                 flat_params_bef = flat_params_aft
                 # Adjust `grda_modl` to force a sync on the last real mini-step
@@ -998,6 +999,7 @@ class Trainer:
         d["lr"] = round(results["lr"], 6)
         if any(k.startswith("tr_") for k in results):
             d["grad_norm"] = round(results["grad_norm"], 3)
+            d["param_norm"] = round(results["param_norm"], 3)
             d["param_delta"] = round(results["param_delta"], 3)
             d["tr_loss"] = round(results["tr_loss"], 3)
             d["tr_gpu_utl"] = round(results["tr_gpu_utl"], 2)
