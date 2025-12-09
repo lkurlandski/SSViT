@@ -86,6 +86,28 @@ def get_model_input_lengths(model: nn.Module) -> tuple[int, int]:
     return lo, hi
 
 
+def functional_forward(z: Tensor, *, module: nn.Module, fp32: bool = False) -> Tensor:
+
+    def check(components: list[Optional[Tensor]]) -> None:
+        components = [w_b for w_b in components if w_b is not None]
+        if any(w_b.dtype != torch.float32 for w_b in components):
+            warnings.warn("Some weights and/or biases are not in float32, which is unexpected, when `fp32=True`.")
+
+    if isinstance(module, nn.Conv1d):
+        w = module.weight.detach()
+        b = module.bias.detach() if module.bias is not None else None
+
+        if fp32:
+            z = z.to(torch.float32)
+            check([w, b])
+
+        z = F.conv1d(z, w, b, **_get_conv_kwds(module))
+
+        return z
+
+    raise NotImplementedError(f"functional_forward does not support {type(module)} yet.")
+
+
 class LowMemoryNetworkMixin(nn.Module, ABC):
     """
     Mixin for neural networks supporting low-memory paths.
@@ -375,6 +397,24 @@ class SinusoidalPositionalEncoding(nn.Module):
 # -------------------------------------------------------------------------------- #
 
 class PatchEncoderBase(nn.Module, ABC):
+    """
+    Breaks a sequence into patches and encodes them.
+
+    Args:
+        in_channels: Input dimension.
+        out_channels: Output dimension.
+        num_patches: Number of patches. If specified, patch_size must be None.
+        patch_size: Size of each patch. If specified, num_patches must be None.
+
+    Returns:
+        Output tensor of shape (B, N, C).
+
+    Notes:
+        Exactly one of `num_patches` or `patch_size` must be specified. If `patch_size` is
+        specified, the number of patches will vary dynamically based on the input sequence length.
+        If `num_patches` is specified, the patch size will vary dynamically based on the input
+        sequence length. In either case, a minimum input sequence length is required, `min_length`.
+    """
 
     def __init__(self, in_channels: int, out_channels: int, num_patches: Optional[int], patch_size: Optional[int]) -> None:
         super().__init__()
@@ -383,17 +423,108 @@ class PatchEncoderBase(nn.Module, ABC):
         self._num_patches = num_patches
         self._patch_size = patch_size
 
+        if (num_patches is None) == (patch_size is None):
+            raise ValueError(f"{self.__class__.__name__} requires `num_patches` is None xor `patch_size` is None.")
+
     @property
     def num_patches(self) -> Optional[int]:
+        """Accessor for _num_patches (supports type override)."""
         return self._num_patches
 
     @property
     def patch_size(self) -> Optional[int]:
+        """Accessor for _patch_size (supports type override)."""
         return self._patch_size
 
     @property
     def min_length(self) -> int:
-        return 0
+        """Minimum input sequence length required."""
+        return 1
+
+    def resolve_patch_dims(self, seq_length: int) -> tuple[int, int]:
+        """
+        Determine (patch_size, num_patches) for a given sequence length.
+        """
+        return self.compute_patch_dims(seq_length, self.patch_size, self.num_patches)
+
+    @staticmethod
+    def compute_patch_dims(seq_length: int, patch_size: Optional[int], num_patches: Optional[int]) -> tuple[int, int]:
+        """
+        Determine (patch_size, num_patches) for a given sequence length.
+        """
+        if seq_length <= 0:
+            raise ValueError(f"{seq_length=} must be positive.")
+        if bool(patch_size is None) == bool(num_patches is None):
+            raise ValueError(f"Exactly one of {patch_size=} or {num_patches=} must be specified.")
+
+        T = seq_length
+
+        # Fixed patch_size, dynamic num_patches.
+        if patch_size is not None:
+            if patch_size <= 0:
+                raise ValueError(f"{patch_size=} must be positive.")
+            P = patch_size
+            N = math.ceil(T / P)
+            return P, N
+
+        # Fixed num_patches, dynamic patch_size.
+        if num_patches is not None:
+            if num_patches <= 0:
+                raise ValueError(f"{num_patches=} must be positive.")
+            N = num_patches
+            P = math.ceil(T / N)
+            return P, N
+
+        raise RuntimeError("Unreachable.")
+
+    @staticmethod
+    def pad_to_multiple(z: Tensor, multiple: int) -> Tensor:
+        """
+        Right-pad z along the temporal dimension to a multiple of `multiple`.
+
+        Args:
+            z: (B, T, E)
+            multiple: positive integer
+
+        Returns:
+            Output tensor of shape (B, T', E) with T' % multiple == 0 and T' >= T.
+        """
+        if multiple <= 0:
+            raise ValueError(f"`multiple` must be positive. Got {multiple}.")
+
+        B, T, E = z.shape
+        remainder = T % multiple
+        if remainder == 0:
+            return z
+
+        pad_len = multiple - remainder
+        pad = z.new_zeros(B, pad_len, E)
+        return torch.cat([z, pad], dim=1)
+
+    @staticmethod
+    def pad_to_length(z: Tensor, length: int) -> Tensor:
+        """
+        Right-pad z along the temporal dimension to a length of `length`.
+
+        Args:
+            z: (B, T, E)
+            length: positive integer (T')
+
+        Returns:
+            Output tensor of shape (B, T', E) with T' >= T.
+        """
+        if length <= 0:
+            raise ValueError(f"`length` must be positive. Got {length}.")
+
+        B, T, E = z.shape
+        if T > length:
+            raise ValueError(f"`length` must be at least the input sequence length. Got {length} < {T}.")
+        if T == length:
+            return z
+
+        pad_len = length - T
+        pad = z.new_zeros(B, pad_len, E)
+        return torch.cat([z, pad], dim=1)
 
     def forward(self, z: Optional[Tensor] = None, preprocess: Optional[PreprocessFn] = None, ts: Optional[Sequence[Tensor]] = None) -> Tensor:
         """
@@ -434,8 +565,9 @@ class PatchEncoderBase(nn.Module, ABC):
     def forward_embeddings(self, z: Tensor) -> Tensor:
         ...
 
+    @abstractmethod
     def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
-        return self.forward_embeddings(preprocess(*ts))
+        ...
 
 
 class PatchEncoder(PatchEncoderBase):
@@ -470,25 +602,18 @@ class PatchEncoder(PatchEncoderBase):
     @property
     def min_length(self) -> int:
         if self.patch_size is not None:
-            return max(self.kernel_size, self.patch_size)
+            return 1
         if self.num_patches is not None:
             return self.num_patches * self.kernel_size
         raise RuntimeError("This should never happen.")
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
-        check_tensor(z, (None, None, None), FLOATS)
-        if z.shape[1] < self.min_length:
-            raise RuntimeError(f"Input sequence length {z.shape[1]} is less than the minimum required length {self.min_length}.")
-
-        B = z.shape[0]
-        T = z.shape[1]
-        E = z.shape[2]
-        P = self.patch_dims(T, self.patch_size, self.num_patches)[0]
-        N = self.patch_dims(T, self.patch_size, self.num_patches)[1]
+        B, T, E = z.shape
+        P, N = self.resolve_patch_dims(T)
         C = self.out_channels
-        S = math.floor((T - self.kernel_size) / self.stride + 1)  # noqa
 
-        z = self.split_patches(z, P, N)  # (B,  N, P, E)
+        z = PatchEncoderBase.pad_to_length(z, N * P)  # (B, NP, E)
+        z = z.view(B, N, P, E)        # (B,  N, P, E)
         z = z.reshape(B * N, P, E)    # (BN, P, E)
         z = z.permute(0, 2, 1)        # (BN, E, P)
         z = self.conv(z)              # (BN, C, S)
@@ -498,46 +623,8 @@ class PatchEncoder(PatchEncoderBase):
 
         return z
 
-    @staticmethod
-    def split_patches(z: Tensor, patch_size: int, num_patches: int) -> Tensor:
-        """
-        Args:
-            z: Input tensor of shape (B, T, E).
-        Returns:
-            Output tensor of shape (B, N, P, E).
-        """
-        B, T, E = z.shape
-        P, N = patch_size, num_patches
-
-        if T < (total := N * P):
-            z = torch.cat([z, z.new_zeros(B, total - T, E)], dim=1)
-
-        z = z.view(B, N, P, E)
-        return z
-
-    @staticmethod
-    def patch_dims(seq_length: int, patch_size: Optional[int], num_patches: Optional[int]) -> tuple[int, int]:
-        """
-        Determine the patch_size and num_patches given one of them for patchifying a sequence of length seq_length.
-        """
-        if seq_length <= 0:
-            raise ValueError(f"Sequence length must be positive. Got {seq_length}.")
-        if bool(patch_size is None) == bool(num_patches is None):
-            raise ValueError(f"Exactly one of patch_size or num_patches must be specified. Got {patch_size=} and {num_patches=}.")
-        if patch_size is not None and (not 0 < patch_size <= seq_length):
-            raise ValueError(f"Patch size must be positive and less than or equal to the sequence length. Got {patch_size=} and {seq_length=}.")
-        if num_patches is not None and (not 0 < num_patches <= seq_length):
-            raise ValueError(f"Number of patches must be positive and less than or equal to the sequence length. Got {num_patches=} and {seq_length=}.")
-
-        if patch_size is not None:
-            num_patches = (seq_length + patch_size - 1) // patch_size
-            return patch_size, num_patches
-        if num_patches is not None:
-            patch_size = (seq_length + num_patches - 1) // num_patches
-            num_patches = (seq_length + patch_size - 1) // patch_size
-            return patch_size, num_patches
-
-        raise RuntimeError("This should never happen.")
+    def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
+        return self.forward_embeddings(preprocess(*ts))
 
 
 class ConvPatchEncoder(PatchEncoderBase):
@@ -555,7 +642,7 @@ class ConvPatchEncoder(PatchEncoderBase):
         super().__init__(in_channels, out_channels, num_patches, patch_size)
 
         if num_patches is not None or patch_size is None:
-            raise ValueError("PatchEncoderLowMem requires `num_patches` > 0 and `patch_size` = None.")
+            raise ValueError(f"{self.__class__.__name__} requires `num_patches` is None and `patch_size` is not None.")
 
         self.kernel_size = patch_size
         self.stride = patch_size
@@ -579,50 +666,21 @@ class ConvPatchEncoder(PatchEncoderBase):
 
     @property
     def min_length(self) -> int:
-        return self.kernel_size
+        return 1
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
         B, T, E = z.shape
-        P = self.patch_size
-        p = z.new_zeros(B, P - (T % P), E) if T % P != 0 else z.new_zeros(B, 0, E)
-        z = torch.cat([z, p], dim=1)
+        P, N = self.resolve_patch_dims(T)
+
+        z = PatchEncoderBase.pad_to_multiple(z, P)  # (B, T', E)
         z = z.permute(0, 2, 1)      # (B, E, T')
         z = self.proj(z)            # (B, C, N)
         z = z.permute(0, 2, 1)      # (B, N, C)
-        return z
-
-
-def compute_factors(n: int) -> list[tuple[int, int]]:
-    """
-    Finds all factors of a given positive integer.
-    """
-    factors = []
-    for i in range(1, n + 1):
-        if n % i == 0:
-            factors.append((i, int(n / i)))
-    return factors
-
-
-def functional_forward(z: Tensor, *, module: nn.Module, fp32: bool = False) -> Tensor:
-
-    def check(components: list[Optional[Tensor]]) -> None:
-        components = [w_b for w_b in components if w_b is not None]
-        if any(w_b.dtype != torch.float32 for w_b in components):
-            warnings.warn("Some weights and/or biases are not in float32, which is unexpected, when `fp32=True`.")
-
-    if isinstance(module, nn.Conv1d):
-        w = module.weight.detach()
-        b = module.bias.detach() if module.bias is not None else None
-
-        if fp32:
-            z = z.to(torch.float32)
-            check([w, b])
-
-        z = F.conv1d(z, w, b, **_get_conv_kwds(module))
 
         return z
 
-    raise NotImplementedError(f"functional_forward does not support {type(module)} yet.")
+    def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
+        return self.forward_embeddings(preprocess(*ts))
 
 
 class HierarchicalConvPatchEncoder(PatchEncoderBase):
@@ -645,16 +703,16 @@ class HierarchicalConvPatchEncoder(PatchEncoderBase):
         super().__init__(in_channels, out_channels, num_patches, patch_size)
 
         if num_patches is not None or patch_size is None:
-            raise ValueError("PatchEncoderLowMem requires `num_patches` > 0 and `patch_size` = None.")
+            raise ValueError(f"{self.__class__.__name__} requires `num_patches` is None and `patch_size` is not None.")
 
         if s1 is None and s2 is None:
-            factors = compute_factors(patch_size)
+            factors = HierarchicalConvPatchEncoder.compute_factors(patch_size)
             s1, s2 = min(factors, key=lambda x: abs(x[0] - x[1]))
             if patch_size != s1 * s2:
                 raise RuntimeError(f"`s1` and `s2` must be a factorization of `patch_size`. Got {patch_size=} {s1=} {s2=} {s1*s2=}.")
         elif s1 is None and s2 is not None:
             if patch_size % s2 != 0:
-                raise ValueError(f"`patch_size` must be divisible by `s1`. Got {patch_size=} {s1=} {s2=}.")
+                raise ValueError(f"`patch_size` must be divisible by `s2`. Got {patch_size=} {s1=} {s2=}.")
             s1 = patch_size // s2
         elif s1 is not None and s2 is None:
             if patch_size % s1 != 0:
@@ -685,16 +743,24 @@ class HierarchicalConvPatchEncoder(PatchEncoderBase):
 
     @property
     def min_length(self) -> int:
-        return self.patch_size
+        return 1
+
+    @staticmethod
+    def compute_factors(n: int) -> list[tuple[int, int]]:
+        """
+        Finds all factors of a given positive integer.
+        """
+        factors = []
+        for i in range(1, n + 1):
+            if n % i == 0:
+                factors.append((i, int(n / i)))
+        return factors
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
         B, T, E = z.shape
-        P = self.patch_size
+        P, N = self.resolve_patch_dims(T)
 
-        # Pad T up to a multiple of P
-        p = z.new_zeros(B, P - (T % P), E) if T % P != 0 else z.new_zeros(B, 0, E)
-        z = torch.cat([z, p], dim=1)  # (B, T', E)
-
+        z = PatchEncoderBase.pad_to_multiple(z, P)  # (B, T', E)
         z = z.permute(0, 2, 1)  # (B, E, T')
         z = self.conv_1(z)      # (B, H, T'')
         z = self.actvfn(z)      # (B, H, T'')
@@ -702,6 +768,9 @@ class HierarchicalConvPatchEncoder(PatchEncoderBase):
         z = z.permute(0, 2, 1)  # (B, N, C)
 
         return z
+
+    def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
+        return self.forward_embeddings(preprocess(*ts))
 
 
 class PatchEncoderLowMem(PatchEncoderBase):
@@ -725,7 +794,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
         super().__init__(in_channels, out_channels, num_patches, patch_size)
 
         if num_patches is None or patch_size is not None:
-            raise ValueError("PatchEncoderLowMem requires `num_patches` > 0 and `patch_size` = None.")
+            raise ValueError(f"{self.__class__.__name__} requires `num_patches` is not None and `patch_size` is None.")
 
         self.kernel_size = kernel_size
         self.stride = stride
@@ -758,15 +827,15 @@ class PatchEncoderLowMem(PatchEncoderBase):
         return self.num_patches * self.kernel_size
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
-        B, T = z.shape[0], z.shape[1]
-        E, C = self.in_channels, self.out_channels
-        P = (T + self.num_patches - 1) // self.num_patches
-        N = (T + P - 1) // P
+        B, T, E = z.shape
+        P, N = self.resolve_patch_dims(T)
+        C = self.out_channels
 
-        p = z.new_zeros(B, max(N * P - T, 0), E)  # (B, N*P - T, E)
-        z = torch.cat([z, p], dim=1)              # (B, N*P, E)
-        z = z.view(B, N, P, E)                    # (B, N, P, E)
-        z = z.view(B * N, P, E).permute(0, 2, 1)  # (BN, E, P)
+        z = PatchEncoderBase.pad_to_length(z, N * P)  # (B, NP, E)
+        z = z.view(B, N, P, E)        # (B,  N, P, E)
+        z = z.reshape(B * N, P, E)    # (BN, P, E)
+        z = z.permute(0, 2, 1)        # (BN, E, P)
+
         g: Tensor = self.conv(z)                  # (BN, C, S)
         g, _ = g.max(dim=-1)                      # (BN, C)
         g = g.view(B, N, C)                       # (B, N, C)
@@ -776,8 +845,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
     def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
         B, T = ts[0].shape[0], ts[0].shape[1]
         E, C = self.in_channels, self.out_channels
-        P = (T + self.num_patches - 1) // self.num_patches
-        N = (T + P - 1) // P
+        P, N = self.resolve_patch_dims(T)
 
         max_vals, pos = _lowmem_patchwise_max_over_time_streaming(
             preprocess=preprocess,
