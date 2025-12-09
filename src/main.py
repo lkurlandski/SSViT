@@ -626,7 +626,7 @@ def main() -> None:
             total_steps=total_steps,
             pct_start=args.warmup_ratio,
             div_factor=args.lr_max / args.lr_beg,
-            final_div_factor=args.lr_max / args.lr_end,
+            final_div_factor=args.lr_beg / args.lr_end,
         )
         print("scheduler=OneCycleLR(")
     elif args.sched == Scheduler.CUST:
