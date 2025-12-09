@@ -2102,16 +2102,21 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         """
         self._check_forward_inputs(x, g)
 
+        def preprocess(i: int, x: Tensor, g: Optional[Tensor] = None) -> Tensor:
+            z = self.embeddings[i](x)  # (B, T, E)
+            z = self.filmers[i](z, g) if torch.is_grad_enabled() else self.filmers[i].forward_functional(z, g)  # type: ignore[arg-type]
+            return z
+
         # Process each structure separately.
         zs: list[Optional[Tensor]] = []
         for i in range(self.num_structures):
             if x[i] is None:
                 zs.append(None)
                 continue
-            z = self.embeddings[i](x[i])  # (B, T, E)
-            z = self.filmers[i](z, g[i])  # (B, T, E)
-            z = self.patchers[i](z)       # (B, N, C)
-            z = self.norms[i](z)          # (B, N, C)
+            ts = (x[i], g[i]) if g[i] is not None else (x[i],)
+            preprocess_ = partial(preprocess, i)
+            z = self.patchers[i](preprocess=preprocess_, ts=ts)  # (B, N, C)
+            z = self.norms[i](z)                                 # (B, N, C)
             zs.append(z)
 
         # Find a representative encoded patch.
