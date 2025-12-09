@@ -918,6 +918,7 @@ def _lowmem_patchwise_max_over_time_streaming(
 
     device: Optional[torch.device] = None
     dtype: Optional[torch.dtype] = None
+    sentinel: Optional[float] = None
 
     max_vals: torch.Tensor
     max_pos: torch.Tensor
@@ -934,20 +935,13 @@ def _lowmem_patchwise_max_over_time_streaming(
             slices = [t[:, start:end_ext] for t in ts]
             z_chunk = preprocess(*slices)                   # (B, L, E)
 
-            if dtype is None or device is None:
+            # On the first iteration of the loop, set up storages.
+            if dtype is None or device is None or sentinel is None:
                 dtype = z_chunk.dtype
                 device = z_chunk.device
-                max_vals = torch.full(
-                    (B, num_patches, channels),
-                    torch.finfo(dtype).min,
-                    device=device,
-                    dtype=dtype,
-                )
-                max_pos = torch.zeros(
-                    (B, num_patches, channels),
-                    device=device,
-                    dtype=torch.long,
-                )
+                sentinel = torch.finfo(dtype).min
+                max_vals = torch.full((B, num_patches, channels), sentinel, device=device, dtype=dtype)
+                max_pos = torch.zeros((B, num_patches, channels), device=device, dtype=torch.long)
 
             z_chunk = z_chunk.transpose(1, 2).contiguous()  # (B, E, L)
 
@@ -957,9 +951,10 @@ def _lowmem_patchwise_max_over_time_streaming(
                 assert B_ == B and C_ == channels
 
                 idx = torch.arange(L_out, device=device)        # (L_out,)
-                pos = start + idx * first_stride                # (L_out,) input start indices
+                pos = start + idx * first_stride                # (L_out,)
+                pos_end = pos + (rf - 1)                        # (L_out,)
                 # Map each conv output position to a patch index
-                patch_idx = torch.div(pos, patch_size, rounding_mode="floor")
+                patch_idx = torch.div(pos_end, patch_size, rounding_mode="floor")
                 patch_idx.clamp_(0, num_patches - 1)
 
                 # For each patch, update maxima
@@ -986,8 +981,17 @@ def _lowmem_patchwise_max_over_time_streaming(
                 break
             start += step
 
-    # Clamp positions to valid window starts
+    # If the sequence is shorter than N * P, we may wind up with empty patches.
+    # These will have max_vals == sentinel; set them to zero to avoid blowing up downstream.
+    assert sentinel is not None
+    mask = (max_vals == sentinel)
+    if mask.any():
+        max_vals = max_vals.masked_fill(mask, 0.0)
+        max_pos = max_pos.masked_fill(mask, 0)
+
+    # Also, clamp the positions to valid window starts.
     max_pos.clamp_(0, max(0, T - rf))
+
     return max_vals, max_pos
 
 
@@ -2104,7 +2108,7 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
 
         def preprocess(i: int, x: Tensor, g: Optional[Tensor] = None) -> Tensor:
             z = self.embeddings[i](x)  # (B, T, E)
-            z = self.filmers[i](z, g) if torch.is_grad_enabled() else self.filmers[i].forward_functional(z, g)  # type: ignore[arg-type]
+            z = self.filmers[i](z, g) if torch.is_grad_enabled() else self.filmers[i].forward_functional(z, g)  # type: ignore[operator]
             return z
 
         # Process each structure separately.
