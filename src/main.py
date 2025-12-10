@@ -14,6 +14,7 @@ import time
 from typing import cast
 from typing import Any
 from typing import Callable
+from typing import Literal
 from typing import Optional
 from typing import Protocol
 from typing import TypeVar
@@ -241,6 +242,7 @@ def get_model(
         vit_nhead    = 8
         vit_feedfrwd = 1024
         vit_layers   = 8
+    posencoder: Literal["fixed", "learned", "none"] = "fixed"
 
     # Head
     num_classes    = 2
@@ -264,7 +266,8 @@ def get_model(
             return MalConvClassifier(embedding, filmer, malconv, head)
         if arch in (Architecture.VIT,):
             patcher = PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
-            transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers)
+            max_len = patcher.num_patches
+            transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencoder, max_len)
             return ViTClassifier(embedding, filmer, patcher, transformer, head)
         raise NotImplementedError(f"{arch}")
 
@@ -298,7 +301,8 @@ def get_model(
         return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
     if arch in (Architecture.VIT,):
         patchers = [tiny_patcher() if s in tiny else full_patcher() for s in structures]
-        transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, num_layers=vit_layers)
+        max_len = sum(p.num_patches for p in patchers)  # type: ignore[misc]
+        transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencoder, max_len)
         return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
 
     raise NotImplementedError(f"{arch}")
