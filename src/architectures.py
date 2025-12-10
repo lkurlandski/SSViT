@@ -1066,13 +1066,13 @@ class ViT(nn.Module):
 
         dim_feedforward = 4 * d_model if dim_feedforward == -1 else dim_feedforward
 
-        self.posencoder = SinusoidalPositionalEncoding(embedding_dim)
         self.proj = nn.Linear(embedding_dim, d_model)
+        self.posencoder = SinusoidalPositionalEncoding(d_model)
         layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, activation=ACTVS[activation], batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(layer, num_layers, norm=nn.LayerNorm(d_model), enable_nested_tensor=layer.norm_first is False)
 
         if pooling == "cls":
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         elif pooling == "mean":
             self.cls_token = None
         else:
@@ -1095,16 +1095,18 @@ class ViT(nn.Module):
         """
         check_tensor(x, (None, None, self.embedding_dim), FLOATS)
 
-        if self.pooling == "cls":  # T <-- T + 1
-            assert self.cls_token is not None
-            t = self.cls_token.expand(x.shape[0], -1, -1)  # (B, 1, E)
-            x = torch.cat((t.to(x.dtype), x), dim=1)  # (B, T, E)
-        z = self.posencoder(x)            # (B, T, E)
-        z = self.proj(z)                  # (B, T, D)
-        z = self.transformer(z)           # (B, T, D)
+        z: Tensor
+
+        z = self.proj(x)                                   # (B, T, D)
         if self.pooling == "cls":
-            z = z[:, 0, :].unsqueeze(1)   # (B, 1, D)
-        z = z.mean(dim=1).to(x.dtype)     # (B, D)
+            assert self.cls_token is not None
+            t = self.cls_token.expand(z.shape[0], -1, -1)  # (B, 1, D)
+            z = torch.cat((t.to(z.dtype), z), dim=1)       # (B, T, D)
+        z = self.posencoder(z)                             # (B, T, D)
+        z = self.transformer(z)                            # (B, T, D)
+        if self.pooling == "cls":
+            z = z[:, 0, :].unsqueeze(1)                    # (B, 1, D)
+        z = z.mean(dim=1).to(x.dtype)                      # (B, D)
 
         check_tensor(z, (x.shape[0], self.d_model), FLOATS)
         return z
