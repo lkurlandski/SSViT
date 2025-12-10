@@ -392,6 +392,54 @@ class SinusoidalPositionalEncoding(nn.Module):
 
         return z
 
+
+class LearnedPositionalEncoding(nn.Module):
+    """
+    Learned Positional Encoding.
+
+    See: Devlin "BERT: Pre-training of deep bidirectional transformers for language understanding" NAACL 2019.
+    """
+
+    def __init__(self, embedding_dim: int, max_len: int, fp32: bool = False) -> None:
+        super().__init__()
+
+        if embedding_dim <= 0:
+            raise ValueError(f"The embedding dimension must be positive. Got {embedding_dim} instead.")
+        if max_len <= 0:
+            raise ValueError(f"`max_len` must be positive. Got {max_len} instead.")
+
+        self.embedding = nn.Embedding(max_len, embedding_dim)
+
+        self.embedding_dim = embedding_dim
+        self.max_len = max_len
+        self.fp32 = fp32
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input tensor of shape (B, T, E).
+
+        Returns:
+            z: Positional encoded tensor of shape (B, T, E).
+        """
+        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
+
+        B, T, E = x.shape
+        if T > self.max_len:
+            raise ValueError(f"Sequence length {T} exceeds maximum supported length {self.max_len}.")
+
+        idx = torch.arange(T, device=x.device, dtype=torch.int32)  # (T,)
+
+        p: Tensor = self.embedding(idx)                            # (T, E)
+        p = p.to(torch.float32 if self.fp32 else x.dtype)          # (T, E)
+        p = p.unsqueeze(0).expand(B, T, E)                         # (B, T, E)
+
+        z = x + p                                                  # (B, T, E)
+
+        check_tensor(z, (B, T, self.embedding_dim), FLOATS)
+        return z
+
+
 # -------------------------------------------------------------------------------- #
 # Patch Encoders
 # -------------------------------------------------------------------------------- #
@@ -1059,6 +1107,8 @@ class ViT(nn.Module):
         nhead: int = 1,
         dim_feedforward: int = -1,
         num_layers: int = 1,
+        posencoder: Literal["fixed", "learned", "none"] = "learned",
+        max_len: Optional[int] = None,
         activation: str = "gelu",
         pooling: Literal["mean", "cls"] = "cls",
     ) -> None:
@@ -1067,7 +1117,17 @@ class ViT(nn.Module):
         dim_feedforward = 4 * d_model if dim_feedforward == -1 else dim_feedforward
 
         self.proj = nn.Linear(embedding_dim, d_model)
-        self.posencoder = SinusoidalPositionalEncoding(d_model)
+        self.posencoder: nn.Identity | SinusoidalPositionalEncoding | LearnedPositionalEncoding
+        if posencoder == "fixed":
+            self.posencoder = SinusoidalPositionalEncoding(d_model)
+        elif posencoder == "learned":
+            if max_len is None:
+                raise ValueError("`max_len` must be specified when using learned positional encoding.")
+            self.posencoder = LearnedPositionalEncoding(d_model, max_len + (1 if pooling == "cls" else 0))
+        elif posencoder == "none":
+            self.posencoder = nn.Identity()
+        else:
+            raise ValueError(f"Unknown positional encoding type: {posencoder}. Supported types are 'fixed', 'learned', and 'none'.")
         layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, activation=ACTVS[activation], batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(layer, num_layers, norm=nn.LayerNorm(d_model), enable_nested_tensor=layer.norm_first is False)
 
@@ -1084,6 +1144,7 @@ class ViT(nn.Module):
         self.activation = activation
         self.nhead = nhead
         self.num_layers = num_layers
+        self.max_len = max_len
         self.pooling = pooling
 
     def forward(self, x: Tensor) -> Tensor:
