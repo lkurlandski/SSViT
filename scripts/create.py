@@ -295,9 +295,9 @@ class Requirements:
         """Return the number of seconds required for the job (configure)."""
         key = (self.config.arch, self.config.size, self.config.do_entropy, bool(self.config.which_characteristics))
 
-        if (tr_vl_throughputs := THROUGHPUTS.get(key)) is not None:
-            tr_throughput = tr_vl_throughputs[0]
-            vl_throughput = tr_vl_throughputs[1]
+        if (vl_tr_throughputs := THROUGHPUTS.get(key)) is not None:
+            tr_throughput = vl_tr_throughputs[1]
+            vl_throughput = vl_tr_throughputs[0]
         else:
             print(f"WARNING ({str(self.config)}): throughput benchmark not found.")
             tr_throughput = 100
@@ -310,7 +310,7 @@ class Requirements:
         vl_samples = 539882  * self.config.max_epochs / self.config.eval_epochs
 
         tr_seconds = tr_samples / tr_throughput
-        vl_seconds = vl_samples / tr_throughput
+        vl_seconds = vl_samples / vl_throughput
 
         seconds = tr_seconds + vl_seconds
         seconds += 0.10 * seconds + 0.25 * 3600
