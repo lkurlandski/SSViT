@@ -179,7 +179,7 @@ class Configuration:
 
     @property
     def lr_max(self) -> float:
-        return 1e-3
+        return 3.16e-4
 
     @property
     def lr_beg(self) -> float:
