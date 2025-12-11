@@ -105,7 +105,17 @@ class Configuration:
             self.seed,
         )
 
-    def get_outdir(self, world_size: int = 1) -> Path:
+    def get_gradient_accumulation_steps(self, world_size: int = 1) -> int:
+        batch_size, remainder = divmod(self.batch_size, world_size)
+        if remainder != 0:
+            print(f"WARNING ({str(self)}): {self.batch_size=} not divisible by {world_size=}.")
+        steps, remainder = divmod(batch_size, self.per_device_batch_size)
+        if remainder != 0:
+            print(f"WARNING ({str(self)}): {batch_size=} not divisible by {self.per_device_batch_size=}.")
+        return max(1, steps)
+
+    @property
+    def outdir(self) -> Path:
         root = Path("./output")
         if DEBUG:
             root = root / "tmp"
@@ -116,7 +126,7 @@ class Configuration:
             f"entropy--{self.do_entropy}",
             f"characteristics--{'_'.join(sorted([str(c.name) for c in self.which_characteristics]))}",
             f"max_length--{self.max_length}",
-            f"batch_size--{self.batch_size * world_size}",
+            f"batch_size--{self.batch_size}",
             f"lr_max--{self.lr_max}",
             f"weight_decay--{self.weight_decay}",
             f"warmup_ratio--{self.warmup_ratio}",
@@ -125,10 +135,6 @@ class Configuration:
             f"seed--{self.seed}",
         ]
         return root.joinpath(*parts)
-
-    @property
-    def gradient_accumulation_steps(self) -> int:
-        return max(self.batch_size // self.per_device_batch_size, 1)
 
     @property
     def batch_size(self) -> int:
@@ -338,6 +344,11 @@ class Requirements:
         return 1
 
     @property
+    def world_size(self) -> int:
+        """Return the total number of GPUs required for the job (constant)."""
+        return self.gpus_per_node * self.nodes
+
+    @property
     def cpus_per_task(self) -> int:
         """Return the number of CPUs per task/node required for the job (constant)."""
         return self.gpus_per_node * (self.config.num_workers * self.config.num_threads_per_worker + 1)
@@ -393,7 +404,7 @@ class ScriptBuilder:
         command = " \\\n".join([
             "python",
             "src/main.py",
-            f"--outdir {self.config.get_outdir(self.reqs.gpus_per_node * self.reqs.nodes)}",
+            f"--outdir {self.config.outdir}",
             f"--arch {self.config.arch.value}",
             f"--size {self.config.size.value}",
             f"--level {self.config.level.value}",
@@ -403,7 +414,7 @@ class ScriptBuilder:
             f"--seed {self.config.seed}",
             f"--num_workers {self.config.num_workers}",
             f"--pin_memory {True if self.config.num_workers > 0 else False}",
-            f"--gradient_accumulation_steps {self.config.gradient_accumulation_steps}",
+            f"--gradient_accumulation_steps {self.config.get_gradient_accumulation_steps(self.reqs.world_size)}",
             f"--tr_batch_size {self.config.per_device_batch_size}",
             f"--vl_batch_size {self.config.per_device_batch_size}",
             f"--ts_batch_size {self.config.per_device_batch_size}",
@@ -545,17 +556,11 @@ def main() -> None:
 
         reqs = Requirements(config)
 
-        if reqs.gpus_per_node * reqs.nodes > 1 and config.gradient_accumulation_steps > 1:
-            warnings.warn(f"WARNING ({str(config)}): requested gradient accumulation ({config.gradient_accumulation_steps}) "
-                f"with multi-GPU training ({reqs.gpus_per_node * reqs.nodes}). Logical batch size will be "
-                f"{config.batch_size * reqs.gpus_per_node * reqs.nodes} samples.")
-
-        outdir = config.get_outdir(reqs.gpus_per_node * reqs.nodes)
-        if str(outdir) in alloutdirs:
-            raise RuntimeError(f"ERROR ({str(outdir)}): duplicate output directory detected.")
-        alloutdirs.add(str(outdir))
-        if outdir.exists() and any(outdir.iterdir()):
-            print(f"WARNING ({str(config)}): output directory exists at {str(outdir)}.")
+        if str(config.outdir) in alloutdirs:
+            raise RuntimeError(f"ERROR ({str(config.outdir)}): duplicate output directory detected.")
+        alloutdirs.add(str(config.outdir))
+        if config.outdir.exists() and any(config.outdir.iterdir()):
+            print(f"WARNING ({str(config)}): output directory exists at {str(config.outdir)}.")
 
         builder = ScriptBuilder(config, reqs)
         outfile = (outpath / str(config)).with_suffix(".sh")
