@@ -434,7 +434,7 @@ class ScriptBuilder:
                 f"--ts_num_samples 8192",
             ])
 
-        command = torchrun + "\n" + command if self.reqs.gpus_per_node > 1 else command
+        command = torchrun + " \\" + "\n" + command if self.reqs.gpus_per_node > 1 else command
 
         script = ""
         script += shebang + "\n\n"
