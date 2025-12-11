@@ -170,6 +170,24 @@ class LowMemoryPreprocessorMixin(nn.Module, ABC):
         """Fully functional interface to the network with aggressive gradient detachment."""
 
 
+class Identity(nn.Module):
+    """
+    Identity layer with a bit more functionality.
+
+    Instead of just accepting one arg to `forward`, it accepts an arbitrary number of args,
+    and furthermore will autocast floating point inputs if `autocast=True`.
+    """
+
+    def __init__(self, autocast: bool = False) -> None:
+        super().__init__()
+        self.autocast = autocast
+
+    def forward(self, x: Tensor, *args: Any, **kwds: Any) -> Tensor:
+        if self.autocast and torch.is_floating_point(x) and torch.is_autocast_enabled():
+            x = x.to(torch.get_autocast_dtype(x.device.type))
+        return x
+
+
 # -------------------------------------------------------------------------------- #
 # Other
 # -------------------------------------------------------------------------------- #
@@ -1087,6 +1105,74 @@ def _scatter_g_to_BNC(
 
     return out
 
+
+class PatchPositionalityEncoder(nn.Module):
+    """
+    Injects approximate byte-level positional information into patch embeddings.
+
+    If `max_length` is provided, both relative and absolute positional information
+    is used. If not, only relative positional information is used.
+    """
+
+    def __init__(self, in_channels: int, max_length: Optional[int] = None, hidden_size: int = 64) -> None:
+        super().__init__()
+
+        if hidden_size <= 0:
+            raise ValueError(f"`hidden_size` must be positive. Got {hidden_size}.")
+
+        self.in_channels = in_channels
+        self.max_length = max_length
+        self.num_features = 2 if max_length is not None else 1
+
+        self.mlp = nn.Sequential(
+            nn.Linear(self.num_features, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, in_channels),
+        )
+
+    def forward(self, z: Tensor, lengths: Optional[Tensor] = None) -> Tensor:
+        """
+        Args:
+            z: input tensor of shape (B, N, C).
+            lengths: input lengths of shape (B,).
+
+        Returns:
+            output tensor of shape (B, N, C).
+        """
+        check_tensor(z, (None, None, self.in_channels), FLOATS)
+
+        B, N, C = z.shape
+
+        if self.max_length is not None:
+            if lengths is None:
+                raise ValueError(f"`lengths` must be provided when `max_length` is set to {self.max_length}.")
+            check_tensor(lengths, (B,), INTEGERS)
+
+        # Relative center of each patch.
+        patch_idx = torch.arange(N, device=z.device, dtype=z.dtype)  # (N,)
+        rel_center = (patch_idx + 0.5) / N                           # (N,)
+        rel_center = rel_center.unsqueeze(0).expand(B, N)            # (B, N)
+
+        # Absolute center of each patch.
+        if self.max_length is not None:
+            assert lengths is not None
+            lengths = lengths.to(z.dtype).clamp(min=1.0)
+            center_bytes = rel_center * lengths.unsqueeze(1)  # (B, N)
+            center_bytes = (center_bytes / float(self.max_length)).clamp(0.0, 1.0)
+
+        # Combine features and produce bias.
+        features_ = [rel_center]
+        if self.max_length is not None:
+            features_.append(center_bytes)
+        features = torch.stack(features_, dim=-1)  # (B, N, F)
+        bias = self.mlp(features.to(z.dtype))      # (B, N, C)
+
+        z = z + bias                               # (B, N, C)
+
+        check_tensor(z, (B, N, self.in_channels), FLOATS)
+
+        return z
+
 # -------------------------------------------------------------------------------- #
 # ViT
 # -------------------------------------------------------------------------------- #
@@ -1973,15 +2059,18 @@ class MalConvClassifier(Classifier):
 
 class ViTClassifier(Classifier):
 
-    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, patcher: PatchEncoderBase, backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, patcher: PatchEncoderBase, patchposencoder: PatchPositionalityEncoder | Identity, backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__()
 
         self.embedding = embedding
         self.filmer = filmer
         self.patcher = patcher
         self.norm = nn.LayerNorm(patcher.out_channels)
+        self.patchposencoder = patchposencoder
         self.backbone = backbone
         self.head = head
+
+        self.should_get_lengths = isinstance(self.patchposencoder, PatchPositionalityEncoder) and self.patchposencoder.max_length is not None
 
     def forward(self, x: Tensor, g: Optional[Tensor]) -> Tensor:
         self._check_forward_inputs(x, g)
@@ -1991,9 +2080,14 @@ class ViTClassifier(Classifier):
             z = self.filmer(z, g) if torch.is_grad_enabled() else self.filmer.forward_functional(z, g)  # type: ignore[arg-type]
             return z
 
+        lengths = None
+        if self.should_get_lengths:
+            lengths = (x != 0).sum(dim=1)  # (B,)
+
         ts = (x, g) if g is not None else (x,)
         z = self.patcher(preprocess=preprocess, ts=ts)  # (B, N, C)
         z = self.norm(z)                                # (B, N, C)
+        z = self.patchposencoder(z, lengths)            # (B, N, C)
         z = self.backbone(z)                            # (B, D)
         z = self.head(z)                                # (B, M)
 
