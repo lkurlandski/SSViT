@@ -925,11 +925,11 @@ class Trainer:
             "prc": prc,
         }
 
-    def print(self, *args, sep: str = " ", end: str = "\n", file: str | None = None) -> None:
+    def print(self, *args: Any, sep: str = " ", end: str = "\n") -> None:
         if self.args.disable_tqdm:
-            print(*args, sep=sep, end=end, file=file)
+            print(*args, sep=sep, end=end)
         else:
-            tqdm.write(sep.join(map(str, args)), file=file, end=end)
+            tqdm.write(sep.join(map(str, args)), end=end)
 
     def _dataloader_lengths(self, dataloader: Collection[Batch] | DataLoader[Batch]) -> list[int]:
         """Return the lengths of the dataloader on each distributed rank."""
@@ -966,7 +966,9 @@ class Trainer:
     def max_epochs(self) -> float:
         if self.args.max_epochs is not None:
             return self.args.max_epochs
-        return self.args.max_steps / self.steps_per_epoch
+        if self.args.max_steps is not None:
+            return self.args.max_steps / self.steps_per_epoch
+        raise RuntimeError("Unreachable.")
 
     @property
     def max_steps(self) -> int:
