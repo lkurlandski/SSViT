@@ -570,14 +570,20 @@ class Trainer:
         iterable = tqdm(iterable, desc, len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
         iterable = iter(iterable)
 
-        # If distributed, pad the dataloader so all ranks have the same number of batches.
+        # Determine the real length of this rank's dataloader, `length`, and the real-length
+        # of the longest dataloader across all ranks, `longest`. If distributed, pad this
+        # rank's dataloader so all ranks have the same number of batches.
+        # TODO: refactor this (and the corresponding logic in evaluate) into a utility function.
+        length = torch.tensor(len(dataloader), device=self.device)
+        longest = length.clone()
+        if is_dist():
+            dist.all_reduce(longest, op=dist.ReduceOp.MAX, group=None)
+        length = int(length.to(torch.int64).item())
+        longest = int(longest.to(torch.int64).item())
         if is_dist():
             assert self.padbatch is not None
-            length = torch.tensor(len(dataloader), device=self.device)
-            longest = length.clone()
-            dist.all_reduce(longest, op=dist.ReduceOp.MAX, group=None)
-            padding = itertools.repeat(self.padbatch, int(longest.item() - length.item()))
-            iterable = itertools.chain(iterable, enumerate(padding, start=len(dataloader)))
+            padding = itertools.repeat(self.padbatch, longest - length)
+            iterable = itertools.chain(iterable, enumerate(padding, start=length))
 
         def get_report() -> dict[str, float]:
             """Assemble a training report (excluding GPU statistics)."""
@@ -615,19 +621,19 @@ class Trainer:
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
         timer.start()
         mini_step = -1  # mini-step within this epoch
-        grda_modl = 0   # gradient accumulation modulo local steps
         for mini_step, batch in iterable:
             batch = batch.to(self.device, non_blocking=True)
             batch = batch.finalize(self.mp_dtype, torch.int32, torch.int64)
 
             # Determine if this is a real or padded batch of data.
             real = mini_step < len(dataloader)
-            is_last_real = (mini_step + 1 == len(dataloader))
             results["num_samples"] += len(batch) * int(real)
 
             # Sync on gradient accumulation boundary or final real mini-step
-            grda_modl = (grda_modl + 1) % self.args.gradient_accumulation_steps
-            sync_gradients = grda_modl == 0 or is_last_real
+            step_in_accum = (mini_step + 1) % self.args.gradient_accumulation_steps
+            is_accum_boundary = (step_in_accum == 0)
+            is_last_step = (mini_step + 1 == longest)
+            sync_gradients = is_accum_boundary or is_last_step
 
             # Compute normalized loss
             with maybe_no_sync(self.model, sync_gradients):
@@ -657,9 +663,6 @@ class Trainer:
                 results["param_norm"] += flat_params_aft.norm().detach()
                 results["param_delta"] += (flat_params_aft - flat_params_bef).norm().detach()
                 flat_params_bef = flat_params_aft
-                # Adjust `grda_modl` to force a sync on the last real mini-step
-                if is_last_real and grda_modl != 0:
-                    grda_modl = 0
                 # Determine what hooks are to be executed.
                 do_logg = any(self._due_hooks())
                 do_eval = self._due_hooks()[0]
