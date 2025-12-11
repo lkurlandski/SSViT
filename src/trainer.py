@@ -542,6 +542,9 @@ class Trainer:
         if self.logg_steps is not None:
             self._next_logg_step = self.glbl_step + self.logg_steps
 
+        pbar = tqdm(total=self.max_epochs, disable=self.args.disable_tqdm, leave=False, unit="step")
+        pbar.set_description(f"Epoch {self.glbl_step // self.steps_per_epoch} of {self.max_steps / self.steps_per_epoch}")
+
         # Conduct an initial validation and checkpointing on the naked model.
         if self.glbl_step == 0:
             self.run_due_hooks(None, do_eval=True, do_chpt=True, do_logg=True)
@@ -549,6 +552,8 @@ class Trainer:
         # Continuously train the model on the training set until finished.
         while not self._done:
             self.train()
+            pbar.update(1)
+            pbar.set_description(f"Epoch {self.glbl_step // self.steps_per_epoch} of {self.max_steps / self.steps_per_epoch}")
 
         self.monitor.stop()
 
@@ -566,8 +571,7 @@ class Trainer:
 
         # Get a wrapped dataloader with padding to the longest rank.
         dataloader = self.tr_loader
-        desc = f"Training Epoch {self.glbl_step // self.steps_per_epoch} of {self.max_steps / self.steps_per_epoch}"
-        iterable = self._wrap_and_pad_loader(dataloader, desc, leave=False)
+        iterable = self._wrap_and_pad_loader(dataloader, "Training...", leave=False)
 
         def get_report() -> dict[str, float]:
             """Assemble a training report (excluding GPU statistics)."""
@@ -654,6 +658,9 @@ class Trainer:
                 if do_eval:
                     del batch, outputs, loss
                     gc.collect()
+                # Close the progress bar if evaluating on the last step
+                if do_eval and is_last_step and isinstance(iterable, tqdm):
+                    iterable.close()
                 # Prepare a training report and reset the tracking objects
                 if do_logg:
                     report = get_report()
@@ -693,8 +700,7 @@ class Trainer:
 
         # Get a wrapped dataloader with padding to the longest rank.
         dataloader = self.vl_loader
-        desc = f"Validating Epoch {self.glbl_step // self.steps_per_epoch} of {self.max_steps / self.steps_per_epoch}"
-        iterable = self._wrap_and_pad_loader(dataloader, desc, leave=False)
+        iterable = self._wrap_and_pad_loader(dataloader, "Validating...", leave=False)
 
         mini_step = -1
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
@@ -836,7 +842,7 @@ class Trainer:
         if due_eval:
             self.stopper.step(report[f"{self.args.stopper_metric}"])
         if self.stopper.stop:
-            print("Early stopping triggered.")
+            self.print("Early stopping triggered.")
             self._done = True
 
     def forward(self, batch: Batch) -> Tensor:
@@ -919,6 +925,12 @@ class Trainer:
             "prc": prc,
         }
 
+    def print(self, *args, sep: str = " ", end: str = "\n", file: str | None = None) -> None:
+        if self.args.disable_tqdm:
+            print(*args, sep=sep, end=end, file=file)
+        else:
+            tqdm.write(sep.join(map(str, args)), file=file, end=end)
+
     def _dataloader_lengths(self, dataloader: Collection[Batch] | DataLoader[Batch]) -> list[int]:
         """Return the lengths of the dataloader on each distributed rank."""
         if not is_dist():
@@ -949,6 +961,12 @@ class Trainer:
         if f is None:
             return None
         return max(1, math.ceil(self.steps_per_epoch * f))
+
+    @property
+    def max_epochs(self) -> float:
+        if self.args.max_epochs is not None:
+            return self.args.max_epochs
+        return self.args.max_steps / self.steps_per_epoch
 
     @property
     def max_steps(self) -> int:
@@ -1017,10 +1035,7 @@ class Trainer:
             d["vl_time"] = round(results["vl_time"], 0)
             d["vl_samples"] = int(results["vl_samples"])
             d["vl_throughput"] = round(results["vl_throughput"], 2)
-        flush()
-        if not self.args.disable_tqdm:
-            print()
-        print(d)
+        self.print(d)
 
     def to_checkpoint(self, path: str | Path) -> None:
         """
