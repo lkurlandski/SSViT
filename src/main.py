@@ -52,6 +52,7 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.architectures import get_model_input_lengths
+from src.architectures import Identity
 from src.architectures import ClassifificationHead
 from src.architectures import FiLM
 from src.architectures import FiLMNoP
@@ -60,6 +61,7 @@ from src.architectures import MalConv
 from src.architectures import MalConvLowMem
 from src.architectures import MalConvGCG
 from src.architectures import ViT
+from src.architectures import PatchPositionalityEncoder
 from src.architectures import PatchEncoderBase
 from src.architectures import PatchEncoder
 from src.architectures import ConvPatchEncoder
@@ -129,6 +131,7 @@ def get_model(
     level: HierarchicalLevel,
     structures: list[HierarchicalStructure],
     parch: PatcherArchitecture,
+    max_length: Optional[int],
 ) -> Classifier | HierarchicalClassifier:
     """
     Get a pre-configured classification model for the given settings.
@@ -266,9 +269,11 @@ def get_model(
             return MalConvClassifier(embedding, filmer, malconv, head)
         if arch in (Architecture.VIT,):
             patcher = PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
-            max_len = patcher.num_patches
-            transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencoder, max_len)
-            return ViTClassifier(embedding, filmer, patcher, transformer, head)
+            total_num_patches = patcher.num_patches
+            transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencoder, total_num_patches)
+            # patchposencoder = PatchPositionalityEncoder(patcher.out_channels, max_length)
+            patchposencoder = Identity(False)
+            return ViTClassifier(embedding, filmer, patcher, patchposencoder, transformer, head)
         raise NotImplementedError(f"{arch}")
 
     # Hierarchical Model
@@ -301,8 +306,8 @@ def get_model(
         return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
     if arch in (Architecture.VIT,):
         patchers = [tiny_patcher() if s in tiny else full_patcher() for s in structures]
-        max_len = sum(p.num_patches for p in patchers)  # type: ignore[misc]
-        transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencoder, max_len)
+        total_num_patches = sum(p.num_patches for p in patchers)  # type: ignore[misc]
+        transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencoder, total_num_patches)
         return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
 
     raise NotImplementedError(f"{arch}")
@@ -490,7 +495,7 @@ def main() -> None:
     print(f"{structures=}")
     print(f"{num_guides=}")
 
-    model = get_model(args.arch, args.size, num_guides, args.level, structures, args.parch).to("cpu")
+    model = get_model(args.arch, args.size, num_guides, args.level, structures, args.parch, args.max_length).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
     min_lengths = [m for m in getattr(model, "min_lengths", [min_length])]
@@ -569,16 +574,18 @@ def main() -> None:
                 break
         return pd.concat(dfs, ignore_index=True)
 
-    tr_stats_df = get_shardwise_stats(tr_datadb, tr_last_shard)
-    ts_stats_df = get_shardwise_stats(ts_datadb, ts_last_shard)
-    with pd.option_context("display.max_rows", None, "display.max_columns", None):
-        print(f"tr_stats_df=\n{tr_stats_df}")
-        print(f"ts_stats_df=\n{ts_stats_df}")
+    # tr_stats_df = get_shardwise_stats(tr_datadb, tr_last_shard)
+    # ts_stats_df = get_shardwise_stats(ts_datadb, ts_last_shard)
+    # with pd.option_context("display.max_rows", None, "display.max_columns", None):
+    #     print(f"tr_stats_df=\n{tr_stats_df}")
+    #     print(f"ts_stats_df=\n{ts_stats_df}")
 
     # Split the shards between distributed workers.
     if world_size() > 1:
         tr_shards = tr_shards[rank()::world_size()]
         ts_shards = ts_shards[rank()::world_size()]
+        print(f"[rank {rank()}] tr_shards={tr_shards}")
+        print(f"[rank {rank()}] ts_shards={ts_shards}")
 
     if args.num_workers > len(tr_shards):
         warnings.warn(f"More workers requested ({args.num_workers}) than tr shards ({len(tr_shards)}). Number of workers will be reduced to {len(tr_shards)}.")
