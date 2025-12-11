@@ -564,26 +564,10 @@ class Trainer:
         self.optimizer.zero_grad()
         self.model.train()
 
+        # Get a wrapped dataloader with padding to the longest rank.
         dataloader = self.tr_loader
-        iterable: Iterable[tuple[int, Batch]] = enumerate(dataloader)
         desc = f"Training Epoch {self.glbl_step // self.steps_per_epoch} of {self.max_steps / self.steps_per_epoch}"
-        iterable = tqdm(iterable, desc, len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
-        iterable = iter(iterable)
-
-        # Determine the real length of this rank's dataloader, `length`, and the real-length
-        # of the longest dataloader across all ranks, `longest`. If distributed, pad this
-        # rank's dataloader so all ranks have the same number of batches.
-        # TODO: refactor this (and the corresponding logic in evaluate) into a utility function.
-        length = torch.tensor(len(dataloader), device=self.device)
-        longest = length.clone()
-        if is_dist():
-            dist.all_reduce(longest, op=dist.ReduceOp.MAX, group=None)
-        length = int(length.to(torch.int64).item())
-        longest = int(longest.to(torch.int64).item())
-        if is_dist():
-            assert self.padbatch is not None
-            padding = itertools.repeat(self.padbatch, longest - length)
-            iterable = itertools.chain(iterable, enumerate(padding, start=length))
+        iterable = self._wrap_and_pad_loader(dataloader, desc, leave=False)
 
         def get_report() -> dict[str, float]:
             """Assemble a training report (excluding GPU statistics)."""
@@ -632,7 +616,7 @@ class Trainer:
             # Sync on gradient accumulation boundary or final real mini-step
             step_in_accum = (mini_step + 1) % self.args.gradient_accumulation_steps
             is_accum_boundary = (step_in_accum == 0)
-            is_last_step = (mini_step + 1 == longest)
+            is_last_step = (mini_step + 1 == len(iterable))
             sync_gradients = is_accum_boundary or is_last_step
 
             # Compute normalized loss
@@ -707,19 +691,10 @@ class Trainer:
         was_training = self.model.training
         self.model.eval()
 
+        # Get a wrapped dataloader with padding to the longest rank.
         dataloader = self.vl_loader
-        iterable: Iterable[tuple[int, Batch]] = enumerate(dataloader)
-        iterable = tqdm(iterable, "Validating...", len(dataloader), False, disable=self.args.disable_tqdm, ascii=True)
-        iterable = iter(iterable)
-
-        # If distributed, pad the dataloader so all ranks have the same number of batches.
-        if is_dist():
-            assert self.padbatch is not None
-            length = torch.tensor(len(dataloader), device=self.device)
-            longest = length.clone()
-            dist.all_reduce(longest, op=dist.ReduceOp.MAX, group=None)
-            padding = itertools.repeat(self.padbatch, int(longest.item() - length.item()))
-            iterable = itertools.chain(iterable, enumerate(padding, start=len(dataloader)))
+        desc = f"Validating Epoch {self.glbl_step // self.steps_per_epoch} of {self.max_steps / self.steps_per_epoch}"
+        iterable = self._wrap_and_pad_loader(dataloader, desc, leave=False)
 
         mini_step = -1
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
@@ -769,6 +744,29 @@ class Trainer:
 
         barrier("Trainer::evaluate:after", self.device)
         return report
+
+    def _wrap_and_pad_loader(self, dataloader: Collection[Batch] | DataLoader[Batch], desc: str = "", leave: bool = True) -> tqdm[tuple[int, Batch]]:
+        if is_dist() and self.padbatch is None:
+            raise RuntimeError("padbatch must be specified for distributed training.")
+
+        # Get the length of this rank's dataloader and the longest dataloader across all ranks.
+        length = torch.tensor(len(dataloader), device=self.device)
+        longest = length.clone()
+        if is_dist():
+            dist.all_reduce(longest, op=dist.ReduceOp.MAX, group=None)
+        length = int(length.to(torch.int64).item())
+        longest = int(longest.to(torch.int64).item())
+
+        # Get a (possibly padded) iterable over the samples in the loader.
+        num_padding = longest - length
+        padding = itertools.repeat(self.padbatch, num_padding)
+        iterable = itertools.chain(dataloader, padding)
+
+        # Wrap the iterable in enumerate and a tqdm progress bar.
+        iterable = enumerate(iterable)
+        iterable = tqdm(iterable, desc, longest, leave, disable=self.args.disable_tqdm, ascii=True)
+
+        return iterable
 
     def _due_hooks(self) -> tuple[bool, bool, bool]:
         do_eval = self._next_eval_step is not None and self.glbl_step >= self._next_eval_step
