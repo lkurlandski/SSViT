@@ -237,7 +237,7 @@ class Configuration:
     @property
     def max_epochs(self) -> float:
         if DEBUG:
-            return 1
+            return 2
         return 10
 
     @property
@@ -572,7 +572,7 @@ def main() -> None:
         if str(config.outdir) in alloutdirs:
             raise RuntimeError(f"ERROR ({str(config.outdir)}): duplicate output directory detected.")
         alloutdirs.add(str(config.outdir))
-        if config.outdir.exists() and any(config.outdir.iterdir()):
+        if config.outdir.exists() and any(config.outdir.iterdir()) and not DEBUG:
             print(f"WARNING ({str(config)}): output directory exists at {str(config.outdir)}.")
 
         builder = ScriptBuilder(config, reqs)
