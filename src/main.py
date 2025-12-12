@@ -100,6 +100,8 @@ from src.helpers import _MTArgs
 from src.helpers import Scheduler
 from src.helpers import Architecture
 from src.helpers import PatcherArchitecture
+from src.helpers import PositionalEncodingArchitecture
+from src.helpers import PatchPositionalEncodingArchitecture
 from src.helpers import ModelSize
 from src.helpers import MainArgs
 from src.simpledb import SimpleDB
@@ -131,6 +133,8 @@ def get_model(
     level: HierarchicalLevel,
     structures: list[HierarchicalStructure],
     parch: PatcherArchitecture,
+    posenc: PositionalEncodingArchitecture,
+    patchposenc: PatchPositionalEncodingArchitecture,
     max_length: Optional[int],
 ) -> Classifier | HierarchicalClassifier:
     """
@@ -154,6 +158,9 @@ def get_model(
         level: The hierarchical level.
         structures: The hierarchical structures.
         parch: The patcher architecture (for ViT only).
+        posenc: The positional encoding type (for ViT only).
+        patchposenc: The patch positional encoding type (for ViT only).
+        max_length: The maximum input length (for absolute patchposenc only).
 
     Returns:
         The model.
@@ -162,6 +169,8 @@ def get_model(
     size = ModelSize(size)
     level = HierarchicalLevel(level)
     parch = PatcherArchitecture(parch)
+    posenc = PositionalEncodingArchitecture(posenc)
+    patchposenc = PatchPositionalEncodingArchitecture(patchposenc)
 
     num_structures = len(structures)
 
@@ -245,7 +254,24 @@ def get_model(
         vit_nhead    = 8
         vit_feedfrwd = 1024
         vit_layers   = 8
-    posencoder: Literal["fixed", "learned", "none"] = "fixed"
+
+    # Positional Encoding
+    posencname: Literal["none", "fixed", "learned"] = posenc.name.lower()  # type: ignore[assignment]
+    if posencname not in ("none", "fixed", "learned"):
+        raise TypeError(f"Unknown positional encoding: {posencname}")
+
+    # Patch Positional Encoding
+    PatchPositionalityEncoderCls: Callable[[int], PatchPositionalityEncoder | Identity]
+    if patchposenc == PatchPositionalEncodingArchitecture.NONE:
+        PatchPositionalityEncoderCls = partial(Identity, autocast=True)
+    elif patchposenc == PatchPositionalEncodingArchitecture.REL:
+        PatchPositionalityEncoderCls = partial(PatchPositionalityEncoder, max_length=None)
+    elif patchposenc == PatchPositionalEncodingArchitecture.BTH:
+        PatchPositionalityEncoderCls = partial(PatchPositionalityEncoder, max_length=max_length)
+    elif patchposenc == PatchPositionalEncodingArchitecture.ABS:
+        raise NotImplementedError(f"{patchposenc}")
+    else:
+        raise NotImplementedError(f"{patchposenc}")
 
     # Head
     num_classes    = 2
@@ -270,9 +296,8 @@ def get_model(
         if arch in (Architecture.VIT,):
             patcher = PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
             total_num_patches = patcher.num_patches
-            transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencoder, total_num_patches)
-            # patchposencoder = PatchPositionalityEncoder(patcher.out_channels, max_length)
-            patchposencoder = Identity(False)
+            transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencname, total_num_patches)
+            patchposencoder = PatchPositionalityEncoderCls(patcher.out_channels)
             return ViTClassifier(embedding, filmer, patcher, patchposencoder, transformer, head)
         raise NotImplementedError(f"{arch}")
 
@@ -307,8 +332,9 @@ def get_model(
     if arch in (Architecture.VIT,):
         patchers = [tiny_patcher() if s in tiny else full_patcher() for s in structures]
         total_num_patches = sum(p.num_patches for p in patchers)  # type: ignore[misc]
-        transformers = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencoder, total_num_patches)
-        return HierarchicalViTClassifier(embeddings, filmers, patchers, transformers, head)
+        patchposencoders = [PatchPositionalityEncoderCls(p.out_channels) for p in patchers]
+        transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencname, total_num_patches)
+        return HierarchicalViTClassifier(embeddings, filmers, patchers, patchposencoders, transformer, head)
 
     raise NotImplementedError(f"{arch}")
 
@@ -495,7 +521,17 @@ def main() -> None:
     print(f"{structures=}")
     print(f"{num_guides=}")
 
-    model = get_model(args.arch, args.size, num_guides, args.level, structures, args.parch, args.max_length).to("cpu")
+    model = get_model(
+        args.arch,
+        args.size,
+        num_guides,
+        args.level,
+        structures,
+        args.parch,
+        args.posenc,
+        args.patchposenc,
+        args.max_length,
+    ).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
     min_lengths = [m for m in getattr(model, "min_lengths", [min_length])]

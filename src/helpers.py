@@ -53,6 +53,19 @@ class PatcherArchitecture(Enum):
     MEM = "mem"      # Low-Memory
 
 
+class PositionalEncodingArchitecture(Enum):
+    NONE     = "none"      # No positional encoding
+    FIXED    = "fixed"     # Sinusoidal absolute positional encoding
+    LEARNED  = "learned"   # Learned absolute positional encoding
+
+
+class PatchPositionalEncodingArchitecture(Enum):
+    NONE = "none" # None
+    REL  = "rel"  # Relative
+    ABS  = "abs"  # Absolute
+    BTH  = "bth"  # Relative and Absolute
+
+
 class Scheduler(Enum):
     NONE = "none"  # Fixed learning rate
     CUST = "cust"  # Custom schduler
@@ -76,6 +89,8 @@ def any_to_section_characteristic(s: lief.PE.Section.CHARACTERISTICS | int | str
 class MainArgs:
     arch: Architecture = Architecture.MCV
     parch: PatcherArchitecture = PatcherArchitecture.MEM
+    posenc: PositionalEncodingArchitecture = PositionalEncodingArchitecture.FIXED
+    patchposenc: PatchPositionalEncodingArchitecture = PatchPositionalEncodingArchitecture.NONE
     size: ModelSize = ModelSize.SM
     seed: int = 0
     do_parser: bool = False

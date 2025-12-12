@@ -24,6 +24,9 @@ from src.binanal import HierarchicalLevel
 from src.binanal import CHARACTERISTICS
 from src.helpers import Architecture
 from src.helpers import ModelSize
+from src.helpers import PatcherArchitecture
+from src.helpers import PositionalEncodingArchitecture
+from src.helpers import PatchPositionalEncodingArchitecture
 from src.helpers import Scheduler
 
 
@@ -113,6 +116,14 @@ class Configuration:
         if remainder != 0:
             print(f"WARNING ({str(self)}): {batch_size=} not divisible by {self.per_device_batch_size=}.")
         return max(1, steps)
+
+    @property
+    def posenc(self) -> PositionalEncodingArchitecture:
+        return PositionalEncodingArchitecture.LEARNED
+
+    @property
+    def patchposenc(self) -> PatchPositionalEncodingArchitecture:
+        return PatchPositionalEncodingArchitecture.BTH
 
     @property
     def outdir(self) -> Path:
@@ -406,6 +417,8 @@ class ScriptBuilder:
             "src/main.py",
             f"--outdir {self.config.outdir}",
             f"--arch {self.config.arch.value}",
+            f"--posenc {self.config.posenc.value}",
+            f"--patchposenc {self.config.patchposenc.value}",
             f"--size {self.config.size.value}",
             f"--level {self.config.level.value}",
             f"--do_entropy {self.config.do_entropy}",
@@ -494,7 +507,7 @@ def config_fiter(config: Configuration) -> bool:
         return False
 
     # Structure
-    if config.level != HierarchicalLevel.NONE:
+    if config.level not in (HierarchicalLevel.NONE, HierarchicalLevel.COARSE):
         return False
 
     # Semantics
