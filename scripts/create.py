@@ -48,6 +48,8 @@ class Configuration:
     def __init__(
         self,
         arch: Architecture,
+        posenc: PositionalEncodingArchitecture,
+        patchposenc: PatchPositionalEncodingArchitecture,
         size: ModelSize,
         level: HierarchicalLevel,
         do_entropy: bool,
@@ -56,6 +58,8 @@ class Configuration:
         seed: int,
     ) -> None:
         self.arch = arch
+        self.posenc = posenc
+        self.patchposenc = patchposenc
         self.size = size
         self.level = level
         self.do_entropy = do_entropy
@@ -77,6 +81,8 @@ class Configuration:
         return (
             f"Configuration("
             f"  arch={self.arch},\n"
+            f"  posenc={self.posenc},\n"
+            f"  patchposenc={self.patchposenc},\n"
             f"  size={self.size},\n"
             f"  level={self.level},\n"
             f"  do_entropy={self.do_entropy},\n"
@@ -89,6 +95,8 @@ class Configuration:
     def __str__(self) -> str:
         return (
             f"{fixed_width_string(self.arch.value, 3, '_')}-"
+            f"{fixed_width_string(self.posenc.value, 3, '_')}-"
+            f"{fixed_width_string(self.patchposenc.value, 3, '_')}-"
             f"{fixed_width_string(self.size.value, 3, '_')}-"
             f"{fixed_width_string(self.level.value, 3, '_')}-"
             f"{'t' if self.do_entropy else 'f'}-"
@@ -118,20 +126,14 @@ class Configuration:
         return max(1, steps)
 
     @property
-    def posenc(self) -> PositionalEncodingArchitecture:
-        return PositionalEncodingArchitecture.LEARNED
-
-    @property
-    def patchposenc(self) -> PatchPositionalEncodingArchitecture:
-        return PatchPositionalEncodingArchitecture.BTH
-
-    @property
     def outdir(self) -> Path:
         root = Path("./output")
         if DEBUG:
             root = root / "tmp"
         parts = [
             f"arch--{self.arch.value}",
+            f"posenc--{self.posenc.value}",
+            f"patchposenc--{self.patchposenc.value}",
             f"size--{self.size.value}",
             f"level--{self.level.value}",
             f"entropy--{self.do_entropy}",
@@ -177,6 +179,8 @@ class Configuration:
                 return 512
             if self.size == ModelSize.LG:  # O(N)
                 if self.do_entropy or self.which_characteristics:
+                    return 64
+                if self.level == HierarchicalLevel.COARSE:
                     return 64
                 return 128
 
@@ -283,11 +287,13 @@ THROUGHPUTS: dict[tuple[Architecture, ModelSize, bool, bool], Optional[tuple[flo
     (Architecture.MCG, ModelSize.MD, True,  False) : (150, 100),
     (Architecture.MCG, ModelSize.MD, True,  True)  : (160,  90),
 
+    # TODO: recompute for the feedforward_dim = 4x hidden_dim
     (Architecture.VIT, ModelSize.MD, False, False) : (450, 350),
     (Architecture.VIT, ModelSize.MD, False, True)  : (275, 225),
     (Architecture.VIT, ModelSize.MD, True,  False) : (250, 225),
     (Architecture.VIT, ModelSize.MD, True,  True)  : (275, 225),
 
+    # TODO: recompute for the feedforward_dim = 4x hidden_dim
     (Architecture.VIT, ModelSize.LG, False, False) : (325, 150),
     (Architecture.VIT, ModelSize.LG, False, True)  : (150, 100),
     (Architecture.VIT, ModelSize.LG, True,  False) : (150, 100),
@@ -329,8 +335,11 @@ class Requirements:
         tr_seconds = tr_samples / tr_throughput
         vl_seconds = vl_samples / vl_throughput
 
+        add = 0.50 * 3600
+        mul = 0.15
+
         seconds = tr_seconds + vl_seconds
-        seconds += 0.10 * seconds + 0.25 * 3600
+        seconds += mul * seconds + add
 
         return int(seconds)
 
@@ -347,7 +356,7 @@ class Requirements:
     @property
     def gpus_per_node(self) -> int:
         """Return the number of GPUs per node required for the job (configure)."""
-        return 1
+        return 2
 
     @property
     def ntasks_per_node(self) -> int:
@@ -453,9 +462,9 @@ class ScriptBuilder:
 
         if DEBUG:
             command += " \\\n" + " \\\n".join([
-                f"--tr_num_samples 8192",
-                f"--vl_num_samples 8192",
-                f"--ts_num_samples 8192",
+                f"--tr_num_samples {1024 * self.config.num_workers * self.reqs.world_size}",
+                f"--vl_num_samples {1024 * self.config.num_workers * self.reqs.world_size}",
+                f"--ts_num_samples {1024 * self.config.num_workers * self.reqs.world_size}",
             ])
 
         command = torchrun + " \\" + "\n" + command if self.reqs.gpus_per_node > 1 else command
@@ -510,7 +519,16 @@ def config_fiter(config: Configuration) -> bool:
     if config.level not in (HierarchicalLevel.NONE, HierarchicalLevel.COARSE):
         return False
 
+    # Positional Encoding
+    if config.level != HierarchicalLevel.NONE:
+        if config.posenc != PositionalEncodingArchitecture.FIXED:
+            return False
+        if config.patchposenc != PatchPositionalEncodingArchitecture.NONE:
+            return False
+
     # Semantics
+    if config.do_entropy or len(config.which_characteristics) > 0:
+        return False
     CHARS = (
         lief.PE.Section.CHARACTERISTICS.MEM_READ,
         lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
@@ -548,6 +566,8 @@ def main() -> None:
 
     configurations = product(
         [a for a in Architecture],
+        [PositionalEncodingArchitecture.FIXED, PositionalEncodingArchitecture.LEARNED],
+        [PatchPositionalEncodingArchitecture.BTH, PatchPositionalEncodingArchitecture.NONE],
         [s for s in ModelSize],
         [l for l in HierarchicalLevel],
         [True, False],
