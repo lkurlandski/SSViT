@@ -499,7 +499,7 @@ class Trainer:
         self.scheduler = scheduler if scheduler is not None else LambdaLR(self.optimizer, lambda _: 1.0)
         self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
         self.device = device if device is not None else next(self.model.parameters()).device
-        self.padbatch = padbatch.to(self.device, non_blocking=True).finalize(self.mp_dtype, torch.int32, torch.int64) if padbatch is not None else None
+        self.padbatch = padbatch
         self.monitor = Monitor(device=self.device)
         self.scaler = GradScaler(self.device.type, enabled=self.mp_dtype == torch.float16)
         self.log: list[Mapping[str, int | float]] = []
@@ -753,13 +753,18 @@ class Trainer:
         barrier("Trainer::evaluate:after", self.device)
         return report
 
+    def _get_padbatch(self) -> Optional[Batch]:
+        if self.padbatch is None:
+            return None
+        return self.padbatch.to(self.device, non_blocking=True).finalize(self.mp_dtype, torch.int32, torch.int64)
+
     def _wrap_and_pad_loader(self, dataloader: Collection[Batch] | DataLoader[Batch], longest: int, desc: str = "", leave: bool = True) -> tqdm[tuple[int, Batch]]:
         if is_dist() and self.padbatch is None:
             raise RuntimeError("padbatch must be specified for distributed training.")
 
         # Get a (possibly padded) iterable over the samples in the loader.
         num_padding = longest - len(dataloader)
-        padding = itertools.repeat(self.padbatch, num_padding)
+        padding = itertools.repeat(self._get_padbatch(), num_padding)
         iterable = itertools.chain(dataloader, padding)
 
         # Wrap the iterable in enumerate and a tqdm progress bar.
