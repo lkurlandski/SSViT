@@ -243,17 +243,17 @@ def get_model(
     if size == ModelSize.SM:
         vit_d_model  = 64
         vit_nhead    = 1
-        vit_feedfrwd = 128
+        vit_feedfrwd = 256
         vit_layers   = 1
     elif size == ModelSize.MD:
         vit_d_model  = 256
         vit_nhead    = 4
-        vit_feedfrwd = 512
+        vit_feedfrwd = 1024
         vit_layers   = 4
     elif size == ModelSize.LG:
         vit_d_model  = 512
         vit_nhead    = 8
-        vit_feedfrwd = 1024
+        vit_feedfrwd = 2048
         vit_layers   = 8
 
     # Positional Encoding
