@@ -850,6 +850,7 @@ def main() -> None:
             padbatch=padbatch,
         )
     print(f"{trainer=}")
+    print("", end="", flush=True)
 
     trainer = trainer()
 
