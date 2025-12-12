@@ -26,6 +26,7 @@ from numpy import typing as npt
 import pandas as pd
 import torch
 from torch import Tensor
+from torch import nn
 from torch import distributed as dist
 from torch.utils.data import IterableDataset
 from torch.distributed.device_mesh import init_device_mesh
@@ -484,6 +485,116 @@ def get_padbatch(level: HierarchicalLevel, structures: list[HierarchicalStructur
     return HSamples(file, name, label, inputs_, guides_, structure)
 
 
+def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlapping: bool = False, verbose: bool = False) -> list[dict[str, Any]]:
+    """
+    Return decay aware parameter groups. Decay will not be applied to biases, normalization, and embeddings.
+
+    Args:
+        model: The model.
+        weight_decay: The weight decay rate.
+        allow_overlapping: If overlapping parameters are found between decay
+            and non-decay groups, moves them to the non-decay group instead of raising.
+        verbose: If True, prints each param's name and whether it will be decayed.
+
+    Returns:
+        A list of parameter groups, each with a `weight_decay` key.
+    """
+
+    # Parameters in these modules will be ignored.
+    layers = (
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+        nn.LazyBatchNorm1d,
+        nn.LazyBatchNorm2d,
+        nn.LazyBatchNorm3d,
+        nn.GroupNorm,
+        nn.SyncBatchNorm,
+        nn.InstanceNorm1d,
+        nn.InstanceNorm2d,
+        nn.InstanceNorm3d,
+        nn.LazyInstanceNorm1d,
+        nn.LazyInstanceNorm2d,
+        nn.LazyInstanceNorm3d,
+        nn.LayerNorm,
+        nn.RMSNorm,
+        nn.Embedding,
+        nn.EmbeddingBag,
+    )
+
+    # Collect the ids of all params into two bins: one for no decay, one for decay.
+    no_decay_ids: set[int] = set()
+    ys_decay_ids: set[int] = set()
+    for module in model.modules():
+        # Don't decay these layers.
+        if isinstance(module, layers):
+            for p in module.parameters(recurse=False):
+                if not p.requires_grad:
+                    continue
+                no_decay_ids.add(id(p))
+            continue
+        # Otherwise, decay them, ignoring bias terms (one-dimensional).
+        for n, p in module.named_parameters(recurse=False):
+            if not p.requires_grad:
+                continue
+            if n == "bias":
+                no_decay_ids.add(id(p))
+            elif "bias" in n.lower():
+                warnings.warn(f"Bias-like parameter {n} will be excluded from decay.")
+                no_decay_ids.add(id(p))
+            elif p.ndim == 1:
+                warnings.warn(f"Bias-like parameter {n} will not be excluded from decay.")
+                ys_decay_ids.add(id(p))
+            else:
+                ys_decay_ids.add(id(p))
+
+    if verbose:
+        print("Param Groups:")
+        for n, p in model.named_parameters(recurse=True):
+            s = " " * (31 - len(n))
+            if not p.requires_grad:
+                print(f"  {n} {s} --> no grad")
+            elif id(p) in no_decay_ids:
+                print(f"  {n} {s} --> no decay")
+            elif id(p) in ys_decay_ids:
+                print(f"  {n} {s} --> decay")
+            else:
+                raise RuntimeError("Unreachable.")
+
+    # Ensure every id param appears exactly once.
+    if (intersection := set.intersection(no_decay_ids, ys_decay_ids)):
+        if not allow_overlapping:
+            raise ValueError(f"Found overlapping param ids: {intersection}.")
+        for i in intersection:
+            ys_decay_ids.remove(i)
+
+    # Collect the params into two lists: one for no decay, one for decay.
+    no_decay_params: list[nn.Parameter] = []
+    ys_decay_params: list[nn.Parameter] = []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        if id(p) in no_decay_ids:
+            no_decay_params.append(p)
+            continue
+        if id(p) in ys_decay_ids:
+            ys_decay_params.append(p)
+            continue
+        raise ValueError(f"Parameter {id(p)} is not covered by a param group.")
+
+    # Ensure every trainable param appears exactly once.
+    total = sum(1 for p in model.parameters() if p.requires_grad)
+    if len(no_decay_params) + len(ys_decay_params) != total:
+        raise ValueError(f"Found {total} trainable parameters, but {len(no_decay_params) + len(ys_decay_params)} are in param groups.")
+
+    groups = [
+        {"params": ys_decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+
+    return groups
+
+
 def main() -> None:
 
     lief.logging.set_level(lief.logging.LEVEL.OFF)
@@ -708,6 +819,8 @@ def main() -> None:
             print(f"Resuming from checkpoint: {checkpoint}")
 
     if checkpoint:
+        if args.weight_decay != 0.0:
+            raise NotImplementedError("decay_aware_param_groups() is not implemented for resuming from checkpoint.")
         trainer = Trainer.from_checkpoint(
             checkpoint,
             model=model,
@@ -721,7 +834,8 @@ def main() -> None:
         )
     else:
         wmodel = wrap_model(model)
-        optimizer = optimizer_init(wmodel.parameters())
+        params = decay_aware_param_groups(wmodel, args.weight_decay, verbose=True)
+        optimizer = optimizer_init(params)
         scheduler = scheduler_init(optimizer)
         trainer = Trainer(
             args=rargs,
