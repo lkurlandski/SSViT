@@ -178,7 +178,7 @@ class Identity(nn.Module):
     and furthermore will autocast floating point inputs if `autocast=True`.
     """
 
-    def __init__(self, autocast: bool = False) -> None:
+    def __init__(self, *args: Any, autocast: bool = False, **kwds: Any) -> None:
         super().__init__()
         self.autocast = autocast
 
@@ -2228,7 +2228,7 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         and feeds the encoded patches to a shared ViT backbone followed by a classification head.
     """
 
-    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(patchers)):
@@ -2238,8 +2238,14 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         self.filmers = nn.ModuleList(filmers)
         self.patchers = nn.ModuleList(patchers)
         self.norms = nn.ModuleList([nn.LayerNorm(p.out_channels) for p in patchers])
+        self.patchposencoders = nn.ModuleList(patchposencoders)
         self.backbone = backbone
         self.head = head
+
+        # The semantics of injecting absolute positional information into each structure's patches is a little murky.
+        # Here, we treat each structure as its own "sequence" of patches, and inject the positional encoding accordingly.
+        # So the positional information is not injected with regard to the entire file, only the structure's own patches.
+        self.should_get_lengths = isinstance(self.patchposencoders[0], PatchPositionalityEncoder) and self.patchposencoders[0].max_length is not None
 
         C_s = [p.out_channels for p in patchers]
         if not all (c == C_s[0] for c in C_s):
@@ -2274,10 +2280,12 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
             if x[i] is None:
                 zs.append(None)
                 continue
+            lengths = (x[i] != 0).sum(dim=1) if self.should_get_lengths else None  # type: ignore[union-attr]
             ts = (x[i], g[i]) if g[i] is not None else (x[i],)
             preprocess_ = partial(preprocess, i)
             z = self.patchers[i](preprocess=preprocess_, ts=ts)  # (B, N, C)
             z = self.norms[i](z)                                 # (B, N, C)
+            z = self.patchposencoders[i](z, lengths)             # (B, N, C)
             zs.append(z)
 
         # Find a representative encoded patch.
