@@ -508,6 +508,8 @@ class Trainer:
         self._next_chpt_step: Optional[int] = None
         self._next_logg_step: Optional[int] = None
         self._done: bool = False
+        self._vl_dataloader_lengths = self._dataloader_lengths(self.vl_loader)
+        self._tr_dataloader_lengths = self._dataloader_lengths(self.tr_loader)
 
     def __repr__(self) -> str:
         return str(self)
@@ -571,7 +573,7 @@ class Trainer:
 
         # Get a wrapped dataloader with padding to the longest rank.
         dataloader = self.tr_loader
-        iterable = self._wrap_and_pad_loader(dataloader, "Training...", leave=False)
+        iterable = self._wrap_and_pad_loader(dataloader, max(self.tr_dataloader_lengths), "Training...", leave=False)
 
         def get_report() -> dict[str, float]:
             """Assemble a training report (excluding GPU statistics)."""
@@ -700,7 +702,7 @@ class Trainer:
 
         # Get a wrapped dataloader with padding to the longest rank.
         dataloader = self.vl_loader
-        iterable = self._wrap_and_pad_loader(dataloader, "Validating...", leave=False)
+        iterable = self._wrap_and_pad_loader(dataloader, max(self.vl_dataloader_lengths), "Validating...", leave=False)
 
         mini_step = -1
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
@@ -751,20 +753,12 @@ class Trainer:
         barrier("Trainer::evaluate:after", self.device)
         return report
 
-    def _wrap_and_pad_loader(self, dataloader: Collection[Batch] | DataLoader[Batch], desc: str = "", leave: bool = True) -> tqdm[tuple[int, Batch]]:
+    def _wrap_and_pad_loader(self, dataloader: Collection[Batch] | DataLoader[Batch], longest: int, desc: str = "", leave: bool = True) -> tqdm[tuple[int, Batch]]:
         if is_dist() and self.padbatch is None:
             raise RuntimeError("padbatch must be specified for distributed training.")
 
-        # Get the length of this rank's dataloader and the longest dataloader across all ranks.
-        length = torch.tensor(len(dataloader), device=self.device)
-        longest = length.clone()
-        if is_dist():
-            dist.all_reduce(longest, op=dist.ReduceOp.MAX, group=None)
-        length = int(length.to(torch.int64).item())
-        longest = int(longest.to(torch.int64).item())
-
         # Get a (possibly padded) iterable over the samples in the loader.
-        num_padding = longest - length
+        num_padding = longest - len(dataloader)
         padding = itertools.repeat(self.padbatch, num_padding)
         iterable = itertools.chain(dataloader, padding)
 
@@ -946,11 +940,11 @@ class Trainer:
 
     @property
     def tr_dataloader_lengths(self) -> list[int]:
-        return self._dataloader_lengths(self.tr_loader)
+        return self._tr_dataloader_lengths
 
     @property
     def vl_dataloader_lengths(self) -> list[int]:
-        return self._dataloader_lengths(self.vl_loader)
+        return self._vl_dataloader_lengths
 
     @property
     def steps_per_epoch(self) -> int:
