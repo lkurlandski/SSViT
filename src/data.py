@@ -257,7 +257,7 @@ class _SemanticGuideOrSemanticGuides(ABC):
 
         if entropy is not None:
             slice_ = [slice(length) if i == self.length_axis else slice(None) for i in range(entropy.ndim)]
-            parse = entropy[tuple(slice_)]
+            entropy = entropy[tuple(slice_)]
 
         if characteristics is not None:
             length_ = length
