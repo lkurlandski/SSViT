@@ -116,6 +116,7 @@ from src.trainer import local_world_size
 from src.trainer import world_size
 from src.trainer import mp_dtype
 from src.trainer import Batch
+from src.trainer import is_dist
 from src.utils import num_sort_files
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
@@ -769,10 +770,22 @@ def main() -> None:
     if args.max_steps is not None:
         total_steps = args.max_steps
     elif args.max_epochs is not None:
-        total_steps = int(args.max_epochs * len(tr_loader) // args.gradient_accumulation_steps)
+        # Compute the total number of steps based on the longest epoch across all workers.
+        # This is a copy-paste from the Trainer class. Maybe we can refactor later.
+        length = torch.tensor(len(tr_loader), device=args.device)
+        if is_dist():
+            lengths = [torch.zeros(1, dtype=length.dtype, device=args.device) for _ in range(world_size())]
+            dist.all_gather(lengths, length, group=None)
+            lengths = [int(l.item()) for l in lengths]
+        else:
+            lengths = [int(length.item())]
+        longest = max(lengths)
+        steps_per_epoch = math.ceil(longest / args.gradient_accumulation_steps)
+        total_steps = max(1, math.ceil(steps_per_epoch * args.max_epochs))
     else:
         raise ValueError("Either `max_steps` or `max_epochs` must be specified.")
     warmup_steps = int(total_steps * args.warmup_ratio)
+    print(f"[rank {rank()}] {total_steps=}, {warmup_steps=}")
 
     scheduler_init: Callable[[Optimizer], LRScheduler]
     if args.sched == Scheduler.NONE:
