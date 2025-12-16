@@ -59,6 +59,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.utils import Timer
+from src.utils import check_tensor
 
 
 ALLOW_PARAM_GRAD_NONE = os.environ.get("ALLOW_PARAM_GRAD_NONE", "0") == "1"
@@ -199,6 +200,38 @@ def barrier(tag: str = "", device: Optional[torch.device] = None) -> None:
             dist.barrier()
     except Exception as e:
         print(f"[rank {rank()}] barrier({tag}) failed: {e}", flush=True)
+        raise
+
+
+def _check_logits_and_labels(logits: Tensor, labels: Tensor, num_classes: Optional[int] = None) -> None:
+    # Check the shape and dtype of logits and labels.
+    check_tensor(logits, (None, None), torch.float64)
+    check_tensor(labels, (None,), torch.int64)
+    # Infer num_classes if not provided.
+    num_classes = logits.shape[1] if num_classes is None else num_classes
+    check_tensor(logits, (None, num_classes), torch.float64)
+    # Check consistency between logits and labels.
+    if logits.shape[0] != labels.shape[0]:
+        raise ValueError(f"Logits and labels have different number of samples: {logits.shape[0]} vs {labels.shape[0]}.")
+    # Check that labels are in bounds.
+    unq: list[int] = torch.unique(labels).tolist()
+    if any((u < 0 or u >= num_classes) for u in unq):
+        raise ValueError(f"Labels contain out-of-bounds values: {unq} not in [0, {num_classes - 1}].")
+
+
+def check_logits_and_labels(logits: Tensor, labels: Tensor, num_classes: Optional[int] = None) -> None:
+    """
+    Check the logits and labels for shape, dtype, and consistency prior to metric computation.
+    """
+    try:
+        _check_logits_and_labels(logits, labels, num_classes)
+    except Exception:
+        torch.save(logits, f"tmp/debug_logits_rank-{rank()}.pt")
+        torch.save(labels, f"tmp/debug_labels_rank-{rank()}.pt")
+        print(f"[rank {rank()}] saved logits to tmp/debug_logits_rank-{rank()}.pt for debugging.")
+        print(f"[rank {rank()}] saved labels to tmp/debug_labels_rank-{rank()}.pt for debugging.")
+        print(f"[rank {rank()}] labels {tuple(labels.shape)} {labels.dtype} {labels.device} {labels.isnan().any().item()} {labels.min().item()} {labels.max().item()}")
+        print(f"[rank {rank()}] logits {tuple(logits.shape)} {logits.dtype} {logits.device} {logits.isnan().any().item()} {logits.min().item()} {logits.max().item()}")
         raise
 
 
@@ -705,7 +738,7 @@ class Trainer:
         iterable = self._wrap_and_pad_loader(dataloader, max(self.vl_dataloader_lengths), "Validating...", leave=False)
 
         mini_step = -1
-        results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
+        totalloss = torch.tensor(0.0, dtype=torch.float64, device=self.device)
         alllabels: list[Tensor] = []
         alllogits: list[Tensor] = []
 
@@ -716,36 +749,79 @@ class Trainer:
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 if real:
-                    results["num_samples"] += len(batch)
-                    results["vl_loss"] += loss * len(batch)
+                    totalloss += loss.to(torch.float64) * len(batch)
                     alllabels.append(batch.get_label())
                     alllogits.append(outputs)
 
         if mini_step < 0:
             raise RuntimeError(f"[rank {rank()}] empty dataloader.")
+        if len(alllabels) == 0 or len(alllogits) == 0:
+            raise RuntimeError(f"[rank {rank()}] no real samples were evaluated.")
 
-        labels = torch.cat(alllabels, dim=0)
-        logits = torch.cat(alllogits, dim=0)
+        labels = torch.cat(alllabels, dim=0).to(torch.int64)
+        logits = torch.cat(alllogits, dim=0).to(torch.float64)
+        check_logits_and_labels(logits, labels)
 
-        # Weight-average the metrics in this rank by the number of valid samples
-        metrics = self.compute_metrics(labels, logits)
-        for k, v in metrics.items():
-            results[f"vl_{k}"] = v.detach() * labels.shape[0]
+        if totalloss.grad is not None or totalloss.dtype != torch.float64:
+            raise RuntimeError("totalloss should be a non-gradient float64 tensor.")
+        if labels.grad is not None or labels.dtype != torch.int64:
+            raise RuntimeError("labels should be a non-gradient int64 tensor.")
+        if logits.grad is not None or logits.dtype != torch.float64:
+            raise RuntimeError("logits should be a non-gradient float64 tensor.")
 
-        # Aggregate results across workers and/or move to CPU
         if is_dist():
-            results = self.reduce_results(results)
-        else:
-            results = {k: results[k].detach().to("cpu") for k in results}
-        num_samples = int(results.pop("num_samples").item())
+            # Determine the lengths of collection of labels/logits across all ranks.
+            length  = torch.tensor([labels.shape[0]], device=self.device, dtype=torch.int64)
+            lengths = [torch.zeros_like(length) for _ in range(world_size())]
+            dist.all_gather(lengths, length)
+            longest = int(torch.max(torch.stack(lengths)).item())
+            # Pad labels/logits to common length so gather works.
+            if (pad := longest - labels.shape[0]) > 0:
+                labels = torch.nn.functional.pad(labels, (0, pad),       value=0)
+                logits = torch.nn.functional.pad(logits, (0, 0, 0, pad), value=torch.nan)
+            # Gather all labels and logits.
+            glabels: Optional[list[Tensor]] = None
+            glogits: Optional[list[Tensor]] = None
+            if rank() == 0:
+                glabels = [torch.empty((longest,),                 device=labels.device, dtype=labels.dtype) for _ in range(world_size())]
+                glogits = [torch.empty((longest, logits.shape[1]), device=logits.device, dtype=logits.dtype) for _ in range(world_size())]
+            dist.gather(labels.contiguous(), gather_list=glabels, dst=0)
+            dist.gather(logits.contiguous(), gather_list=glogits, dst=0)
+            # Concatenate and remove padding.
+            if rank() == 0:
+                assert glabels is not None
+                assert glogits is not None
+                labels = torch.cat([glabels[r][: int(lengths[r].item())] for r in range(world_size())], dim=0)
+                logits = torch.cat([glogits[r][: int(lengths[r].item())] for r in range(world_size())], dim=0)
+                check_logits_and_labels(logits, labels)
+            # Sum the loss across all ranks.
+            dist.all_reduce(totalloss, op=dist.ReduceOp.SUM)
+            # Cleanup some references to prevent bugs.
+            del length, lengths, longest, pad, glabels, glogits
 
-        # Average statistics over total number of samples
-        report = {}
-        for k in results:
-            report[k] = results[k].item() / num_samples
-        report["vl_time"] = time.time() - t_0
-        report["vl_samples"] = num_samples
-        report["vl_throughput"] = num_samples / report["vl_time"]
+        # Compute the metrics.
+        if rank() == 0:
+            metrics = self.compute_metrics(labels.to("cpu"), logits.to("cpu"))
+            metrics["loss"] = totalloss.to("cpu") / labels.shape[0]
+
+        # Prepare a validation report.
+        report: Optional[dict[str, float]] = None
+        if rank() == 0:
+            report = {}
+            for k in metrics:
+                report[f"vl_{k}"] = metrics[k].item()
+            report["vl_time"] = time.time() - t_0
+            report["vl_samples"] = labels.shape[0]
+            report["vl_throughput"] = labels.shape[0] / report["vl_time"]
+
+        # Broadcast the report to all ranks.
+        if is_dist():
+            obj = [report]
+            dist.broadcast_object_list(obj, src=0)
+            report = obj[0]
+
+        if report is None:
+            raise RuntimeError("Unreachable.")
 
         if was_training:
             self.model.train()
