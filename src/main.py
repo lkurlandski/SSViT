@@ -303,36 +303,21 @@ def get_model(
             return ViTClassifier(embedding, filmer, patcher, patchposencoder, transformer, head)
         raise NotImplementedError(f"{arch}")
 
+    # The original idea was to use different architectures for different structures, for example,
+    # CNNs with small strides for shorter structures, like the PE Header. Unfortunately, this does not work
+    # that well in practice because the stuctures that should be short can actually be quite long due to
+    # natural and unnatural variation in PE files. As a result, the architectures specialized for shorter
+    # inputs end up having to handle very long inputs, which can result in lower throughput and increased
+    # memory usage. Most severely, this can even lead to segmentation faults in the underlying CUDA kernels.
+
     # Hierarchical Model
-    tiny = (
-        HierarchicalStructureCoarse.HEADERS,
-        HierarchicalStructureMiddle.HEADERS,
-        HierarchicalStructureFine.DOS_HEADER,
-        HierarchicalStructureFine.DOS_STUB,
-        HierarchicalStructureFine.COFF_HEADER,
-        HierarchicalStructureFine.OPTN_HEADER,
-        HierarchicalStructureFine.SECTN_TABLE,
-    )
-
-    def tiny_malconv() -> MalConvBase:
-        return MalConvCls(embedding_dim, mcnv_channels, kernel_size=64, stride=1, overlap=0)
-
-    def full_malconv() -> MalConvBase:
-        return MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap)
-
-    def tiny_patcher() -> PatchEncoder:
-        return PatchEncoder(embedding_dim, patcher_channels, num_patches=1, patch_size=None, kernel_size=64, stride=1)
-
-    def full_patcher() -> PatchEncoderBase:
-        return PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
-
     embeddings = [Embedding(num_embeddings, embedding_dim, padding_idx) for _ in range(num_structures)]
     filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden) for _ in range(num_structures)]
     if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-        malconvs = [tiny_malconv() if s in tiny else full_malconv() for s in structures]
+        malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap) for s in structures]
         return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
     if arch in (Architecture.VIT,):
-        patchers = [tiny_patcher() if s in tiny else full_patcher() for s in structures]
+        patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size) for s in structures]
         total_num_patches = sum(p.num_patches for p in patchers)  # type: ignore[misc]
         patchposencoders = [PatchPositionalityEncoderCls(p.out_channels) for p in patchers]
         transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencname, total_num_patches)
