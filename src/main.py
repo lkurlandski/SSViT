@@ -39,6 +39,7 @@ from torch.nn import Module
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 from torch.optim import AdamW
+from torch.optim.optimizer import ParamsT
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.optim.lr_scheduler import LambdaLR
@@ -749,7 +750,7 @@ def main() -> None:
     loss_fn = CrossEntropyLoss(label_smoothing=args.label_smoothing)
     print(f"{loss_fn=}")
 
-    optimizer_init: Callable[[Iterable[torch.nn.Parameter]], Optimizer] = partial(AdamW, lr=args.lr_max, weight_decay=args.weight_decay)
+    optimizer_init: Callable[[ParamsT], Optimizer] = partial(AdamW, lr=args.lr_max, weight_decay=args.weight_decay)
     print(f"{optimizer_init=}")
 
     if args.max_steps is not None:
