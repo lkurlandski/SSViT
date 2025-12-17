@@ -34,6 +34,7 @@ from src.helpers import Scheduler
 
 
 DEBUG = False
+NGPUS: Optional[int] = None
 
 
 def fixed_width_string(string: Any, width: int, char: str = " ", left: bool = False) -> str:
@@ -356,7 +357,11 @@ class Requirements:
     @property
     def gpus_per_node(self) -> int:
         """Return the number of GPUs per node required for the job (configure)."""
-        return 2
+        if NGPUS is not None:
+            return NGPUS
+        if self.config.arch == Architecture.VIT:
+            return 4
+        return 1
 
     @property
     def ntasks_per_node(self) -> int:
@@ -412,6 +417,10 @@ class ScriptBuilder:
             f"export PTW_NUM_THREADS={self.reqs.omp_num_threads}",
         ])
 
+        locals = "\n".join([
+            f"OUTDIR=\"{self.config.outdir}\"",
+        ])
+
         torchrun = " \\\n".join([
             "torchrun",
             "--no-python",
@@ -424,7 +433,7 @@ class ScriptBuilder:
         command = " \\\n".join([
             "python",
             "src/main.py",
-            f"--outdir {self.config.outdir}",
+            f"--outdir \"$OUTDIR\"",
             f"--arch {self.config.arch.value}",
             f"--posenc {self.config.posenc.value}",
             f"--patchposenc {self.config.patchposenc.value}",
@@ -474,6 +483,7 @@ class ScriptBuilder:
         script += slurm + "\n\n"
         script += environment + "\n\n"
         script += variables + "\n\n"
+        script += locals + "\n\n"
         script += command + "\n\n"
 
         return script
@@ -553,10 +563,13 @@ def main() -> None:
 
     parser = ArgumentParser(description="Create large batches of experiments.")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--ngpus", type=int, default=None)
     args = parser.parse_args()
 
     global DEBUG
+    global NGPUS
     DEBUG = args.debug
+    NGPUS = args.ngpus
 
     outpath = Path("./run")
     outpath.mkdir(exist_ok=True)
