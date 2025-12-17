@@ -1203,6 +1203,27 @@ class IterableSimpleDBDataset(IterableDataset[FSample]):
     def __len__(self) -> int:
         return sum(self.db.num_samples(self._get_local_shards()))
 
+    def __repr__(self) -> str:
+
+        def display_shards() -> str:
+            if len(self.shards) == 0:
+                return "[]"
+            if self.shards == list(range(self.shards[0], self.shards[-1] + 1)):
+                return f"[{self.shards[0]}...{self.shards[-1]}]"
+            return "[...]"
+
+        return (
+            f"{self.__class__.__name__}"
+            "("
+            f"db={self.db.__class__.__name__}, "
+            f"metadb={self.metadb.__class__.__name__}, "
+            f"preprocessor={self.preprocessor.__class__.__name__}, "
+            f"shards={display_shards()}, "
+            f"shuffle={self.shuffle}, "
+            f"poolsize={self.poolsize}"
+            ")"
+        )
+
     def preprocess(self, sample: SimpleDBSample, meta: pl.DataFrame) -> FSample:
         return self.preprocessor(
             sample.name,
