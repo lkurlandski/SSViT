@@ -582,6 +582,25 @@ def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlappi
     return groups
 
 
+def get_shardwise_stats(datadb: SimpleDB, last_shard: int) -> pd.DataFrame:
+    dfs = []
+    for shard, (size_df, meta_df) in enumerate(zip(datadb.get_size_dfs(), datadb.get_meta_dfs())):
+        s = size_df["size"].to_numpy(np.int64)
+        l = meta_df["malware"].to_numpy(np.int64)
+        d = np.unique(l, return_counts=True)[1]
+        df = pd.DataFrame({
+            "shard-idx": shard,
+            "size-max": np.max(s),
+            "size-min": np.min(s),
+            "size-avg": np.mean(s),
+            "ratio-malware": d[1] / (d[0] + d[1]),
+        }, index=[0])
+        dfs.append(df)
+        if shard >= last_shard:
+            break
+    return pd.concat(dfs, ignore_index=True)
+
+
 def main() -> None:
 
     lief.logging.set_level(lief.logging.LEVEL.OFF)
@@ -690,29 +709,11 @@ def main() -> None:
     print(f"tr_shards=[0, ..., {tr_last_shard}]")
     print(f"ts_shards=[0, ..., {ts_last_shard}]")
 
-    def get_shardwise_stats(datadb: SimpleDB, last_shard: int) -> pd.DataFrame:
-        dfs = []
-        for shard, (size_df, meta_df) in enumerate(zip(datadb.get_size_dfs(), datadb.get_meta_dfs())):
-            s = size_df["size"].to_numpy(np.int64)
-            l = meta_df["malware"].to_numpy(np.int64)
-            d = np.unique(l, return_counts=True)[1]
-            df = pd.DataFrame({
-                "shard-idx": shard,
-                "size-max": np.max(s),
-                "size-min": np.min(s),
-                "size-avg": np.mean(s),
-                "ratio-malware": d[1] / (d[0] + d[1]),
-            }, index=[0])
-            dfs.append(df)
-            if shard >= last_shard:
-                break
-        return pd.concat(dfs, ignore_index=True)
-
-    # tr_stats_df = get_shardwise_stats(tr_datadb, tr_last_shard)
-    # ts_stats_df = get_shardwise_stats(ts_datadb, ts_last_shard)
-    # with pd.option_context("display.max_rows", None, "display.max_columns", None):
-    #     print(f"tr_stats_df=\n{tr_stats_df}")
-    #     print(f"ts_stats_df=\n{ts_stats_df}")
+    tr_stats_df = get_shardwise_stats(tr_datadb, tr_last_shard)
+    ts_stats_df = get_shardwise_stats(ts_datadb, ts_last_shard)
+    with pd.option_context("display.max_rows", 4, "display.max_columns", None):
+        print(f"tr_stats_df=\n{tr_stats_df}")
+        print(f"ts_stats_df=\n{ts_stats_df}")
 
     # Split the shards between distributed workers.
     if world_size() > 1:
@@ -730,6 +731,8 @@ def main() -> None:
     ts_dataset = IterableSimpleDBDataset(ts_datadb, ts_metadb, preprocessor, ts_shards, shuffle=False)
     print(f"{tr_dataset=}")
     print(f"{ts_dataset=}")
+    print(f"{len(tr_dataset)=}")
+    print(f"{len(ts_dataset)=}")
 
     collate_fn = get_collate_fn(args.level, min_lengths, structures)
     print(f"{collate_fn=}")
@@ -738,11 +741,15 @@ def main() -> None:
     ts_loader = get_loader(ts_dataset, args.ts_batch_size, False, None, None, min(args.num_workers, len(ts_shards)), collate_fn, args.pin_memory, args.prefetch_factor)
     print(f"tr_loader=DataLoader(pin_memory={tr_loader.pin_memory}, num_workers={tr_loader.num_workers}, prefetch_factor={tr_loader.prefetch_factor})")
     print(f"ts_loader=DataLoader(pin_memory={ts_loader.pin_memory}, num_workers={ts_loader.num_workers}, prefetch_factor={ts_loader.prefetch_factor})")
+    print(f"{len(tr_loader)=}")
+    print(f"{len(ts_loader)=}")
 
     tr_streamer = get_streamer(tr_loader, args.device, args.num_streams)
     ts_streamer = get_streamer(ts_loader, args.device, args.num_streams)
     print(f"{tr_streamer=}")
     print(f"{ts_streamer=}")
+    print(f"{len(tr_streamer)=}")
+    print(f"{len(ts_streamer)=}")
 
     rargs = TrainerArgs.from_dict(args.to_dict())
     print(f"{rargs=}")
