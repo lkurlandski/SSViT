@@ -199,6 +199,19 @@ class SimpleDB:
                 d[row["name"]] = row["idx"]
         return d
 
+    def get_shardix_from_idx(self, idx: int) -> int:
+        left, right = 0, self.num_shards - 1
+        while left <= right:
+            mid = (left + right) // 2
+            size_df = self.get_size_df(mid)
+            if idx < size_df["idx"].min():
+                right = mid - 1
+            elif idx > size_df["idx"].max():
+                left = mid + 1
+            else:
+                return mid
+        raise ValueError(f"Index {idx} not found in any shard.")
+
 
 class SimpleDBReader:
     """
@@ -211,13 +224,14 @@ class SimpleDBReader:
 
     def get(self, idx_or_name: int | str) -> Sample:
         idx = idx_or_name if isinstance(idx_or_name, int) else self.name_to_idx_map[idx_or_name]
+        shardidx = self.db.get_shardix_from_idx(idx)
 
-        blob = self.db.files_data[idx].read_bytes()
+        blob = self.db.files_data[shardidx].read_bytes()
         if blob.startswith(b'\x28\xb5\x2f\xfd'):
             blob = zstd.decompress(blob)
 
-        size_df = self.db.get_size_df(idx)
-        meta_df = self.db.get_meta_df(idx)
+        size_df = self.db.get_size_df(shardidx)
+        meta_df = self.db.get_meta_df(shardidx)
 
         size_row = size_df[size_df["idx"] == idx].iloc[0]
         meta_row = meta_df[meta_df["idx"] == idx].iloc[0]
