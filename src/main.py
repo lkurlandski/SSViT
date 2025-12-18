@@ -116,8 +116,8 @@ from src.trainer import rank
 from src.trainer import local_world_size
 from src.trainer import world_size
 from src.trainer import mp_dtype
-from src.trainer import Batch
 from src.trainer import is_dist
+from src.trainer import largest_possible_dataloader_length
 from src.utils import num_sort_files
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
@@ -395,6 +395,7 @@ def get_loader(
     num_workers: int,
     collate_fn: Callable[[Sequence[FSample]], FSamples | HSamples],
     pin_memory: bool,
+    drop_last: bool,
     prefetch_factor: int,
 ) -> DataLoader[FOrHSamples]:
     """
@@ -404,7 +405,7 @@ def get_loader(
     override `shuffle`, `batch_size`, and `drop_last`. Similarly, providing
     and IterableDataset will override `shuffle` and `sampler`.
     """
-    return DataLoader(
+    loader = DataLoader(
         dataset=dataset,
         batch_size=batch_size if batch_sampler is None else None,
         shuffle=shuffle if sampler is None and batch_sampler is None and not isinstance(dataset, IterableDataset) else None,
@@ -413,26 +414,19 @@ def get_loader(
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
+        drop_last=drop_last,
         worker_init_fn=None if num_workers == 0 else worker_init_fn,
         multiprocessing_context=None if num_workers == 0 else "forkserver",
         prefetch_factor=None if num_workers == 0 else prefetch_factor,
         persistent_workers=False if num_workers == 0 else True,
     )
 
-
-def get_streamer(loader: DataLoader[Any], device: torch.device, num_streams: int) -> DataLoader[FOrHSamples] | StreamlessCUDAPrefetcher | CUDAPrefetcher:
-    """If multiple streams in use, wrap a DataLoader with a CUDAPrefetcher and warmup its workers."""
-    if num_streams < 0:
-        raise ValueError(f"`num_streams` must be non-negative, got {num_streams}.")
     if loader.persistent_workers:
         iter(loader)
-        time.sleep(loader.num_workers * 0.5)
+        time.sleep(loader.num_workers * 1.0)
         print("", end="", flush=True)
-    if num_streams == 0:
-        return loader
-    if num_streams == 1:
-        return StreamlessCUDAPrefetcher(loader, device)
-    return CUDAPrefetcher(loader, device, num_streams)
+
+    return loader
 
 
 def get_padbatch(level: HierarchicalLevel, structures: list[HierarchicalStructure], do_parse: bool, do_entropy: bool, which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS], min_lengths: list[int], batch_size: int) -> FSamples | HSamples:
@@ -737,19 +731,12 @@ def main() -> None:
     collate_fn = get_collate_fn(args.level, min_lengths, structures)
     print(f"{collate_fn=}")
 
-    tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, min(args.num_workers, len(tr_shards)), collate_fn, args.pin_memory, args.prefetch_factor)
-    ts_loader = get_loader(ts_dataset, args.ts_batch_size, False, None, None, min(args.num_workers, len(ts_shards)), collate_fn, args.pin_memory, args.prefetch_factor)
-    print(f"tr_loader=DataLoader(pin_memory={tr_loader.pin_memory}, num_workers={tr_loader.num_workers}, prefetch_factor={tr_loader.prefetch_factor})")
-    print(f"ts_loader=DataLoader(pin_memory={ts_loader.pin_memory}, num_workers={ts_loader.num_workers}, prefetch_factor={ts_loader.prefetch_factor})")
-    print(f"{len(tr_loader)=}")
-    print(f"{len(ts_loader)=}")
-
-    tr_streamer = get_streamer(tr_loader, args.device, args.num_streams)
-    ts_streamer = get_streamer(ts_loader, args.device, args.num_streams)
-    print(f"{tr_streamer=}")
-    print(f"{ts_streamer=}")
-    print(f"{len(tr_streamer)=}")
-    print(f"{len(ts_streamer)=}")
+    tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, min(args.num_workers, len(tr_shards)), collate_fn, args.pin_memory, False, args.prefetch_factor)
+    ts_loader = get_loader(ts_dataset, args.ts_batch_size, False, None, None, min(args.num_workers, len(ts_shards)), collate_fn, args.pin_memory, False, args.prefetch_factor)
+    print(f"tr_loader=DataLoader(pin_memory={tr_loader.pin_memory}, num_workers={tr_loader.num_workers}, prefetch_factor={tr_loader.prefetch_factor}, drop_last={tr_loader.drop_last})")
+    print(f"ts_loader=DataLoader(pin_memory={ts_loader.pin_memory}, num_workers={ts_loader.num_workers}, prefetch_factor={ts_loader.prefetch_factor}, drop_last={ts_loader.drop_last})")
+    print(f"{len(tr_loader)=} {largest_possible_dataloader_length(tr_loader)=}")
+    print(f"{len(ts_loader)=} {largest_possible_dataloader_length(ts_loader)=}")
 
     rargs = TrainerArgs.from_dict(args.to_dict())
     print(f"{rargs=}")
@@ -831,8 +818,8 @@ def main() -> None:
             checkpoint,
             model=model,
             wrap_model=wrap_model,
-            tr_loader=tr_streamer,
-            vl_loader=ts_streamer,
+            tr_loader=tr_loader,
+            vl_loader=ts_loader,
             loss_fn=loss_fn,
             optimizer_init=optimizer_init,
             scheduler_init=scheduler_init,
@@ -846,14 +833,14 @@ def main() -> None:
         trainer = Trainer(
             args=rargs,
             model=wmodel,
-            tr_loader=tr_streamer,
-            vl_loader=ts_streamer,
+            tr_loader=tr_loader,
+            vl_loader=ts_loader,
+            padbatch=padbatch,
             loss_fn=loss_fn,
             optimizer=optimizer,
             scheduler=scheduler,
             stopper=stopper,
             device=args.device,
-            padbatch=padbatch,
         )
     print(f"{trainer=}")
     print("", end="", flush=True)
