@@ -181,9 +181,16 @@ class Configuration:
             if self.size == ModelSize.LG:  # O(N)
                 if self.do_entropy or self.which_characteristics:
                     return 64
+                if self.level == HierarchicalLevel.NONE:
+                    return 128
                 if self.level == HierarchicalLevel.COARSE:
                     return 64
-                return 128
+                if self.level == HierarchicalLevel.MIDDLE:
+                    return 64
+                if self.level == HierarchicalLevel.FINE:
+                    return 64
+                print(f"WARNING ({str(self)}): max_per_device_batch_size not found.")
+                return 64
 
         raise NotImplementedError(f"ERROR ({str(self)}): batch size not defined for this configuration.")
 
@@ -326,6 +333,16 @@ class Requirements:
             print(f"WARNING ({str(self.config)}): throughput benchmark not found.")
             tr_throughput = 100
             vl_throughput = 100
+
+        if self.config.level == HierarchicalLevel.COARSE:
+            tr_throughput *= 0.75
+            vl_throughput *= 0.50
+        if self.config.level == HierarchicalLevel.MIDDLE:
+            tr_throughput *= 0.60
+            vl_throughput *= 0.40
+        if self.config.level == HierarchicalLevel.FINE:
+            tr_throughput *= 0.40
+            vl_throughput *= 0.30
 
         tr_throughput = tr_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
         vl_throughput = vl_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
@@ -509,6 +526,12 @@ def config_fiter(config: Configuration) -> bool:
     if not isinstance(config, Configuration):
         raise TypeError()
 
+    CHARS = (
+        lief.PE.Section.CHARACTERISTICS.MEM_READ,
+        lief.PE.Section.CHARACTERISTICS.MEM_WRITE,
+        lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
+    )
+
     # Debug
     if DEBUG:
         ...
@@ -526,34 +549,28 @@ def config_fiter(config: Configuration) -> bool:
         return False
 
     # Structure
-    if config.level not in (HierarchicalLevel.NONE, HierarchicalLevel.COARSE):
-        return False
+    if config.level != HierarchicalLevel.NONE:
+        if config.do_entropy:
+            return False
+        if config.which_characteristics:
+            return False
 
     # Positional Encoding
-    if config.level != HierarchicalLevel.NONE:
-        if config.posenc != PositionalEncodingArchitecture.FIXED:
-            return False
-        if config.patchposenc != PatchPositionalEncodingArchitecture.NONE:
-            return False
-
-    # Semantics
-    if config.do_entropy or len(config.which_characteristics) > 0:
+    if config.posenc != PositionalEncodingArchitecture.LEARNED:
         return False
-    CHARS = (
-        lief.PE.Section.CHARACTERISTICS.MEM_READ,
-        lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
-        lief.PE.Section.CHARACTERISTICS.CNT_CODE,
-    )
-    if len(config.which_characteristics) > 0 and any(c not in CHARS for c in config.which_characteristics):
+    if config.level == HierarchicalLevel.NONE and config.patchposenc != PatchPositionalEncodingArchitecture.BTH:
         return False
-    if len(config.which_characteristics) not in (0, 1, len(CHARS)):
-        return False
-    if config.do_entropy and len(config.which_characteristics) not in (0, len(CHARS)):
-        return False
-    if not config.do_entropy and len(config.which_characteristics) == len(CHARS):
+    if config.level != HierarchicalLevel.NONE and config.patchposenc != PatchPositionalEncodingArchitecture.NONE:
         return False
 
-    if config.do_entropy and len(config.which_characteristics) == len(CHARS):
+    # Entropy
+    if config.do_entropy:
+        return False
+
+    # Characteristics
+    if config.which_characteristics and not all(c in CHARS for c in config.which_characteristics):
+        return False
+    if config.which_characteristics and len(config.which_characteristics) != 3:
         return False
 
     return True
