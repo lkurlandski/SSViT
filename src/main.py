@@ -304,22 +304,56 @@ def get_model(
             return ViTClassifier(embedding, filmer, patcher, patchposencoder, transformer, head)
         raise NotImplementedError(f"{arch}")
 
+    # Hierarchical Model
+
     # The original idea was to use different architectures for different structures, for example,
     # CNNs with small strides for shorter structures, like the PE Header. Unfortunately, this does not work
     # that well in practice because the stuctures that should be short can actually be quite long due to
     # natural and unnatural variation in PE files. As a result, the architectures specialized for shorter
     # inputs end up having to handle very long inputs, which can result in lower throughput and increased
     # memory usage. Most severely, this can even lead to segmentation faults in the underlying CUDA kernels.
+    # All told, we need to use architectures that can handle long inputs elegantly for all structures.
 
-    # Hierarchical Model
+    tiny = (
+        HierarchicalStructureCoarse.HEADERS,
+        HierarchicalStructureCoarse.DIRECTORY,
+        HierarchicalStructureMiddle.HEADERS,
+        HierarchicalStructureMiddle.DIRECTORY,
+        HierarchicalStructureFine.DOS_HEADER,
+        HierarchicalStructureFine.DOS_STUB,
+        HierarchicalStructureFine.COFF_HEADER,
+        HierarchicalStructureFine.OPTN_HEADER,
+        HierarchicalStructureFine.SECTN_TABLE,
+        HierarchicalStructureFine.IDATA,
+        HierarchicalStructureFine.DELAYIMP,
+        HierarchicalStructureFine.EDATA,
+        HierarchicalStructureFine.RESOURCE,
+        HierarchicalStructureFine.TLS,
+        HierarchicalStructureFine.LOADCFG,
+        HierarchicalStructureFine.RELOC,
+        HierarchicalStructureFine.DEBUG,
+        HierarchicalStructureFine.CLR,
+        HierarchicalStructureFine.OTHERDIR,
+    )
+
     embeddings = [Embedding(num_embeddings, embedding_dim, padding_idx) for _ in range(num_structures)]
     filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden) for _ in range(num_structures)]
     if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
         malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap) for s in structures]
         return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
     if arch in (Architecture.VIT,):
-        patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size) for s in structures]
-        total_num_patches = sum(p.num_patches for p in patchers)  # type: ignore[misc]
+        # Allocate one patch to each tiny structure; divide the remaining patches among the full structures.
+        num_patches_tiny = None
+        num_patches_full = None
+        if num_patches is not None:
+            num_tiny = sum(1 for s in structures if s in tiny)
+            num_full = sum(1 for s in structures if s not in tiny)
+            num_patches_tiny = 1
+            num_patches_full = (num_patches - num_tiny * num_patches_tiny) // max(1, num_full)
+            actual_num_patches = num_patches_full * num_full + num_patches_tiny * num_tiny
+            print(f"[INFO] [rank {rank()}] [get_model] {num_patches} patches available and {actual_num_patches} patches will be used.")
+        patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches_tiny if s in tiny else num_patches_full, patch_size) for s in structures]
+        total_num_patches = sum(p.num_patches for p in patchers if p.num_patches is not None)
         patchposencoders = [PatchPositionalityEncoderCls(p.out_channels) for p in patchers]
         transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencname, total_num_patches)
         return HierarchicalViTClassifier(embeddings, filmers, patchers, patchposencoders, transformer, head)
