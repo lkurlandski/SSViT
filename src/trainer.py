@@ -20,6 +20,7 @@ import math
 import os
 from pathlib import Path
 import pickle
+import sys
 import threading
 import time
 from typing import Any
@@ -546,6 +547,7 @@ class Trainer:
         self.scaler = GradScaler(self.device.type, enabled=self.mp_dtype == torch.float16)
         self.log: list[Mapping[str, int | float]] = []
         self.glbl_step = 0
+        self.epoch_idx = 0
         self._next_eval_step: Optional[int] = None
         self._next_chpt_step: Optional[int] = None
         self._next_logg_step: Optional[int] = None
@@ -587,7 +589,7 @@ class Trainer:
             self._next_logg_step = self.glbl_step + self.logg_steps
 
         pbar = tqdm(total=self.max_epochs, disable=self.args.disable_tqdm, leave=False, unit="step")
-        pbar.set_description(f"Epoch {self.glbl_step // self.steps_per_epoch} of {self.max_steps / self.steps_per_epoch}")
+        pbar.set_description(f"Epoch {self.epoch_idx} of {self.max_steps / self.steps_per_epoch}")
 
         # Conduct an initial validation and checkpointing on the naked model.
         if self.glbl_step == 0:
@@ -596,8 +598,9 @@ class Trainer:
         # Continuously train the model on the training set until finished.
         while not self._done:
             self.train()
+            self.epoch_idx += 1
             pbar.update(1)
-            pbar.set_description(f"Epoch {self.glbl_step // self.steps_per_epoch} of {self.max_steps / self.steps_per_epoch}")
+            pbar.set_description(f"Epoch {self.epoch_idx} of {self.max_steps / self.steps_per_epoch}")
 
         self.monitor.stop()
 
@@ -615,7 +618,7 @@ class Trainer:
 
         # Get a wrapped dataloader with padding to the longest rank and gradient accumulation.
         iterable = self.get_iterable(self.tr_loader, self.tr_dataloader_length, "Training...", leave=False)
-        self.print(f"[INFO] [rank {rank()}] [Trainer::train] {len(self.tr_loader)=} {largest_possible_dataloader_length(self.tr_loader)=} {self.tr_dataloader_length=} {len(iterable)=}")
+        # self.print(f"[INFO] [rank {rank()}] [Trainer::train] {len(self.tr_loader)=} {largest_possible_dataloader_length(self.tr_loader)=} {self.tr_dataloader_length=} {len(iterable)=}")
 
         def get_report() -> dict[str, float]:
             """Assemble a training report (excluding GPU statistics)."""
@@ -704,8 +707,18 @@ class Trainer:
                     results["param_delta"] += (flat_params_aft - flat_params_bef).norm().detach()
                     flat_params_bef = flat_params_aft
                 # Determine what hooks are to be executed
-                do_logg = any(self._due_hooks())
-                do_eval = self._due_hooks()[0]
+                do_eval, do_chpt, do_logg = self._due_hooks()
+                ad_eval, ad_chpt, ad_logg = None, None, None
+                # Since the step-based schedules are likely overestimating the number of steps/epoch,
+                # we might want to manually fire them if we're using epoch-based schedules at the end of an epoch.
+                if not anyone_had_real_window:
+                    if self._should_fire_hook_at_end_of_epoch(self.args.eval_epochs):
+                        do_eval, ad_eval = True, True
+                    if self._should_fire_hook_at_end_of_epoch(self.args.chpt_epochs):
+                        do_chpt, ad_chpt = True, True
+                    if self._should_fire_hook_at_end_of_epoch(self.args.logg_epochs):
+                        do_logg, ad_logg = True, True
+                should_prepare_report = any((do_eval, do_chpt, do_logg))
                 # Free up memory before validation to keep GPU memory usage lower
                 if do_eval:
                     del batch, outputs, loss
@@ -714,7 +727,7 @@ class Trainer:
                 if do_eval and isinstance(iterable, tqdm) and (mini_step + 1 == len(iterable) or not anyone_had_real_window):
                     iterable.close()
                 # Prepare a training report and reset the tracking objects
-                if do_logg:
+                if should_prepare_report:
                     report = get_report()
                     timer.start()
                     results = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
@@ -722,11 +735,11 @@ class Trainer:
                     report = None
                 # Run the due hooks, but pause the timer during their execution
                 timer.pause()
-                self.run_due_hooks(report)
+                self.run_due_hooks(report, do_eval=do_eval, do_chpt=do_chpt, do_logg=do_logg, ad_eval=ad_eval, ad_chpt=ad_chpt, ad_logg=ad_logg)
                 self.model.train()
                 timer.resume()
                 # Clear the monitor if logging was performed
-                if do_logg:
+                if should_prepare_report:
                     self.monitor.clear()
                 # Break from the loop if every rank is on padding
                 if not anyone_had_real_window:
@@ -757,7 +770,7 @@ class Trainer:
 
         # Get a wrapped dataloader with padding to the longest rank.
         iterable = self.get_iterable(self.vl_loader, self.vl_dataloader_length, "Validating...", leave=False)
-        self.print(f"[INFO] [rank {rank()}] [Trainer::evaluate] {len(self.vl_loader)=} {largest_possible_dataloader_length(self.vl_loader)=} {self.vl_dataloader_length=} {len(iterable)=}")
+        # self.print(f"[INFO] [rank {rank()}] [Trainer::evaluate] {len(self.vl_loader)=} {largest_possible_dataloader_length(self.vl_loader)=} {self.vl_dataloader_length=} {len(iterable)=}")
 
         mini_step = -1
         totalloss = torch.tensor(0.0, dtype=torch.float64, device=self.device)
@@ -774,7 +787,7 @@ class Trainer:
                     alllabels.append(batch.get_label())
                     alllogits.append(outputs)
 
-        self.print(f"[INFO] [rank {rank()}] [Trainer::evaluate] {mini_step=} num_real={len(alllabels)} num_fake={mini_step + 1 - len(alllabels)}")
+        # self.print(f"[INFO] [rank {rank()}] [Trainer::evaluate] {mini_step=} num_real={len(alllabels)} num_fake={mini_step + 1 - len(alllabels)}")
         if mini_step < 0:
             raise RuntimeError(f"[rank {rank()}] empty dataloader.")
         if len(alllabels) == 0 or len(alllogits) == 0:
@@ -885,6 +898,23 @@ class Trainer:
         do_logg = self._next_logg_step is not None and self.glbl_step >= self._next_logg_step
         return do_eval, do_chpt, do_logg
 
+    def _should_fire_hook_at_end_of_epoch(self, x_epochs: Optional[float]) -> bool:
+        """
+        Decide whether a hook with an epoch period should fire at the *end* of this epoch.
+
+        Args:
+            x_epochs: The number of epochs after which the hook should fire.
+        """
+        if x_epochs is None:
+            return False
+        if x_epochs == 1.0:
+            return True
+        if x_epochs < 1.0 and (1 / x_epochs).is_integer():
+            return True
+        if x_epochs > 1.0 and ((self.epoch_idx + 1) % x_epochs == 0):
+            return True
+        return False
+
     def run_due_hooks(
         self,
         tr_report: Optional[dict[str, float]],
@@ -892,18 +922,24 @@ class Trainer:
         do_eval: Optional[bool] = None,
         do_chpt: Optional[bool] = None,
         do_logg: Optional[bool] = None,
+        ad_eval: Optional[bool] = None,
+        ad_chpt: Optional[bool] = None,
+        ad_logg: Optional[bool] = None,
     ) -> None:
         """
-        Conduct periodic activities, such as running validation and checkpointing.
+        Conduct periodic activities, such as running validation, checkpointing, and logging.
 
         Args:
             tr_report: Optional dictionary of training statistics to include in the report.
             do_eval: If True, run validation even if not scheduled.
             do_chpt: If True, save a checkpoint even if not scheduled.
-            do_logg: If True, update the console and log files even if not scheduled.
+            do_logg: If True, update the logs even if not scheduled.
+            ad_eval: Whether or not to advance the eval schedule. If None, will advance only if fired organically.
+            ad_chpt: Whether or not to advance the checkpoint schedule. If None, will advance only if fired organically.
+            ad_logg: Whether or not to advance the log schedule. If None, will advance only if fired organically.
 
-        NOTE: the schedules are only advanced if fired organically, not via the `do_*` arguments.
-        NOTE: logging will occur if any hook fires, but will not advance the logging schedule.
+        NOTE: logging will occur if any hook fires, but will not advance the logging schedule by default.
+        NOTE: the early stoppper will be updated if validation was run and the validation schedule advanced.
         """
         due_eval, due_chpt, due_logg = self._due_hooks()
 
@@ -916,7 +952,11 @@ class Trainer:
             return
 
         # Otherwise, assemble report to log.
-        report = {"epoch": self.glbl_step / self.steps_per_epoch, "glbl_step": self.glbl_step, "lr": self.scheduler.get_last_lr()[0]}
+        report = {
+            "epoch": self.epoch_idx,
+            "glbl_step": self.glbl_step,
+            "lr": self.scheduler.get_last_lr()[0],
+        }
         if tr_report is not None:
             report |= tr_report
             report |= {f"tr_{k}": v for k, v in self.get_monitor_report().items()}
@@ -935,16 +975,21 @@ class Trainer:
         self._update_cons(report)
         self._update_logs(report)
 
+        # Determine which schedules to advance.
+        adv_eval = due_eval if ad_eval is None else ad_eval
+        adv_chpt = due_chpt if ad_chpt is None else ad_chpt
+        adv_logg = due_logg if ad_logg is None else ad_logg
+
         # Advance schedules that fired.
-        if due_eval:
+        if adv_eval:
             self._next_eval_step += self.eval_steps  # type: ignore[operator]
-        if due_chpt:
+        if adv_chpt:
             self._next_chpt_step += self.chpt_steps  # type: ignore[operator]
-        if due_logg:
+        if adv_logg:
             self._next_logg_step += self.logg_steps  # type: ignore[operator]
 
-        # Handle early stopping (only if validation is orgnanically scheduled).
-        if due_eval:
+        # Handle early stopping.
+        if do_eval and adv_eval:
             self.stopper.step(report[f"{self.args.stopper_metric}"])
         if self.stopper.stop:
             self.print("Early stopping triggered.")
@@ -1049,7 +1094,7 @@ class Trainer:
         if self.args.disable_tqdm:
             print(*args, sep=sep, end=end)
         else:
-            tqdm.write(sep.join(map(str, args)), end=end)
+            tqdm.write(sep.join(map(str, args)), sys.stderr, end=end)
 
     def get_dataloader_lengths(self, dataloader: DataLoader[Batch]) -> list[int]:
         """Return the maximum possible lengths of the dataloader on each distributed rank."""
