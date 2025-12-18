@@ -6,6 +6,7 @@ from __future__ import annotations
 from argparse import Namespace
 from collections import defaultdict
 from collections.abc import Collection
+from collections.abc import Generator
 from collections.abc import Iterable
 from collections.abc import Mapping
 import contextlib
@@ -56,6 +57,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
 from src.utils import Timer
@@ -140,6 +143,29 @@ class Batch(Protocol):
         Access the guides tensor(s), which should have been finalized in `finalize` (no copy/compute).
         """
         ...
+
+
+def largest_possible_dataloader_length(loader: DataLoader[Any]) -> int:
+    # Validate the type and properties of the dataloader's dataset.
+    if not isinstance(loader.dataset, (Dataset, IterableDataset)):
+        raise TypeError("`loader.dataset` must be a `Dataset` or `IterableDataset`.")
+    if not hasattr(loader.dataset, "__len__"):
+        raise ValueError("`loader.dataset` has no `__len__` method.")
+    if len(loader.dataset) is None:
+        raise ValueError("`len(loader.dataset)` returned None.")
+    # The length for underlying map-style datasets is exact.
+    if isinstance(loader.dataset, Dataset) and not isinstance(loader.dataset, IterableDataset):
+        return len(loader)
+    # The length for underlying iterable-style datasets is an estimate.
+    length = len(loader.dataset)  # type: ignore[arg-type]
+    length = length / (loader.batch_size if loader.batch_size is not None else 1)
+    length = math.floor(length) if loader.drop_last else math.ceil(length)
+    length = max(0, int(length) + loader.num_workers - 1)
+    return length
+
+
+def round_up_to_multiple(x: int, m: int) -> int:
+    return ((x + m - 1) // m) * m
 
 
 def is_dist() -> bool:
@@ -491,48 +517,31 @@ def print_parameter_summary(model: nn.Module, spaces: int = 0) -> None:
 class Trainer:
     """
     Trainer class for training models with PyTorch.
-
-    Usage
-    -----
-    It is not recommended to use trainer.train() or trainer.evaluate() directly, as these
-    have complex side effects on the Trainer's internal state. Instead, use Trainer.__call__().
-    >>> trainer = Trainer(...)
-    >>> trainer = trainer()
-    >>> print(trainer.best_epoch, trainer.best_metric)
-
-    NOTE
-    -----
-    - If the GradScaler causes all optimization steps to be skipped, the LR scheduler will trigger a
-        warning that it was called before optimizer.step().
-
-    TODO
-    ----
-    - Adjust the progress bars to display the longest running rank automatically.
     """
 
     def __init__(
         self,
         args: TrainerArgs,
         model: Module,
-        tr_loader: Collection[Batch] | DataLoader[Batch],
-        vl_loader: Collection[Batch] | DataLoader[Batch],
+        tr_loader: DataLoader[Batch],
+        vl_loader: DataLoader[Batch],
+        padbatch: Batch,
         loss_fn: Module,
         optimizer: Optional[Optimizer] = None,
         scheduler: Optional[LRScheduler] = None,
         stopper: Optional[EarlyStopper] = None,
         device: Optional[torch.device] = None,
-        padbatch: Optional[Batch] = None,
     ) -> None:
         self.args = args
         self.model = model
         self.tr_loader = tr_loader
         self.vl_loader = vl_loader
+        self.padbatch = padbatch
         self.loss_fn = loss_fn
         self.optimizer = optimizer if optimizer is not None else AdamW(model.parameters())
         self.scheduler = scheduler if scheduler is not None else LambdaLR(self.optimizer, lambda _: 1.0)
         self.stopper = stopper if stopper is not None else EarlyStopper(patience=float("inf"))
         self.device = device if device is not None else next(self.model.parameters()).device
-        self.padbatch = padbatch
         self.monitor = Monitor(device=self.device)
         self.scaler = GradScaler(self.device.type, enabled=self.mp_dtype == torch.float16)
         self.log: list[Mapping[str, int | float]] = []
@@ -541,8 +550,8 @@ class Trainer:
         self._next_chpt_step: Optional[int] = None
         self._next_logg_step: Optional[int] = None
         self._done: bool = False
-        self._vl_dataloader_lengths = self._dataloader_lengths(self.vl_loader)
-        self._tr_dataloader_lengths = self._dataloader_lengths(self.tr_loader)
+        self._vl_dataloader_lengths = self.get_dataloader_lengths(self.vl_loader)
+        self._tr_dataloader_lengths = self.get_dataloader_lengths(self.tr_loader)
 
     def __repr__(self) -> str:
         return str(self)
@@ -604,9 +613,9 @@ class Trainer:
         self.optimizer.zero_grad()
         self.model.train()
 
-        # Get a wrapped dataloader with padding to the longest rank.
-        dataloader = self.tr_loader
-        iterable = self._wrap_and_pad_loader(dataloader, max(self.tr_dataloader_lengths), "Training...", leave=False)
+        # Get a wrapped dataloader with padding to the longest rank and gradient accumulation.
+        iterable = self.get_iterable(self.tr_loader, self.tr_dataloader_length, "Training...", leave=False)
+        self.print(f"[INFO] [rank {rank()}] [Trainer::train] {len(self.tr_loader)=} {largest_possible_dataloader_length(self.tr_loader)=} {self.tr_dataloader_length=} {len(iterable)=}")
 
         def get_report() -> dict[str, float]:
             """Assemble a training report (excluding GPU statistics)."""
@@ -644,19 +653,18 @@ class Trainer:
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
         timer.start()
         mini_step = -1  # mini-step within this epoch
-        for mini_step, batch in iterable:
+        had_real_window = False # whether any real data was seen in window of mini-steps
+        for mini_step, real, batch in iterable:
             batch = batch.to(self.device, non_blocking=True)
             batch = batch.finalize(self.mp_dtype, torch.int32, torch.int64)
 
             # Determine if this is a real or padded batch of data.
-            real = mini_step < len(dataloader)
+            had_real_window |= bool(real)
             results["num_samples"] += len(batch) * int(real)
 
-            # Sync on gradient accumulation boundary or final real mini-step
+            # Sync on gradient accumulation boundary.
             step_in_accum = (mini_step + 1) % self.args.gradient_accumulation_steps
-            is_accum_boundary = (step_in_accum == 0)
-            is_last_step = (mini_step + 1 == len(iterable))
-            sync_gradients = is_accum_boundary or is_last_step
+            sync_gradients = (step_in_accum == 0)
 
             # Compute normalized loss
             with maybe_no_sync(self.model, sync_gradients):
@@ -676,25 +684,34 @@ class Trainer:
 
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
-                results["grad_steps"] += 1
-                # Take an optimization step
-                grad_norm = self.step()
-                results["grad_norm"] += grad_norm.detach()
-                # Compute parameter delta
-                with torch.no_grad():
-                    flat_params_aft = torch.cat([p.view(-1) for p in self.model.parameters()])
-                results["param_norm"] += flat_params_aft.norm().detach()
-                results["param_delta"] += (flat_params_aft - flat_params_bef).norm().detach()
-                flat_params_bef = flat_params_aft
-                # Determine what hooks are to be executed.
+                # Determine how many ranks had a real window of data
+                had = torch.tensor(int(had_real_window), device=self.device, dtype=torch.int32)
+                if is_dist():
+                    dist.all_reduce(had, op=dist.ReduceOp.SUM)
+                real_ranks = int(had.item())
+                anyone_had_real_window = (real_ranks > 0)
+                grad_scale = (world_size() / real_ranks) if (is_dist() and anyone_had_real_window) else 1.0
+                # If anyone had real data, take an optimization step and log stats
+                if anyone_had_real_window:
+                    results["grad_steps"] += 1
+                    # Take an optimization step
+                    grad_norm = self.step(grad_scale=grad_scale)
+                    results["grad_norm"] += grad_norm.detach()
+                    # Compute parameter delta
+                    with torch.no_grad():
+                        flat_params_aft = torch.cat([p.view(-1) for p in self.model.parameters()])
+                    results["param_norm"] += flat_params_aft.norm().detach()
+                    results["param_delta"] += (flat_params_aft - flat_params_bef).norm().detach()
+                    flat_params_bef = flat_params_aft
+                # Determine what hooks are to be executed
                 do_logg = any(self._due_hooks())
                 do_eval = self._due_hooks()[0]
                 # Free up memory before validation to keep GPU memory usage lower
                 if do_eval:
                     del batch, outputs, loss
                     gc.collect()
-                # Close the progress bar if evaluating on the last step
-                if do_eval and is_last_step and isinstance(iterable, tqdm):
+                # Close the progress bar if we're going to stop training right after this
+                if do_eval and isinstance(iterable, tqdm) and (mini_step + 1 == len(iterable) or not anyone_had_real_window):
                     iterable.close()
                 # Prepare a training report and reset the tracking objects
                 if do_logg:
@@ -711,6 +728,11 @@ class Trainer:
                 # Clear the monitor if logging was performed
                 if do_logg:
                     self.monitor.clear()
+                # Break from the loop if every rank is on padding
+                if not anyone_had_real_window:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    break
+                had_real_window = False
 
             # Stop if we've reached the maximum number of global steps
             if self.glbl_step >= self.max_steps:
@@ -734,8 +756,8 @@ class Trainer:
         self.model.eval()
 
         # Get a wrapped dataloader with padding to the longest rank.
-        dataloader = self.vl_loader
-        iterable = self._wrap_and_pad_loader(dataloader, max(self.vl_dataloader_lengths), "Validating...", leave=False)
+        iterable = self.get_iterable(self.vl_loader, self.vl_dataloader_length, "Validating...", leave=False)
+        self.print(f"[INFO] [rank {rank()}] [Trainer::evaluate] {len(self.vl_loader)=} {largest_possible_dataloader_length(self.vl_loader)=} {self.vl_dataloader_length=} {len(iterable)=}")
 
         mini_step = -1
         totalloss = torch.tensor(0.0, dtype=torch.float64, device=self.device)
@@ -743,9 +765,8 @@ class Trainer:
         alllogits: list[Tensor] = []
 
         with torch.no_grad():
-            for mini_step, batch in iterable:
+            for mini_step, real, batch in iterable:
                 batch = batch.to(self.device, non_blocking=True).finalize(self.mp_dtype, torch.int32, torch.int64)
-                real = mini_step < len(dataloader)
                 outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 if real:
@@ -753,6 +774,7 @@ class Trainer:
                     alllabels.append(batch.get_label())
                     alllogits.append(outputs)
 
+        self.print(f"[INFO] [rank {rank()}] [Trainer::evaluate] {mini_step=} num_real={len(alllabels)} num_fake={mini_step + 1 - len(alllabels)}")
         if mini_step < 0:
             raise RuntimeError(f"[rank {rank()}] empty dataloader.")
         if len(alllabels) == 0 or len(alllogits) == 0:
@@ -829,25 +851,33 @@ class Trainer:
         barrier("Trainer::evaluate:after", self.device)
         return report
 
-    def _get_padbatch(self) -> Optional[Batch]:
-        if self.padbatch is None:
-            return None
-        return self.padbatch.to(self.device, non_blocking=True).finalize(self.mp_dtype, torch.int32, torch.int64)
+    def get_iterable(self, dataloader: DataLoader[Batch], length: int, desc: str = "", leave: bool = True) -> tqdm[tuple[int, bool, Batch]]:
+        """
+        Get a padded and wrapped stream of batches from a dataloader.
 
-    def _wrap_and_pad_loader(self, dataloader: Collection[Batch] | DataLoader[Batch], longest: int, desc: str = "", leave: bool = True) -> tqdm[tuple[int, Batch]]:
-        if is_dist() and self.padbatch is None:
-            raise RuntimeError("padbatch must be specified for distributed training.")
+        Args:
+            dataloader: The dataloader to wrap and pad.
+            length: The length to pad the dataloader to.
+            desc: Description for the tqdm progress bar.
+            leave: Whether to leave the tqdm progress bar after iteration.
 
-        # Get a (possibly padded) iterable over the samples in the loader.
-        num_padding = longest - len(dataloader)
-        padding = itertools.repeat(self._get_padbatch(), num_padding)
-        iterable = itertools.chain(dataloader, padding)
+        Returns:
+            A tqdm iterable yielding tuples of (mini_step, is_real, batch), where `is_real` is
+            True if the batch is from the original dataloader, and False if it is a padded batch.
+        """
 
-        # Wrap the iterable in enumerate and a tqdm progress bar.
-        iterable = enumerate(iterable)
-        iterable = tqdm(iterable, desc, longest, leave, disable=self.args.disable_tqdm, ascii=True)
+        def stream() -> Generator[tuple[int, bool, Batch]]:
+            # Yield all real batches first.
+            i = -1
+            for i, batch in enumerate(dataloader):
+                yield i, True, batch
+            # Then yield padded batches.
+            while i < length - 1:
+                i += 1
+                yield i, False, self.padbatch.clone()
+            return
 
-        return iterable
+        return tqdm(stream(), desc, length, leave, disable=self.args.disable_tqdm, ascii=True)
 
     def _due_hooks(self) -> tuple[bool, bool, bool]:
         do_eval = self._next_eval_step is not None and self.glbl_step >= self._next_eval_step
@@ -934,17 +964,32 @@ class Trainer:
         with torch.autocast(self.device.type, dtype=self.mp_dtype, enabled=self.args.mp16):
             return self.loss_fn(outputs, batch.get_label())  # type: ignore[no-any-return]
 
-    def step(self) -> Tensor:
+    def step(self, *, grad_scale: float = 1.0) -> Tensor:
         """
         Take an optimization step and return the norm of gradients.
+
+        NOTE: If the GradScaler causes all optimization steps to be skipped, the LR scheduler
+            will trigger a misleading warning that it was called before optimizer.step().
         """
         self.scaler.unscale_(self.optimizer)
+        if grad_scale != 1.0:
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(grad_scale)
         norm: Tensor = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        warnings.filterwarnings("ignore")
-        self.scheduler.step()
-        warnings.resetwarnings()
+        total_steps = getattr(self.scheduler, "total_steps", None)
+        if total_steps is not None and self.glbl_step >= total_steps:
+            self.print(
+                f"[WARN] [rank {rank()}] [Trainer::step] scheduler {type(self.scheduler).__name__} reached {total_steps} steps. "
+                f"Skipping `scheduler.step()` on global step {self.glbl_step}. "
+                f"Learning rate will be held at {self.scheduler.get_last_lr()[0]:.6e}."
+            )
+        else:
+            warnings.filterwarnings("ignore")
+            self.scheduler.step()
+            warnings.resetwarnings()
         self.optimizer.zero_grad()
         self.glbl_step += 1
         return norm
@@ -1006,31 +1051,42 @@ class Trainer:
         else:
             tqdm.write(sep.join(map(str, args)), end=end)
 
-    def _dataloader_lengths(self, dataloader: Collection[Batch] | DataLoader[Batch]) -> list[int]:
-        """Return the lengths of the dataloader on each distributed rank."""
+    def get_dataloader_lengths(self, dataloader: DataLoader[Batch]) -> list[int]:
+        """Return the maximum possible lengths of the dataloader on each distributed rank."""
+        length = torch.tensor(largest_possible_dataloader_length(dataloader), dtype=torch.int64, device=self.device)
         if not is_dist():
-            return [len(dataloader)]
-        length = torch.tensor(len(dataloader), device=self.device)
+            return [int(length.item())]
         lengths = [torch.zeros(1, dtype=length.dtype, device=self.device) for _ in range(world_size())]
         dist.all_gather(lengths, length, group=None)
         return [int(l.item()) for l in lengths]
+
+    @property
+    def tr_dataloader_lengths(self) -> list[int]:
+        """Maximum possible lengths of the training dataloader on each distributed rank."""
+        return self._tr_dataloader_lengths
+
+    @property
+    def vl_dataloader_lengths(self) -> list[int]:
+        """Maximum possible lengths of the validation dataloader on each distributed rank."""
+        return self._vl_dataloader_lengths
+
+    @property
+    def tr_dataloader_length(self) -> int:
+        """Maximum possible length of the training dataloader across all distributed ranks, padded to multiple of `gradient_accumulation_steps`."""
+        return round_up_to_multiple(max(self.tr_dataloader_lengths), self.args.gradient_accumulation_steps)
+
+    @property
+    def vl_dataloader_length(self) -> int:
+        """Maximum possible length of the validation dataloader across all distributed ranks."""
+        return max(self.vl_dataloader_lengths)
 
     @property
     def mp_dtype(self) -> torch.dtype:
         return mp_dtype(self.args.mp16, self.device)
 
     @property
-    def tr_dataloader_lengths(self) -> list[int]:
-        return self._tr_dataloader_lengths
-
-    @property
-    def vl_dataloader_lengths(self) -> list[int]:
-        return self._vl_dataloader_lengths
-
-    @property
     def steps_per_epoch(self) -> int:
-        length = max(self.tr_dataloader_lengths)
-        return math.ceil(length / self.args.gradient_accumulation_steps)
+        return math.ceil(self.tr_dataloader_length / self.args.gradient_accumulation_steps)
 
     def _epochs_to_steps(self, f: Optional[float]) -> Optional[int]:
         if f is None:
@@ -1188,8 +1244,8 @@ class Trainer:
         *,
         model: Module,
         wrap_model: Callable[[Module], Module],
-        tr_loader: Collection[Batch] | DataLoader[Batch],
-        vl_loader: Collection[Batch] | DataLoader[Batch],
+        tr_loader: DataLoader[Batch],
+        vl_loader: DataLoader[Batch],
         loss_fn: Module,
         optimizer: Optional[Optimizer] = None,
         optimizer_init: Optional[Callable[[Iterable[torch.nn.Parameter]], Optimizer]] = None,
@@ -1284,12 +1340,12 @@ class Trainer:
             model,
             tr_loader,
             vl_loader,
+            padbatch,
             loss_fn,
             optimizer,
             scheduler,
             stopper,
             device,
-            padbatch,
         )
         trainer.glbl_step = glbl_step
         trainer._next_eval_step = _next_eval_step
