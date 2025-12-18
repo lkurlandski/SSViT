@@ -48,7 +48,6 @@ Upon further analysis it seems the issue is more complex than this. Rather than 
 
 - Review the ConvViT (CvT) architecture, from ICCV '21.
 - Review and adjust the overlap concept for the low-memory convolution.
-- Fix bug with hierarchical training.
-- Why does "./logs/debug_20975244.out" have non-real batches in the validation loop if its not using DDP?
 - Improve the modularity of selecting structures.
 - Improve the modularity of selecting guides.
+- Improve the calculation for the total number of steps in the lr scheduler then remove the warnings in trainer.
