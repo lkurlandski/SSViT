@@ -786,7 +786,7 @@ def main() -> None:
     elif args.max_epochs is not None:
         # Compute the total number of steps based on the longest epoch across all workers.
         # This is a copy-paste from the Trainer class. Maybe we can refactor later.
-        length = torch.tensor(len(tr_loader), device=args.device)
+        length = torch.tensor(largest_possible_dataloader_length(tr_loader), device=args.device)
         if is_dist():
             lengths = [torch.zeros(1, dtype=length.dtype, device=args.device) for _ in range(world_size())]
             dist.all_gather(lengths, length, group=None)
@@ -861,7 +861,7 @@ def main() -> None:
         )
     else:
         wmodel = wrap_model(model)
-        params = decay_aware_param_groups(wmodel, args.weight_decay, verbose=True)
+        params = decay_aware_param_groups(wmodel, args.weight_decay)
         optimizer = optimizer_init(params)
         scheduler = scheduler_init(optimizer)
         trainer = Trainer(
