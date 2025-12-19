@@ -853,7 +853,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
         *,
         kernel_size: int = 64,
         stride: int = 64,
-        chunk_size: int = 2**16,
+        chunk_size: int = 2 ** 16,
         overlap: Optional[int] = None,
         fp32: bool = True,
     ) -> None:
