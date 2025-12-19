@@ -184,11 +184,11 @@ class Configuration:
                 if self.level == HierarchicalLevel.NONE:
                     return 128
                 if self.level == HierarchicalLevel.COARSE:
-                    return 64
+                    return 32
                 if self.level == HierarchicalLevel.MIDDLE:
-                    return 64
+                    return 32
                 if self.level == HierarchicalLevel.FINE:
-                    return 64
+                    return 32
                 print(f"WARNING ({str(self)}): max_per_device_batch_size not found.")
                 return 64
 
