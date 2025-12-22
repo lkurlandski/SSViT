@@ -105,6 +105,12 @@ def functional_forward(z: Tensor, *, module: nn.Module, fp32: bool = False) -> T
 
         return z
 
+    if isinstance(module, GatedConvolution):
+        return module.forward_functional(z, fp32=fp32)
+
+    if hasattr(module, "forward_functional"):
+        return module.forward_functional(z, fp32=fp32)  # type: ignore[operator]
+
     raise NotImplementedError(f"functional_forward does not support {type(module)} yet.")
 
 
@@ -868,7 +874,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
         self.overlap = kernel_size // 2 if overlap is None else overlap
         self.fp32 = fp32
 
-        self.conv = nn.Conv1d(
+        self.conv = GatedConvolution(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
