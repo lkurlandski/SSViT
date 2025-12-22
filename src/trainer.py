@@ -57,6 +57,8 @@ from torch.optim import Optimizer
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.lr_scheduler import LambdaLR
+from torch.profiler import record_function
+from torch.profiler import profile
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torch.utils.data import IterableDataset
@@ -606,7 +608,7 @@ class Trainer:
 
         return self
 
-    def train(self) -> None:
+    def train(self, prof: Optional[profile] = None) -> None:
         """
         Train the model on the training set.
         """
@@ -654,12 +656,24 @@ class Trainer:
             flat_params_bef = torch.cat([p.view(-1) for p in self.model.parameters()])
 
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
+
+        had_real_window = False  # whether any real data was seen in window of mini-steps
+        mini_step = -1           # mini-step within this epoch
+        real: bool               # whether the current mini-batch has real data
+        batch: Batch             # current mini-batch
+
+        iterator = iter(iterable)
         timer.start()
-        mini_step = -1  # mini-step within this epoch
-        had_real_window = False # whether any real data was seen in window of mini-steps
-        for mini_step, real, batch in iterable:
-            batch = batch.to(self.device, non_blocking=True)
-            batch = batch.finalize(self.mp_dtype, torch.int32, torch.int64)
+        while True:
+            with record_function("stage::prepare"):
+                try:
+                    mini_step, real, batch = next(iterator)
+                except StopIteration:
+                    break
+            with record_function("stage::transfer"):
+                batch = batch.to(self.device, non_blocking=True)
+            with record_function("stage::finalize"):
+                batch = batch.finalize(self.mp_dtype, torch.int32, torch.int64)
 
             # Determine if this is a real or padded batch of data.
             had_real_window |= bool(real)
@@ -671,10 +685,12 @@ class Trainer:
 
             # Compute normalized loss
             with maybe_no_sync(self.model, sync_gradients):
-                outputs = self.forward(batch)
+                with record_function("stage::forward"):
+                    outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
                 loss = loss * int(real) / self.args.gradient_accumulation_steps
-                self.scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
+                with record_function("stage::backward"):
+                    self.scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
 
             # Check for parameters with no gradients
@@ -698,7 +714,8 @@ class Trainer:
                 if anyone_had_real_window:
                     results["grad_steps"] += 1
                     # Take an optimization step
-                    grad_norm = self.step(grad_scale=grad_scale)
+                    with record_function("stage::step"):
+                        grad_norm = self.step(grad_scale=grad_scale)
                     results["grad_norm"] += grad_norm.detach()
                     # Compute parameter delta
                     with torch.no_grad():
@@ -746,6 +763,11 @@ class Trainer:
                     self.optimizer.zero_grad(set_to_none=True)
                     break
                 had_real_window = False
+
+            if prof is not None:
+                if not isinstance(prof, profile):
+                    raise TypeError("prof must be a torch.profiler.profile instance.")
+                prof.step()  # type: ignore[no-untyped-call]
 
             # Stop if we've reached the maximum number of global steps
             if self.glbl_step >= self.max_steps:
