@@ -541,6 +541,11 @@ def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlappi
         nn.EmbeddingBag,
     )
 
+    # Parameters in these modules and their submodules will be ignored recursively.
+    layersr = (
+        FiLM,
+    )
+
     # Collect the ids of all params into two bins: one for no decay, one for decay.
     no_decay_ids: set[int] = set()
     ys_decay_ids: set[int] = set()
@@ -552,9 +557,17 @@ def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlappi
                     continue
                 no_decay_ids.add(id(p))
             continue
+        if isinstance(module, layersr):
+            for p in module.parameters(recurse=True):
+                if not p.requires_grad:
+                    continue
+                no_decay_ids.add(id(p))
+            continue
         # Otherwise, decay them, ignoring bias terms (one-dimensional).
         for n, p in module.named_parameters(recurse=False):
             if not p.requires_grad:
+                continue
+            if id(p) in no_decay_ids:
                 continue
             if n == "bias":
                 no_decay_ids.add(id(p))
