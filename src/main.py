@@ -46,6 +46,10 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.optim.lr_scheduler import LinearLR
 from torch.optim.lr_scheduler import SequentialLR
+from torch.profiler import profile
+from torch.profiler import ProfilerActivity
+from torch.profiler import schedule
+from torch.profiler import tensorboard_trace_handler
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
@@ -880,6 +884,28 @@ def main() -> None:
     print("", end="", flush=True)
 
     trainer = trainer()
+    return
+
+    trainer.args.eval_steps = None
+    trainer.args.eval_epochs = None
+    trainer.args.chpt_steps = None
+    trainer.args.chpt_epochs = None
+    trainer.args.logg_steps = None
+    trainer.args.logg_epochs = None
+    activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+    sched = schedule(wait=10, warmup=10, active=20, repeat=1)
+    handler = tensorboard_trace_handler("./tb_trace-5", worker_name=f"rank-{local_rank()}")
+    with profile(
+        activities=activities,
+        schedule=sched,
+        on_trace_ready=handler,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as prof:
+        trainer.train(prof)
+        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=30))
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
 
 
 if __name__ == "__main__":
