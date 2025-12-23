@@ -83,6 +83,7 @@ from src.binanal import HierarchicalLevel
 from src.binanal import LEVEL_STRUCTURE_MAP
 from src.binanal import DIRECTORY_STRUCTURES
 from src.binanal import HierarchicalStructure
+from src.binanal import HierarchicalStructureNone
 from src.binanal import HierarchicalStructureCoarse
 from src.binanal import HierarchicalStructureMiddle
 from src.binanal import HierarchicalStructureFine
@@ -131,6 +132,11 @@ from src.utils import count_parameters
 STRICT_RAFF_MATCH = os.environ.get("STRICT_RAFF_MATCH", "0") == "1"
 if STRICT_RAFF_MATCH:
     warnings.warn("STRICT_RAFF_MATCH is enabled. MalConv models will match the original Raff et al. implementation more closely.")
+
+
+STRUCTURES_AS_GUIDES = os.environ.get("STRUCTURES_AS_GUIDES", "0") == "1"
+if STRUCTURES_AS_GUIDES:
+    warnings.warn("STRUCTURES_AS_GUIDES is enabled. Hierarchical structures will be used as semantic guides.")
 
 
 def get_model(
@@ -228,6 +234,8 @@ def get_model(
         patch_size       = None
     else:
         patcher_channels = 64
+        factor = int(os.environ.get("PATCHER_CHANNEL_FACTOR", "1"))
+        patcher_channels = 64 * factor
         num_patches      = 256
         patch_size       = None
     if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV):
@@ -409,6 +417,8 @@ def wrap_model_fsdp(model: M, mpdtype: torch.dtype, fsdp_offload: bool) -> M:
 def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int], structures: list[HierarchicalStructure]) -> CollateFn | CollateFnHierarchical:
     if level == HierarchicalLevel.NONE:
         return CollateFn(False, False, min_lengths[0])
+    if STRUCTURES_AS_GUIDES:
+        return CollateFn(False, False, min_lengths[0])
     return CollateFnHierarchical(False, False, len(structures), min_lengths)
 
 
@@ -484,6 +494,12 @@ def get_padbatch(level: HierarchicalLevel, structures: list[HierarchicalStructur
         characteristics = torch.zeros((batch_size, length, len(which_characteristics)), dtype=torch.bool) if which_characteristics else None
         return SemanticGuides(parse, entropy, characteristics).decompress()
 
+    def get_structure_as_guides(length: int) -> SemanticGuides:
+        parse = None
+        entropy = None
+        characteristics = torch.zeros((batch_size, length, len(structures)), dtype=torch.bool)
+        return SemanticGuides(parse, entropy, characteristics).decompress()
+
     def get_structure() -> StructureMaps:
         index: list[list[tuple[int, int]]] = [[] for _ in structures]
         lexicon = {}
@@ -491,6 +507,14 @@ def get_padbatch(level: HierarchicalLevel, structures: list[HierarchicalStructur
             index[i] = [(0, min_lengths[i])]
             lexicon[i] = s
         return StructureMaps([deepcopy(index) for _ in range(batch_size)], lexicon)
+
+    if STRUCTURES_AS_GUIDES:
+        inputs = get_inputs(min_lengths[0])
+        guides = get_structure_as_guides(min_lengths[0])
+        index = [[(0, min_lengths[0])]]
+        lexicon = {0: HierarchicalStructureNone.ANY}
+        structure = StructureMaps([deepcopy(index) for _ in range(batch_size)], lexicon)
+        return FSamples(file, name, label, inputs, guides, structure)
 
     structure = get_structure()
 
@@ -680,6 +704,8 @@ def main() -> None:
     if args.ignore_directory_structures:
         structures = [s for s in structures if s not in DIRECTORY_STRUCTURES]
     num_guides = len(args.which_characteristics) + (1 if args.do_entropy else 0)
+    if STRUCTURES_AS_GUIDES:
+        num_guides = len(structures)
     print(f"{structures=}")
     print(f"{num_guides=}")
 
@@ -687,7 +713,7 @@ def main() -> None:
         args.arch,
         args.size,
         num_guides,
-        args.level,
+        args.level if not STRUCTURES_AS_GUIDES else HierarchicalLevel.NONE,
         structures,
         args.parch,
         args.posenc,
@@ -718,6 +744,7 @@ def main() -> None:
         structures=structures,
         max_length=args.max_length,
         unsafe=False,
+        structures_as_guides=STRUCTURES_AS_GUIDES,
     )
     print(f"{preprocessor=}")
 

@@ -48,6 +48,7 @@ from src.binanal import LiefParse
 from src.binanal import ParserGuider
 from src.binanal import CharacteristicGuider
 from src.binanal import StructureParser
+from src.binanal import LEVEL_STRUCTURE_MAP
 from src.binanal import HierarchicalLevel
 from src.binanal import HierarchicalStructure
 from src.binanal import HierarchicalStructureCoarse
@@ -1259,7 +1260,18 @@ class Preprocessor:
         structures: Sequence[HierarchicalStructure] = (HierarchicalStructureNone.ANY,),
         max_length: Optional[int] = None,
         unsafe: bool = False,
+        structures_as_guides: bool = False,
     ) -> None:
+        """
+        Args:
+            do_entropy: whether to compute entropy guide.
+            which_characteristics: which section characteristics to include as guides.
+            level: hierarchical level for structure partitioning.
+            structures: hierarchical structures to partition.
+            max_length: maximum length of the binary to consider (in bytes). If None, use full length.
+            unsafe: whether to use unsafe memoryview for input buffer.
+            structures_as_guides: if True, encode the structure as SemanticGuide, not as a StructureMap.
+        """
         self.do_entropy = do_entropy
         self.which_characteristics = which_characteristics
         self.level = level
@@ -1267,7 +1279,10 @@ class Preprocessor:
         self.max_length = max_length
         self.unsafe = unsafe
         self.guider = SemanticGuider(do_entropy=do_entropy, which_characteristics=which_characteristics)
+        self.structures_as_guides = structures_as_guides
         self.partitioner = StructurePartitioner(level, structures)
+        if self.structures_as_guides and (len(self.structures) == 1 or len(which_characteristics) > 0 or do_entropy):
+            raise ValueError("structures_as_guides can only be True when using multiple structures without other guides.")
 
     def __call__(self, name: str, label: int, data: bytes, meta: pl.DataFrame) -> FSample:
         mv = memoryview(data)[0:self.max_length]
@@ -1287,12 +1302,27 @@ class Preprocessor:
             torch.frombuffer(buffer, dtype=torch.uint8),
             torch.tensor(size, dtype=torch.int64),
         )
-        guides = SemanticGuide(
-            None,
-            self.guider._get_entropy(inputs.inputids) if self.do_entropy else None,
-            self.get_characteristics(meta, size) if self.which_characteristics else None,
-        )
-        structure = self.get_structure(meta, size)
+        if not self.structures_as_guides:
+            guides = SemanticGuide(
+                None,
+                self.guider._get_entropy(inputs.inputids) if self.do_entropy else None,
+                self.get_characteristics(meta, size) if self.which_characteristics else None,
+            )
+            structure = self.get_structure(meta, size)
+        else:
+            assert self.level != HierarchicalLevel.NONE
+            assert not self.do_entropy
+            assert len(self.which_characteristics) == 0
+            assert len(self.structures) > 1
+            guides = SemanticGuide(
+                None,
+                None,
+                self.get_structure_as_guides(meta, size),
+            )
+            structure = StructureMap(
+                [[(0, size)]],
+                {0: HierarchicalStructureNone.ANY},
+            )
 
         return FSample(
             file=file,
@@ -1357,6 +1387,34 @@ class Preprocessor:
                 index[i].append((s, e))
 
         return StructureMap(index, lexicon)
+
+    def get_structure_as_guides(self, meta: pl.DataFrame, size: int) -> torch.Tensor:
+        df_sec = meta.filter(
+            pl.col("group") == "partitions",
+            pl.col("level") == self.level.name,
+        )
+
+        n_sec = len(df_sec)
+        n_chr = len(self.structures)
+
+        offsets = np.empty(n_sec, dtype=np.int64)
+        sizes   = np.empty(n_sec, dtype=np.int64)
+        flags   = np.zeros((n_sec, n_chr), dtype=np.uint8)
+
+        for i, row in enumerate(df_sec.iter_rows(named=True)):
+            s = row["start"]
+            e = row["end"]
+            offsets[i] = s
+            sizes[i]   = e - s
+            c = row["label"]
+            l = LEVEL_STRUCTURE_MAP[self.level][c]
+            if l not in self.structures:
+                continue
+            j = self.structures.index(l)
+            flags[i, j] = 1
+
+        x = CharacteristicGuider._get_bit_mask_(size, offsets, sizes, flags)
+        return torch.from_numpy(x)
 
 
 class CollateFn:
