@@ -874,7 +874,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
         self.overlap = kernel_size // 2 if overlap is None else overlap
         self.fp32 = fp32
 
-        self.conv = GatedConvolution(
+        self.conv = nn.Conv1d(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
