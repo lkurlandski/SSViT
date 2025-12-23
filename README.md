@@ -52,3 +52,5 @@ Upon further analysis it seems the issue is more complex than this. Rather than 
 - Improve the modularity of selecting guides.
 - Improve the calculation for the total number of steps in the lr scheduler then remove the warnings in trainer.
 - Add a real logging system with DEBUG, INFO, and WARN modes.
+- There might be O(C^2) memory complexity in the low-mem implementations when computing winner positions.
+- Investigate the weird training behavior of the coarse model.
