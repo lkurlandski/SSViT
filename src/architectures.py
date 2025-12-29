@@ -535,6 +535,8 @@ class PatchEncoderBase(nn.Module, ABC):
         if patch_size is not None:
             if patch_size <= 0:
                 raise ValueError(f"{patch_size=} must be positive.")
+            if patch_size > T:
+                warnings.warn(f"{patch_size=} greater than sequence length {T}.")
             P = patch_size
             N = math.ceil(T / P)
             return P, N
@@ -543,6 +545,8 @@ class PatchEncoderBase(nn.Module, ABC):
         if num_patches is not None:
             if num_patches <= 0:
                 raise ValueError(f"{num_patches=} must be positive.")
+            if num_patches > T:
+                warnings.warn(f"{num_patches=} greater than sequence length {T}.")
             N = num_patches
             P = math.ceil(T / N)
             return P, N
