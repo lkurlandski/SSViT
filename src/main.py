@@ -73,6 +73,7 @@ from src.architectures import PatchEncoder
 from src.architectures import ConvPatchEncoder
 from src.architectures import HierarchicalConvPatchEncoder
 from src.architectures import PatchEncoderLowMem
+from src.architectures import PatchEncoderLowMemSwitchMoE
 from src.architectures import Classifier
 from src.architectures import MalConvClassifier
 from src.architectures import ViTClassifier
@@ -250,6 +251,8 @@ def get_model(
         PatchEncoderCls = HierarchicalConvPatchEncoder
     elif parch == PatcherArchitecture.MEM:
         PatchEncoderCls = PatchEncoderLowMem
+    elif parch == PatcherArchitecture.EXP:
+        PatchEncoderCls = partial(PatchEncoderLowMemSwitchMoE, num_experts=16)  # type: ignore[assignment]
     else:
         PatchEncoderCls = PatchEncoderBase
 

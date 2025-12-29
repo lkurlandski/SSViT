@@ -961,6 +961,294 @@ class PatchEncoderLowMem(PatchEncoderBase):
         return z
 
 
+class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
+    """
+    Switch-style MoE patch encoder with constant-memory streaming and recompute.
+
+    - Probe: Conv1d(in_channels->probe_dim, k=1) + max pooling (low-mem).
+    - Router: MLP(probe_feat) -> logits over experts.
+    - Experts: independent Conv1d(in_channels->out_channels, k=kernel_size) + max pooling (low-mem).
+    - Top-1 routing: each patch uses exactly one expert.
+    - Gate scaling: output *= p_top1 so router gets end-to-end gradients.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_patches: Optional[int],
+        patch_size: Optional[int],
+        *,
+        kernel_size: int = 64,
+        stride: int = 64,
+        chunk_size: int = 2 ** 16,
+        overlap: Optional[int] = None,
+        fp32: bool = True,
+        # MoE
+        num_experts: int = 1,
+        probe_dim: int = 16,
+        router_hidden: int = 64,
+        router_temperature: float = 1.0,
+        router_noise_std: float = 0.0,
+        load_balance_alpha: float = 0.0,
+    ) -> None:
+        super().__init__(in_channels, out_channels, num_patches, patch_size)
+
+        if num_patches is None or patch_size is not None:
+            raise ValueError(f"{self.__class__.__name__} requires `num_patches` is not None and `patch_size` is None.")
+
+        if num_experts <= 0:
+            raise ValueError(f"{num_experts=} must be positive.")
+        if probe_dim <= 0:
+            raise ValueError(f"{probe_dim=} must be positive.")
+        if router_hidden <= 0:
+            raise ValueError(f"{router_hidden=} must be positive.")
+        if router_temperature <= 0:
+            raise ValueError(f"{router_temperature=} must be positive.")
+        if router_noise_std < 0:
+            raise ValueError(f"{router_noise_std=} must be non-negative.")
+        if load_balance_alpha < 0:
+            raise ValueError(f"{load_balance_alpha=} must be non-negative.")
+
+        if num_experts == 1:
+            warnings.warn(f"{self.__class__.__name__} instantiated with a single expert. Consider using `PatchEncoderLowMem` instead.")
+
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.chunk_size = chunk_size
+        self.overlap = kernel_size // 2 if overlap is None else overlap
+        self.fp32 = fp32
+
+        self.num_experts = num_experts
+        self.probe_dim = probe_dim
+        self.router_temperature = float(router_temperature)
+        self.router_noise_std = float(router_noise_std)
+        self.load_balance_alpha = float(load_balance_alpha)
+        self.last_aux_loss = torch.zeros(())
+
+        self.probe = nn.Conv1d(in_channels, probe_dim, kernel_size=1, stride=stride)
+        self.router = nn.Sequential(
+            nn.LayerNorm(probe_dim),
+            nn.Linear(probe_dim, router_hidden),
+            nn.GELU(),
+            nn.Linear(router_hidden, num_experts),
+        )
+        self.experts = nn.ModuleList([
+            nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride)
+            for _ in range(num_experts)
+        ])
+
+        if self.overlap < self.kernel_size / 2:
+            warnings.warn(f"Overlap {self.overlap} is less than half the kernel size {self.kernel_size}. Pooling may be impacted windowing issues.")
+
+    @property
+    def conv(self) -> nn.Conv1d:
+        return self.experts[0]  # type: ignore[return-value]
+
+    @property
+    def num_patches(self) -> int:
+        assert self._num_patches is not None
+        return self._num_patches
+
+    @property
+    def patch_size(self) -> None:
+        assert self._patch_size is None
+        return self._patch_size
+
+    @property
+    def min_length(self) -> int:
+        return self.num_patches * self.kernel_size
+
+    def _route(self, probe_feat: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        Route patches to experts based on probe features.
+
+        Args:
+            probe_feat: Tensor of shape (B, N, D).
+
+        Returns:
+          top1: Tensor (long)  of shape (B, N) indicating the selected expert per patch.
+          p1:   Tensor (float) of shape (B, N) indicating the probability of the selected expert per patch.
+          aux:  Tensor (float) of shape (,) indicating the load balancing auxillary loss.
+        """
+        assert self.router is not None
+
+        B, N, D = probe_feat.shape
+
+        x = probe_feat.reshape(B * N, D)
+
+        # Get the logits for each expert.
+        logits: Tensor = self.router(x)               # (BN, E)
+        logits = logits.view(B, N, self.num_experts)  # (B, N, E)
+
+        # Add noise for exploration (training only).
+        if self.training and self.router_noise_std > 0:
+            logits = logits + torch.randn_like(logits) * self.router_noise_std
+
+        # Compute probabilities for gate scaling and auxillary loss.
+        probs = torch.softmax(logits / self.router_temperature, dim=-1)  # (B, N, E)
+
+        # Most likely expert and its probability.
+        top1 = torch.argmax(logits, dim=-1)                    # (B, N)
+        p1 = probs.gather(-1, top1.unsqueeze(-1)).squeeze(-1)  # (B,N)
+
+        # Switch-style load balancing loss.
+        aux = probs.new_zeros(())
+        if self.load_balance_alpha > 0:
+            onehot = torch.nn.functional.one_hot(top1, num_classes=self.num_experts).to(probs.dtype)  # (B, N, E)
+            f = onehot.mean(dim=(0, 1))  # (E,)
+            p = probs.mean(dim=(0, 1))   # (E,)
+            aux = self.load_balance_alpha * (self.num_experts * (f * p).sum())
+
+        return top1, p1, aux
+
+    def forward_embeddings(self, z: Tensor) -> Tensor:
+
+        B, T, E = z.shape
+        P, N = self.resolve_patch_dims(T)
+        C = self.out_channels
+
+        # Prepare patches.
+        z = PatchEncoderBase.pad_to_length(z, N * P)  # (B, NP, E)
+        z = z.view(B, N, P, E)                        # (B,  N, P, E)
+        z = z.reshape(B * N, P, E)                    # (BN, P, E)
+        z = z.permute(0, 2, 1)                        # (BN, E, P)
+
+        # Probe features.
+        r: Tensor = self.probe(z)         # (BN, D, S_probe)
+        r = r.max(dim=-1)[0]              # (BN, D)
+        r = r.view(B, N, self.probe_dim)  # (B, N, D)
+
+        # Route to experts.
+        top1, p1, aux = self._route(r)
+        top1_flat = top1.view(B * N)   # (BN,)
+        p1_flat   = p1.view(B * N)     # (BN,)
+        self.last_aux_loss = aux       # (,)
+
+        # Expert passes.
+        out = z.new_zeros((B * N, C))
+        g_e: Tensor
+        for e, expert in enumerate(self.experts):
+            idx = (top1_flat == e).nonzero(as_tuple=False).squeeze(-1)
+            if idx.numel() == 0:
+                continue
+            z_e = z.index_select(0, idx)                            # (n_e, E, P)
+            g_e = expert(z_e)                                       # (n_e, C, S)
+            g_e, _ = g_e.max(dim=-1)                                # (n_e, C)
+            g_e = g_e * p1_flat.index_select(0, idx).unsqueeze(-1)  # (n_e, C)
+            out.index_copy_(0, idx, g_e)
+
+        # Reshape and return.
+        out = out.view(B, N, C)  # (B, N, C)
+
+        return out
+
+    def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
+
+        B, T = ts[0].shape[0], ts[0].shape[1]
+        E, C = self.in_channels, self.out_channels
+        P, N = self.resolve_patch_dims(T)
+
+        g_all: Tensor
+
+        # Probe features.
+        max_vals, pos = _lowmem_patchwise_max_over_time_streaming(
+            preprocess=preprocess,
+            ts=ts,
+            rf=self.probe.kernel_size[0],
+            first_stride=self.stride,
+            chunk_size=self.chunk_size,
+            overlap=0,
+            channels=self.probe_dim,
+            num_patches=self.num_patches,
+            activations_fn=partial(functional_forward, module=self.probe, fp32=self.fp32),
+        )
+        if not self.training:
+            r = max_vals
+            del max_vals
+            del pos
+        else:
+            positions_flat = pos.view(B, N * self.probe_dim)
+            wins_cat, meta = _gather_wins_via_preprocess_batched(
+                preprocess=preprocess,
+                ts=ts,
+                positions=positions_flat,
+                rf=self.probe.kernel_size[0],
+                embedding_dim=E,
+                mask=None,
+            )
+            g_all = self.probe(wins_cat)
+            g_all = g_all.squeeze(-1)
+            r = _scatter_g_to_BNC(
+                g_all=g_all,
+                meta=meta,
+                batch_size=B,
+                num_patches=self.num_patches,
+                channels=self.probe_dim,
+            )
+            del max_vals
+            del pos
+            del positions_flat
+            del wins_cat
+            del meta
+            del g_all
+
+        # Route to experts.
+        top1, p1, aux = self._route(r)
+        self.last_aux_loss = aux
+
+        # Expert passes.
+        out = r.new_zeros((B, N, C))
+        for e, expert in enumerate(self.experts):
+            active = (top1 == e)                                           # (B, N)
+            mask = active.unsqueeze(-1).expand(B, N, C).reshape(B, N * C)  # (B, NC)
+            if not active.any():
+                continue
+
+            max_vals, pos = _lowmem_patchwise_max_over_time_streaming(
+                preprocess=preprocess,
+                ts=ts,
+                rf=self.kernel_size,
+                first_stride=self.stride,
+                chunk_size=self.chunk_size,
+                overlap=self.overlap,
+                channels=C,
+                num_patches=self.num_patches,
+                activations_fn=partial(functional_forward, module=expert, fp32=self.fp32),
+                patch_active=active,
+            )
+
+            if not self.training:
+                out = out + max_vals
+                continue
+
+            positions_flat = pos.view(B, N * C)
+            wins_cat, meta = _gather_wins_via_preprocess_batched(
+                preprocess=preprocess,
+                ts=ts,
+                positions=positions_flat,
+                rf=self.kernel_size,
+                embedding_dim=E,
+                mask=mask,
+            )
+
+            g_all = expert(wins_cat)
+            g_all = g_all.squeeze(-1)
+
+            z = _scatter_g_to_BNC(
+                g_all=g_all,
+                meta=meta,
+                batch_size=B,
+                num_patches=self.num_patches,
+                channels=C,
+            )
+            out = out + z
+
+        # Switch-style gate scaling.
+        out = out * p1.unsqueeze(-1)
+        return out
+
+
 def _lowmem_patchwise_max_over_time_streaming(
     *,
     preprocess: PreprocessFn,
@@ -972,6 +1260,7 @@ def _lowmem_patchwise_max_over_time_streaming(
     channels: int,
     num_patches: int,
     activations_fn: Callable[[Tensor], Tensor],  # (B,E,L)->(B,C,L_out)
+    patch_active: Optional[torch.Tensor] = None,  # (B, N) bool; update maxima only where True
 ) -> tuple[Tensor, Tensor]:
     """
     Streaming version: never materializes (B,T,E). Returns
@@ -1001,6 +1290,10 @@ def _lowmem_patchwise_max_over_time_streaming(
 
     step = max(1, chunk_size - overlap)
     start = 0
+
+    if patch_active is not None:
+        check_tensor(patch_active, (B, num_patches), torch.bool)
+        patch_active = patch_active.to(device=ts[0].device)
 
     with torch.no_grad():
         while start < T:
@@ -1038,6 +1331,9 @@ def _lowmem_patchwise_max_over_time_streaming(
                     mask = (patch_idx == j)                    # (L_out,)
                     if not mask.any():
                         continue
+                    # If nobody in the batch is active for this patch, skip work.
+                    if patch_active is not None and not patch_active[:, j].any():
+                        continue
 
                     g_j = g[..., mask]                         # (B, C, L_j)
                     v_j, idx_j_local = g_j.max(dim=-1)         # (B, C)
@@ -1050,6 +1346,8 @@ def _lowmem_patchwise_max_over_time_streaming(
                     cur_p = max_pos[:, j, :]
 
                     upd = v_j > cur_v
+                    if patch_active is not None:
+                        upd = upd & patch_active[:, j].unsqueeze(1)
                     max_vals[:, j, :] = torch.where(upd, v_j, cur_v)
                     max_pos[:, j, :]  = torch.where(upd, pos_j, cur_p)
 
@@ -1091,7 +1389,7 @@ def _scatter_g_to_BNC(
     g_all[start:start + U_b] has shape (U_b, C). For each (patch j, channel c),
     we want g_all_b[ inv_flat[j*C + c], c ].
     """
-    out = torch.empty(
+    out = torch.zeros(
         (batch_size, num_patches, channels),
         device=g_all.device,
         dtype=g_all.dtype,
@@ -1104,14 +1402,18 @@ def _scatter_g_to_BNC(
                 f"{inv_flat.numel()} vs {num_patches * channels}"
             )
 
+        if u_b == 0:
+            continue
+
         g_b = g_all[start:start + u_b]     # (U_b, C)
         inv = inv_flat.view(num_patches, channels)  # (N, C)
 
-        # Build per-patch/channel indices
-        row_idx = inv                                  # (N, C)
-        col_idx = torch.arange(channels, device=g_all.device).view(1, -1)
-        col_idx = col_idx.expand(num_patches, -1)      # (N, C)
-        out[b] = g_b[row_idx, col_idx]                 # (N, C)
+        active = inv >= 0
+        row_idx = inv.clamp(min=0)
+        col_idx = torch.arange(channels, device=g_all.device).view(1, -1).expand(num_patches, -1)
+        gathered = g_b[row_idx, col_idx]                 # (N, C), junk where inv=-1
+        out[b] = torch.where(active, gathered, out[b])
+
 
     return out
 
@@ -1941,31 +2243,61 @@ def _gather_wins_via_preprocess_batched(
     positions: torch.Tensor,            # (B, C)
     rf: int,
     embedding_dim: int,
+    mask: Optional[torch.Tensor] = None,  # (B, C) bool; only these entries participate
 ) -> tuple[torch.Tensor, list[tuple[int, torch.Tensor, int]]]:
     B, T = ts[0].shape[:2]
     device = ts[0].device
 
+    if mask is not None:
+        check_tensor(mask, (B, positions.shape[1]), torch.bool)
+        mask = mask.to(device=device)
+
     posuniq_list, inv_list, u_counts = [], [], []
     for b in range(B):
         pos_b = positions[b]
-        posuniq_b, inv_b = torch.unique(pos_b, sorted=True, return_inverse=True)
+        if mask is None:
+            pos_sel = pos_b
+            sel = None
+        else:
+            sel = mask[b]
+            pos_sel = pos_b[sel]
+
+        if pos_sel.numel() == 0:
+            posuniq_b = pos_b.new_empty((0,), dtype=torch.long)
+            inv_full = pos_b.new_full((pos_b.numel(),), -1, dtype=torch.long)
+            U_b = 0
+        else:
+            posuniq_b, inv_sel = torch.unique(pos_sel, sorted=True, return_inverse=True)
+            inv_full = pos_b.new_full((pos_b.numel(),), -1, dtype=torch.long)
+            if sel is None:
+                inv_full[:] = inv_sel.to(torch.long)
+            else:
+                inv_full[sel] = inv_sel.to(torch.long)
+            U_b = int(posuniq_b.numel())
+
         posuniq_list.append(posuniq_b)
-        inv_list.append(inv_b)
-        u_counts.append(int(posuniq_b.numel()))
+        inv_list.append(inv_full)
+        u_counts.append(U_b)
+
+    meta: list[tuple[int, torch.Tensor, int]] = []
 
     sum_U = int(sum(u_counts))
     if sum_U == 0:
         wins_empty = ts[0].new_empty((0, rf) + tuple(ts[0].shape[2:]))
         z = preprocess(*([wins_empty] * len(ts)))            # (0, rf, E)
-        return z.transpose(1, 2).contiguous(), [(0, torch.empty(0, device=device, dtype=torch.long), 0) for _ in range(B)]
+        z = z.transpose(1, 2).contiguous()                 # (0, E, rf)
+        meta = [(0, inv_list[b], 0) for b in range(B)]
+        return z, meta
 
     arange_rf = torch.arange(rf, device=device, dtype=torch.int32)
     batch_ix_chunks, time_ix_chunks = [], []
     offset = 0
-    meta: list[tuple[int, torch.Tensor, int]] = []
 
     for b, posuniq_b in enumerate(posuniq_list):
         U_b = int(posuniq_b.numel())
+        if U_b == 0:
+            meta.append((offset, inv_list[b].to(torch.long), 0))
+            continue
         time_ix_b  = (posuniq_b.to(torch.int32).unsqueeze(1) + arange_rf.unsqueeze(0))  # (U_b, rf)
         batch_ix_b = torch.full_like(time_ix_b, b, dtype=torch.int32)                    # (U_b, rf)
         time_ix_chunks.append(time_ix_b)

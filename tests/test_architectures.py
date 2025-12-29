@@ -2,7 +2,6 @@
 Tests.
 """
 
-import inspect
 import math
 from typing import Literal
 from typing import Optional
@@ -18,7 +17,10 @@ from src.architectures import ClassifificationHead
 from src.architectures import FiLM
 from src.architectures import FiLMNoP
 from src.architectures import SinusoidalPositionalEncoding
+from src.architectures import PatchEncoderBase
 from src.architectures import PatchEncoder
+from src.architectures import PatchEncoderLowMem
+from src.architectures import PatchEncoderLowMemSwitchMoE
 from src.architectures import ViT
 from src.architectures import MalConvBase
 from src.architectures import MalConv
@@ -195,6 +197,146 @@ class TestPatchEncoder:
         num_patches = num_patches if num_patches is not None else math.ceil(seq_length / patch_size)  # type: ignore[operator]
         assert z.shape[0] == batch_size
         assert 0 < z.shape[1] <= num_patches
+        assert z.shape[2] == out_channels
+
+
+class TestPatchEncoderLowMem:
+
+    @pytest.mark.parametrize("batch_size", [1, 3])
+    @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
+    @pytest.mark.parametrize("in_channels", [3, 5])
+    @pytest.mark.parametrize("out_channels", [7, 11])
+    @pytest.mark.parametrize("num_patches", [None, 1, 3])
+    @pytest.mark.parametrize("patch_size", [None, 1, 3])
+    @pytest.mark.parametrize("kernel_size", [3, 5])
+    @pytest.mark.parametrize("stride", [1, 2])
+    @pytest.mark.parametrize("chunk_size", [16, 32, 64])
+    @pytest.mark.parametrize("overlap", [None, 0, 1])
+    @pytest.mark.parametrize("fp32", [True, False])
+    def test_forward(
+        self,
+        batch_size: int,
+        seq_length: int,
+        in_channels: int,
+        out_channels: int,
+        num_patches: Optional[int],
+        patch_size: Optional[int],
+        kernel_size: int,
+        stride: int,
+        chunk_size: int,
+        overlap: Optional[int],
+        fp32: bool,
+    ) -> None:
+
+        def init() -> PatchEncoderLowMem:
+            return PatchEncoderLowMem(
+                in_channels,
+                out_channels,
+                num_patches,
+                patch_size,
+                kernel_size=kernel_size,
+                stride=stride,
+                chunk_size=chunk_size,
+                overlap=overlap,
+                fp32=fp32,
+            )
+
+        if num_patches is None:
+            with pytest.raises(ValueError):
+                net = init()
+            pytest.skip("IGNORE")
+            return
+
+        if patch_size is not None:
+            with pytest.raises(ValueError):
+                net = init()
+            pytest.skip("IGNORE")
+            return
+
+        net = init()
+
+        z = torch.rand(batch_size, seq_length, in_channels)
+
+        if seq_length < net.min_length:
+            with pytest.raises(RuntimeError):
+                net.forward(z)
+            pytest.skip("IGNORE")
+            return
+
+        z = net.forward(z)
+
+        assert z.shape[0] == batch_size
+        assert z.shape[1] == num_patches
+        assert z.shape[2] == out_channels
+
+
+class TestPatchEncoderLowMemSwitchMoE:
+
+    @pytest.mark.parametrize("batch_size", [1, 3])
+    @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
+    @pytest.mark.parametrize("num_patches", [1, 3])
+    @pytest.mark.parametrize("num_experts", [1, 2, 3])
+    @pytest.mark.parametrize("probe_dim", [4, 8])
+    @pytest.mark.parametrize("router_hidden", [8, 16])
+    @pytest.mark.parametrize("router_temperature", [1e-6, 1.0])
+    @pytest.mark.parametrize("router_noise_std", [0.0, 0.1])
+    @pytest.mark.parametrize("load_balance_alpha", [0.0, 0.1])
+    def test_forward(
+        self,
+        batch_size: int,
+        seq_length: int,
+        num_patches: int,
+        num_experts: int,
+        probe_dim: int,
+        router_hidden: int,
+        router_temperature: float,
+        router_noise_std: float,
+        load_balance_alpha: float,
+    ) -> None:
+
+        in_channels = 8
+        out_channels = 16
+        num_patches = 4
+        patch_size = None
+        kernel_size = 3
+        stride = 2
+        chunk_size = 32
+        overlap = None
+        fp32 = True
+
+        def init() -> PatchEncoderLowMemSwitchMoE:
+            return PatchEncoderLowMemSwitchMoE(
+                in_channels,
+                out_channels,
+                num_patches,
+                patch_size,
+                kernel_size=kernel_size,
+                stride=stride,
+                chunk_size=chunk_size,
+                overlap=overlap,
+                fp32=fp32,
+                num_experts=num_experts,
+                probe_dim=probe_dim,
+                router_hidden=router_hidden,
+                router_temperature=router_temperature,
+                router_noise_std=router_noise_std,
+                load_balance_alpha=load_balance_alpha,
+            )
+
+        net = init()
+
+        z = torch.rand(batch_size, seq_length, in_channels)
+
+        if seq_length < net.min_length:
+            with pytest.raises(RuntimeError):
+                net.forward(z)
+            pytest.skip("IGNORE")
+            return
+
+        z = net.forward(z)
+
+        assert z.shape[0] == batch_size
+        assert z.shape[1] == num_patches
         assert z.shape[2] == out_channels
 
 
@@ -676,9 +818,6 @@ class TestLowmemPatchwiseMaxOverTimeStreaming:
         """
         Forward-compatible: after patch_active=(B,N) is added, verify inactive patches are zero.
         """
-        sig = inspect.signature(_lowmem_patchwise_max_over_time_streaming)
-        if "patch_active" not in sig.parameters:
-            pytest.skip("patch_active not implemented yet")
 
         torch.manual_seed(5)
 
@@ -693,7 +832,7 @@ class TestLowmemPatchwiseMaxOverTimeStreaming:
         def activations_fn(x: torch.Tensor) -> torch.Tensor:
             return conv(x)  # type: ignore[no-any-return]
 
-        full_vals, _ = _lowmem_patchwise_max_over_time_streaming(  # type: ignore[call-arg]
+        full_vals, _ = _lowmem_patchwise_max_over_time_streaming(
             preprocess=_identity_preprocess,
             ts=[z],
             rf=rf,
@@ -709,7 +848,7 @@ class TestLowmemPatchwiseMaxOverTimeStreaming:
         patch_active = torch.zeros((B, N), dtype=torch.bool)
         patch_active[:, ::2] = True
 
-        masked_vals, _ = _lowmem_patchwise_max_over_time_streaming(  # type: ignore[call-arg]
+        masked_vals, _ = _lowmem_patchwise_max_over_time_streaming(
             preprocess=_identity_preprocess,
             ts=[z],
             rf=rf,
@@ -864,13 +1003,10 @@ class TestScatterGToBNC:
 
     def test_gather_mask_produces_zeros_when_available(self) -> None:
         """
-        Forward-compatible: after mask=(B,K) is added and scatter handles inv=-1, verify inactive
-        entries are zeros.
+        Verify:
+        (1) masked-out entries are exactly zero after scatter
+        (2) masked-in entries match manual conv (within float32 tolerance)
         """
-        sig = inspect.signature(_gather_wins_via_preprocess_batched)
-        if "mask" not in sig.parameters:
-            pytest.skip("mask not implemented yet")
-
         torch.manual_seed(6)
 
         B, T, E = 2, 128, 4
@@ -887,7 +1023,7 @@ class TestScatterGToBNC:
         mask = torch.zeros((B, K), dtype=torch.bool)
         mask[:, : K // 2] = True
 
-        wins_cat, meta = _gather_wins_via_preprocess_batched(  # type: ignore[call-arg]
+        wins_cat, meta = _gather_wins_via_preprocess_batched(
             preprocess=_identity_preprocess,
             ts=[z],
             positions=positions,
@@ -906,6 +1042,11 @@ class TestScatterGToBNC:
             channels=C,
         )
 
+        # (1) Masked-out entries should be *exactly* zero.
+        out_flat = out.reshape(B, K)
+        assert torch.all(out_flat[~mask] == 0)
+
+        # (2) Masked-in entries should match manual conv (float32 tolerance).
         out_manual = torch.zeros((B, N, C), dtype=out.dtype)
         for b in range(B):
             for n in range(N):
@@ -918,4 +1059,4 @@ class TestScatterGToBNC:
                     y = conv(w).squeeze(-1).squeeze(0)
                     out_manual[b, n, c] = y[c]
 
-        torch.testing.assert_close(out, out_manual, rtol=0, atol=0)
+        torch.testing.assert_close(out, out_manual, rtol=0, atol=1e-6)

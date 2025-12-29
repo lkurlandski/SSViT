@@ -51,6 +51,7 @@ class PatcherArchitecture(Enum):
     CNV = "cnv"      # Convolutional
     HCV = "hcv"      # Hierarchical Convolutional
     MEM = "mem"      # Low-Memory
+    EXP = "exp"      # Low-Memory with Experts
 
 
 class PositionalEncodingArchitecture(Enum):
