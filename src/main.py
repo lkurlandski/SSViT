@@ -191,7 +191,7 @@ def get_model(
     # Embedding
     padding_idx    = 0
     num_embeddings = 384
-    embedding_dim  = 8
+    embedding_dim  = int(os.environ.get("EMBEDDING_DIM", "8"))
 
     # FiLM
     guide_dim    = num_guides
@@ -234,9 +234,7 @@ def get_model(
         num_patches      = 128
         patch_size       = None
     else:
-        patcher_channels = 64
-        factor = int(os.environ.get("PATCHER_CHANNEL_FACTOR", "1"))
-        patcher_channels = 64 * factor
+        patcher_channels = 64 * int(os.environ.get("PATCHER_CHANNEL_FACTOR", "1"))
         num_patches      = 256
         patch_size       = None
     if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV):
@@ -893,8 +891,6 @@ def main() -> None:
             print(f"Resuming from checkpoint: {checkpoint}")
 
     if checkpoint:
-        if args.weight_decay != 0.0:
-            raise NotImplementedError("decay_aware_param_groups() is not implemented for resuming from checkpoint.")
         trainer = Trainer.from_checkpoint(
             checkpoint,
             model=model,
@@ -903,9 +899,14 @@ def main() -> None:
             vl_loader=ts_loader,
             loss_fn=loss_fn,
             optimizer_init=optimizer_init,
+            get_param_groups=partial(decay_aware_param_groups, weight_decay=args.weight_decay),
             scheduler_init=scheduler_init,
             device=args.device,
         )
+        if rank() == 0:
+            print("Retrieved a trainer from checkpoint. Current log: ")
+            for d in trainer.log:
+                print(d)
     else:
         wmodel = wrap_model(model)
         params = decay_aware_param_groups(wmodel, args.weight_decay)

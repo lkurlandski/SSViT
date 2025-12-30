@@ -57,6 +57,7 @@ from torch.optim import Optimizer
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.optimizer import ParamsT
 from torch.profiler import record_function
 from torch.profiler import profile
 from torch.utils.data import DataLoader
@@ -572,6 +573,8 @@ class Trainer:
             f"  scheduler={self.scheduler.__class__.__name__}(...),\n"
             f"  stopper={self.stopper.__class__.__name__}(...),\n"
             f"  device={self.device},\n"
+            f"  glbl_step={self.glbl_step},\n"
+            f"  epoch_idx={self.epoch_idx},\n"
             f")"
         )
 
@@ -590,7 +593,7 @@ class Trainer:
         if self.logg_steps is not None:
             self._next_logg_step = self.glbl_step + self.logg_steps
 
-        pbar = tqdm(total=self.max_epochs, disable=self.args.disable_tqdm, leave=False, unit="step")
+        pbar = tqdm(total=self.max_epochs - self.epoch_idx, disable=self.args.disable_tqdm, leave=False, unit="step")
         pbar.set_description(f"Epoch {self.epoch_idx} of {self.max_steps / self.steps_per_epoch}")
 
         # Conduct an initial validation and checkpointing on the naked model.
@@ -1315,7 +1318,8 @@ class Trainer:
         vl_loader: DataLoader[Batch],
         loss_fn: Module,
         optimizer: Optional[Optimizer] = None,
-        optimizer_init: Optional[Callable[[Iterable[torch.nn.Parameter]], Optimizer]] = None,
+        optimizer_init: Optional[Callable[[ParamsT], Optimizer]] = None,
+        get_param_groups: Callable[[Module], ParamsT] = lambda m: m.parameters(),
         scheduler: Optional[LRScheduler] = None,
         scheduler_init: Optional[Callable[[Optimizer], LRScheduler]] = None,
         device: Optional[torch.device] = None,
@@ -1351,7 +1355,7 @@ class Trainer:
         if optimizer_init is None:
             optimizer_init = AdamW
         if optimizer is None and not is_dcp:
-            optimizer = optimizer_init(model.parameters())
+            optimizer = optimizer_init(get_param_groups(model))
         if scheduler_init is None:
             scheduler_init = partial(LambdaLR, lr_lambda=lambda _: 1.0)
         if scheduler is None and not is_dcp:
@@ -1379,7 +1383,7 @@ class Trainer:
             # Concretely, the model must first be wrapped appropriately, before the optimizer is initialized.
             # Then both their state dicts can be loaded and from the checkpoint.
             model = wrap_model(model)
-            optimizer = optimizer_init(model.parameters())
+            optimizer = optimizer_init(get_param_groups(model))
             mstate, ostate = get_state_dict(model, optimizer)
             dcp.load(mstate, checkpoint_id=path / "model")
             dcp.load(ostate, checkpoint_id=path / "optimizer")
@@ -1415,6 +1419,7 @@ class Trainer:
             device,
         )
         trainer.glbl_step = glbl_step
+        trainer.epoch_idx = glbl_step // trainer.steps_per_epoch
         trainer._next_eval_step = _next_eval_step
         trainer._next_chpt_step = _next_chpt_step
         trainer._next_logg_step = _next_logg_step
