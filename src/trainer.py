@@ -701,7 +701,8 @@ class Trainer:
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
 
             # Check for parameters with no gradients
-            if CHECK_PARAM_GRAD_NONE and any(param.grad is None for param in self.model.parameters()):
+            # Skip for fake batches, as they take anomalous paths for MoE models and naturally have missing gradients
+            if real and CHECK_PARAM_GRAD_NONE and any(param.grad is None for param in self.model.parameters()):
                 flush()
                 print(f"{'-' * 20} Parameter Summary After Step {self.glbl_step:09} {'-' * 20}")
                 print_parameter_summary(self.model, spaces=2)
