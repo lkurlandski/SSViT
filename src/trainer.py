@@ -69,9 +69,13 @@ from src.utils import Timer
 from src.utils import check_tensor
 
 
-ALLOW_PARAM_GRAD_NONE = os.environ.get("ALLOW_PARAM_GRAD_NONE", "0") == "1"
+CHECK_PARAM_GRAD_NONE = os.environ.get("CHECK_PARAM_GRAD_NONE", "1") == "1"
+if not CHECK_PARAM_GRAD_NONE:
+    warnings.warn("Parameters will not be checked for having gradients.")
+
+ALLOW_PARAM_GRAD_NONE = not CHECK_PARAM_GRAD_NONE or os.environ.get("ALLOW_PARAM_GRAD_NONE", "0") == "1"
 if ALLOW_PARAM_GRAD_NONE:
-    warnings.warn("Allowing parameters with no gradients; some weights may not be updated.")
+    warnings.warn("Parameters are allowed to have no gradients.")
 
 
 def debug_autocast_dtypes(model: nn.Module) -> None:
@@ -697,12 +701,13 @@ class Trainer:
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
 
             # Check for parameters with no gradients
-            if not ALLOW_PARAM_GRAD_NONE and any(param.grad is None for param in self.model.parameters()):
+            if CHECK_PARAM_GRAD_NONE and any(param.grad is None for param in self.model.parameters()):
                 flush()
                 print(f"{'-' * 20} Parameter Summary After Step {self.glbl_step:09} {'-' * 20}")
                 print_parameter_summary(self.model, spaces=2)
                 print(f"{'-' * 80}")
-                raise RuntimeError("Some of the parameters have no gradients.")
+                if not ALLOW_PARAM_GRAD_NONE:
+                    raise RuntimeError("Some of the parameters have no gradients.")
 
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
