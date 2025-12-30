@@ -250,7 +250,12 @@ def get_model(
     elif parch == PatcherArchitecture.MEM:
         PatchEncoderCls = PatchEncoderLowMem
     elif parch == PatcherArchitecture.EXP:
-        PatchEncoderCls = partial(PatchEncoderLowMemSwitchMoE, num_experts=16)  # type: ignore[assignment]
+        PatchEncoderCls = partial(  # type: ignore[assignment]
+            PatchEncoderLowMemSwitchMoE,
+            num_experts=16,
+            load_balance_alpha=0.01,
+            router_noise_std=0.1,
+        )
     else:
         PatchEncoderCls = PatchEncoderBase
 
