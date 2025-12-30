@@ -114,6 +114,48 @@ def functional_forward(z: Tensor, *, module: nn.Module, fp32: bool = False) -> T
     raise NotImplementedError(f"functional_forward does not support {type(module)} yet.")
 
 
+def _check_lowmem_config(kernel_size: int, stride: int, chunk_size: int, overlap: int, mode: Literal["raise", "warn", "ignore"] = "warn") -> bool:
+    """
+    Check low-memory configuration for potential issues and possibly raise/warn.
+
+    Args:
+        kernel_size: Convolution kernel size.
+        stride: Convolution stride.
+        chunk_size: Low-memory chunk size.
+        overlap: Low-memory chunk overlap.
+        mode: One of "raise", "warn", or "ignore".
+
+    Returns:
+        True if configuration is without concern.
+    """
+    if mode not in ("raise", "warn", "ignore"):
+        raise ValueError(f"Invalid mode: {mode}. Must be one of 'raise', 'warn', or 'ignore'.")
+
+    status = True
+
+    def process(msg: str) -> None:
+        nonlocal status
+        if mode == "raise":
+            raise ValueError(msg)
+        if mode == "warn":
+            warnings.warn(msg)
+        status = False
+
+    if overlap < kernel_size / 2:
+        msg = f"Overlap {overlap} is less than half the kernel size {kernel_size}. Pooling may be impacted windowing issues. Consider overlap >= kernel_size / 2."
+        process(msg)
+
+    if max(1, chunk_size - overlap) % stride != 0:
+        msg = f"Chunk stepping {max(1, chunk_size - overlap)} is not aligned with stride {stride}. Pooling window positions may differ between chunks. Consider (chunk_size - overlap) % stride == 0."
+        process(msg)
+
+    if overlap % stride != 0:
+        msg = f"Overlap {overlap} is not divisible by stride {stride}. Window positions near chunk edges may differ between chunks. Consider overlap % stride == 0."
+        process(msg)
+
+    return status
+
+
 class LowMemoryNetworkMixin(nn.Module, ABC):
     """
     Mixin for neural networks supporting low-memory paths.
@@ -972,6 +1014,8 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
     - Gate scaling: output *= p_top1 so router gets end-to-end gradients.
     """
 
+    last_aux_loss: Tensor
+
     def __init__(
         self,
         in_channels: int,
@@ -987,6 +1031,9 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         # MoE
         num_experts: int = 1,
         probe_dim: int = 16,
+        probe_kernel_size: int = 64,
+        probe_stride: int = 64,
+        probe_overlap: Optional[int] = None,
         router_hidden: int = 64,
         router_temperature: float = 1.0,
         router_noise_std: float = 0.0,
@@ -1021,12 +1068,16 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
 
         self.num_experts = num_experts
         self.probe_dim = probe_dim
+        self.probe_kernel_size = probe_kernel_size
+        self.probe_stride = probe_stride
+        self.router_hidden = router_hidden
+        self.probe_overlap = probe_kernel_size // 2 if probe_overlap is None else probe_overlap
         self.router_temperature = float(router_temperature)
         self.router_noise_std = float(router_noise_std)
         self.load_balance_alpha = float(load_balance_alpha)
-        self.last_aux_loss = torch.zeros(())
+        self.register_buffer("last_aux_loss", torch.zeros(()), persistent=False)
 
-        self.probe = nn.Conv1d(in_channels, probe_dim, kernel_size=1, stride=stride)
+        self.probe = nn.Conv1d(in_channels, probe_dim, probe_kernel_size, probe_stride)
         self.router = nn.Sequential(
             nn.LayerNorm(probe_dim),
             nn.Linear(probe_dim, router_hidden),
@@ -1034,12 +1085,12 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             nn.Linear(router_hidden, num_experts),
         )
         self.experts = nn.ModuleList([
-            nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride)
+            nn.Conv1d(in_channels, out_channels, kernel_size, stride)
             for _ in range(num_experts)
         ])
 
-        if self.overlap < self.kernel_size / 2:
-            warnings.warn(f"Overlap {self.overlap} is less than half the kernel size {self.kernel_size}. Pooling may be impacted windowing issues.")
+        _check_lowmem_config(kernel_size, stride, chunk_size, self.overlap)
+        _check_lowmem_config(probe_kernel_size, probe_stride, chunk_size, self.probe_overlap)
 
     @property
     def conv(self) -> nn.Conv1d:
@@ -1057,7 +1108,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
 
     @property
     def min_length(self) -> int:
-        return self.num_patches * self.kernel_size
+        return self.num_patches * max(self.kernel_size, self.probe_kernel_size)
 
     def _route(self, probe_feat: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """
@@ -1135,7 +1186,8 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             z_e = z.index_select(0, idx)                            # (n_e, E, P)
             g_e = expert(z_e)                                       # (n_e, C, S)
             g_e, _ = g_e.max(dim=-1)                                # (n_e, C)
-            g_e = g_e * p1_flat.index_select(0, idx).unsqueeze(-1)  # (n_e, C)
+            if self.training:
+                g_e = g_e * p1_flat.index_select(0, idx).unsqueeze(-1)
             out.index_copy_(0, idx, g_e)
 
         # Reshape and return.
@@ -1155,10 +1207,10 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         max_vals, pos = _lowmem_patchwise_max_over_time_streaming(
             preprocess=preprocess,
             ts=ts,
-            rf=self.probe.kernel_size[0],
-            first_stride=self.stride,
+            rf=self.probe_kernel_size,
+            first_stride=self.probe_stride,
             chunk_size=self.chunk_size,
-            overlap=0,
+            overlap=self.probe_overlap,
             channels=self.probe_dim,
             num_patches=self.num_patches,
             activations_fn=partial(functional_forward, module=self.probe, fp32=self.fp32),
@@ -1173,7 +1225,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
                 preprocess=preprocess,
                 ts=ts,
                 positions=positions_flat,
-                rf=self.probe.kernel_size[0],
+                rf=self.probe_kernel_size,
                 embedding_dim=E,
                 mask=None,
             )
@@ -1219,6 +1271,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             )
 
             if not self.training:
+                max_vals = self._clean_max_vals(max_vals, active, e)
                 out = out + max_vals
                 continue
 
@@ -1245,8 +1298,23 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             out = out + z
 
         # Switch-style gate scaling.
-        out = out * p1.unsqueeze(-1)
+        if self.training:
+            out = out * p1.unsqueeze(-1)
+
         return out
+
+    def _clean_max_vals(self, max_vals: Tensor, active: Tensor, e: int) -> Tensor:
+        # Find any inactive patch that has a nonzero value in any channel.
+        # This should never happen and indicates a bug in the low-memory max computation.
+        inactive = ~active
+        if inactive.any():
+            bad = (max_vals.abs() > 0).any(dim=-1) & inactive
+            if bad.any():
+                num_bad = int(bad.sum().item())
+                max_leak = float(max_vals[inactive].abs().max().item())
+                warnings.warn(f"Non-zero inactive patches ({num_bad}) with maximal leakage of {max_leak} detected in expert {e}. Zeroing them out.")
+            max_vals = max_vals * active.unsqueeze(-1).to(max_vals.dtype)
+        return max_vals
 
 
 def _lowmem_patchwise_max_over_time_streaming(
@@ -1413,7 +1481,6 @@ def _scatter_g_to_BNC(
         col_idx = torch.arange(channels, device=g_all.device).view(1, -1).expand(num_patches, -1)
         gathered = g_b[row_idx, col_idx]                 # (N, C), junk where inv=-1
         out[b] = torch.where(active, gathered, out[b])
-
 
     return out
 
