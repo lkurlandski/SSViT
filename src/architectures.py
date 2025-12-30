@@ -1195,6 +1195,9 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         # Reshape and return.
         out = out.view(B, N, C)  # (B, N, C)
 
+        # Ensure every expert parameter participates in the autograd graph.
+        out = self._ddp_keepalive(out)
+
         return out
 
     def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
@@ -1305,6 +1308,9 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         if self.training:
             out = out * p1.unsqueeze(-1)
 
+        # Ensure every expert parameter participates in the autograd graph.
+        out = self._ddp_keepalive(out)
+
         return out
 
     def _clean_max_vals(self, max_vals: Tensor, active: Tensor, e: int) -> Tensor:
@@ -1319,6 +1325,23 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
                 warnings.warn(f"Non-zero inactive patches ({num_bad}) with maximal leakage of {max_leak} detected in expert {e}. Zeroing them out.")
             max_vals = max_vals * active.unsqueeze(-1).to(max_vals.dtype)
         return max_vals
+
+    def _ddp_keepalive(self, out: torch.Tensor) -> torch.Tensor:
+        """
+        Ensure all expert parameters participate in the autograd graph every step.
+        This avoids DDP 'unused parameter' errors when routing skips experts.
+        """
+        if (not self.training) or (not torch.is_grad_enabled()):
+            return out
+
+        dummy = out.sum() * 0.0  # scalar connected to the graph
+        for expert in self.experts:
+            if not isinstance(expert, nn.Conv1d):
+                raise NotImplementedError("Only Conv1d experts are supported for DDP keepalive.")
+            dummy = dummy + expert.weight.view(-1)[0] * 0.0
+            if expert.bias is not None:
+                dummy = dummy + expert.bias.view(-1)[0] * 0.0
+        return out + dummy
 
 
 def _lowmem_patchwise_max_over_time_dispatched(
