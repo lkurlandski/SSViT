@@ -1038,6 +1038,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         router_temperature: float = 1.0,
         router_noise_std: float = 0.0,
         load_balance_alpha: float = 0.0,
+        patch_batch_size: Optional[int] = None,
     ) -> None:
         super().__init__(in_channels, out_channels, num_patches, patch_size)
 
@@ -1075,6 +1076,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         self.router_temperature = float(router_temperature)
         self.router_noise_std = float(router_noise_std)
         self.load_balance_alpha = float(load_balance_alpha)
+        self.patch_batch_size = patch_batch_size
         self.register_buffer("last_aux_loss", torch.zeros(()), persistent=False)
 
         self.probe = nn.Conv1d(in_channels, probe_dim, probe_kernel_size, probe_stride)
@@ -1201,6 +1203,8 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         E, C = self.in_channels, self.out_channels
         P, N = self.resolve_patch_dims(T)
 
+        patch_batch_size = self.patch_batch_size if self.patch_batch_size is not None else B
+
         g_all: Tensor
 
         # Probe features.
@@ -1257,17 +1261,17 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             if not active.any():
                 continue
 
-            max_vals, pos = _lowmem_patchwise_max_over_time_streaming(
+            max_vals, pos = _lowmem_patchwise_max_over_time_dispatched(
                 preprocess=preprocess,
                 ts=ts,
                 rf=self.kernel_size,
-                first_stride=self.stride,
-                chunk_size=self.chunk_size,
-                overlap=self.overlap,
-                channels=C,
+                stride=self.stride,
+                patch_size=P,
                 num_patches=self.num_patches,
+                channels=C,
                 activations_fn=partial(functional_forward, module=expert, fp32=self.fp32),
                 patch_active=active,
+                patch_batch_size=patch_batch_size,
             )
 
             if not self.training:
@@ -1315,6 +1319,162 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
                 warnings.warn(f"Non-zero inactive patches ({num_bad}) with maximal leakage of {max_leak} detected in expert {e}. Zeroing them out.")
             max_vals = max_vals * active.unsqueeze(-1).to(max_vals.dtype)
         return max_vals
+
+
+def _lowmem_patchwise_max_over_time_dispatched(
+    *,
+    preprocess: PreprocessFn,
+    ts: Sequence[Tensor],                 # each (B,T,*)
+    rf: int,
+    stride: int,
+    patch_size: int,
+    num_patches: int,
+    channels: int,
+    activations_fn: Callable[[Tensor], Tensor],  # (M,E,L)->(M,C,L_out)
+    patch_active: torch.Tensor,           # (B,N) bool
+    patch_batch_size: int = 128,
+) -> tuple[Tensor, Tensor]:
+    """
+    Compute patchwise (max_vals, max_pos) for ONLY the active (b,j) patches.
+
+    Returns:
+      max_vals: (B,N,C) with zeros for inactive/invalid patches
+      max_pos:  (B,N,C) with zeros for inactive/invalid patches
+
+    Strategy:
+      - For each active (b,j), slice the minimal input span needed for patch j:
+          start = max(0, j*patch_size - (rf-1))
+          end   = min(T, (j+1)*patch_size)
+        (This contains all windows whose end can fall in patch j, but also includes some
+         windows that end in patch j-1; those are filtered out by patch_idx==j.)
+      - Batch a set of patch slices (micro-batch) into (M,Lmax,*) with padding using an
+        extra all-zeros time step at index T.
+      - Run preprocess + conv once per micro-batch.
+      - Mask conv outputs to (a) valid L_out for each slice and (b) patch_idx==j.
+      - Take max and argmax to produce per-(patch,channel) maxima and positions.
+    """
+    if not ts or any(t.shape[0] != ts[0].shape[0] for t in ts):
+        raise ValueError("All tensors in `ts` must share batch dim.")
+    B, T = ts[0].shape[:2]
+    if T < rf:
+        raise RuntimeError(f"Input sequence length {T} < receptive field {rf}")
+    if patch_size <= 0:
+        raise ValueError(f"{patch_size=} must be positive.")
+    if stride <= 0:
+        raise ValueError(f"{stride=} must be positive.")
+    check_tensor(patch_active, (B, num_patches), torch.bool)
+    patch_active = patch_active.to(device=ts[0].device)
+
+    device = ts[0].device
+
+    # Outputs default to zeros (inactive patches stay zero)
+    max_vals = ts[0].new_zeros((B, num_patches, channels), dtype=torch.float32).to(device=device)
+    max_pos  = torch.zeros((B, num_patches, channels), device=device, dtype=torch.long)
+
+    # Active patch list: (M,2) = (b,j)
+    bj = patch_active.nonzero(as_tuple=False)
+    if bj.numel() == 0:
+        return max_vals, max_pos
+
+    # Precompute per-task slice bounds
+    b_idx = bj[:, 0]
+    j_idx = bj[:, 1]
+
+    patch_start = (j_idx * patch_size).to(torch.long)                 # (M,)
+    patch_end   = torch.minimum((j_idx + 1) * patch_size, torch.tensor(T, device=device)).to(torch.long)  # (M,)
+    start = torch.maximum(patch_start - (rf - 1), torch.zeros_like(patch_start))  # (M,)
+    end   = patch_end                                                 # (M,)
+    lengths = (end - start).to(torch.long)                            # (M,)
+
+    # Some patches can be too short to produce any conv output; we'll just leave zeros there.
+    valid_task = lengths >= rf
+    if not valid_task.any():
+        return max_vals, max_pos
+
+    b_idx = b_idx[valid_task]
+    j_idx = j_idx[valid_task]
+    start = start[valid_task]
+    end   = end[valid_task]
+    lengths = lengths[valid_task]
+
+    M_total = int(b_idx.numel())
+
+    # Append a single all-zero timestep at index T for padding.
+    # This assumes your preprocess treats all-zero raw inputs as padding reasonably
+    # (e.g., embedding padding_idx=0, or zero features -> neutral).
+    ts_pad: list[Tensor] = []
+    for t in ts:
+        pad = t.new_zeros((B, 1) + t.shape[2:])
+        ts_pad.append(torch.cat([t, pad], dim=1))  # (B,T+1,*)
+
+    # Process in micro-batches of patches
+    for off in range(0, M_total, patch_batch_size):
+        sl = slice(off, min(off + patch_batch_size, M_total))
+
+        b_mb = b_idx[sl]          # (m,)
+        j_mb = j_idx[sl]          # (m,)
+        s_mb = start[sl]          # (m,)
+        e_mb = end[sl]            # (m,)
+        L_mb = lengths[sl]        # (m,)
+        m = int(b_mb.numel())
+
+        Lmax = int(L_mb.max().item())
+        if Lmax < rf:
+            continue
+
+        ar = torch.arange(Lmax, device=device, dtype=torch.long)              # (Lmax,)
+        time_ix = s_mb.unsqueeze(1) + ar.unsqueeze(0)                         # (m,Lmax)
+        valid_time = ar.unsqueeze(0) < L_mb.unsqueeze(1)                      # (m,Lmax)
+        time_ix = torch.where(valid_time, time_ix, torch.full_like(time_ix, T))  # pad index T
+
+        batch_ix = b_mb.unsqueeze(1).expand(m, Lmax)                          # (m,Lmax)
+
+        # Gather + preprocess: (m,Lmax,*) -> (m,Lmax,E)
+        wins: list[Tensor] = []
+        for tpad in ts_pad:
+            wins.append(tpad[batch_ix, time_ix, ...].contiguous())            # (m,Lmax,*)
+
+        z = preprocess(*wins)                                                 # (m,Lmax,E)
+        z = z.transpose(1, 2).contiguous()                                    # (m,E,Lmax)
+
+        with torch.no_grad():
+            g = activations_fn(z)                                             # (m,C,L_out_max)
+            _, _, L_out_max = g.shape
+
+            # Valid conv outputs per slice
+            # L_out_i = floor((L_i - rf)/stride) + 1
+            L_out_i = torch.div((L_mb - rf), stride, rounding_mode="floor") + 1  # (m,)
+            idx = torch.arange(L_out_max, device=device, dtype=torch.long)       # (L_out_max,)
+            valid_out = idx.unsqueeze(0) < L_out_i.unsqueeze(1)                  # (m,L_out_max)
+
+            # Compute patch assignment of each conv output (global indices)
+            # pos_end = (start + idx*stride) + (rf-1)
+            pos_end = s_mb.unsqueeze(1) + idx.unsqueeze(0) * stride + (rf - 1)   # (m,L_out_max)
+            patch_idx = torch.div(pos_end, patch_size, rounding_mode="floor").clamp(0, num_patches - 1)
+
+            in_this_patch = patch_idx == j_mb.unsqueeze(1)                       # (m,L_out_max)
+            keep = valid_out & in_this_patch                                    # (m,L_out_max)
+
+            # Mask g so only outputs belonging to patch j remain
+            neg_inf = torch.finfo(g.dtype).min
+            g_masked = g.masked_fill(~keep.unsqueeze(1), neg_inf)                # (m,C,L_out_max)
+
+            v, arg = g_masked.max(dim=-1)                                       # (m,C), (m,C)
+            has_any = keep.any(dim=1)                                           # (m,)
+
+            # If no valid outputs for this patch (should be rare), force to zero.
+            if (~has_any).any():
+                v = torch.where(has_any.unsqueeze(1), v, v.new_zeros((m, channels)))
+                arg = torch.where(has_any.unsqueeze(1), arg, arg.new_zeros((m, channels), dtype=torch.long))
+
+            pos = s_mb.unsqueeze(1) + arg * stride                              # (m,C)
+            pos = pos.clamp(0, max(0, T - rf))
+
+        # Write back into (B,N,C)
+        max_vals[b_mb, j_mb, :] = v.to(max_vals.dtype)
+        max_pos[b_mb, j_mb, :]  = pos
+
+    return max_vals, max_pos
 
 
 def _lowmem_patchwise_max_over_time_streaming(
