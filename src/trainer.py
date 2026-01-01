@@ -522,6 +522,17 @@ def print_parameter_summary(model: nn.Module, spaces: int = 0) -> None:
             print(f"{' ' * spaces}param {name} grad: {grad.dtype} {tuple(grad.shape)} {grad.device} {grad.sum().item():.4f}")
 
 
+def get_last_aux_loss(model: nn.Module) -> Optional[Tensor]:
+    if isinstance(model, (DistributedDataParallel, DataParallel)):
+        model = model.module  # type: ignore[no-any-return]
+    last_aux_loss = getattr(model, "last_aux_loss", None)
+    if last_aux_loss is None:
+        return None
+    if not isinstance(last_aux_loss, Tensor):
+        raise TypeError("Model's `last_aux_loss` attribute must be a Tensor.")
+    return last_aux_loss
+
+
 class Trainer:
     """
     Trainer class for training models with PyTorch.
@@ -695,6 +706,8 @@ class Trainer:
                 with record_function("stage::forward"):
                     outputs = self.forward(batch)
                 loss = self.compute_loss(batch, outputs)
+                if (last_aux_loss := get_last_aux_loss(self.model)) is not None:
+                    loss = loss + last_aux_loss.to(loss.device, loss.dtype)
                 loss = loss * int(real) / self.args.gradient_accumulation_steps
                 with record_function("stage::backward"):
                     self.scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
