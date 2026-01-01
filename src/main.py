@@ -255,6 +255,9 @@ def get_model(
             num_experts=16,
             load_balance_alpha=0.01,
             router_noise_std=0.1,
+            probe_kernel_size=256,
+            probe_stride=256,
+            router_hidden=256,
         )
     else:
         PatchEncoderCls = PatchEncoderBase
