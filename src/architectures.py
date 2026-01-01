@@ -1014,7 +1014,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
     - Gate scaling: output *= p_top1 so router gets end-to-end gradients.
     """
 
-    last_aux_loss: Tensor
+    _last_aux_loss: Tensor
 
     def __init__(
         self,
@@ -1077,7 +1077,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         self.router_noise_std = float(router_noise_std)
         self.load_balance_alpha = float(load_balance_alpha)
         self.patch_batch_size = patch_batch_size
-        self.register_buffer("last_aux_loss", torch.zeros(()), persistent=False)
+        self.register_buffer("_last_aux_loss", torch.zeros(()), persistent=False)
 
         self.probe = nn.Conv1d(in_channels, probe_dim, probe_kernel_size, probe_stride)
         self.router = nn.Sequential(
@@ -1107,6 +1107,10 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
     def patch_size(self) -> None:
         assert self._patch_size is None
         return self._patch_size
+
+    @property
+    def last_aux_loss(self) -> Tensor:
+        return self._last_aux_loss
 
     @property
     def min_length(self) -> int:
@@ -1153,6 +1157,8 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             p = probs.mean(dim=(0, 1))   # (E,)
             aux = self.load_balance_alpha * (self.num_experts * (f * p).sum())
 
+        self._last_aux_loss = aux
+
         return top1, p1, aux
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
@@ -1176,7 +1182,6 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         top1, p1, aux = self._route(r)
         top1_flat = top1.view(B * N)   # (BN,)
         p1_flat   = p1.view(B * N)     # (BN,)
-        self.last_aux_loss = aux       # (,)
 
         # Expert passes.
         out = z.new_zeros((B * N, C))
@@ -1254,7 +1259,6 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
 
         # Route to experts.
         top1, p1, aux = self._route(r)
-        self.last_aux_loss = aux
 
         # Expert passes.
         out = r.new_zeros((B, N, C))
@@ -2690,6 +2694,10 @@ class ViTClassifier(Classifier):
         fully_shard([self.embedding, self.filmer, self.patcher], **kwds)
         self.backbone.fully_shard(**kwds)
         fully_shard(self, **kwds | {"reshard_after_forward": False})
+
+    @property
+    def last_aux_loss(self) -> Optional[Tensor]:
+        return getattr(self.patcher, "last_aux_loss", None)
 
 # -------------------------------------------------------------------------------- #
 # Hierarchical Classifiers
