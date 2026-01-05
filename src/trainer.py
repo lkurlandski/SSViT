@@ -524,7 +524,7 @@ def print_parameter_summary(model: nn.Module, spaces: int = 0) -> None:
 
 def get_last_aux_loss(model: nn.Module) -> Optional[Tensor]:
     if isinstance(model, (DistributedDataParallel, DataParallel)):
-        model = model.module  # type: ignore[no-any-return]
+        model = model.module
     last_aux_loss = getattr(model, "last_aux_loss", None)
     if last_aux_loss is None:
         return None
