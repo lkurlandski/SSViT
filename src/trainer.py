@@ -651,7 +651,7 @@ class Trainer:
             report = {}
             for k in allresults:
                 # Average these over number of samples.
-                if k in ("tr_loss",):
+                if k in ("tr_loss", "aux_loss"):
                     report[k] = allresults[k].item() / num_samples
                 # Average these over number of steps.
                 elif k in ("grad_norm", "param_norm", "param_delta",):
@@ -659,6 +659,9 @@ class Trainer:
                 # Do not average these.
                 elif k in ("num_samples",):
                     report[k] = allresults[k].item()
+                # Average these over number of samples.
+                elif "loss" in k:
+                    report[k] = allresults[k].item() / num_samples
                 # Otherwise raise an error.
                 else:
                     raise KeyError(f"Unknown training metric '{k}' encountered.")
@@ -705,13 +708,13 @@ class Trainer:
             with maybe_no_sync(self.model, sync_gradients):
                 with record_function("stage::forward"):
                     outputs = self.forward(batch)
-                loss = self.compute_loss(batch, outputs)
-                if (last_aux_loss := get_last_aux_loss(self.model)) is not None:
-                    loss = loss + last_aux_loss.to(loss.device, loss.dtype)
+                loss, losses = self.compute_loss(batch, outputs)
                 loss = loss * int(real) / self.args.gradient_accumulation_steps
                 with record_function("stage::backward"):
                     self.scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
+                for lossname in losses:
+                    results[lossname] += losses[lossname].detach() * len(batch) * int(real)
 
             # Check for parameters with no gradients
             # Skip for fake batches, as they take anomalous paths for MoE models and naturally have missing gradients
@@ -818,6 +821,7 @@ class Trainer:
 
         mini_step = -1
         totalloss = torch.tensor(0.0, dtype=torch.float64, device=self.device)
+        totallosses: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
         alllabels: list[Tensor] = []
         alllogits: list[Tensor] = []
 
@@ -825,9 +829,11 @@ class Trainer:
             for mini_step, real, batch in iterable:
                 batch = batch.to(self.device, non_blocking=True).finalize(self.mp_dtype, torch.int32, torch.int64)
                 outputs = self.forward(batch)
-                loss = self.compute_loss(batch, outputs)
+                loss, losses = self.compute_loss(batch, outputs)
                 if real:
                     totalloss += loss.to(torch.float64) * len(batch)
+                    for lossname in losses:
+                        totallosses[lossname] += losses[lossname].to(torch.float64) * len(batch)
                     alllabels.append(batch.get_label())
                     alllogits.append(outputs)
 
@@ -837,12 +843,16 @@ class Trainer:
         if len(alllabels) == 0 or len(alllogits) == 0:
             raise RuntimeError(f"[rank {rank()}] no real samples were evaluated.")
 
+        totallosses = dict(totallosses)
         labels = torch.cat(alllabels, dim=0).to(torch.int64)
         logits = torch.cat(alllogits, dim=0).to(torch.float64)
         check_logits_and_labels(logits, labels)
 
         if totalloss.grad is not None or totalloss.dtype != torch.float64:
             raise RuntimeError("totalloss should be a non-gradient float64 tensor.")
+        for lossname in totallosses:
+            if totallosses[lossname].grad is not None or totallosses[lossname].dtype != torch.float64:
+                raise RuntimeError(f"totallosses['{lossname}'] should be a non-gradient float64 tensor.")
         if labels.grad is not None or labels.dtype != torch.int64:
             raise RuntimeError("labels should be a non-gradient int64 tensor.")
         if logits.grad is not None or logits.dtype != torch.float64:
@@ -875,6 +885,8 @@ class Trainer:
                 check_logits_and_labels(logits, labels)
             # Sum the loss across all ranks.
             dist.all_reduce(totalloss, op=dist.ReduceOp.SUM)
+            for lossname in totallosses:
+                dist.all_reduce(totallosses[lossname], op=dist.ReduceOp.SUM)
             # Cleanup some references to prevent bugs.
             del length, lengths, longest, pad, glabels, glogits
 
@@ -882,6 +894,8 @@ class Trainer:
         if rank() == 0:
             metrics = self.compute_metrics(labels.to("cpu"), logits.to("cpu"))
             metrics["loss"] = totalloss.to("cpu") / labels.shape[0]
+            for lossname in totallosses:
+                metrics[lossname] = totallosses[lossname].to("cpu") / labels.shape[0]
 
         # Prepare a validation report.
         report: Optional[dict[str, float]] = None
@@ -1046,12 +1060,36 @@ class Trainer:
         with torch.autocast(self.device.type, dtype=self.mp_dtype, enabled=self.args.mp16):
             return self.model(batch.get_inputs(), batch.get_guides())  # type: ignore[no-any-return]
 
-    def compute_loss(self, batch: Batch, outputs: Tensor) -> Tensor:
+    def compute_loss(self, batch: Batch, outputs: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
         """
         Compute the loss over a batch of examples.
+
+        Args:
+            batch: The batch of data.
+            outputs: The model outputs for the batch.
+
+        Returns:
+            loss - The computed loss tensor.
+            losses - A dictionary of detached individual loss components.
         """
+        losses: dict[str, Tensor] = {}
+        dtype = outputs.dtype
+        device = outputs.device
+
         with torch.autocast(self.device.type, dtype=self.mp_dtype, enabled=self.args.mp16):
-            return self.loss_fn(outputs, batch.get_label())  # type: ignore[no-any-return]
+            clf_loss: Tensor = self.loss_fn(outputs, batch.get_label())
+            losses["clf_loss"] = clf_loss.to(device=device, dtype=dtype)
+
+        if (last_aux_loss := get_last_aux_loss(self.model)) is not None:
+            losses["aux_loss"] = last_aux_loss.to(device=device, dtype=dtype)
+
+        loss = torch.tensor(0.0, dtype=dtype, device=device)
+        for k in losses:
+            loss += losses[k]
+
+        losses = {k: losses[k].detach() for k in losses}
+
+        return loss, losses
 
     def step(self, *, grad_scale: float = 1.0) -> Tensor:
         """
@@ -1243,6 +1281,9 @@ class Trainer:
             d["param_norm"] = round(results["param_norm"], 3)
             d["param_delta"] = round(results["param_delta"], 3)
             d["tr_loss"] = round(results["tr_loss"], 3)
+            if "tr_aux_loss" in results:
+                d["tr_clf_loss"] = round(results["tr_clf_loss"], 3)
+                d["tr_aux_loss"] = round(results["tr_aux_loss"], 3)
             d["tr_gpu_utl"] = round(results["tr_gpu_utl"], 2)
             d["tr_gpu_mem"] = round(results["tr_gpu_mem"] / (1024 ** 3), 2)
             d["tr_time"] = round(results["tr_time"], 0)
@@ -1250,6 +1291,9 @@ class Trainer:
             d["tr_throughput"] = round(results["tr_throughput"], 2)
         if any(k.startswith("vl_") for k in results):
             d["vl_loss"] = round(results["vl_loss"], 3)
+            if "vl_aux_loss" in results:
+                d["vl_clf_loss"] = round(results["vl_clf_loss"], 3)
+                d["vl_aux_loss"] = round(results["vl_aux_loss"], 3)
             d["vl_roc"] = round(results["vl_roc"], 3)
             d["vl_prc"] = round(results["vl_prc"], 3)
             d["vl_gpu_utl"] = round(results["vl_gpu_utl"], 2)
