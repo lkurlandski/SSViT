@@ -128,9 +128,14 @@ class Configuration:
 
     @property
     def outdir(self) -> Path:
-        root = Path("./output")
+        root = Path("/shared/rc/admalware")
+        # root = Path("/home/lk3591")
+        root /= "Documents/code/SSViT/output"
         if DEBUG:
             root = root / "tmp"
+        root /= "conv1d"
+        root /= f"embedding_dim--{os.environ.get('EMBEDDING_DIM', '8')}"
+        root /= f"patcher_channel_factor--{os.environ.get('PATCHER_CHANNEL_FACTOR', '1')}"
         parts = [
             f"arch--{self.arch.value}",
             f"posenc--{self.posenc.value}",
@@ -180,9 +185,9 @@ class Configuration:
                 return 512
             if self.size == ModelSize.LG:  # O(N)
                 if self.do_entropy or self.which_characteristics:
-                    return 64
+                    return 32
                 if self.level == HierarchicalLevel.NONE:
-                    return 128
+                    return 64
                 if self.level == HierarchicalLevel.COARSE:
                     return 32
                 if self.level == HierarchicalLevel.MIDDLE:
@@ -432,6 +437,8 @@ class ScriptBuilder:
         variables = "\n".join([
             f"export OMP_NUM_THREADS={self.reqs.omp_num_threads}",
             f"export PTW_NUM_THREADS={self.reqs.omp_num_threads}",
+            f"export PATCHER_CHANNEL_FACTOR={os.environ.get('PATCHER_CHANNEL_FACTOR', '1')}",
+            f"export EMBEDDING_DIM={os.environ.get('EMBEDDING_DIM', '8')}",
         ])
 
         locals = "\n".join([
@@ -550,6 +557,7 @@ def config_fiter(config: Configuration) -> bool:
 
     # Structure
     if config.level != HierarchicalLevel.NONE:
+        return False
         if config.do_entropy:
             return False
         if config.which_characteristics:
