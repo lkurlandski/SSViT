@@ -1005,13 +1005,7 @@ class PatchEncoderLowMem(PatchEncoderBase):
 
 class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
     """
-    Switch-style MoE patch encoder with constant-memory streaming and recompute.
-
-    - Probe: Conv1d(in_channels->probe_dim, k=1) + max pooling (low-mem).
-    - Router: MLP(probe_feat) -> logits over experts.
-    - Experts: independent Conv1d(in_channels->out_channels, k=kernel_size) + max pooling (low-mem).
-    - Top-1 routing: each patch uses exactly one expert.
-    - Gate scaling: output *= p_top1 so router gets end-to-end gradients.
+    MoE patch encoder with constant-memory.
     """
 
     _last_aux_loss: Tensor
@@ -1124,9 +1118,9 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             probe_feat: Tensor of shape (B, N, D).
 
         Returns:
-          top1: Tensor (long)  of shape (B, N) indicating the selected expert per patch.
-          p1:   Tensor (float) of shape (B, N) indicating the probability of the selected expert per patch.
-          aux:  Tensor (float) of shape (,) indicating the load balancing auxillary loss.
+            top1: Tensor (long)  of shape (B, N) indicating the selected expert per patch.
+            gates: Tensor (float) of shape (B, N, E) hard one-hot in forward, STE grads in backward.
+            aux:  Tensor (float) of shape (,) indicating the load balancing auxillary loss.
         """
         assert self.router is not None
 
@@ -1145,21 +1139,24 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         # Compute probabilities for gate scaling and auxillary loss.
         probs = torch.softmax(logits / self.router_temperature, dim=-1)  # (B, N, E)
 
-        # Most likely expert and its probability.
-        top1 = torch.argmax(logits, dim=-1)                    # (B, N)
-        p1 = probs.gather(-1, top1.unsqueeze(-1)).squeeze(-1)  # (B,N)
+        # In STE hard routing, forward is one-hot, backward flows through soft relaxation.
+        if self.training:
+            gates = F.gumbel_softmax(logits, tau=self.router_temperature, hard=True, dim=-1)  # (B, N, E)
+        else:
+            gates = F.one_hot(torch.argmax(logits, dim=-1), self.num_experts).to(probs.dtype)  # (B, N, E)
+
+        top1 = gates.argmax(dim=-1)  # (B, N)
 
         # Switch-style load balancing loss.
         aux = probs.new_zeros(())
         if self.load_balance_alpha > 0:
-            onehot = torch.nn.functional.one_hot(top1, num_classes=self.num_experts).to(probs.dtype)  # (B, N, E)
-            f = onehot.mean(dim=(0, 1))  # (E,)
+            f = gates.mean(dim=(0, 1))   # (E,)
             p = probs.mean(dim=(0, 1))   # (E,)
             aux = self.load_balance_alpha * (self.num_experts * (f * p).sum())
 
         self._last_aux_loss = aux
 
-        return top1, p1, aux
+        return top1, gates, aux
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
 
@@ -1179,9 +1176,9 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         r = r.view(B, N, self.probe_dim)  # (B, N, D)
 
         # Route to experts.
-        top1, p1, aux = self._route(r)
+        top1, gates, aux = self._route(r)
         top1_flat = top1.view(B * N)   # (BN,)
-        p1_flat   = p1.view(B * N)     # (BN,)
+        gates_flat = gates.view(B * N, self.num_experts)  # (BN,E)
 
         # Expert passes.
         out = z.new_zeros((B * N, C))
@@ -1194,7 +1191,9 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             g_e = expert(z_e)                                       # (n_e, C, S)
             g_e, _ = g_e.max(dim=-1)                                # (n_e, C)
             if self.training:
-                g_e = g_e * p1_flat.index_select(0, idx).unsqueeze(-1)
+                # STE gate factor. Forward is 1.0 for selected expert. Backward provides router grads.
+                w = gates_flat.index_select(0, idx)[:, e].unsqueeze(-1).to(dtype=g_e.dtype)  # (n_e, 1)
+                g_e = g_e * w
             out.index_copy_(0, idx, g_e)
 
         # Reshape and return.
@@ -1258,7 +1257,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             del g_all
 
         # Route to experts.
-        top1, p1, aux = self._route(r)
+        top1, gates, aux = self._route(r)
 
         # Expert passes.
         out = r.new_zeros((B, N, C))
@@ -1306,11 +1305,13 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
                 num_patches=self.num_patches,
                 channels=C,
             )
-            out = out + z
 
-        # Switch-style gate scaling.
-        if self.training:
-            out = out * p1.unsqueeze(-1)
+            # STE gate factor.
+            if self.training:
+                w = gates[..., e].unsqueeze(-1).to(dtype=z.dtype)
+                out = out + z * w
+            else:
+                out = out + z
 
         # Ensure every expert parameter participates in the autograd graph.
         out = self._ddp_keepalive(out)
