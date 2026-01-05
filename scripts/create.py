@@ -35,6 +35,7 @@ from src.helpers import Scheduler
 
 DEBUG = False
 NGPUS: Optional[int] = None
+OROOT = Path("/shared/rc/admalware") if Path("/shared/rc/admalware").exists() else Path.home()
 
 
 def fixed_width_string(string: Any, width: int, char: str = " ", left: bool = False) -> str:
@@ -49,6 +50,7 @@ class Configuration:
     def __init__(
         self,
         arch: Architecture,
+        parch: PatcherArchitecture,
         posenc: PositionalEncodingArchitecture,
         patchposenc: PatchPositionalEncodingArchitecture,
         size: ModelSize,
@@ -59,6 +61,7 @@ class Configuration:
         seed: int,
     ) -> None:
         self.arch = arch
+        self.parch = parch
         self.posenc = posenc
         self.patchposenc = patchposenc
         self.size = size
@@ -82,6 +85,7 @@ class Configuration:
         return (
             f"Configuration("
             f"  arch={self.arch},\n"
+            f"  parch={self.parch},\n"
             f"  posenc={self.posenc},\n"
             f"  patchposenc={self.patchposenc},\n"
             f"  size={self.size},\n"
@@ -96,6 +100,7 @@ class Configuration:
     def __str__(self) -> str:
         return (
             f"{fixed_width_string(self.arch.value, 3, '_')}-"
+            f"{fixed_width_string(self.parch.value, 3, '_')}-"
             f"{fixed_width_string(self.posenc.value, 3, '_')}-"
             f"{fixed_width_string(self.patchposenc.value, 3, '_')}-"
             f"{fixed_width_string(self.size.value, 3, '_')}-"
@@ -109,6 +114,9 @@ class Configuration:
     def _attrs(self) -> tuple[Any, ...]:
         return (
             self.arch.value,
+            self.parch.value,
+            self.posenc.value,
+            self.patchposenc.value,
             self.size.value,
             self.level.value,
             self.do_entropy,
@@ -128,16 +136,12 @@ class Configuration:
 
     @property
     def outdir(self) -> Path:
-        root = Path("/shared/rc/admalware")
-        # root = Path("/home/lk3591")
-        root /= "Documents/code/SSViT/output"
+        root = OROOT / "Documents/code/SSViT/output"
         if DEBUG:
             root = root / "tmp"
-        root /= "conv1d"
-        root /= f"embedding_dim--{os.environ.get('EMBEDDING_DIM', '8')}"
-        root /= f"patcher_channel_factor--{os.environ.get('PATCHER_CHANNEL_FACTOR', '1')}"
         parts = [
             f"arch--{self.arch.value}",
+            f"parch--{self.parch.value}",
             f"posenc--{self.posenc.value}",
             f"patchposenc--{self.patchposenc.value}",
             f"size--{self.size.value}",
@@ -349,6 +353,10 @@ class Requirements:
             tr_throughput *= 0.40
             vl_throughput *= 0.30
 
+        if self.config.parch == PatcherArchitecture.EXP:
+            tr_throughput *= 0.50
+            vl_throughput *= 0.50
+
         tr_throughput = tr_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
         vl_throughput = vl_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
 
@@ -459,6 +467,7 @@ class ScriptBuilder:
             "src/main.py",
             f"--outdir \"$OUTDIR\"",
             f"--arch {self.config.arch.value}",
+            f"--parch {self.config.parch.value}",
             f"--posenc {self.config.posenc.value}",
             f"--patchposenc {self.config.patchposenc.value}",
             f"--size {self.config.size.value}",
@@ -589,12 +598,15 @@ def main() -> None:
     parser = ArgumentParser(description="Create large batches of experiments.")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--ngpus", type=int, default=None)
+    parser.add_argument("--root", type=str, default="auto")
     args = parser.parse_args()
 
     global DEBUG
     global NGPUS
+    global OROOT
     DEBUG = args.debug
     NGPUS = args.ngpus
+    OROOT = Path(args.root) if args.root != "auto" else OROOT
 
     outpath = Path("./run")
     outpath.mkdir(exist_ok=True)
@@ -604,6 +616,7 @@ def main() -> None:
 
     configurations = product(
         [a for a in Architecture],
+        [PatcherArchitecture.EXP, PatcherArchitecture.MEM],
         [PositionalEncodingArchitecture.FIXED, PositionalEncodingArchitecture.LEARNED],
         [PatchPositionalEncodingArchitecture.BTH, PatchPositionalEncodingArchitecture.NONE],
         [s for s in ModelSize],
