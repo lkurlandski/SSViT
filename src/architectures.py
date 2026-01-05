@@ -894,6 +894,10 @@ class HierarchicalConvPatchEncoder(PatchEncoderBase):
 class PatchEncoderLowMem(PatchEncoderBase):
     """
     Breaks a sequence into a fixed number of patches and encodes them via constant memory convolution.
+
+    See: Shazeer et al., "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer", ICLR 2017.
+    See: Fedus et al., "Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity", JMLR 2022.
+    See: Jang et al., "Categorial Reparameterization with Gumbel-Softmax", ICLR 2017.
     """
 
     def __init__(
@@ -1031,6 +1035,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         router_hidden: int = 64,
         router_temperature: float = 1.0,
         router_noise_std: float = 0.0,
+        router_mode: Literal["ste", "soft"] = "soft",
         load_balance_alpha: float = 0.0,
         patch_batch_size: Optional[int] = None,
     ) -> None:
@@ -1051,6 +1056,8 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             raise ValueError(f"{router_noise_std=} must be non-negative.")
         if load_balance_alpha < 0:
             raise ValueError(f"{load_balance_alpha=} must be non-negative.")
+        if router_mode not in {"ste", "soft"}:
+            raise ValueError(f"{router_mode=} must be one of 'ste' or 'soft'.")
 
         if num_experts == 1:
             warnings.warn(f"{self.__class__.__name__} instantiated with a single expert. Consider using `PatchEncoderLowMem` instead.")
@@ -1069,6 +1076,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         self.probe_overlap = probe_kernel_size // 2 if probe_overlap is None else probe_overlap
         self.router_temperature = float(router_temperature)
         self.router_noise_std = float(router_noise_std)
+        self.router_mode = router_mode
         self.load_balance_alpha = float(load_balance_alpha)
         self.patch_batch_size = patch_batch_size
         self.register_buffer("_last_aux_loss", torch.zeros(()), persistent=False)
@@ -1119,7 +1127,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
 
         Returns:
             top1: Tensor (long)  of shape (B, N) indicating the selected expert per patch.
-            gates: Tensor (float) of shape (B, N, E) hard one-hot in forward, STE grads in backward.
+            gates: Tensor (float) of shape (B, N, E) gating weights used to scale expert outputs.
             aux:  Tensor (float) of shape (,) indicating the load balancing auxillary loss.
         """
         assert self.router is not None
@@ -1139,18 +1147,29 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         # Compute probabilities for gate scaling and auxillary loss.
         probs = torch.softmax(logits / self.router_temperature, dim=-1)  # (B, N, E)
 
-        # In STE hard routing, forward is one-hot, backward flows through soft relaxation.
-        if self.training:
-            gates = F.gumbel_softmax(logits, tau=self.router_temperature, hard=True, dim=-1)  # (B, N, E)
+        if self.router_mode == "soft":
+            gates = probs
+        elif self.router_mode == "ste":
+            # In STE hard routing, forward is one-hot, backward flows through soft relaxation.
+            if self.training:
+                gates = F.gumbel_softmax(logits, tau=self.router_temperature, hard=True, dim=-1)   # (B, N, E)
+            else:
+                gates = F.one_hot(torch.argmax(logits, dim=-1), self.num_experts).to(probs.dtype)  # (B, N, E)
         else:
-            gates = F.one_hot(torch.argmax(logits, dim=-1), self.num_experts).to(probs.dtype)  # (B, N, E)
-
+            raise RuntimeError("Unreachable.")
         top1 = gates.argmax(dim=-1)  # (B, N)
 
         # Switch-style load balancing loss.
         aux = probs.new_zeros(())
         if self.load_balance_alpha > 0:
-            f = gates.mean(dim=(0, 1))   # (E,)
+            if self.router_mode == "soft":
+                assign = F.one_hot(top1, self.num_experts).to(probs.dtype)  # (B, N, E)
+            elif self.router_mode == "ste":
+                assign = gates
+            else:
+                raise RuntimeError("Unreachable.")
+
+            f = assign.mean(dim=(0, 1))  # (E,)
             p = probs.mean(dim=(0, 1))   # (E,)
             aux = self.load_balance_alpha * (self.num_experts * (f * p).sum())
 
