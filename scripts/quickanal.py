@@ -15,6 +15,7 @@ parser.add_argument("--logfile", type=Path)
 parser.add_argument("--jobid", type=str)
 parser.add_argument("--json", action="store_true")
 parser.add_argument("--detailed", action="store_true")
+parser.add_argument("--ddetailed", action="store_true")
 parser.add_argument("--quiet", action="store_true")
 parser.add_argument("--verbose", action="store_true")
 args = parser.parse_args()
@@ -29,6 +30,7 @@ if args.verbose:
     print(f"{args.logfile=}")
     print(f"{args.jobid=}")
     print(f"{args.detailed=}")
+    print(f"{args.ddetailed=}")
     print(f"{args.quiet=}")
     print(f"{args.summary=}")
 
@@ -103,7 +105,11 @@ if args.verbose:
 # (lower-is-better, best-epoch, value)
 best: dict[str, tuple[bool, int, float]] = {
     "tr_loss": (True, -1, float("inf")),
+    "aux_loss": (True, -1, float("inf")),
+    "clf_loss": (True, -1, float("inf")),
     "vl_loss": (True, -1, float("inf")),
+    "vl_aux_loss": (True, -1, float("inf")),
+    "vl_clf_loss": (True, -1, float("inf")),
     "vl_roc": (False, -1, -float("inf")),
     "vl_prc": (False, -1, -float("inf")),
 }
@@ -117,18 +123,20 @@ def float_print_json(d: dict[str, float]) -> None:
     print("}")
 
 
-if args.detailed:
+if args.detailed or args.ddetailed:
     if not args.quiet:
         print("Training Details:")
     if args.json:
         for d in log:
-            if not all(k in d for k in best):
+            if not args.ddetailed and not all(k in d for k in best):
                 continue
-            d = {k: d[k] for k in best}
+            d = {k: d[k] for k in best if k in d}
             float_print_json(d)
     else:
         df = pd.DataFrame(log)
-        with pd.option_context('display.max_rows', None, 'display.max_columns', None):
+        if not args.ddetailed:
+            df = df[df["vl_loss"].notnull()]
+        with pd.option_context('display.max_rows', None, 'display.max_columns', None, 'display.width', None):
             print(df[[k for k in best]])
 
 for d in log:
