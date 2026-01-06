@@ -1012,7 +1012,9 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
     MoE patch encoder with constant-memory.
     """
 
-    _last_aux_loss: Tensor
+    _last_aux_loss: Tensor  # ()   Most recent auxiliary loss for load balancing.
+    _last_usage: Tensor     # (E,) Most recent expert usage statistic.
+    _last_entropy: Tensor   # ()   Most recent routing entropy.
 
     def __init__(
         self,
@@ -1079,7 +1081,6 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         self.router_mode = router_mode
         self.load_balance_alpha = float(load_balance_alpha)
         self.patch_batch_size = patch_batch_size
-        self.register_buffer("_last_aux_loss", torch.zeros(()), persistent=False)
 
         self.probe = nn.Conv1d(in_channels, probe_dim, probe_kernel_size, probe_stride)
         self.router = nn.Sequential(
@@ -1092,6 +1093,10 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             nn.Conv1d(in_channels, out_channels, kernel_size, stride)
             for _ in range(num_experts)
         ])
+
+        self.register_buffer("_last_aux_loss", torch.zeros(()), persistent=False)
+        self.register_buffer("_last_usage", torch.zeros((num_experts,)), persistent=False)
+        self.register_buffer("_last_entropy", torch.zeros(()), persistent=False)
 
         _check_lowmem_config(kernel_size, stride, chunk_size, self.overlap)
         _check_lowmem_config(probe_kernel_size, probe_stride, chunk_size, self.probe_overlap)
@@ -1109,10 +1114,6 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
     def patch_size(self) -> None:
         assert self._patch_size is None
         return self._patch_size
-
-    @property
-    def last_aux_loss(self) -> Tensor:
-        return self._last_aux_loss
 
     @property
     def min_length(self) -> int:
@@ -1174,6 +1175,8 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             aux = self.load_balance_alpha * (self.num_experts * (f * p).sum())
 
         self._last_aux_loss = aux
+        self._last_entropy = -(probs * (probs.clamp_min(1e-8).log())).sum(dim=-1).mean()
+        self._last_usage = F.one_hot(top1, self.num_experts).float().mean(dim=(0, 1))
 
         return top1, gates, aux
 
@@ -1366,6 +1369,18 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             if expert.bias is not None:
                 dummy = dummy + expert.bias.view(-1)[0] * 0.0
         return out + dummy
+
+    @property
+    def last_aux_loss(self) -> Tensor:
+        return self._last_aux_loss
+
+    @property
+    def last_usage(self) -> list[float]:
+        return self._last_usage
+
+    @property
+    def last_entropy(self) -> Tensor:
+        return self._last_entropy
 
 
 def _lowmem_patchwise_max_over_time_dispatched(
