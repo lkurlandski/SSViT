@@ -1401,7 +1401,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         return self._last_aux_loss
 
     @property
-    def last_usage(self) -> list[float]:
+    def last_usage(self) -> Tensor:
         return self._last_usage
 
     @property
