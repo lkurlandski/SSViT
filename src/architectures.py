@@ -1010,6 +1010,32 @@ class PatchEncoderLowMem(PatchEncoderBase):
 class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
     """
     MoE patch encoder with constant-memory.
+
+    See: Shazeer et al., "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer", ICLR 2017.
+    See: Fedus et al., "Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity", JMLR 2022.
+    See: Jang et al., "Categorial Reparameterization with Gumbel-Softmax", ICLR 2017.
+
+    Args:
+        in_channels: Input dimension.
+        out_channels: Output dimension.
+        num_patches: Number of patches. Must be specified.
+        patch_size: Size of each patch. Must be None.
+        kernel_size: Convolution kernel size (experts).
+        stride: Convolution stride (experts).
+        chunk_size: Low-memory streaming chunk size (experts and probe).
+        overlap: Low-memory streaming overlap size (experts).
+        fp32: Low-memory streaming precision mode (for experts and probe).
+        num_experts: Number of experts in the Mixture-of-Experts.
+        probe_dim: Dimension of the probe features used for routing.
+        probe_kernel_size: Convolution kernel size (probe).
+        probe_stride: Convolution stride (probe).
+        probe_overlap: Low-memory streaming overlap size (probe).
+        router_hidden: Hidden dimension of the routing MLP.
+        router_temperature: Softmax temperature for routing.
+        router_noise_std: Standard deviation of Gaussian noise added to the router logits during training.
+        router_mode: Routing mode, either "ste" (straight-through estimator) or "soft" (soft routing).
+        load_balance_alpha: Coefficient for the load balancing auxiliary loss.
+        patch_batch_size: Batch size for patch processing during training. If None, uses input batch size.
     """
 
     _last_aux_loss: Tensor  # ()   Most recent auxiliary loss for load balancing.
