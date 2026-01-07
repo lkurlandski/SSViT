@@ -38,6 +38,9 @@ NGPUS: Optional[int] = None
 OROOT = Path("/shared/rc/admalware") if Path("/shared/rc/admalware").exists() else Path.home()
 
 
+TRAINER_EARLY_TERMINATE = 1
+
+
 def fixed_width_string(string: Any, width: int, char: str = " ", left: bool = False) -> str:
     string = str(string)
     if left:
@@ -59,6 +62,9 @@ class Configuration:
         which_characteristics: tuple[lief.PE.Section.CHARACTERISTICS, ...],
         max_length: int,
         seed: int,
+        moe_num_experts: int,
+        moe_router_noise_std: float,
+        moe_load_balance_alpha: float,
     ) -> None:
         self.arch = arch
         self.parch = parch
@@ -70,6 +76,9 @@ class Configuration:
         self.which_characteristics = which_characteristics
         self.max_length = max_length
         self.seed = seed
+        self.moe_num_experts = moe_num_experts
+        self.moe_router_noise_std = moe_router_noise_std
+        self.moe_load_balance_alpha = moe_load_balance_alpha
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Configuration):
@@ -94,6 +103,9 @@ class Configuration:
             f"  which_characteristics={self.which_characteristics},\n"
             f"  max_length={self.max_length},\n"
             f"  seed={self.seed},\n"
+            f"  moe_num_experts={self.moe_num_experts},\n"
+            f"  moe_router_noise_std={self.moe_router_noise_std},\n"
+            f"  moe_load_balance_alpha={self.moe_load_balance_alpha},\n"
             ")"
         )
 
@@ -108,6 +120,9 @@ class Configuration:
             f"{'t' if self.do_entropy else 'f'}-"
             f"{fixed_width_string(sum(map(int, self.which_characteristics)), len(str(sum(map(int, CHARACTERISTICS)))), '0', left=True)}-"
             f"{fixed_width_string(self.max_length, 7, '8', left=True)}-"
+            f"{fixed_width_string(self.moe_num_experts, 2, '0', left=True)}-"
+            f"{fixed_width_string(self.moe_router_noise_std, 7, '0')}-"
+            f"{fixed_width_string(self.moe_load_balance_alpha, 7, '0')}-"
             f"{fixed_width_string(self.seed, 1, '_')}"
         )
 
@@ -123,6 +138,9 @@ class Configuration:
             tuple(map(int, self.which_characteristics)),
             self.max_length,
             self.seed,
+            self.moe_num_experts,
+            self.moe_router_noise_std,
+            self.moe_load_balance_alpha,
         )
 
     def get_gradient_accumulation_steps(self, world_size: int = 1) -> int:
@@ -139,9 +157,13 @@ class Configuration:
         root = OROOT / "Documents/code/SSViT/output"
         if DEBUG:
             root = root / "tmp"
+        root = root / "tunemoe"
         parts = [
             f"arch--{self.arch.value}",
             f"parch--{self.parch.value}",
+            f"moe_num_experts--{self.moe_num_experts}",
+            f"moe_router_noise_std--{self.moe_router_noise_std}",
+            f"moe_load_balance_alpha--{self.moe_load_balance_alpha}",
             f"posenc--{self.posenc.value}",
             f"patchposenc--{self.patchposenc.value}",
             f"size--{self.size.value}",
@@ -205,7 +227,7 @@ class Configuration:
 
     @property
     def num_workers(self) -> int:
-        return 8
+        return 4
 
     @property
     def num_threads_per_worker(self) -> int:
@@ -265,13 +287,13 @@ class Configuration:
     def eval_epochs(self) -> float:
         if DEBUG:
             return 1
-        return 0.50
+        return 0.25
 
     @property
     def chpt_epochs(self) -> float:
         if DEBUG:
             return 1
-        return 0.50
+        return 0.25
 
     @property
     def logg_epochs(self) -> float:
@@ -333,6 +355,11 @@ class Requirements:
     @property
     def time(self) -> int:
         """Return the number of seconds required for the job (configure)."""
+        if self.config.parch == PatcherArchitecture.EXP:
+            return 12 * 3600
+        if self.config.parch == PatcherArchitecture.MEM:
+            return 8  * 3600
+        raise Exception()
         key = (self.config.arch, self.config.size, self.config.do_entropy, bool(self.config.which_characteristics))
 
         if (vl_tr_throughputs := THROUGHPUTS.get(key)) is not None:
@@ -445,8 +472,10 @@ class ScriptBuilder:
         variables = "\n".join([
             f"export OMP_NUM_THREADS={self.reqs.omp_num_threads}",
             f"export PTW_NUM_THREADS={self.reqs.omp_num_threads}",
-            f"export PATCHER_CHANNEL_FACTOR={os.environ.get('PATCHER_CHANNEL_FACTOR', '1')}",
-            f"export EMBEDDING_DIM={os.environ.get('EMBEDDING_DIM', '8')}",
+            f"export TRAINER_EARLY_TERMINATE={TRAINER_EARLY_TERMINATE}",
+            f"export MOE_NUM_EXPERTS={self.config.moe_num_experts}",
+            f"export MOE_ROUTER_NOISE_STD={self.config.moe_router_noise_std}",
+            f"export MOE_LOAD_BALANCE_ALPHA={self.config.moe_load_balance_alpha}",
         ])
 
         locals = "\n".join([
@@ -573,12 +602,6 @@ def config_fiter(config: Configuration) -> bool:
             return False
 
     # Positional Encoding
-    if config.posenc != PositionalEncodingArchitecture.LEARNED:
-        return False
-    if config.level == HierarchicalLevel.NONE and config.patchposenc != PatchPositionalEncodingArchitecture.BTH:
-        return False
-    if config.level != HierarchicalLevel.NONE and config.patchposenc != PatchPositionalEncodingArchitecture.NONE:
-        return False
 
     # Entropy
     if config.do_entropy:
@@ -589,6 +612,22 @@ def config_fiter(config: Configuration) -> bool:
         return False
     if config.which_characteristics and len(config.which_characteristics) != 3:
         return False
+    if config.which_characteristics:
+        return False
+
+    # MoE
+    if config.parch == PatcherArchitecture.EXP:
+        if config.moe_num_experts == 0:
+            return False
+    else:
+        if config.moe_num_experts != 0:
+            return False
+
+    if config.moe_num_experts in (0, 1):
+        if config.moe_router_noise_std != 0:
+            return False
+        if config.moe_load_balance_alpha != 0:
+            return False
 
     return True
 
@@ -617,14 +656,17 @@ def main() -> None:
     configurations = product(
         [a for a in Architecture],
         [PatcherArchitecture.EXP, PatcherArchitecture.MEM],
-        [PositionalEncodingArchitecture.FIXED, PositionalEncodingArchitecture.LEARNED],
-        [PatchPositionalEncodingArchitecture.BTH, PatchPositionalEncodingArchitecture.NONE],
-        [s for s in ModelSize],
+        [PositionalEncodingArchitecture.FIXED],
+        [PatchPositionalEncodingArchitecture.NONE],
+        [ModelSize.LG],
         [l for l in HierarchicalLevel],
         [True, False],
-        chain.from_iterable(combinations(CHARACTERISTICS, r) for r in range(len(CHARACTERISTICS) + 1)),
+        [tuple()],
         [1000000],
         [0],
+        [0, 1, 2, 4],  # moe_num_experts
+        [0.0, 1e-2, 1e-3],  # moe_router_noise_std
+        [0.0, 1e-3, 1e-4],  # moe_load_balance_alpha
     )
     configurations = (Configuration(*config) for config in configurations)
     configurations = (config for config in configurations if config_fiter(config))
@@ -647,7 +689,7 @@ def main() -> None:
             print(f"WARNING ({str(config)}): output directory exists at {str(config.outdir)}.")
 
         builder = ScriptBuilder(config, reqs)
-        outfile = (outpath / str(config)).with_suffix(".sh")
+        outfile = Path((outpath / str(config)).as_posix() + ".sh")
         script = builder()
         outfile.write_text(script)
         print(f"{outfile}")
