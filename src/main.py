@@ -252,14 +252,12 @@ def get_model(
     elif parch == PatcherArchitecture.EXP:
         PatchEncoderCls = partial(  # type: ignore[assignment]
             PatchEncoderLowMemSwitchMoE,
-            num_experts=4,
+            num_experts=int(os.environ.get("MOE_NUM_EXPERTS", "1")),
             probe_kernel_size=256,
             probe_stride=256,
             router_hidden=256,
-            load_balance_alpha=1e-3,
-            router_temperature=1.0,
-            router_noise_std=1e-2,
-            router_mode="soft",
+            router_noise_std=float(os.environ.get("MOE_ROUTER_NOISE_STD", "0.0")),
+            load_balance_alpha=float(os.environ.get("MOE_LOAD_BALANCE_ALPHA", "0.0")),
         )
     else:
         PatchEncoderCls = PatchEncoderBase
