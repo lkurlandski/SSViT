@@ -1127,6 +1127,19 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         _check_lowmem_config(kernel_size, stride, chunk_size, self.overlap)
         _check_lowmem_config(probe_kernel_size, probe_stride, chunk_size, self.probe_overlap)
 
+    def __repr__(self) -> str:
+        s: str = super().__repr__()  # type: ignore[no-untyped-call]
+        add = (
+            "("
+            f"router_temperature={self.router_temperature}, "
+            f"router_noise_std={self.router_noise_std}, "
+            f"load_balance_alpha={self.load_balance_alpha}"
+            ")"
+        )
+        sub = f"{self.__class__.__name__}("
+        s = s.replace(sub, sub + add)
+        return s
+
     @property
     def conv(self) -> nn.Conv1d:
         return self.experts[0]  # type: ignore[return-value]
