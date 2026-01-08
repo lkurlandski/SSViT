@@ -631,7 +631,7 @@ class Trainer:
             pbar.update(1)
             pbar.set_description(f"Epoch {self.epoch_idx} of {self.max_steps / self.steps_per_epoch}")
             if self.epoch_idx >= int(os.environ.get("TRAINER_EARLY_TERMINATE", f"{sys.maxsize}")):
-                self.print(f"Early termination triggered.")
+                self.print("Early termination triggered.")
                 break
 
         self.monitor.stop()
