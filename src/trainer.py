@@ -951,7 +951,7 @@ class Trainer:
                 yield i, False, self.padbatch.clone()
             return
 
-        return tqdm(stream(), desc, length, leave, disable=self.args.disable_tqdm, ascii=True)
+        return tqdm(stream(), desc, length, leave, disable=self.args.disable_tqdm or rank() != 0, ascii=True)
 
     def _due_hooks(self) -> tuple[bool, bool, bool]:
         do_eval = self._next_eval_step is not None and self.glbl_step >= self._next_eval_step
