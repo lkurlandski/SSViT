@@ -14,22 +14,28 @@ from typing import Any
 import pytest
 import torch
 from torch import Tensor
-from torch import ShortTensor
-from torch import LongTensor
 
 from src.binanal import CHARACTERISTICS
 from src.binanal import HierarchicalStructureNone
 from src.binanal import get_ranges_numpy
+from src.data import PAD_TO_MULTIPLE_OF
 from src.data import Name
+from src.data import _InputOrInputs
+from src.data import Input
+from src.data import Inputs
+from src.data import _FSampleOrSamples
 from src.data import FSample
 from src.data import FSamples
+from src.data import _HSampleOrSamples
 from src.data import HSample
 from src.data import HSamples
+from src.data import _SemanticGuideOrSemanticGuides
 from src.data import SemanticGuide
 from src.data import SemanticGuides
-from src.data import SemanticGuider
+from src.data import _StructureMapOrStructureMaps
 from src.data import StructureMap
 from src.data import StructureMaps
+from src.data import SemanticGuider
 from src.data import StructurePartitioner
 from src.data import Preprocessor
 from src.data import CollateFn
@@ -63,6 +69,7 @@ class TestSemanticGuider:
         assert bool(sample.entropy is None) != do_entropy
         assert bool(sample.characteristics is None) != (num_characteristics > 0)
         if num_characteristics > 0:
+            assert isinstance(sample.characteristics, Tensor)
             assert sample.characteristics.shape[1] == num_characteristics
 
 
@@ -91,12 +98,13 @@ class TestCollateFn:
 
         collate_fn = CollateFn(pin_memory=pin_memory, bitpack=False, min_length=min_length)
 
-        samples = []
+        samples: list[FSample] = []
         for i in range(batch_size):
             file = f"{get_random_str(16)}/{get_random_bytes(32).hex()}"
             name = Name(file.split("/")[-1])
             label = torch.randint(0, 2, (1,), dtype=torch.long)[0]
             inputs = torch.randint(0, 256, (seq_length + i,), dtype=torch.uint8)
+            inputs = Input(inputs, torch.tensor(inputs.shape[0]))
             guides = SemanticGuide(None, None, None)
             structure = StructureMap(
                 indicator_mask_to_ranges(torch.full((seq_length + i, 1), True)),
@@ -107,7 +115,7 @@ class TestCollateFn:
 
         # Everything should be padded to the nearest multiple of 8.
         out_seq_length = max(min_length, seq_length + batch_size - 1)
-        out_seq_length = math.ceil(out_seq_length / 8) * 8
+        out_seq_length = math.ceil(out_seq_length / PAD_TO_MULTIPLE_OF) * PAD_TO_MULTIPLE_OF
 
         batch = collate_fn(samples)
         assert isinstance(batch, FSamples)
@@ -122,17 +130,17 @@ class TestCollateFn:
         for n_1, n_2 in zip(batch.name, (s.name for s in samples), strict=True):
             assert n_1 == n_2
 
-        assert isinstance(batch.label, LongTensor)
+        assert batch.label.dtype == torch.long
         assert batch.label.shape == (batch_size,)
         for l_1, l_2 in zip(batch.label, (s.label for s in samples), strict=True):
             assert torch.equal(l_1.to(torch.float64), l_2.to(torch.float64))
 
-        assert isinstance(batch.inputs, ShortTensor)
+        assert isinstance(batch.inputs, Inputs)
+        assert batch.inputs.inputids.dtype == torch.uint8
         assert batch.inputs.shape == (batch_size, out_seq_length)
-        assert batch.inputs.is_pinned() == pin_memory
-        # The inputs should be incremented by 1 to reserve 0 for padding.
-        for i_1, i_2 in zip(batch.inputs, (s.inputs for s in samples), strict=True):
-            assert torch.equal(i_1[:i_2.shape[0]].to(torch.float64), i_2.to(torch.float64) + 1)
+        assert batch.inputs.inputids.is_pinned() == pin_memory
+        for i_1, i_2 in zip(batch.inputs.inputids, (s.inputs.inputids for s in samples), strict=True):
+            assert torch.equal(i_1[:i_2.shape[0]].to(torch.float64), i_2.to(torch.float64))
 
         assert isinstance(batch.guides, SemanticGuides)
         assert isinstance(batch.structure, StructureMaps)
@@ -147,12 +155,13 @@ class TestCollateFn:
 
         collate_fn = CollateFn(pin_memory=False, bitpack=bitpack_out, min_length=min_length)
 
-        samples = []
+        samples: list[FSample] = []
         for i in range(batch_size):
             file = f"{get_random_str(16)}/{get_random_bytes(32).hex()}"
             name = Name(file.split("/")[-1])
             label = torch.randint(0, 2, (1,), dtype=torch.long)[0]
             inputs = torch.randint(0, 256, (seq_length + i,), dtype=torch.uint8)
+            inputs = Input(inputs, torch.tensor(inputs.shape[0]))
             characteristics = torch.randint(0, 2, (seq_length + i, 12), dtype=torch.bool)
             if bitpack_in:
                 characteristics = packbits(characteristics, axis=0)
@@ -166,7 +175,7 @@ class TestCollateFn:
 
         # Everything should be padded to the nearest multiple of 8.
         out_seq_length = max(min_length, seq_length + batch_size - 1)
-        out_seq_length = math.ceil(out_seq_length / 8) * 8
+        out_seq_length = math.ceil(out_seq_length / PAD_TO_MULTIPLE_OF) * PAD_TO_MULTIPLE_OF
 
         batch = collate_fn(samples)
         assert isinstance(batch, FSamples)
@@ -181,16 +190,16 @@ class TestCollateFn:
         for n_1, n_2 in zip(batch.name, (s.name for s in samples), strict=True):
             assert n_1 == n_2
 
-        assert isinstance(batch.label, LongTensor)
+        assert batch.label.dtype == torch.long
         assert batch.label.shape == (batch_size,)
         for l_1, l_2 in zip(batch.label, (s.label for s in samples), strict=True):
             assert torch.equal(l_1.to(torch.float64), l_2.to(torch.float64))
 
-        assert isinstance(batch.inputs, ShortTensor)
+        assert isinstance(batch.inputs, Inputs)
+        assert batch.inputs.inputids.dtype == torch.uint8
         assert batch.inputs.shape == (batch_size, out_seq_length)
-        # The inputs should be incremented by 1 to reserve 0 for padding.
-        for i_1, i_2 in zip(batch.inputs, (s.inputs for s in samples), strict=True):
-            assert torch.equal(i_1[:i_2.shape[0]].to(torch.float64), i_2.to(torch.float64) + 1)
+        for i_1, i_2 in zip(batch.inputs.inputids, (s.inputs.inputids for s in samples), strict=True):
+            assert torch.equal(i_1[:i_2.shape[0]].to(torch.float64), i_2.to(torch.float64))
 
         assert isinstance(batch.guides, SemanticGuides)
         assert batch.guides.parse is None
@@ -222,6 +231,7 @@ class TestCollateFnHierarchical:
             name = Name(file.split("/")[-1])
             label = torch.randint(0, 2, (1,), dtype=torch.long)[0]
             inputs = torch.randint(0, 256, (seq_length + i,), dtype=torch.uint8)
+            inputs = Input(inputs, torch.tensor(inputs.shape[0]))
             guides = SemanticGuide(None, None, None)
             structure = StructureMap(
                 indicator_mask_to_ranges(torch.randint(0, 2, (seq_length + i, num_structures), dtype=torch.bool)),
@@ -243,13 +253,14 @@ class TestCollateFnHierarchical:
         for n_1, n_2 in zip(batch.name, (s.name for s in samples), strict=True):
             assert n_1 == n_2
 
-        assert isinstance(batch.label, LongTensor)
+        assert batch.label.dtype == torch.long
         assert batch.label.shape == (batch_size,)
         for l_1, l_2 in zip(batch.label, (s.label for s in samples), strict=True):
             assert torch.equal(l_1.to(torch.float64), l_2.to(torch.float64))
 
         assert isinstance(batch.inputs, list)
-        assert all(isinstance(x, ShortTensor) for x in batch.inputs)
+        assert all(isinstance(x, Inputs) for x in batch.inputs)
+        assert all(x.inputids.dtype == torch.uint8 for x in batch.inputs)
         assert all(x.shape[0] == batch_size for x in batch.inputs)
 
         assert isinstance(batch.guides, list)
@@ -280,6 +291,7 @@ class TestCollateFnHierarchical:
             name = Name(file.split("/")[-1])
             label = torch.randint(0, 2, (1,), dtype=torch.long)[0]
             inputs = torch.randint(0, 256, (seq_length + i,), dtype=torch.uint8)
+            inputs = Input(inputs, torch.tensor(inputs.shape[0]))
             characteristics = torch.randint(0, 2, (seq_length + i, 12), dtype=torch.bool)
             if bitpack_in:
                 characteristics = packbits(characteristics, axis=0)
@@ -304,13 +316,14 @@ class TestCollateFnHierarchical:
         for n_1, n_2 in zip(batch.name, (s.name for s in samples), strict=True):
             assert n_1 == n_2
 
-        assert isinstance(batch.label, LongTensor)
+        assert batch.label.dtype == torch.long
         assert batch.label.shape == (batch_size,)
         for l_1, l_2 in zip(batch.label, (s.label for s in samples), strict=True):
             assert torch.equal(l_1.to(torch.float64), l_2.to(torch.float64))
 
         assert isinstance(batch.inputs, list)
-        assert all(isinstance(x, ShortTensor) for x in batch.inputs)
+        assert all(isinstance(x, Inputs) for x in batch.inputs)
+        assert all(x.inputids.dtype == torch.uint8 for x in batch.inputs)
         assert all(x.shape[0] == batch_size for x in batch.inputs)
 
         assert isinstance(batch.guides, list)
