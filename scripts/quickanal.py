@@ -137,7 +137,7 @@ if args.detailed or args.ddetailed:
         if not args.ddetailed:
             df = df[df["vl_loss"].notnull()]
         with pd.option_context('display.max_rows', None, 'display.max_columns', None, 'display.width', None):
-            print(df[[k for k in best]])
+            print(df[[k for k in best if k in df.columns]])
 
 for d in log:
     for k in best:
