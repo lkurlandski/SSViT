@@ -615,9 +615,18 @@ class Trainer:
         if self.glbl_step == 0:
             self.run_due_hooks(None, do_eval=True, do_chpt=True, do_logg=True)
 
+        # Determine the first mini-batch to train upon.
+        start_mini_step = 0
+        if self.glbl_step > 0:
+            steps_into_epoch = self.glbl_step - (self.epoch_idx * self.steps_per_epoch)
+            mini_steps_into_epoch = steps_into_epoch * self.args.gradient_accumulation_steps
+            start_mini_step = 1 + mini_steps_into_epoch
+            self.print(f"[INFO] [rank {rank()}] [Trainer::train] {steps_into_epoch=} {mini_steps_into_epoch=} {start_mini_step=}")
+
         # Continuously train the model on the training set until finished.
         while not self._done:
-            self.train()
+            self.train(start_mini_step=start_mini_step)
+            start_mini_step = 0
             self.epoch_idx += 1
             pbar.update(1)
             pbar.set_description(f"Epoch {self.epoch_idx} of {self.max_steps / self.steps_per_epoch}")
@@ -629,9 +638,13 @@ class Trainer:
 
         return self
 
-    def train(self, prof: Optional[profile] = None) -> None:
+    def train(self, prof: Optional[profile] = None, start_mini_step: int = 0) -> None:
         """
         Train the model on the training set.
+
+        Args:
+            prof: If provided, will profile using this profiler.
+            start_mini_step: If provided, will skip mini_batches until this index.
         """
         barrier("Trainer::train:before", self.device)
         timer = Timer()
@@ -694,6 +707,8 @@ class Trainer:
                     mini_step, real, batch = next(iterator)
                 except StopIteration:
                     break
+            if mini_step < start_mini_step:
+                continue
             with record_function("stage::transfer"):
                 batch = batch.to(self.device, non_blocking=True)
             with record_function("stage::finalize"):
