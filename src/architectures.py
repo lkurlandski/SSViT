@@ -3098,6 +3098,9 @@ class StructuralViTClassifier(StructuralClassifier):
         self.backbone = backbone
         self.head = head
 
+        if not all (isinstance(p, Identity) for p in patchposencoders):
+            raise NotImplementedError("StructuralViTClassifier currently only supports Identity patchposencoders.")
+
         # The semantics of injecting absolute positional information into each structure's patches is a little murky.
         # Here, we treat each structure as its own "sequence" of patches, and inject the positional encoding accordingly.
         # So the positional information is not injected with regard to the entire file, only the structure's own patches.
@@ -3113,8 +3116,6 @@ class StructuralViTClassifier(StructuralClassifier):
 
         B = len(order)
 
-        warnings.warn(f"{self.__class__.__name__}::forward does not implement proper batching yet.")
-
         self._check_forward_inputs(x, g, order)
 
         def preprocess(i: int, x: Tensor, g: Optional[Tensor] = None) -> Tensor:
@@ -3125,13 +3126,18 @@ class StructuralViTClassifier(StructuralClassifier):
         # Process each structure separately.
         zs: list[Tensor] = []
         for i in range(self.num_structures):
-            lengths = (x[i] != 0).sum(dim=1) if self.should_get_lengths else None
-            ts = (x[i], g[i]) if g[i] is not None else (x[i],)
             preprocess_ = partial(preprocess, i)
-            z = self.patchers[i](preprocess=preprocess_, ts=ts)  # (B_i, N_i, C)
-            z = self.norms[i](z)                                 # (B_i, N_i, C)
-            z = self.patchposencoders[i](z, lengths)             # (B_i, N_i, C)
-            zs.append(z)
+            zbs: list[Tensor] = []
+            for b in range(0, x[i].shape[0], B):
+                x_i_b = x[i][b:b + B]
+                g_i_b = g[i][b:b + B] if g[i] is not None else None  # type: ignore[index]
+                ts    = (x_i_b, g_i_b) if g_i_b is not None else (x_i_b,)
+                lengths = (x_i_b != 0).sum(dim=1) if self.should_get_lengths else None
+                z = self.patchers[i](preprocess=preprocess_, ts=ts)  # (max(B, B_i), N_i, C)
+                z = self.norms[i](z)                                 # (max(B, B_i), N_i, C)
+                z = self.patchposencoders[i](z, lengths)             # (max(B, B_i), N_i, C)
+                zbs.append(z)
+            zs.append(torch.cat(zbs, dim=0))  # (B_i, N_i, C)
 
         # Reconcile the sample index and the input index.
         z, key_padding_mask = self.reconcile_per_structure_patches(zs, order)  # (B, N, C)
