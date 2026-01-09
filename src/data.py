@@ -1397,7 +1397,10 @@ class IterableSimpleDBDataset(IterableDataset[FSample]):
         # If not shuffling, just yield samples in order.
         if not self.shuffle:
             for sample in reader.iter(shards):
-                meta = self.metadb.get(sample.name, reader.curshardidx)
+                try:
+                    meta = self.metadb.get(sample.name, reader.curshardidx)
+                except KeyError:
+                    meta = None
                 yield self.preprocess(sample, meta)
             return
 
@@ -1408,9 +1411,12 @@ class IterableSimpleDBDataset(IterableDataset[FSample]):
             rng.shuffle(shards)
 
         # Yield samples randomly using a reservoir sampling.
-        pool: list[tuple[SimpleDBSample, pl.DataFrame]] = []
+        pool: list[tuple[SimpleDBSample, Optional[pl.DataFrame]]] = []
         for sample in reader.iter(shards):
-            meta = self.metadb.get(sample.name, reader.curshardidx)
+            try:
+                meta = self.metadb.get(sample.name, reader.curshardidx)
+            except KeyError:
+                meta = None
             if len(pool) < self.poolsize:
                 pool.append((sample, meta))
                 continue
@@ -1448,7 +1454,7 @@ class IterableSimpleDBDataset(IterableDataset[FSample]):
             ")"
         )
 
-    def preprocess(self, sample: SimpleDBSample, meta: pl.DataFrame) -> FSample:
+    def preprocess(self, sample: SimpleDBSample, meta: Optional[pl.DataFrame]) -> FSample:
         return self.preprocessor(
             sample.name,
             1 if sample.malware else 0,
@@ -1484,6 +1490,7 @@ class Preprocessor:
         max_length: Optional[int] = None,
         unsafe: bool = False,
         structures_as_guides: bool = False,
+        allow_missing_metadata: bool = True,
     ) -> None:
         """
         Args:
@@ -1494,6 +1501,7 @@ class Preprocessor:
             max_length: maximum length of the binary to consider (in bytes). If None, use full length.
             unsafe: whether to use unsafe memoryview for input buffer.
             structures_as_guides: if True, encode the structure as SemanticGuide, not as a StructureMap.
+            allow_missing_metadata: if True, missing metadata will be ignored gracefully.
         """
         self.do_entropy = do_entropy
         self.which_characteristics = which_characteristics
@@ -1501,13 +1509,25 @@ class Preprocessor:
         self.structures = structures
         self.max_length = max_length
         self.unsafe = unsafe
-        self.guider = SemanticGuider(do_entropy=do_entropy, which_characteristics=which_characteristics)
         self.structures_as_guides = structures_as_guides
+        self.allow_missing_metadata = allow_missing_metadata
+        self.guider = SemanticGuider(do_entropy=do_entropy, which_characteristics=which_characteristics)
         self.partitioner = StructurePartitioner(level, structures)
         if self.structures_as_guides and (len(self.structures) == 1 or len(which_characteristics) > 0 or do_entropy):
             raise ValueError("structures_as_guides can only be True when using multiple structures without other guides.")
+        self.unkstructure: Optional[HierarchicalStructure] = None
+        if allow_missing_metadata:
+            for s in structures:
+                if s.name in ("ANY", "UNKNOWN", "OTHER"):
+                    self.unkstructure = s
+                    break
+            else:
+                raise RuntimeError("When allow_missing_metadata is True, one of the structures must be ANY, UNKNOWN, or OTHER.")
 
-    def __call__(self, name: str, label: int, data: bytes, meta: pl.DataFrame) -> FSample:
+    def __call__(self, name: str, label: int, data: bytes, meta: Optional[pl.DataFrame]) -> FSample:
+        if not self.allow_missing_metadata and meta is None:
+            raise ValueError(f"Metadata is required but missing for sample {name}.")
+
         mv = memoryview(data)[0:self.max_length]
         size = len(mv)
 
@@ -1556,7 +1576,12 @@ class Preprocessor:
             structure=structure,
         )
 
-    def get_characteristics(self, meta: pl.DataFrame, size: int) -> torch.Tensor:
+    def get_characteristics(self, meta: Optional[pl.DataFrame], size: int) -> torch.Tensor:
+        if meta is None:
+            if not self.allow_missing_metadata:
+                raise ValueError("Metadata is required but missing.")
+            return torch.zeros((size, len(self.which_characteristics)), dtype=torch.uint8)
+
         df_sec = meta.filter(
             pl.col("group") == "partitions",
             pl.col("level") == "COARSE",
@@ -1594,13 +1619,24 @@ class Preprocessor:
         x = CharacteristicGuider._get_bit_mask_(size, offsets, sizes, flags)
         return torch.from_numpy(x)
 
-    def get_structure(self, meta: pl.DataFrame, size: int) -> StructureMap:
+    def get_structure(self, meta: Optional[pl.DataFrame], size: int) -> StructureMap:
+        lexicon = {}
+        index: list[list[tuple[int, int]]] = []
+
+        if meta is None:
+            if not self.allow_missing_metadata:
+                raise ValueError("Metadata is required but missing.")
+            for i, structure in enumerate(self.structures):
+                lexicon[i] = structure
+                index.append([])
+                if structure == self.unkstructure:
+                    index[i].append((0, size))
+            return StructureMap(index, lexicon)
+
         df = meta.filter(
             pl.col("group") == "partitions",
             pl.col("level") == self.level.name,
         )
-        lexicon = {}
-        index: list[list[tuple[int, int]]] = []
         for i, structure in enumerate(self.structures):
             lexicon[i] = structure
             index.append([])
@@ -1611,7 +1647,12 @@ class Preprocessor:
 
         return StructureMap(index, lexicon)
 
-    def get_structure_as_guides(self, meta: pl.DataFrame, size: int) -> torch.Tensor:
+    def get_structure_as_guides(self, meta: Optional[pl.DataFrame], size: int) -> torch.Tensor:
+        if meta is None:
+            if not self.allow_missing_metadata:
+                raise ValueError("Metadata is required but missing.")
+            return torch.zeros((size, len(self.structures)), dtype=torch.uint8)
+
         df_sec = meta.filter(
             pl.col("group") == "partitions",
             pl.col("level") == self.level.name,

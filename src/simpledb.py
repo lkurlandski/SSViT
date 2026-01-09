@@ -464,4 +464,7 @@ class MetadataDB:
             self.df = pl.read_parquet(self.files[shard])
             self.shard = shard
 
-        return self.df.filter(pl.col("sha") == name)
+        df = self.df.filter(pl.col("sha") == name)
+        if df.is_empty():
+            raise KeyError(f"Sample {name} not found in shard {shard}.")
+        return df
