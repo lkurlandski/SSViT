@@ -1143,8 +1143,231 @@ class HSamples(_HSampleOrSamples[Sequence[StrPath], Sequence[Name], Inputs, Sema
         check_tensor(self.label, (None,), (torch.int16, torch.int32, torch.int64))
 
 
+class SSamples:
+    """
+    A container for samples used with the structural models.
+
+    file: the files associated with each sample
+    name: the names associated with each sample
+    label: the labels associated with each sample
+    inputs: a sequence of inputs per structure
+    guides: a sequence of guides per structure
+    structure: the structure maps
+    samplemap: a mapping from input to sample index
+    sampleorder: the order in which each input should be processed per sample
+
+    In this container, the per structure elements within `inputs` do not correspond
+    to the samples. So while `file[i]`, `name[i]`, `label[i]`, and `structure[i]` all
+    correspond to the `i`-th sample, `inputs[j][i]` does not. Instead, the sample that
+    `inputs[j][k]` corresponds to is stored in `samplemap[j][k]`. `guides` works similarly.
+
+    Furthermore, the order in which various structures should be processed is stored
+    in `sampleorder`. Concretely, `sampleorder[i]` is a list of tuples `(j, k)` indicating
+    that order, where `j` is a structure index and `k` is an index within `inputs[k]`.
+    """
+
+    file: Sequence[StrPath]
+    name: Sequence[Name]
+    label: Tensor
+    inputs: Sequence[Inputs]
+    guides: Sequence[SemanticGuides]
+    structure: StructureMaps
+    samplemap: Sequence[Sequence[int]]
+    sampleorder: Sequence[Sequence[tuple[int, int]]]
+
+    def __init__(
+        self,
+        file: Sequence[StrPath],
+        name: Sequence[Name],
+        label: Tensor,
+        inputs: Sequence[Inputs],
+        guides: Sequence[SemanticGuides],
+        structure: StructureMaps,
+        samplemap: Sequence[Sequence[int]],
+        sampleorder: Sequence[Sequence[tuple[int, int]]],
+    ) -> None:
+        self.file = file
+        self.name = name
+        self.label = label
+        self.inputs = inputs
+        self.guides = guides
+        self.structure = structure
+        self.samplemap = samplemap
+        self.sampleorder = sampleorder
+        self.verify_inputs()
+
+    def __iter__(self) -> Iterator[Sequence[StrPath] | Sequence[Name] | Tensor | Sequence[Inputs] | Sequence[SemanticGuides] | StructureMaps | Sequence[Sequence[int]] | Sequence[Sequence[tuple[int, int]]]]:
+        return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure, self.samplemap, self.sampleorder))
+
+    @property
+    def num_structures(self) -> int:
+        return len(self.inputs)
+
+    @property
+    def parse(self) -> list[Optional[Tensor]]:
+        return [g.parse for g in self.guides]
+
+    @property
+    def entropy(self) -> list[Optional[Tensor]]:
+        return [g.entropy for g in self.guides]
+
+    @property
+    def characteristics(self) -> list[Optional[Tensor]]:
+        return [g.characteristics for g in self.guides]
+
+    def get_label(self) -> Tensor:
+        return self.label
+
+    def get_inputs(self) -> list[Tensor]:
+        return [i.inputids for i in self.inputs]
+
+    def get_guides(self) -> list[Optional[Tensor]]:
+        return [g.allguides for g in self.guides]
+
+    def __len__(self) -> int:
+        return len(self.file)
+
+    def verify_inputs(self) -> None:
+        if len(self.guides) != len(self.inputs):
+            raise ValueError(f"HSample inputs and guides must have the same length. Got {len(self.inputs)} and {len(self.guides)}.")
+        if self.num_structures == 0:
+            raise ValueError("HSample must have at least one structure.")
+        if self.num_structures == 1:
+            warnings.warn("_HSampleOrSamples has only one structure. Consider using _FSampleOrSamples instead.")
+        # FIXME: add more checks.
+
+    @property
+    def is_cuda(self) -> bool:
+        for i in range(self.num_structures):
+            if self.inputs[i].is_cuda and (self.guides[i].is_cuda is True or self.guides[i].is_cuda is None):
+                continue
+            break
+        else:
+            if self.label.is_cuda:
+                return True
+
+        for i in range(self.num_structures):
+            if not self.inputs[i].is_cuda and (self.guides[i].is_cuda is False or self.guides[i].is_cuda is None):
+                continue
+            break
+        else:
+            if not self.label.is_cuda:
+                return False
+
+        raise RuntimeError("Unexpected tensor device state with some components on GPU and some not.")
+
+    def record_stream(self, s: torch.cuda.Stream) -> None:
+        self.label.record_stream(s)
+        for i in range(self.num_structures):
+            self.inputs[i].record_stream(s)
+            self.guides[i].record_stream(s)
+
+    def detach(self) -> Self:
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.detach()
+        inputs = []
+        guides = []
+        for i in range(self.num_structures):
+            inputs.append(self.inputs[i].detach())
+            guides.append(self.guides[i].detach())
+        structure = self.structure.clone()
+        samplemap = deepcopy(self.samplemap)
+        sampleorder = deepcopy(self.sampleorder)
+        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+
+    def clone(self) -> Self:
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.clone()
+        inputs = []
+        guides = []
+        for i in range(self.num_structures):
+            inputs.append(self.inputs[i].clone())
+            guides.append(self.guides[i].clone())
+        structure = self.structure.clone()
+        samplemap = deepcopy(self.samplemap)
+        sampleorder = deepcopy(self.sampleorder)
+        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+
+    def to(self, device: torch.device, non_blocking: bool = False) -> Self:
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.to(device, non_blocking=non_blocking)
+        inputs = []
+        guides = []
+        for i in range(self.num_structures):
+            inputs.append(self.inputs[i].to(device, non_blocking=non_blocking))
+            guides.append(self.guides[i].to(device, non_blocking=non_blocking))
+        structure = self.structure.clone()
+        samplemap = deepcopy(self.samplemap)
+        sampleorder = deepcopy(self.sampleorder)
+        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+
+    def pin_memory(self) -> Self:
+        if self.label.is_cuda or any(inp.is_cuda for inp in self.inputs) or any(guide.is_cuda for guide in self.guides):
+            raise RuntimeError("Cannot pin memory of a CUDA tensor.")
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.pin_memory()
+        inputs = []
+        guides = []
+        for i in range(self.num_structures):
+            inputs.append(self.inputs[i].pin_memory())
+            guides.append(self.guides[i].pin_memory())
+        structure = self.structure.clone()
+        samplemap = deepcopy(self.samplemap)
+        sampleorder = deepcopy(self.sampleorder)
+        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+
+    def compress(self) -> Self:
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label
+        inputs = []
+        guides = []
+        for i in range(self.num_structures):
+            inputs.append(self.inputs[i])
+            guides.append(self.guides[i].compress())
+        structure = self.structure.clone()
+        samplemap = deepcopy(self.samplemap)
+        sampleorder = deepcopy(self.sampleorder)
+        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+
+    def decompress(self) -> Self:
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label
+        inputs = []
+        guides = []
+        for i in range(self.num_structures):
+            inputs.append(self.inputs[i])
+            guides.append(self.guides[i].decompress())
+        structure = self.structure.clone()
+        samplemap = deepcopy(self.samplemap)
+        sampleorder = deepcopy(self.sampleorder)
+        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+
+    def finalize(self, ftype: torch.dtype, itype: torch.dtype, ltype: torch.dtype) -> Self:
+        """Finalize the datatypes of the batch."""
+        file = deepcopy(self.file)
+        name = deepcopy(self.name)
+        label = self.label.to(ltype)
+        inputs: list[Inputs] = []
+        guides: list[SemanticGuides] = []
+        for i in range(self.num_structures):
+            inputs.append(self.inputs[i].finalize(itype))
+            guides.append(self.guides[i].decompress().to(dtype=ftype))
+        for g in guides:
+            g.build_allguides()
+        structure = self.structure.clone()
+        samplemap = deepcopy(self.samplemap)
+        sampleorder = deepcopy(self.sampleorder)
+        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+
+
 FOrHSample  = FSample | HSample
-FOrHSamples = FSamples | HSamples
+FOrHSamples = FSamples | HSamples | SSamples
 
 
 class IterableSimpleDBDataset(IterableDataset[FSample]):
@@ -1417,6 +1640,9 @@ class Preprocessor:
         return torch.from_numpy(x)
 
 
+# FIXME: remove `change_dtype_after_pad`.
+
+
 class CollateFn:
 
     def __init__(self, pin_memory: bool, bitpack: bool, min_length: int = 0, change_dtype_after_pad: bool = True) -> None:
@@ -1489,6 +1715,86 @@ class CollateFnHierarchical:
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, num_structures={self.num_structures}, min_lengths={self.min_lengths})"
+
+
+class CollateFnStructural:
+
+    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None, change_dtype_after_pad: bool = True) -> None:
+        self.pin_memory = pin_memory
+        self.bitpack = bitpack
+        self.num_structures = num_structures
+        self.min_lengths = [0] * num_structures if min_lengths is None else min_lengths
+        self.change_dtype_after_pad = change_dtype_after_pad
+
+        if pin_memory or bitpack:
+            raise NotImplementedError(f"{self.__class__.__name__} does not support pin_memory or bitpack yet.")
+
+    def __call__(self, batch: Sequence[FSample]) -> SSamples:
+        file = [s.file for s in batch]
+        name = [s.name for s in batch]
+        label = torch.stack([s.label for s in batch])
+
+        inputs = []
+        guides = []
+        samplemap = []
+        per_sample_entries: list[list[tuple[int, int, int]]] = [[] for _ in range(len(batch))]
+        for i in range(self.num_structures):
+            xs: list[Input] = []
+            gs: list[SemanticGuide] = []
+            sm: list[int] = []
+            for j in range(len(batch)):
+                ranges = batch[j].structure.index[i]
+                for k in range(len(ranges)):
+                    if ranges[k][0] >= batch[j].inputs.inputids.shape[0]:
+                        continue
+                    if ranges[k][0] > ranges[k][1]:
+                        continue
+                    x_i_j_k = batch[j].inputs.select(ranges=[ranges[k]])
+                    g_i_j_k = batch[j].guides.select(ranges=[ranges[k]])
+                    xs.append(x_i_j_k)
+                    gs.append(g_i_j_k.compress() if self.bitpack else g_i_j_k)
+                    sm.append(j)
+                    per_sample_entries[j].append((ranges[k][0], i, len(sm) - 1))
+                    assert x_i_j_k.inputids.shape[0] > 0, x_i_j_k.inputids.shape
+                    assert g_i_j_k.parse is None or g_i_j_k.parse.shape[0] > 0, g_i_j_k.parse.shape
+                    assert g_i_j_k.entropy is None or g_i_j_k.entropy.shape[0] > 0, g_i_j_k.entropy.shape
+                    assert g_i_j_k.characteristics is None or g_i_j_k.characteristics.shape[0] > 0, g_i_j_k.characteristics.shape
+
+            assert len(xs) == len(sm) == len(gs)
+
+            # Handle empty structure case.
+            if len(xs) == 0:
+                xs = [Input(torch.full((self.min_lengths[i],), 0, dtype=torch.uint8), torch.tensor(self.min_lengths[i], dtype=torch.int64))]
+                gs = [self._create_synthetic_guide(batch[0].guides, self.min_lengths[i] // 8 if self.bitpack else self.min_lengths[i])]
+            xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i])
+            gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8))
+            inputs.append(xs)
+            guides.append(gs)
+            samplemap.append(sm)
+
+        sampleorder: list[list[tuple[int, int]]] = []
+        for j in range(len(batch)):
+            entries = per_sample_entries[j]
+            entries.sort(key=lambda t: t[0])
+            order_j = [(struct_idx, local_idx) for _, struct_idx, local_idx in entries]
+            sampleorder.append(order_j)
+
+        structure = [s.structure for s in batch]
+        structure = StructureMaps.from_singles(structure, self.pin_memory)
+        return SSamples(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+
+    @staticmethod
+    def _create_synthetic_guide(guides: SemanticGuide, length: int) -> SemanticGuide:
+        parse = None
+        if guides.parse is not None:
+            parse = torch.full((length,), 0, dtype=guides.parse.dtype)
+        entropy = None
+        if guides.entropy is not None:
+            entropy = torch.full((length,), 0, dtype=guides.entropy.dtype)
+        characteristics = None
+        if guides.characteristics is not None:
+            characteristics = torch.full((length,), 0, dtype=guides.characteristics.dtype)
+        return SemanticGuide(parse, entropy, characteristics)
 
 
 class CUDAPrefetcher:
