@@ -829,6 +829,9 @@ class _FSampleOrSamples(Generic[F, N, I, G, S], ABC):
     def get_guides(self) -> Optional[Tensor]:
         return self.guides.allguides
 
+    def get_otherkwds(self) -> dict[str, Any]:
+        return {}
+
     @abstractmethod
     def __len__(self) -> int:
         ...
@@ -994,6 +997,9 @@ class _HSampleOrSamples(Generic[F, N, I, G, S], ABC):
     def get_guides(self) -> list[Optional[Tensor]]:
         return [g.allguides for g in self.guides]
 
+    def get_otherkwds(self) -> dict[str, Any]:
+        return {}
+
     @abstractmethod
     def __len__(self) -> int:
         ...
@@ -1153,17 +1159,14 @@ class SSamples:
     inputs: a sequence of inputs per structure
     guides: a sequence of guides per structure
     structure: the structure maps
-    samplemap: a mapping from input to sample index
-    sampleorder: the order in which each input should be processed per sample
+    order: the order in which each input should be processed per sample
 
     In this container, the per structure elements within `inputs` do not correspond
     to the samples. So while `file[i]`, `name[i]`, `label[i]`, and `structure[i]` all
-    correspond to the `i`-th sample, `inputs[j][i]` does not. Instead, the sample that
-    `inputs[j][k]` corresponds to is stored in `samplemap[j][k]`. `guides` works similarly.
-
-    Furthermore, the order in which various structures should be processed is stored
-    in `sampleorder`. Concretely, `sampleorder[i]` is a list of tuples `(j, k)` indicating
-    that order, where `j` is a structure index and `k` is an index within `inputs[k]`.
+    correspond to the `i`-th sample, `inputs[j][i]` does not. Instead, the list `order`
+    indicates the location of each sample's inputs within the `inputs` list. So, for
+    example, `order[i]` gives the list of tuples `(j, k)` indicating that the `i`-th
+    sample's `k`-th structure corresponds to `inputs[j]`.
     """
 
     file: Sequence[StrPath]
@@ -1172,8 +1175,7 @@ class SSamples:
     inputs: Sequence[Inputs]
     guides: Sequence[SemanticGuides]
     structure: StructureMaps
-    samplemap: Sequence[Sequence[int]]
-    sampleorder: Sequence[Sequence[tuple[int, int]]]
+    order: Sequence[Sequence[tuple[int, int]]]
 
     def __init__(
         self,
@@ -1183,8 +1185,7 @@ class SSamples:
         inputs: Sequence[Inputs],
         guides: Sequence[SemanticGuides],
         structure: StructureMaps,
-        samplemap: Sequence[Sequence[int]],
-        sampleorder: Sequence[Sequence[tuple[int, int]]],
+        order: Sequence[Sequence[tuple[int, int]]],
     ) -> None:
         self.file = file
         self.name = name
@@ -1192,12 +1193,11 @@ class SSamples:
         self.inputs = inputs
         self.guides = guides
         self.structure = structure
-        self.samplemap = samplemap
-        self.sampleorder = sampleorder
+        self.order = order
         self.verify_inputs()
 
     def __iter__(self) -> Iterator[Sequence[StrPath] | Sequence[Name] | Tensor | Sequence[Inputs] | Sequence[SemanticGuides] | StructureMaps | Sequence[Sequence[int]] | Sequence[Sequence[tuple[int, int]]]]:
-        return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure, self.samplemap, self.sampleorder))
+        return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure, self.order))
 
     @property
     def num_structures(self) -> int:
@@ -1223,6 +1223,9 @@ class SSamples:
 
     def get_guides(self) -> list[Optional[Tensor]]:
         return [g.allguides for g in self.guides]
+
+    def get_otherkwds(self) -> dict[str, Any]:
+        return {"order": self.order}
 
     def __len__(self) -> int:
         return len(self.file)
@@ -1272,9 +1275,8 @@ class SSamples:
             inputs.append(self.inputs[i].detach())
             guides.append(self.guides[i].detach())
         structure = self.structure.clone()
-        samplemap = deepcopy(self.samplemap)
-        sampleorder = deepcopy(self.sampleorder)
-        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+        order = deepcopy(self.order)
+        return self.__class__(file, name, label, inputs, guides, structure, order)
 
     def clone(self) -> Self:
         file = deepcopy(self.file)
@@ -1286,9 +1288,8 @@ class SSamples:
             inputs.append(self.inputs[i].clone())
             guides.append(self.guides[i].clone())
         structure = self.structure.clone()
-        samplemap = deepcopy(self.samplemap)
-        sampleorder = deepcopy(self.sampleorder)
-        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+        order = deepcopy(self.order)
+        return self.__class__(file, name, label, inputs, guides, structure, order)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> Self:
         file = deepcopy(self.file)
@@ -1300,9 +1301,8 @@ class SSamples:
             inputs.append(self.inputs[i].to(device, non_blocking=non_blocking))
             guides.append(self.guides[i].to(device, non_blocking=non_blocking))
         structure = self.structure.clone()
-        samplemap = deepcopy(self.samplemap)
-        sampleorder = deepcopy(self.sampleorder)
-        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+        order = deepcopy(self.order)
+        return self.__class__(file, name, label, inputs, guides, structure, order)
 
     def pin_memory(self) -> Self:
         if self.label.is_cuda or any(inp.is_cuda for inp in self.inputs) or any(guide.is_cuda for guide in self.guides):
@@ -1316,9 +1316,8 @@ class SSamples:
             inputs.append(self.inputs[i].pin_memory())
             guides.append(self.guides[i].pin_memory())
         structure = self.structure.clone()
-        samplemap = deepcopy(self.samplemap)
-        sampleorder = deepcopy(self.sampleorder)
-        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+        order = deepcopy(self.order)
+        return self.__class__(file, name, label, inputs, guides, structure, order)
 
     def compress(self) -> Self:
         file = deepcopy(self.file)
@@ -1330,9 +1329,8 @@ class SSamples:
             inputs.append(self.inputs[i])
             guides.append(self.guides[i].compress())
         structure = self.structure.clone()
-        samplemap = deepcopy(self.samplemap)
-        sampleorder = deepcopy(self.sampleorder)
-        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+        order = deepcopy(self.order)
+        return self.__class__(file, name, label, inputs, guides, structure, order)
 
     def decompress(self) -> Self:
         file = deepcopy(self.file)
@@ -1344,9 +1342,8 @@ class SSamples:
             inputs.append(self.inputs[i])
             guides.append(self.guides[i].decompress())
         structure = self.structure.clone()
-        samplemap = deepcopy(self.samplemap)
-        sampleorder = deepcopy(self.sampleorder)
-        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+        order = deepcopy(self.order)
+        return self.__class__(file, name, label, inputs, guides, structure, order)
 
     def finalize(self, ftype: torch.dtype, itype: torch.dtype, ltype: torch.dtype) -> Self:
         """Finalize the datatypes of the batch."""
@@ -1361,9 +1358,8 @@ class SSamples:
         for g in guides:
             g.build_allguides()
         structure = self.structure.clone()
-        samplemap = deepcopy(self.samplemap)
-        sampleorder = deepcopy(self.sampleorder)
-        return self.__class__(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+        order = deepcopy(self.order)
+        return self.__class__(file, name, label, inputs, guides, structure, order)
 
 
 FOrHSample  = FSample | HSample
@@ -1777,12 +1773,11 @@ class CollateFnStructural:
 
         inputs = []
         guides = []
-        samplemap = []
         per_sample_entries: list[list[tuple[int, int, int]]] = [[] for _ in range(len(batch))]
         for i in range(self.num_structures):
             xs: list[Input] = []
             gs: list[SemanticGuide] = []
-            sm: list[int] = []
+            local_idx = 0
             for j in range(len(batch)):
                 ranges = batch[j].structure.index[i]
                 for k in range(len(ranges)):
@@ -1794,14 +1789,14 @@ class CollateFnStructural:
                     g_i_j_k = batch[j].guides.select(ranges=[ranges[k]])
                     xs.append(x_i_j_k)
                     gs.append(g_i_j_k.compress() if self.bitpack else g_i_j_k)
-                    sm.append(j)
-                    per_sample_entries[j].append((ranges[k][0], i, len(sm) - 1))
+                    per_sample_entries[j].append((ranges[k][0], i, local_idx))
+                    local_idx += 1
                     assert x_i_j_k.inputids.shape[0] > 0, x_i_j_k.inputids.shape
                     assert g_i_j_k.parse is None or g_i_j_k.parse.shape[0] > 0, g_i_j_k.parse.shape
                     assert g_i_j_k.entropy is None or g_i_j_k.entropy.shape[0] > 0, g_i_j_k.entropy.shape
                     assert g_i_j_k.characteristics is None or g_i_j_k.characteristics.shape[0] > 0, g_i_j_k.characteristics.shape
 
-            assert len(xs) == len(sm) == len(gs)
+            assert len(xs) == len(gs)
 
             # Handle empty structure case.
             if len(xs) == 0:
@@ -1811,18 +1806,19 @@ class CollateFnStructural:
             gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8))
             inputs.append(xs)
             guides.append(gs)
-            samplemap.append(sm)
 
-        sampleorder: list[list[tuple[int, int]]] = []
+        order: list[list[tuple[int, int]]] = []
         for j in range(len(batch)):
             entries = per_sample_entries[j]
             entries.sort(key=lambda t: t[0])
             order_j = [(struct_idx, local_idx) for _, struct_idx, local_idx in entries]
-            sampleorder.append(order_j)
+            order.append(order_j)
+            if order_j == []:
+                raise RuntimeError(f"Sample {j} has no structures to process.")
 
         structure = [s.structure for s in batch]
         structure = StructureMaps.from_singles(structure, self.pin_memory)
-        return SSamples(file, name, label, inputs, guides, structure, samplemap, sampleorder)
+        return SSamples(file, name, label, inputs, guides, structure, order)
 
     @staticmethod
     def _create_synthetic_guide(guides: SemanticGuide, length: int) -> SemanticGuide:
