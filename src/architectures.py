@@ -1873,14 +1873,17 @@ class ViT(nn.Module):
         self.max_len = max_len
         self.pooling = pooling
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
         Args:
             x: Input embeddings of shape (B, T, E).
+            key_padding_mask: Optional mask of shape (B, T) indicating padding positions.
         Returns:
             z: Hidden representation of shape (B, D).
         """
         check_tensor(x, (None, None, self.embedding_dim), FLOATS)
+        if key_padding_mask is not None:
+            check_tensor(key_padding_mask, (x.shape[0], x.shape[1]), torch.bool)
 
         z: Tensor
 
@@ -1889,8 +1892,11 @@ class ViT(nn.Module):
             assert self.cls_token is not None
             t = self.cls_token.expand(z.shape[0], -1, -1)  # (B, 1, D)
             z = torch.cat((t.to(z.dtype), z), dim=1)       # (B, T, D)
+            if key_padding_mask is not None:
+                t = torch.zeros((key_padding_mask.shape[0], 1), dtype=torch.bool, device=key_padding_mask.device)
+                key_padding_mask = torch.cat((t, key_padding_mask), dim=1)  # (B, T+1)
         z = self.posencoder(z)                             # (B, T, D)
-        z = self.transformer(z)                            # (B, T, D)
+        z = self.transformer(z, src_key_padding_mask=key_padding_mask)                            # (B, T, D)
         if self.pooling == "cls":
             z = z[:, 0, :].unsqueeze(1)                    # (B, 1, D)
         z = z.mean(dim=1).to(x.dtype)                      # (B, D)
@@ -3001,3 +3007,215 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
             fully_shard([self.embeddings[i], self.filmers[i], self.patchers[i]], **kwds)
         self.backbone.fully_shard(**kwds)
         fully_shard(self, **kwds | {"reshard_after_forward": False})
+
+# -------------------------------------------------------------------------------- #
+# Structural Classifiers
+# -------------------------------------------------------------------------------- #
+
+class StructuralClassifier(nn.Module, ABC):
+
+    def __init__(self, num_structures: int) -> None:
+        super().__init__()
+        if num_structures < 1:
+            raise ValueError(f"num_structures must be at least 1. Got {num_structures} instead.")
+        if num_structures == 1:
+            warnings.warn("HierarchicalClassifier with num_structures=1 is equivalent to a standard Classifier.")
+        self.num_structures = num_structures
+
+    @abstractmethod
+    def forward(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> Tensor:
+        """
+        Args:
+            x: Input tensors of shape (B, T_i) for each structure i. None if no input for that structure.
+            g: FiLM conditioning vectors of shape (B, T_i, G) for each structure i. None if no input for that structure or not using guides.
+            order: the order in which each input should be processed per sample, given as a list of lists of (structure_index, input_index) tuples.
+        Returns:
+            z: Classification logits of shape (B, M).
+        """
+        ...
+
+    @abstractmethod
+    def fully_shard(self, **kwds: Any) -> None:
+        ...
+
+    @property
+    @abstractmethod
+    def _trunks(self) -> Sequence[tuple[nn.Module, ...]]:
+        ...
+
+    def _get_min_max_lengths(self) -> list[tuple[int, int]]:
+        lengths = []
+        for i in range(self.num_structures):
+            trunk = self._trunks[i]
+            los, his = zip(*(get_model_input_lengths(m) for m in trunk))
+            lengths.append((max(los), min(his)))
+        return lengths
+
+    @property
+    def min_lengths(self) -> list[int]:
+        return [l[0] for l in self._get_min_max_lengths()]
+
+    @property
+    def max_lengths(self) -> list[int]:
+        return [l[1] for l in self._get_min_max_lengths()]
+
+    def _check_forward_inputs(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> None:
+        if not (len(x) == len(g) == self.num_structures):
+            raise ValueError(f"Expected {self.num_structures} structures, got {len(x)=} and {len(g)=} instead.")
+
+        for i in range(self.num_structures):
+            check_tensor(x[i], (x[i].shape[0], x[i].shape[1]), INTEGERS)
+            if g[i] is not None:
+                assert isinstance(g[i], Tensor)
+                check_tensor(g[i], (x[i].shape[0], x[i].shape[1], None), FLOATS)  # type: ignore[arg-type]
+
+        if len(order) <= 0:
+            raise ValueError("Order must indicate at least one sample.")
+
+        for sample_idx in range(len(order)):
+            for structure_idx, local_idx in order[sample_idx]:
+                if not (0 <= structure_idx < self.num_structures):
+                    raise ValueError(f"Order for sample {sample_idx} has invalid structure index {structure_idx}.")
+                if not (0 <= local_idx < x[structure_idx].shape[0]):
+                    raise ValueError(f"Order for sample {sample_idx}, structure {structure_idx} has invalid local index {local_idx}.")
+                if x[structure_idx].shape[0] <= 0:
+                    raise ValueError(f"Structure {structure_idx} has no inputs, but is referenced in order for sample {sample_idx}.")
+
+
+class StructuralViTClassifier(StructuralClassifier):
+
+    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
+        super().__init__(len(embeddings))
+
+        if not (len(embeddings) == len(filmers) == len(patchers)):
+            raise ValueError("The number of embeddings, filmers, and patchers must be the same.")
+
+        self.embeddings = nn.ModuleList(embeddings)
+        self.filmers = nn.ModuleList(filmers)
+        self.patchers = nn.ModuleList(patchers)
+        self.norms = nn.ModuleList([nn.LayerNorm(p.out_channels) for p in patchers])
+        self.patchposencoders = nn.ModuleList(patchposencoders)
+        self.backbone = backbone
+        self.head = head
+
+        # The semantics of injecting absolute positional information into each structure's patches is a little murky.
+        # Here, we treat each structure as its own "sequence" of patches, and inject the positional encoding accordingly.
+        # So the positional information is not injected with regard to the entire file, only the structure's own patches.
+        self.should_get_lengths = isinstance(self.patchposencoders[0], PatchPositionalityEncoder) and self.patchposencoders[0].max_length is not None
+
+        C_s = [p.out_channels for p in patchers]
+        if not all (c == C_s[0] for c in C_s):
+            raise ValueError("For HierarchicalViT, all patchers must output the same number of channels.")
+        self.C_s: list[int] = C_s
+        self.C = self.C_s[0]
+
+    def forward(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> Tensor:
+
+        B = len(order)
+
+        warnings.warn(f"{self.__class__.__name__}::forward does not implement proper batching yet.")
+
+        self._check_forward_inputs(x, g, order)
+
+        def preprocess(i: int, x: Tensor, g: Optional[Tensor] = None) -> Tensor:
+            z = self.embeddings[i](x)  # (B, T, E)
+            z = self.filmers[i](z, g) if torch.is_grad_enabled() else self.filmers[i].forward_functional(z, g)  # type: ignore[operator]
+            return z
+
+        # Process each structure separately.
+        zs: list[Tensor] = []
+        for i in range(self.num_structures):
+            lengths = (x[i] != 0).sum(dim=1) if self.should_get_lengths else None
+            ts = (x[i], g[i]) if g[i] is not None else (x[i],)
+            preprocess_ = partial(preprocess, i)
+            z = self.patchers[i](preprocess=preprocess_, ts=ts)  # (B_i, N_i, C)
+            z = self.norms[i](z)                                 # (B_i, N_i, C)
+            z = self.patchposencoders[i](z, lengths)             # (B_i, N_i, C)
+            zs.append(z)
+
+        # Reconcile the sample index and the input index.
+        z, key_padding_mask = self.reconcile_per_structure_patches(zs, order)  # (B, N, C)
+        check_tensor(z, (B, None, self.C), FLOATS)
+
+        # Ensure all trunks participate in autograd graph.
+        z = self._ddp_keepalive(z)
+
+        # Feed concatenated patches to shared ViT backbone and classification head.
+        z = self.backbone(z, key_padding_mask=key_padding_mask)  # (B, D)
+        z = self.head(z)                                         # (B, M)
+
+        check_tensor(z, (B, self.head.num_classes), FLOATS)
+        return z
+
+    def reconcile_per_structure_patches(self, zs: list[Tensor], order: list[list[tuple[int, int]]]) -> tuple[Tensor, Tensor]:
+        """
+        Reconcile the sample index and the input index.
+
+        Args:
+            zs: list of Tensors of shape (B_i, N_i, C) for each structure i.
+            order: the order in which each input should be processed per sample, given as a list of lists of (structure_index, input_index) tuples.
+
+        Returns:
+            z: Tensor of shape (B, N, C).
+            key_padding_mask: Tensor of shape (B, N) where True indicates padding positions.
+        """
+        B = len(order)
+
+        per_sample_tokens: list[Tensor] = []
+
+        for b in range(B):
+            tokens_b: list[Tensor] = []
+
+            for struct_idx, local_idx in order[b]:
+                z_struct = zs[struct_idx][local_idx]  # (N_i, C)
+                tokens_b.append(z_struct)
+
+            if not tokens_b:
+                raise RuntimeError(f"Sample {b} has no structures to process.")
+
+            seq_b = torch.cat(tokens_b, dim=0)  # (N_b, C)
+            per_sample_tokens.append(seq_b)
+
+        # Now pad these variable-length sequences into a (B, N_max, C) tensor.
+        M = max(seq.size(0) for seq in per_sample_tokens)
+        C = per_sample_tokens[0].size(1)
+
+        z = torch.zeros((B, M, C), device=per_sample_tokens[0].device, dtype=per_sample_tokens[0].dtype)
+
+        key_padding_mask = torch.full((B, M), False, device=z.device, dtype=torch.bool)
+        for b, seq in enumerate(per_sample_tokens):
+            length = seq.size(0)
+            z[b, :length] = seq
+            key_padding_mask[b, length:] = True
+
+        return z, key_padding_mask
+
+    @property
+    def _trunks(self) -> Sequence[tuple[nn.Module, ...]]:
+        trunks = []
+        for i in range(self.num_structures):
+            trunk = (self.embeddings[i], self.filmers[i], self.patchers[i], self.norms[i], self.patchposencoders[i])
+            trunks.append(trunk)
+        return trunks
+
+    def fully_shard(self, **kwds: Any) -> None:
+        for i in range(self.num_structures):
+            fully_shard([self.embeddings[i], self.filmers[i], self.patchers[i]], **kwds)
+        self.backbone.fully_shard(**kwds)
+        fully_shard(self, **kwds | {"reshard_after_forward": False})
+
+    def _ddp_keepalive(self, out: torch.Tensor) -> torch.Tensor:
+        """
+        Ensure all trunk parameters participate in the autograd graph every step.
+        This avoids DDP 'unused parameter' errors when some trunks have no inputs.
+        """
+        if (not self.training) or (not torch.is_grad_enabled()):
+            return out
+
+        dummy = out.sum() * 0.0
+        for trunk in self._trunks:
+            for mod in trunk:
+                for p in mod.parameters():
+                    dummy = dummy + p.view(-1)[0] * 0.0
+
+        return out + dummy

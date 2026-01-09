@@ -152,6 +152,12 @@ class Batch(Protocol):
         """
         ...
 
+    def get_otherkwds(self) -> dict[str, Any]:
+        """
+        Access any other keyword arguments needed for the model, which should have been finalized in `finalize` (no copy/compute).
+        """
+        ...
+
 
 def largest_possible_dataloader_length(loader: DataLoader[Any]) -> int:
     # Validate the type and properties of the dataloader's dataset.
@@ -1076,7 +1082,7 @@ class Trainer:
         Send a batch of inputs forward through the model.
         """
         with torch.autocast(self.device.type, dtype=self.mp_dtype, enabled=self.args.mp16):
-            return self.model(batch.get_inputs(), batch.get_guides())  # type: ignore[no-any-return]
+            return self.model(batch.get_inputs(), batch.get_guides(), **batch.get_otherkwds())  # type: ignore[no-any-return]
 
     def compute_loss(self, batch: Batch, outputs: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
         """
