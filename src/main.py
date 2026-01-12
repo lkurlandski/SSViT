@@ -942,6 +942,8 @@ def main() -> None:
             print("Retrieved a trainer from checkpoint. Current log: ")
             for d in trainer.log:
                 print(d)
+        if trainer.args.outdir != args.outdir:
+            trainer.args.outdir = Path(args.outdir)
     else:
         wmodel = wrap_model(model)
         params = decay_aware_param_groups(wmodel, args.weight_decay)
