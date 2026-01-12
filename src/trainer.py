@@ -1461,7 +1461,10 @@ class Trainer:
         if (rng_cpu := torch.load(path / "rng-cpu.pt", map_location="cpu")) is not None:
             torch.random.set_rng_state(rng_cpu)
         if (rng_gpu := torch.load(path / "rng-gpu.pt", map_location="cpu")) is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(rng_gpu)
+            if torch.cuda.device_count() != len(rng_gpu):
+                warnings.warn(f"Number of CUDA devices from checkpoint was {len(rng_gpu)} but number available now is {torch.cuda.device_count()}. CUDA RNG states may not be restored correctly.")
+            else:
+                torch.cuda.set_rng_state_all(rng_gpu)
         padbatch = torch.load(path / "padbatch.pt", map_location="cpu", weights_only=False)  # Load custom types (unsafe)
         loss_fn.load_state_dict(torch.load(path / "loss_fn.pt", map_location="cpu"))
 
