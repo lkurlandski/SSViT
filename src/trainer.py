@@ -77,6 +77,10 @@ ALLOW_PARAM_GRAD_NONE = not CHECK_PARAM_GRAD_NONE or os.environ.get("ALLOW_PARAM
 if ALLOW_PARAM_GRAD_NONE:
     warnings.warn("Parameters are allowed to have no gradients.")
 
+TRAINER_SAVE_PREDICTIONS = os.environ.get("TRAINER_SAVE_PREDICTIONS", "1") == "1"
+if TRAINER_SAVE_PREDICTIONS:
+    warnings.warn("Trainer will save predictions during evaluation.")
+
 
 def debug_autocast_dtypes(model: nn.Module) -> None:
     def hook(mod, inp, out):  # type: ignore[no-untyped-def]
@@ -131,6 +135,12 @@ class Batch(Protocol):
     def finalize(self, ftype: torch.dtype, itype: torch.dtype, ltype: torch.dtype) -> Self:
         """
         Finalize the batch for use within the network.
+        """
+        ...
+
+    def get_names(self) -> list[str]:
+        """
+        Return a list of fixed-width names, e.g., hexadecimal hashes, of the samples in the batch.
         """
         ...
 
@@ -846,8 +856,9 @@ class Trainer:
         mini_step = -1
         totalloss = torch.tensor(0.0, dtype=torch.float64, device=self.device)
         totallosses: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
-        alllabels: list[Tensor] = []
-        alllogits: list[Tensor] = []
+        alllabels: list[Tensor] = []  # [(B,)]    list of one-dimensional tensors, num-samples
+        alllogits: list[Tensor] = []  # [(B, C)]  list of two-dimensional tensors, num-samples x num-classes
+        allnames: list[Tensor] = []   # [(B, F)]  list of two-dimensional tensors, num-samples x name-length
 
         with torch.no_grad():
             for mini_step, real, batch in iterable:
@@ -860,6 +871,7 @@ class Trainer:
                         totallosses[lossname] += losses[lossname].to(torch.float64) * len(batch)
                     alllabels.append(batch.get_label())
                     alllogits.append(outputs)
+                    allnames.append(torch.tensor([name.encode("utf-8") for name in batch.get_names()], dtype=torch.uint8))
 
         # self.print(f"[INFO] [rank {rank()}] [Trainer::evaluate] {mini_step=} num_real={len(alllabels)} num_fake={mini_step + 1 - len(alllabels)}")
         if mini_step < 0:
@@ -868,8 +880,9 @@ class Trainer:
             raise RuntimeError(f"[rank {rank()}] no real samples were evaluated.")
 
         totallosses = dict(totallosses)
-        labels = torch.cat(alllabels, dim=0).to(torch.int64)
-        logits = torch.cat(alllogits, dim=0).to(torch.float64)
+        labels = torch.cat(alllabels, dim=0).to(device=self.device, dtype=torch.int64)
+        logits = torch.cat(alllogits, dim=0).to(device=self.device, dtype=torch.float64)
+        names  = torch.cat(allnames, dim=0).to(device=self.device, dtype=torch.uint8)
         check_logits_and_labels(logits, labels)
 
         if totalloss.grad is not None or totalloss.dtype != torch.float64:
@@ -892,27 +905,33 @@ class Trainer:
             if (pad := longest - labels.shape[0]) > 0:
                 labels = torch.nn.functional.pad(labels, (0, pad),       value=0)
                 logits = torch.nn.functional.pad(logits, (0, 0, 0, pad), value=torch.nan)
+                names  = torch.nn.functional.pad(names,  (0, 0, 0, pad), value=0)
             # Gather all labels and logits.
             glabels: Optional[list[Tensor]] = None
             glogits: Optional[list[Tensor]] = None
+            gnames: Optional[list[Tensor]]  = None
             if rank() == 0:
                 glabels = [torch.empty((longest,),                 device=labels.device, dtype=labels.dtype) for _ in range(world_size())]
                 glogits = [torch.empty((longest, logits.shape[1]), device=logits.device, dtype=logits.dtype) for _ in range(world_size())]
+                gnames  = [torch.empty((longest, names.shape[1]),  device=names.device,  dtype=names.dtype)  for _ in range(world_size())]
             dist.gather(labels.contiguous(), gather_list=glabels, dst=0)
             dist.gather(logits.contiguous(), gather_list=glogits, dst=0)
+            dist.gather(names.contiguous(),  gather_list=gnames,  dst=0)
             # Concatenate and remove padding.
             if rank() == 0:
                 assert glabels is not None
                 assert glogits is not None
+                assert gnames is not None
                 labels = torch.cat([glabels[r][: int(lengths[r].item())] for r in range(world_size())], dim=0)
                 logits = torch.cat([glogits[r][: int(lengths[r].item())] for r in range(world_size())], dim=0)
+                names  = torch.cat([gnames[r][: int(lengths[r].item())]  for r in range(world_size())], dim=0)
                 check_logits_and_labels(logits, labels)
             # Sum the loss across all ranks.
             dist.all_reduce(totalloss, op=dist.ReduceOp.SUM)
             for lossname in totallosses:
                 dist.all_reduce(totallosses[lossname], op=dist.ReduceOp.SUM)
             # Cleanup some references to prevent bugs.
-            del length, lengths, longest, pad, glabels, glogits
+            del length, lengths, longest, pad, glabels, glogits, gnames
 
         # Compute the metrics.
         if rank() == 0:
@@ -942,6 +961,14 @@ class Trainer:
 
         if was_training:
             self.model.train()
+
+        # Save the labels, logits, and names if needed.
+        if os.environ.get("TRAINER_SAVE_PREDICTIONS", "1") == "1" and rank() == 0:
+            output = self.args.outdir / f"predictions-{self.glbl_step}"
+            output.mkdir(parents=True, exist_ok=True)
+            torch.save(labels, (output / "labels.pt").as_posix())
+            torch.save(logits, (output / "logits.pt").as_posix())
+            torch.save(names,  (output / "names.pt").as_posix())
 
         barrier("Trainer::evaluate:after", self.device)
         return report

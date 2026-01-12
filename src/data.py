@@ -937,6 +937,9 @@ class FSamples(_FSampleOrSamples[Sequence[StrPath], Sequence[Name], Inputs, Sema
     def verify_inputs(self) -> None:
         check_tensor(self.label, (None,), (torch.int16, torch.int32, torch.int64))
 
+    def get_names(self) -> list[str]:
+        return [str(n) for n in self.name]
+
 
 class _HSampleOrSamples(Generic[F, N, I, G, S], ABC):
     """
@@ -1148,6 +1151,9 @@ class HSamples(_HSampleOrSamples[Sequence[StrPath], Sequence[Name], Inputs, Sema
         super().verify_inputs()
         check_tensor(self.label, (None,), (torch.int16, torch.int32, torch.int64))
 
+    def get_names(self) -> list[str]:
+        return [str(n) for n in self.name]
+
 
 class SSamples:
     """
@@ -1214,6 +1220,9 @@ class SSamples:
     @property
     def characteristics(self) -> list[Optional[Tensor]]:
         return [g.characteristics for g in self.guides]
+
+    def get_names(self) -> list[str]:
+        return [str(n) for n in self.name]
 
     def get_label(self) -> Tensor:
         return self.label
