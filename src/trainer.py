@@ -871,7 +871,7 @@ class Trainer:
                         totallosses[lossname] += losses[lossname].to(torch.float64) * len(batch)
                     alllabels.append(batch.get_label())
                     alllogits.append(outputs)
-                    allnames.append(torch.tensor([name.encode("utf-8") for name in batch.get_names()], dtype=torch.uint8))
+                    allnames.append(torch.tensor([name.encode("latin1") for name in batch.get_names()], dtype=torch.uint8))
 
         # self.print(f"[INFO] [rank {rank()}] [Trainer::evaluate] {mini_step=} num_real={len(alllabels)} num_fake={mini_step + 1 - len(alllabels)}")
         if mini_step < 0:
