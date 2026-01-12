@@ -80,6 +80,8 @@ from src.architectures import ViTClassifier
 from src.architectures import HierarchicalClassifier
 from src.architectures import HierarchicalMalConvClassifier
 from src.architectures import HierarchicalViTClassifier
+from src.architectures import StructuralClassifier
+from src.architectures import StructuralViTClassifier
 from src.binanal import HierarchicalLevel
 from src.binanal import LEVEL_STRUCTURE_MAP
 from src.binanal import DIRECTORY_STRUCTURES
@@ -94,6 +96,7 @@ from src.data import Inputs
 from src.data import IterableSimpleDBDataset
 from src.data import CollateFn
 from src.data import CollateFnHierarchical
+from src.data import CollateFnStructural
 from src.data import CUDAPrefetcher
 from src.data import StreamlessCUDAPrefetcher
 from src.data import Name
@@ -101,6 +104,7 @@ from src.data import Preprocessor
 from src.data import FSample
 from src.data import FSamples
 from src.data import HSamples
+from src.data import SSamples
 from src.data import FOrHSamples
 from src.helpers import create_argument_parser_from_dataclass
 from src.helpers import flatten_dataclasses
@@ -140,6 +144,11 @@ if STRUCTURES_AS_GUIDES:
     warnings.warn("STRUCTURES_AS_GUIDES is enabled. Hierarchical structures will be used as semantic guides.")
 
 
+STRUCTURAL_DESIGN_VERSION_TWO = os.environ.get("STRUCTURAL_DESIGN_VERSION_TWO", "0") == "1"
+if STRUCTURAL_DESIGN_VERSION_TWO:
+    warnings.warn("STRUCTURAL_DESIGN_VERSION_TWO is enabled. Using the second version of the structural design.")
+
+
 def get_model(
     arch: Architecture,
     size: ModelSize,
@@ -150,7 +159,7 @@ def get_model(
     posenc: PositionalEncodingArchitecture,
     patchposenc: PatchPositionalEncodingArchitecture,
     max_length: Optional[int],
-) -> Classifier | HierarchicalClassifier:
+) -> Classifier | HierarchicalClassifier | StructuralClassifier:
     """
     Get a pre-configured classification model for the given settings.
 
@@ -240,6 +249,9 @@ def get_model(
     if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV):
         patch_size  = 2 ** 22 // num_patches
         num_patches = None
+    if STRUCTURAL_DESIGN_VERSION_TWO:
+        num_patches      = 1
+        patch_size       = None
     PatchEncoderCls: type[PatchEncoderBase]
     if parch == PatcherArchitecture.BAS:
         PatchEncoderCls = PatchEncoder
@@ -361,7 +373,14 @@ def get_model(
     filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden) for _ in range(num_structures)]
     if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
         malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap) for s in structures]
+        if STRUCTURAL_DESIGN_VERSION_TWO:
+            raise NotImplementedError("StructuralMalConvClassifier is not implemented yet.")
         return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
+    if arch in (Architecture.VIT,) and STRUCTURAL_DESIGN_VERSION_TWO:
+        patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size) for s in structures]
+        patchposencoders = [PatchPositionalityEncoderCls(p.out_channels) for p in patchers]
+        transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, "fixed", max_len=1024)
+        return StructuralViTClassifier(embeddings, filmers, patchers, patchposencoders, transformer, head)
     if arch in (Architecture.VIT,):
         # Allocate one patch to each tiny structure; divide the remaining patches among the full structures.
         num_patches_tiny = None
@@ -423,11 +442,13 @@ def wrap_model_fsdp(model: M, mpdtype: torch.dtype, fsdp_offload: bool) -> M:
     return model
 
 
-def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int], structures: list[HierarchicalStructure]) -> CollateFn | CollateFnHierarchical:
+def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int], structures: list[HierarchicalStructure]) -> CollateFn | CollateFnHierarchical | CollateFnStructural:
     if level == HierarchicalLevel.NONE:
         return CollateFn(False, False, min_lengths[0])
     if STRUCTURES_AS_GUIDES:
         return CollateFn(False, False, min_lengths[0])
+    if STRUCTURAL_DESIGN_VERSION_TWO:
+        return CollateFnStructural(False, False, len(structures), min_lengths)
     return CollateFnHierarchical(False, False, len(structures), min_lengths)
 
 
@@ -450,7 +471,7 @@ def get_loader(
     sampler: Optional[Sampler[Any]],
     batch_sampler: Optional[Sampler[Any]],
     num_workers: int,
-    collate_fn: Callable[[Sequence[FSample]], FSamples | HSamples],
+    collate_fn: Callable[[Sequence[FSample]], FSamples | HSamples | SSamples],
     pin_memory: bool,
     drop_last: bool,
     prefetch_factor: int,
@@ -486,7 +507,7 @@ def get_loader(
     return loader
 
 
-def get_padbatch(level: HierarchicalLevel, structures: list[HierarchicalStructure], do_parse: bool, do_entropy: bool, which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS], min_lengths: list[int], batch_size: int) -> FSamples | HSamples:
+def get_padbatch(level: HierarchicalLevel, structures: list[HierarchicalStructure], do_parse: bool, do_entropy: bool, which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS], min_lengths: list[int], batch_size: int) -> FSamples | HSamples | SSamples:
     """Return a short batch of purely padding samples."""
     file = ["./" + "0" * 64] * batch_size
     name = [Name("0" * 64)] * batch_size
@@ -531,6 +552,12 @@ def get_padbatch(level: HierarchicalLevel, structures: list[HierarchicalStructur
         inputs = get_inputs(min_lengths[0])
         guides = get_guides(min_lengths[0])
         return FSamples(file, name, label, inputs, guides, structure)
+
+    if STRUCTURAL_DESIGN_VERSION_TWO:
+        inputs_ = [get_inputs(l) for l in min_lengths]
+        guides_ = [get_guides(l) for l in min_lengths]
+        order   = [[(structure_index, local_index) for structure_index in range(len(structures))] for local_index in range(batch_size)]
+        return SSamples(file, name, label, inputs_, guides_, structure, order)
 
     inputs_ = [get_inputs(l) for l in min_lengths]
     guides_ = [get_guides(l) for l in min_lengths]
