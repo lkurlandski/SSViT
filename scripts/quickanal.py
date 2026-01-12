@@ -104,6 +104,7 @@ if args.verbose:
 
 # (lower-is-better, best-epoch, value)
 best: dict[str, tuple[bool, int, float]] = {
+    "glbl_step": (None, -1, float("inf")),
     "tr_loss": (True, -1, float("inf")),
     "aux_loss": (True, -1, float("inf")),
     "clf_loss": (True, -1, float("inf")),
@@ -162,11 +163,13 @@ for d in log:
 if not args.quiet:
     print("Training Summary:")
 if args.json:
-    d = {k: e for k, (l, e, v) in best.items()}
+    d = {k: e for k, (l, e, v) in best.items() if l is not None}
     print(d)
-    d = {k: v for k, (l, e, v) in best.items()}
+    d = {k: v for k, (l, e, v) in best.items() if l is not None}
     float_print_json(d)
 else:
     for k, (l, e, v) in best.items():
+        if l is None:
+            continue
         print(f"{k} @{e} {v:.4f}")
 
