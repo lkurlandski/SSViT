@@ -1251,10 +1251,9 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             z_e = z.index_select(0, idx)                            # (n_e, E, P)
             g_e = expert(z_e)                                       # (n_e, C, S)
             g_e, _ = g_e.max(dim=-1)                                # (n_e, C)
-            if self.training:
-                # STE gate factor. Forward is 1.0 for selected expert. Backward provides router grads.
-                w = gates_flat.index_select(0, idx)[:, e].unsqueeze(-1).to(dtype=g_e.dtype)  # (n_e, 1)
-                g_e = g_e * w
+            # STE gate factor. Forward is 1.0 for selected expert. Backward provides router grads.
+            w = gates_flat.index_select(0, idx)[:, e].unsqueeze(-1).to(dtype=g_e.dtype)  # (n_e, 1)
+            g_e = g_e * w
             out.index_copy_(0, idx, g_e)
 
         # Reshape and return.
@@ -1343,7 +1342,8 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
 
             if not self.training:
                 max_vals = self._clean_max_vals(max_vals, active, e)
-                out = out + max_vals
+                w = gates[..., e].unsqueeze(-1).to(dtype=max_vals.dtype)
+                out = out + max_vals * w
                 continue
 
             positions_flat = pos.view(B, N * C)
@@ -1368,11 +1368,8 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             )
 
             # STE gate factor.
-            if self.training:
-                w = gates[..., e].unsqueeze(-1).to(dtype=z.dtype)
-                out = out + z * w
-            else:
-                out = out + z
+            w = gates[..., e].unsqueeze(-1).to(dtype=z.dtype)
+            out = out + z * w
 
         # Ensure every expert parameter participates in the autograd graph.
         out = self._ddp_keepalive(out)
