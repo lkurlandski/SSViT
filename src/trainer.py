@@ -77,7 +77,7 @@ ALLOW_PARAM_GRAD_NONE = not CHECK_PARAM_GRAD_NONE or os.environ.get("ALLOW_PARAM
 if ALLOW_PARAM_GRAD_NONE:
     warnings.warn("Parameters are allowed to have no gradients.")
 
-TRAINER_SAVE_PREDICTIONS = os.environ.get("TRAINER_SAVE_PREDICTIONS", "1") == "1"
+TRAINER_SAVE_PREDICTIONS = os.environ.get("TRAINER_SAVE_PREDICTIONS", "0") == "1"
 if TRAINER_SAVE_PREDICTIONS:
     warnings.warn("Trainer will save predictions during evaluation.")
 
