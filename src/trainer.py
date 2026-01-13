@@ -677,25 +677,23 @@ class Trainer:
             # Aggregate results across workers and move to CPU.
             allresults = self.reduce_results(results) if is_dist() else results
             allresults = {k: allresults[k].detach().to("cpu") for k in allresults}
+            # If zero real samples were seen across all ranks then `num_samples` will be zero and `grad_steps` will be missing.
             num_samples = int(allresults.pop("num_samples").item())
-            grad_steps = math.ceil(int(allresults.pop("grad_steps").item()) / world_size())
-            # Average statistics over some period for logging.
+            grad_steps = math.ceil(int(allresults.pop("grad_steps", torch.tensor(0)).item()) / world_size())
+            # Average statistics over some period for logging. If real data was seen, we average the
+            # losses over number of samples and the norms over the number of gradient steps.
+            # If no real data was seen, don't average anything because `num_samples` and `grad_steps`
+            # will both be 0, so we'll get a ZeroDivisionError. We still want the key in the report, though.
             report = {}
             for k in allresults:
-                # Average these over number of samples.
-                if k in ("tr_loss", "aux_loss"):
-                    report[k] = allresults[k].item() / num_samples
-                # Average these over number of steps.
+                report[k] = allresults[k].item()
+                if k in ("tr_loss", "aux_loss", "clf_loss"):
+                    if anyone_had_real_window:
+                        report[k] /= num_samples
                 elif k in ("grad_norm", "param_norm", "param_delta",):
-                    report[k] = allresults[k].item() / grad_steps
-                # Do not average these.
-                elif k in ("num_samples",):
-                    report[k] = allresults[k].item()
-                # Average these over number of samples.
-                elif "loss" in k:
-                    report[k] = allresults[k].item() / num_samples
-                # Otherwise raise an error.
-                else:
+                    if anyone_had_real_window:
+                        report[k] /= grad_steps
+                elif k not in ("num_samples",):
                     raise KeyError(f"Unknown training metric '{k}' encountered.")
             report["tr_time"] = timer.get_elapsed()
             report["tr_samples"] = num_samples
@@ -708,6 +706,8 @@ class Trainer:
         with torch.no_grad():
             flat_params_bef = torch.cat([p.view(-1) for p in self.model.parameters()])
 
+        # NOTE: the dynamic nature of this dictionary is making it challenging to account for all the required keys.
+        # TODO: We may want to refactor this at some point with a list of static, required keys.
         results: dict[str, Tensor] = defaultdict(lambda: torch.tensor(0.0, dtype=torch.float64, device=self.device))
 
         had_real_window = False  # whether any real data was seen in window of mini-steps
@@ -782,6 +782,12 @@ class Trainer:
                     results["param_norm"] += flat_params_aft.norm().detach()
                     results["param_delta"] += (flat_params_aft - flat_params_bef).norm().detach()
                     flat_params_bef = flat_params_aft
+                else:
+                    # Do this dumb shit to ensure we don't get a KeyError in other places.
+                    results["grad_steps"] += 0
+                    results["grad_norm"] += 0.0
+                    results["param_norm"] += 0.0
+                    results["param_delta"] += 0.0
                 # Determine what hooks are to be executed
                 do_eval, do_chpt, do_logg = self._due_hooks()
                 ad_eval, ad_chpt, ad_logg = None, None, None
