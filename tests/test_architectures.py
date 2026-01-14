@@ -244,13 +244,11 @@ class TestPatchEncoderLowMem:
         if num_patches is None:
             with pytest.raises(ValueError):
                 net = init()
-            pytest.skip("IGNORE")
             return
 
         if patch_size is not None:
             with pytest.raises(ValueError):
                 net = init()
-            pytest.skip("IGNORE")
             return
 
         net = init()
@@ -260,7 +258,6 @@ class TestPatchEncoderLowMem:
         if seq_length < net.min_length:
             with pytest.raises(RuntimeError):
                 net.forward(z)
-            pytest.skip("IGNORE")
             return
 
         z = net.forward(z)
@@ -330,7 +327,6 @@ class TestPatchEncoderLowMemSwitchMoE:
         if seq_length < net.min_length:
             with pytest.raises(RuntimeError):
                 net.forward(z)
-            pytest.skip("IGNORE")
             return
 
         z = net.forward(z)
