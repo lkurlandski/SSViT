@@ -1512,7 +1512,7 @@ def _lowmem_patchwise_max_over_time_dispatched(
         b_mb = b_idx[sl]          # (m,)
         j_mb = j_idx[sl]          # (m,)
         s_mb = start[sl]          # (m,)
-        e_mb = end[sl]            # (m,)
+        e_mb = end[sl]            # (m,)  # noqa: F841
         L_mb = lengths[sl]        # (m,)
         m = int(b_mb.numel())
 
