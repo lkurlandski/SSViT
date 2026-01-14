@@ -81,6 +81,7 @@ from src.architectures import HierarchicalClassifier
 from src.architectures import HierarchicalMalConvClassifier
 from src.architectures import HierarchicalViTClassifier
 from src.architectures import StructuralClassifier
+from src.architectures import StructuralMalConvClassifier
 from src.architectures import StructuralViTClassifier
 from src.binanal import HierarchicalLevel
 from src.binanal import LEVEL_STRUCTURE_MAP
@@ -110,11 +111,11 @@ from src.helpers import create_argument_parser_from_dataclass
 from src.helpers import flatten_dataclasses
 from src.helpers import _MTArgs
 from src.helpers import Scheduler
+from src.helpers import Design
 from src.helpers import Architecture
 from src.helpers import PatcherArchitecture
 from src.helpers import PositionalEncodingArchitecture
 from src.helpers import PatchPositionalEncodingArchitecture
-from src.helpers import ModelSize
 from src.helpers import MainArgs
 from src.simpledb import SimpleDB
 from src.simpledb import MetadataDB
@@ -144,21 +145,17 @@ if STRUCTURES_AS_GUIDES:
     warnings.warn("STRUCTURES_AS_GUIDES is enabled. Hierarchical structures will be used as semantic guides.")
 
 
-STRUCTURAL_DESIGN_VERSION_TWO = os.environ.get("STRUCTURAL_DESIGN_VERSION_TWO", "0") == "1"
-if STRUCTURAL_DESIGN_VERSION_TWO:
-    warnings.warn("STRUCTURAL_DESIGN_VERSION_TWO is enabled. Using the second version of the structural design.")
-
-
 def get_model(
+    design: Design,
     arch: Architecture,
-    size: ModelSize,
-    num_guides: int,
-    level: HierarchicalLevel,
-    structures: list[HierarchicalStructure],
-    parch: PatcherArchitecture,
-    posenc: PositionalEncodingArchitecture,
-    patchposenc: PatchPositionalEncodingArchitecture,
-    max_length: Optional[int],
+    parch: PatcherArchitecture = PatcherArchitecture.BAS,
+    posenc: PositionalEncodingArchitecture = PositionalEncodingArchitecture.FIXED,
+    patchposenc: PatchPositionalEncodingArchitecture = PatchPositionalEncodingArchitecture.NONE,
+    num_guides: int = 0,
+    structures: Sequence[HierarchicalStructure] = tuple(),
+    max_length: Optional[int] = None,
+    share_embeddings: bool = False,
+    share_patchers: bool = False,
 ) -> Classifier | HierarchicalClassifier | StructuralClassifier:
     """
     Get a pre-configured classification model for the given settings.
@@ -167,177 +164,28 @@ def get_model(
         were selected to facilitate good tensor core utilization on modern GPUs
         (i.e., using multiples of 8 and ideally 64, where possible).
 
-    The `size` parameter controls the overall model size. Note that the Embedding,
-        FiLM, and Head components are not impacted directly by this parameter.
-        `ModelSize.SM` will produce a very small model suitable for testing/debugging.
-        The other sizes, e.g., `ModelSize.LG`, will increase the size of the ViT
-        backbone (if applicable), but do not affect the MalConv backbone because
-        this architecture has already been extensively tuned by previous authors.
-
     Args:
-        arch: The architecture type.
-        size: The model size.
+        design: The model design type.
+        arch: The backbone architecture type.
+        parch: The patcher architecture type (`arch==Architecture.VIT`).
+        posenc: The positional encoding type (`arch==Architecture.VIT`).
+        patchposenc: The patch positional encoding type (`arch==Architecture.VIT`).
+        max_length: The maximum input length.
         num_guides: The number of semantic guides.
-        level: The hierarchical level.
         structures: The hierarchical structures.
-        parch: The patcher architecture (for ViT only).
-        posenc: The positional encoding type (for ViT only).
-        patchposenc: The patch positional encoding type (for ViT only).
-        max_length: The maximum input length (for absolute patchposenc only).
+        share_embeddings: For hierarchical and structural designs, whether to share embeddings across structures.
+        share_patchers: For hierarchical and structural designs, whether to share patchers across structures.
 
     Returns:
         The model.
     """
+    design = Design(design)
     arch = Architecture(arch)
-    size = ModelSize(size)
-    level = HierarchicalLevel(level)
     parch = PatcherArchitecture(parch)
     posenc = PositionalEncodingArchitecture(posenc)
     patchposenc = PatchPositionalEncodingArchitecture(patchposenc)
 
-    num_structures = len(structures)
-
-    # Embedding
-    padding_idx    = 0
-    num_embeddings = 384
-    embedding_dim  = int(os.environ.get("EMBEDDING_DIM", "8"))
-
-    # FiLM
-    guide_dim    = num_guides
-    guide_hidden = 16
-    FiLMCls: type[FiLM | FiLMNoP]
-    if num_guides > 0:
-        FiLMCls = FiLM
-    else:
-        FiLMCls = FiLMNoP
-
-    # MalConv
-    mcnv_overlap = 0 if STRICT_RAFF_MATCH else None
-    if size == ModelSize.SM:
-        mcnv_channels = 64
-        mcnv_kernel   = 1024
-        mcnv_stride   = 1024
-    else:
-        mcnv_channels = 256 if arch == Architecture.MCG else 128
-        mcnv_kernel   = 256 if arch == Architecture.MCG else 512
-        mcnv_stride   = 64 if  arch == Architecture.MCG else 512
-    MalConvCls: type[MalConvBase]
-    if arch == Architecture.MCV:
-        MalConvCls = MalConv
-    elif arch == Architecture.MC2:
-        MalConvCls = MalConvLowMem
-    elif arch == Architecture.MCG:
-        MalConvCls = MalConvGCG
-    else:
-        MalConvCls = MalConvBase  # type: ignore[type-abstract]
-
-    # Patch Encoder
-    num_patches: Optional[int] = None
-    patch_size:  Optional[int] = None
-    if size == ModelSize.SM:
-        patcher_channels = 16
-        num_patches      = 64
-        patch_size       = None
-    elif size == ModelSize.MD:
-        patcher_channels = 32
-        num_patches      = 128
-        patch_size       = None
-    else:
-        patcher_channels = 64 * int(os.environ.get("PATCHER_CHANNEL_FACTOR", "1"))
-        num_patches      = 256
-        patch_size       = None
-    if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV):
-        patch_size  = 2 ** 22 // num_patches
-        num_patches = None
-    if STRUCTURAL_DESIGN_VERSION_TWO:
-        num_patches      = 1
-        patch_size       = None
-    PatchEncoderCls: type[PatchEncoderBase]
-    if parch == PatcherArchitecture.BAS:
-        PatchEncoderCls = PatchEncoder
-    elif parch == PatcherArchitecture.CNV:
-        PatchEncoderCls = ConvPatchEncoder
-    elif parch == PatcherArchitecture.HCV:
-        PatchEncoderCls = HierarchicalConvPatchEncoder
-    elif parch == PatcherArchitecture.MEM:
-        PatchEncoderCls = PatchEncoderLowMem
-    elif parch == PatcherArchitecture.EXP:
-        PatchEncoderCls = partial(  # type: ignore[assignment]
-            PatchEncoderLowMemSwitchMoE,
-            num_experts=int(os.environ.get("MOE_NUM_EXPERTS", "1")),
-            probe_kernel_size=256,
-            probe_stride=256,
-            router_hidden=256,
-            router_noise_std=float(os.environ.get("MOE_ROUTER_NOISE_STD", "0.0")),
-            load_balance_alpha=float(os.environ.get("MOE_LOAD_BALANCE_ALPHA", "0.0")),
-        )
-    else:
-        PatchEncoderCls = PatchEncoderBase
-
-    # ViT
-    if size == ModelSize.SM:
-        vit_d_model  = 64
-        vit_nhead    = 1
-        vit_feedfrwd = 256
-        vit_layers   = 1
-    elif size == ModelSize.MD:
-        vit_d_model  = 256
-        vit_nhead    = 4
-        vit_feedfrwd = 1024
-        vit_layers   = 4
-    elif size == ModelSize.LG:
-        vit_d_model  = 512
-        vit_nhead    = 8
-        vit_feedfrwd = 2048
-        vit_layers   = 8
-
-    # Positional Encoding
-    posencname: Literal["none", "fixed", "learned"] = posenc.name.lower()  # type: ignore[assignment]
-    if posencname not in ("none", "fixed", "learned"):
-        raise TypeError(f"Unknown positional encoding: {posencname}")
-
-    # Patch Positional Encoding
-    PatchPositionalityEncoderCls: Callable[[int], PatchPositionalityEncoder | Identity]
-    if patchposenc == PatchPositionalEncodingArchitecture.NONE:
-        PatchPositionalityEncoderCls = partial(Identity, autocast=True)
-    elif patchposenc == PatchPositionalEncodingArchitecture.REL:
-        PatchPositionalityEncoderCls = partial(PatchPositionalityEncoder, max_length=None)
-    elif patchposenc == PatchPositionalEncodingArchitecture.BTH:
-        PatchPositionalityEncoderCls = partial(PatchPositionalityEncoder, max_length=max_length)
-    elif patchposenc == PatchPositionalEncodingArchitecture.ABS:
-        raise NotImplementedError(f"{patchposenc}")
-    else:
-        raise NotImplementedError(f"{patchposenc}")
-
-    # Head
-    num_classes    = 2
-    clf_layers     = 2
-    if arch == Architecture.VIT:
-        clf_input_size = vit_d_model
-        clf_hidden     = 256
-        clf_dropout    = 0.1
-    else:
-        clf_input_size = mcnv_channels
-        clf_hidden     = mcnv_channels if STRICT_RAFF_MATCH else 256
-        clf_dropout    = 0.0 if STRICT_RAFF_MATCH else 0.1
-    head = ClassifificationHead(clf_input_size, num_classes, clf_hidden, clf_layers, clf_dropout)
-
-    # Flat Model
-    if level == HierarchicalLevel.NONE:
-        embedding = Embedding(num_embeddings, embedding_dim, padding_idx)
-        filmer = FiLMCls(guide_dim, embedding_dim, guide_hidden)
-        if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-            malconv = MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap)
-            return MalConvClassifier(embedding, filmer, malconv, head)
-        if arch in (Architecture.VIT,):
-            patcher = PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size)
-            total_num_patches = patcher.num_patches
-            transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencname, total_num_patches)
-            patchposencoder = PatchPositionalityEncoderCls(patcher.out_channels)
-            return ViTClassifier(embedding, filmer, patcher, patchposencoder, transformer, head)
-        raise NotImplementedError(f"{arch}")
-
-    # Hierarchical Model
+    num_structures = len(structures) if structures is not None else 0
 
     # The original idea was to use different architectures for different structures, for example,
     # CNNs with small strides for shorter structures, like the PE Header. Unfortunately, this does not work
@@ -346,8 +194,7 @@ def get_model(
     # inputs end up having to handle very long inputs, which can result in lower throughput and increased
     # memory usage. Most severely, this can even lead to segmentation faults in the underlying CUDA kernels.
     # All told, we need to use architectures that can handle long inputs elegantly for all structures.
-
-    tiny = (
+    TINY_STRUCTURES = (
         HierarchicalStructureCoarse.HEADERS,
         HierarchicalStructureCoarse.DIRECTORY,
         HierarchicalStructureMiddle.HEADERS,
@@ -369,36 +216,221 @@ def get_model(
         HierarchicalStructureFine.OTHERDIR,
     )
 
-    embeddings = [Embedding(num_embeddings, embedding_dim, padding_idx) for _ in range(num_structures)]
-    filmers = [FiLMCls(guide_dim, embedding_dim, guide_hidden) for _ in range(num_structures)]
-    if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
-        malconvs = [MalConvCls(embedding_dim, mcnv_channels, mcnv_kernel, mcnv_stride, overlap=mcnv_overlap) for s in structures]
-        if STRUCTURAL_DESIGN_VERSION_TWO:
-            raise NotImplementedError("StructuralMalConvClassifier is not implemented yet.")
-        return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
-    if arch in (Architecture.VIT,) and STRUCTURAL_DESIGN_VERSION_TWO:
-        patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches, patch_size) for s in structures]
-        patchposencoders = [PatchPositionalityEncoderCls(p.out_channels) for p in patchers]
-        transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, "fixed", max_len=1024)
-        return StructuralViTClassifier(embeddings, filmers, patchers, patchposencoders, transformer, head)
-    if arch in (Architecture.VIT,):
-        # Allocate one patch to each tiny structure; divide the remaining patches among the full structures.
-        num_patches_tiny = None
-        num_patches_full = None
-        if num_patches is not None:
-            num_tiny = sum(1 for s in structures if s in tiny)
-            num_full = sum(1 for s in structures if s not in tiny)
-            num_patches_tiny = 1
-            num_patches_full = (num_patches - num_tiny * num_patches_tiny) // max(1, num_full)
-            actual_num_patches = num_patches_full * num_full + num_patches_tiny * num_tiny
-            print(f"[INFO] [rank {rank()}] [get_model] {num_patches} patches available and {actual_num_patches} patches will be used.")
-        patchers = [PatchEncoderCls(embedding_dim, patcher_channels, num_patches_tiny if s in tiny else num_patches_full, patch_size) for s in structures]
-        total_num_patches = sum(p.num_patches for p in patchers if p.num_patches is not None)
-        patchposencoders = [PatchPositionalityEncoderCls(p.out_channels) for p in patchers]
-        transformer = ViT(patcher_channels, vit_d_model, vit_nhead, vit_feedfrwd, vit_layers, posencname, total_num_patches)
-        return HierarchicalViTClassifier(embeddings, filmers, patchers, patchposencoders, transformer, head)
+    # (Embedding) Build the embedding
+    embedding_dim = 8
+    def build_embedding() -> Embedding:
+        return Embedding(num_embeddings=384, embedding_dim=embedding_dim, padding_idx=0)
 
-    raise NotImplementedError(f"{arch}")
+    # (FiLM | FiLMNop) Build the filmer
+    def build_filmer() -> FiLM | FiLMNoP:
+        hidden_size = 16
+        if num_guides == 0:
+            return FiLMNoP(num_guides, embedding_dim, hidden_size)
+        return FiLM(num_guides, embedding_dim, hidden_size)
+
+    # (MalConvBase) Build the malconv
+    malconv_channels = 256 if arch == Architecture.MCG else 128
+    def build_malconv() -> MalConvBase:
+        kernel_size = 256 if arch == Architecture.MCG else 512
+        stride = 64 if arch == Architecture.MCG else 512
+        if arch == Architecture.MCV:
+            return MalConv(embedding_dim, malconv_channels, kernel_size, stride)
+        if arch == Architecture.MC2:
+            return MalConvLowMem(embedding_dim, malconv_channels, kernel_size, stride)
+        if arch == Architecture.MCG:
+            return MalConvGCG(embedding_dim, malconv_channels, kernel_size, stride)
+        raise NotImplementedError(f"{arch}")
+
+    # (PatchEncoderBase) Build the patcher
+    patcher_channels = 64
+    num_patches = None if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV) else 256
+    patch_size = 4096 if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV) else None
+    def build_patcher(num_patches: Optional[int], patch_size: Optional[int]) -> PatchEncoderBase:
+        if parch == PatcherArchitecture.BAS:
+            return PatchEncoder(embedding_dim, patcher_channels, num_patches, patch_size)
+        if parch == PatcherArchitecture.CNV:
+            return ConvPatchEncoder(embedding_dim, patcher_channels, num_patches, patch_size)
+        if parch == PatcherArchitecture.HCV:
+            return HierarchicalConvPatchEncoder(embedding_dim, patcher_channels, num_patches, patch_size)
+        if parch == PatcherArchitecture.MEM:
+            return PatchEncoderLowMem(embedding_dim, patcher_channels, num_patches, patch_size)
+        if parch == PatcherArchitecture.EXP:
+            return PatchEncoderLowMemSwitchMoE(
+                embedding_dim,
+                patcher_channels,
+                num_patches,
+                patch_size,
+                num_experts=int(os.environ.get("MOE_NUM_EXPERTS", "1")),
+                router_noise_std=float(os.environ.get("MOE_ROUTER_NOISE_STD", "0.0")),
+                load_balance_alpha=float(os.environ.get("MOE_LOAD_BALANCE_ALPHA", "0.0")),
+            )
+        raise NotImplementedError(f"{parch}")
+
+    # (LayerNorm) Build the norm
+    def build_norm() -> nn.LayerNorm:
+        return nn.LayerNorm(patcher_channels)
+
+    # (PatchPositionalityEncoder | Identity) Build the patchposencoder
+    def build_patchposencoder() -> PatchPositionalityEncoder | Identity:
+        hidden_size = 64
+        if patchposenc == PatchPositionalEncodingArchitecture.NONE:
+            return Identity(autocast=True)
+        if patchposenc == PatchPositionalEncodingArchitecture.REL:
+            return PatchPositionalityEncoder(in_channels=patcher_channels, max_length=None, hidden_size=hidden_size)
+        if patchposenc == PatchPositionalEncodingArchitecture.BTH:
+            if max_length is None:
+                raise ValueError("max_length must be specified when using BTH patch positional encodings.")
+            return PatchPositionalityEncoder(in_channels=patcher_channels, max_length=max_length, hidden_size=hidden_size)
+        if patchposenc == PatchPositionalEncodingArchitecture.ABS:
+            raise NotImplementedError(f"{patchposenc}")
+        raise NotImplementedError(f"{patchposenc}")
+
+    # (ViT) Build the transformer
+    vit_d_model = 512
+    def build_transformer() -> ViT:
+        posencname: Literal["none", "fixed", "learned"] = posenc.name.lower()  # type: ignore[assignment]
+        if posencname not in ("none", "fixed", "learned"):
+            raise TypeError(f"Unknown positional encoding: {posencname}")
+
+        max_len = num_patches
+        if posenc == PositionalEncodingArchitecture.LEARNED and num_patches is None:
+            assert patch_size is not None
+            if max_length is None:
+                raise ValueError("max_length must be specified when using a dynamic number of patches and learned positional encodings.")
+            max_len = math.ceil(max_length / patch_size)
+
+        return ViT(
+            embedding_dim=patcher_channels,
+            d_model=vit_d_model,
+            nhead=8,
+            dim_feedforward=2048,
+            num_layers=8,
+            posencoder=posencname,
+            max_len=max_len,
+            activation="gelu",
+            pooling="cls",
+        )
+
+    # (ClassifificationHead) Build the head
+    def build_head() -> ClassifificationHead:
+        if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
+            input_size = malconv_channels
+        elif arch == Architecture.VIT:
+            input_size = vit_d_model
+        else:
+            raise NotImplementedError(f"{arch}")
+        return ClassifificationHead(input_size, num_classes=2, hidden_size=256, num_layers=2, dropout=0.1)
+
+    # Helpers
+    T = TypeVar("T", bound=Module)
+    def _build_modules(caller: Callable[[], T], num: int, shared: bool) -> list[T]:
+        if not shared:
+            return [caller() for _ in range(num)]
+        instance = caller()
+        return [instance for _ in range(num)]
+
+    # (Classifier) Construct a flat model
+    def construct_flat_model() -> Classifier:
+        embedding = build_embedding()
+        filmer = build_filmer()
+        head = build_head()
+        if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
+            malconv = build_malconv()
+            return MalConvClassifier(embedding, filmer, malconv, head)
+        if arch in (Architecture.VIT,):
+            patcher = build_patcher(num_patches, patch_size)
+            norm = build_norm()
+            patchposencoder = build_patchposencoder()
+            transformer = build_transformer()
+            return ViTClassifier(embedding, filmer, patcher, norm, patchposencoder, transformer, head)
+        raise NotImplementedError(f"{arch}")
+
+    # (HierarchicalClassifier) Construct a hierarchical model
+    def construct_hierarchical_model() -> HierarchicalClassifier:
+        if structures is None or len(structures) == 0 or num_structures == 0:
+            raise ValueError(f"Hierarchical design requires non-empty structures {structures=}.")
+
+        if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
+            embeddings = _build_modules(build_embedding, num_structures, share_embeddings)
+            filmers = _build_modules(build_filmer, num_structures, share_embeddings)
+            malconvs = _build_modules(build_malconv, num_structures, False)
+            head = build_head()
+            return HierarchicalMalConvClassifier(embeddings, filmers, malconvs, head)
+
+        if arch in (Architecture.VIT,):
+            if share_patchers:
+                raise NotImplementedError("Hierarchical ViT with shared patchers is not implemented.")
+            # If working with a fixed-patch budget, then we allocate patches intelligently.
+            # We provide one patch for each tiny structure then divide the remaining patches among the full structures.
+            num_patches_tiny = None
+            num_patches_full = None
+            actual_num_patches = None
+            if num_patches is not None:
+                num_tiny = sum(1 for s in structures if s in TINY_STRUCTURES)
+                num_full = sum(1 for s in structures if s not in TINY_STRUCTURES)
+                num_patches_tiny = 1
+                num_patches_full = (num_patches - num_tiny * num_patches_tiny) // max(1, num_full)
+                actual_num_patches = num_patches_full * num_full + num_patches_tiny * num_tiny
+                print(f"[rank {rank()}] [get_model] [INFO] {num_patches} were requested in total, but using {actual_num_patches} patches.")
+            embeddings = _build_modules(build_embedding, num_structures, share_embeddings)
+            filmers = _build_modules(build_filmer, num_structures, share_embeddings)
+            patchers = [build_patcher(num_patches_tiny if s in TINY_STRUCTURES else num_patches_full, patch_size) for s in structures]
+            patchposencoders = _build_modules(build_patchposencoder, num_structures, False)
+            norms = _build_modules(build_norm, num_structures, False)
+            transformer = build_transformer()
+            head = build_head()
+            return HierarchicalViTClassifier(embeddings, filmers, patchers, norms, patchposencoders, transformer, head)
+
+        raise NotImplementedError(f"{arch}")
+
+    # (StructuralClassifier) Construct a structural model
+    def construct_structural_model() -> StructuralClassifier:
+        if structures is None or len(structures) == 0 or num_structures == 0:
+            raise ValueError(f"Hierarchical design requires non-empty structures {structures=}.")
+
+        if arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG):
+            embeddings = _build_modules(build_embedding, num_structures, share_embeddings)
+            filmers = _build_modules(build_filmer, num_structures, share_embeddings)
+            malconvs = _build_modules(build_malconv, num_structures, False)
+            head = build_head()
+            return StructuralMalConvClassifier(embeddings, filmers, malconvs, head)
+
+        if arch in (Architecture.VIT,):
+            # If working with a fixed-patch budget, then we just allocate one patch per structure.
+            # Otherwise, multiple patches may be allocated to each structure.
+            num_patches_ = 1 if num_patches is not None else None
+            patch_size_ = patch_size if patch_size is not None else None
+            # If using the MoE-based patch encoders, then we want all structures to have shared components.
+            # The specialization (i.e., the non-shared components) will be handled internally by the MoE.
+            # In this case, the user should specify both `share_embeddings=True` and `share_patchers=True`.
+            embeddings = _build_modules(build_embedding, num_structures, share_embeddings)
+            filmers = _build_modules(build_filmer, num_structures, share_embeddings)
+            patchers = _build_modules(partial(build_patcher, num_patches=num_patches_, patch_size=patch_size_), num_structures, share_patchers)
+            norms = _build_modules(build_norm, num_structures, share_patchers)
+            patchposencoders = _build_modules(build_patchposencoder, num_structures, share_patchers)
+            transformer = build_transformer()
+            head = build_head()
+            return StructuralViTClassifier(embeddings, filmers, patchers, norms, patchposencoders, transformer, head)
+
+        raise NotImplementedError(f"{arch}")
+
+    if design == Design.FLAT:
+        return construct_flat_model()
+
+    if share_patchers and not share_embeddings:
+        warnings.warn("share_patchers is True but share_embeddings is False. While not an error, this is an unusual configuration.")
+    if parch == PatcherArchitecture.EXP and not share_patchers:
+        warnings.warn("parch == PatcherArchitecture.EXP but share_patchers is False. While not an error, this is an unusual configuration.")
+    if share_patchers and parch != PatcherArchitecture.EXP:
+        warnings.warn("share_patchers is True but parch != PatcherArchitecture.EXP. While not an error, this is an unusual configuration.")
+
+    if design == Design.HIERARCHICAL:
+        return construct_hierarchical_model()
+
+    if design == Design.STRUCTURAL:
+        return construct_structural_model()
+
+    raise NotImplementedError(f"{design}")
 
 
 def get_lr_scheduler(optimizer: Optimizer, lr_beg: float, lr_max: float, lr_end: float, total_steps: int, warmup_steps: int) -> LRScheduler:
@@ -442,14 +474,14 @@ def wrap_model_fsdp(model: M, mpdtype: torch.dtype, fsdp_offload: bool) -> M:
     return model
 
 
-def get_collate_fn(level: HierarchicalLevel, min_lengths: list[int], structures: list[HierarchicalStructure]) -> CollateFn | CollateFnHierarchical | CollateFnStructural:
-    if level == HierarchicalLevel.NONE:
+def get_collate_fn(design: Design, min_lengths: list[int], structures: list[HierarchicalStructure]) -> CollateFn | CollateFnHierarchical | CollateFnStructural:
+    if design == Design.FLAT:
         return CollateFn(False, False, min_lengths[0])
-    if STRUCTURES_AS_GUIDES:
-        return CollateFn(False, False, min_lengths[0])
-    if STRUCTURAL_DESIGN_VERSION_TWO:
+    if design == Design.STRUCTURAL:
         return CollateFnStructural(False, False, len(structures), min_lengths)
-    return CollateFnHierarchical(False, False, len(structures), min_lengths)
+    if design == Design.HIERARCHICAL:
+        return CollateFnHierarchical(False, False, len(structures), min_lengths)
+    raise NotImplementedError(f"{design}")
 
 
 def worker_init_fn(worker_id: int) -> None:
@@ -507,7 +539,7 @@ def get_loader(
     return loader
 
 
-def get_padbatch(level: HierarchicalLevel, structures: list[HierarchicalStructure], do_parse: bool, do_entropy: bool, which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS], min_lengths: list[int], batch_size: int) -> FSamples | HSamples | SSamples:
+def get_padbatch(design: Design, structures: list[HierarchicalStructure], do_parse: bool, do_entropy: bool, which_characteristics: Sequence[lief.PE.Section.CHARACTERISTICS], min_lengths: list[int], batch_size: int) -> FSamples | HSamples | SSamples:
     """Return a short batch of purely padding samples."""
     file = ["./" + "0" * 64] * batch_size
     name = [Name("0" * 64)] * batch_size
@@ -538,7 +570,13 @@ def get_padbatch(level: HierarchicalLevel, structures: list[HierarchicalStructur
             lexicon[i] = s
         return StructureMaps([deepcopy(index) for _ in range(batch_size)], lexicon)
 
-    if STRUCTURES_AS_GUIDES:
+    if design == Design.FLAT and not STRUCTURES_AS_GUIDES:
+        inputs = get_inputs(min_lengths[0])
+        guides = get_guides(min_lengths[0])
+        structure = get_structure()
+        return FSamples(file, name, label, inputs, guides, structure)
+
+    if design == Design.FLAT and STRUCTURES_AS_GUIDES:
         inputs = get_inputs(min_lengths[0])
         guides = get_structure_as_guides(min_lengths[0])
         index = [[(0, min_lengths[0])]]
@@ -546,22 +584,20 @@ def get_padbatch(level: HierarchicalLevel, structures: list[HierarchicalStructur
         structure = StructureMaps([deepcopy(index) for _ in range(batch_size)], lexicon)
         return FSamples(file, name, label, inputs, guides, structure)
 
-    structure = get_structure()
-
-    if level == HierarchicalLevel.NONE:
-        inputs = get_inputs(min_lengths[0])
-        guides = get_guides(min_lengths[0])
-        return FSamples(file, name, label, inputs, guides, structure)
-
-    if STRUCTURAL_DESIGN_VERSION_TWO:
+    if design == Design.STRUCTURAL:
         inputs_ = [get_inputs(l) for l in min_lengths]
         guides_ = [get_guides(l) for l in min_lengths]
+        structure = get_structure()
         order   = [[(structure_index, local_index) for structure_index in range(len(structures))] for local_index in range(batch_size)]
         return SSamples(file, name, label, inputs_, guides_, structure, order)
 
-    inputs_ = [get_inputs(l) for l in min_lengths]
-    guides_ = [get_guides(l) for l in min_lengths]
-    return HSamples(file, name, label, inputs_, guides_, structure)
+    if design == Design.HIERARCHICAL:
+        inputs_ = [get_inputs(l) for l in min_lengths]
+        guides_ = [get_guides(l) for l in min_lengths]
+        structure = get_structure()
+        return HSamples(file, name, label, inputs_, guides_, structure)
+
+    raise NotImplementedError(f"{design}")
 
 
 def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlapping: bool = False, verbose: bool = False) -> list[dict[str, Any]]:
@@ -746,15 +782,15 @@ def main() -> None:
     print(f"{num_guides=}")
 
     model = get_model(
+        args.design,
         args.arch,
-        args.size,
-        num_guides,
-        args.level if not STRUCTURES_AS_GUIDES else HierarchicalLevel.NONE,
-        structures,
         args.parch,
         args.posenc,
         args.patchposenc,
+        num_guides,
+        structures,
         args.max_length,
+        args.share_embeddings,
     ).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
@@ -842,7 +878,7 @@ def main() -> None:
     print(f"{len(tr_dataset)=}")
     print(f"{len(ts_dataset)=}")
 
-    collate_fn = get_collate_fn(args.level, min_lengths, structures)
+    collate_fn = get_collate_fn(args.design, min_lengths, structures)
     print(f"{collate_fn=}")
 
     tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, min(args.num_workers, len(tr_shards)), collate_fn, args.pin_memory, False, args.prefetch_factor)
@@ -912,7 +948,7 @@ def main() -> None:
     print(")")
     print(f"{scheduler_init=}")
 
-    padbatch = get_padbatch(args.level, structures, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)
+    padbatch = get_padbatch(args.design, structures, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)
     print(f"{padbatch=}")
 
     stopper = EarlyStopper(args.stopper_patience, args.stopper_threshold, args.stopper_mode)  # type: ignore[arg-type]

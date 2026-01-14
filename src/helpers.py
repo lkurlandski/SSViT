@@ -33,17 +33,17 @@ from src.trainer import TrainerArgs
 from src.utils import str_to_bool
 
 
+class Design(Enum):
+    FLAT         = "flat"          # Flat
+    HIERARCHICAL = "hierarchical"  # Hierarchical
+    STRUCTURAL   = "structural"    # Structured
+
+
 class Architecture(Enum):
     MCV = "mcv"  # Original MalConv
     MC2 = "mc2"  # Low-memory MalConv
     MCG = "mcg"  # Low-memory MalConv with Gating
     VIT = "vit"  # Vision Transformer
-
-
-class ModelSize(Enum):
-    SM = "sm"  # Small
-    MD = "md"  # Medium
-    LG = "lg"  # Large
 
 
 class PatcherArchitecture(Enum):
@@ -88,16 +88,18 @@ def any_to_section_characteristic(s: lief.PE.Section.CHARACTERISTICS | int | str
 # TODO: write an ArgumentParser that takes a dataclass and generates arguments.
 @dataclass
 class MainArgs:
+    design: Design = Design.FLAT
     arch: Architecture = Architecture.MCV
     parch: PatcherArchitecture = PatcherArchitecture.MEM
     posenc: PositionalEncodingArchitecture = PositionalEncodingArchitecture.FIXED
     patchposenc: PatchPositionalEncodingArchitecture = PatchPositionalEncodingArchitecture.NONE
-    size: ModelSize = ModelSize.SM
     seed: int = 0
     do_parser: bool = False
     do_entropy: bool = False
     which_characteristics: tuple[lief.PE.Section.CHARACTERISTICS, ...] = tuple()
     level: HierarchicalLevel = HierarchicalLevel.NONE
+    share_embeddings: bool = False
+    share_patchers: bool = False
     ignore_directory_structures: bool = True
     tr_num_samples: Optional[int] = None
     vl_num_samples: Optional[int] = None
