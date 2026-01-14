@@ -306,8 +306,9 @@ class TestGetModel:
             assert len(ids_embd) == len(structures)
             assert len(ids_film) == len(structures)
 
-    def test_structural_malconv(self, ) -> None:
-        design = Design.STRUCTURAL
+    @pytest.skip(reason="Not yet implemented")
+    def test_structural_malconv(self) -> None:
+        ...
 
     @pytest.mark.parametrize("parch", PatcherArchitecture)
     @pytest.mark.parametrize("posenc", PositionalEncodingArchitecture)
