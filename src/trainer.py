@@ -546,7 +546,7 @@ def get_last_aux_loss(model: nn.Module) -> Optional[Tensor]:
         return None
     if not isinstance(last_aux_loss, Tensor):
         raise TypeError("Model's `last_aux_loss` attribute must be a Tensor.")
-    return last_aux_loss
+    return last_aux_loss.sum()
 
 
 class Trainer:
