@@ -1057,10 +1057,10 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         # MoE
         num_experts: int = 1,
         probe_dim: int = 16,
-        probe_kernel_size: int = 64,
-        probe_stride: int = 64,
+        probe_kernel_size: int = 256,
+        probe_stride: int = 256,
         probe_overlap: Optional[int] = None,
-        router_hidden: int = 64,
+        router_hidden: int = 256,
         router_temperature: float = 1.0,
         router_noise_std: float = 0.0,
         router_mode: Literal["ste", "soft"] = "soft",
