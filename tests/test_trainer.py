@@ -5,6 +5,7 @@ Tests.
 from __future__ import annotations
 
 from contextlib import closing
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+from typing import Any
 from typing import Optional
 from typing import Self
 from typing import Sequence
@@ -85,6 +87,9 @@ class MockBatch:
         y = self.y.to(dtype=ltype)
         return self.__class__(x, y)
 
+    def get_names(self) -> list[str]:
+        return [sha256(bytes(bytearray([i]))).hexdigest() for i in range(len(self))]
+
     def get_label(self) -> Tensor:
         return self.y
 
@@ -93,6 +98,9 @@ class MockBatch:
 
     def get_guides(self) -> Optional[Tensor] | Sequence[Optional[Tensor]]:
         return None
+
+    def get_otherkwds(self) -> dict[str, Any]:
+        return {}
 
 
 class MockCollateFn:
