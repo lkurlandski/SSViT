@@ -3,6 +3,7 @@ Create large batches of experiments.
 """
 
 from argparse import ArgumentParser
+import inspect
 from itertools import chain
 from itertools import combinations
 from itertools import product
@@ -12,6 +13,7 @@ from pathlib import Path
 import sys
 from typing import Any
 from typing import Optional
+from typing import Iterable
 import warnings
 
 import lief
@@ -22,12 +24,13 @@ if __name__ == "__main__":
 
 from src.binanal import HierarchicalLevel
 from src.binanal import CHARACTERISTICS
+from src.helpers import Design
 from src.helpers import Architecture
-from src.helpers import ModelSize
 from src.helpers import PatcherArchitecture
 from src.helpers import PositionalEncodingArchitecture
 from src.helpers import PatchPositionalEncodingArchitecture
 from src.helpers import Scheduler
+from src.helpers import MainArgs
 
 
 # ruff: noqa: F541
@@ -49,22 +52,22 @@ class Configuration:
 
     def __init__(
         self,
+        design: Design,
         arch: Architecture,
         parch: PatcherArchitecture,
         posenc: PositionalEncodingArchitecture,
         patchposenc: PatchPositionalEncodingArchitecture,
-        size: ModelSize,
         level: HierarchicalLevel,
         do_entropy: bool,
         which_characteristics: tuple[lief.PE.Section.CHARACTERISTICS, ...],
         max_length: int,
         seed: int,
     ) -> None:
+        self.design = design
         self.arch = arch
         self.parch = parch
         self.posenc = posenc
         self.patchposenc = patchposenc
-        self.size = size
         self.level = level
         self.do_entropy = do_entropy
         self.which_characteristics = which_characteristics
@@ -84,11 +87,11 @@ class Configuration:
     def __repr__(self) -> str:
         return (
             f"Configuration("
+            f"  design={self.design},\n"
             f"  arch={self.arch},\n"
             f"  parch={self.parch},\n"
             f"  posenc={self.posenc},\n"
             f"  patchposenc={self.patchposenc},\n"
-            f"  size={self.size},\n"
             f"  level={self.level},\n"
             f"  do_entropy={self.do_entropy},\n"
             f"  which_characteristics={self.which_characteristics},\n"
@@ -99,11 +102,11 @@ class Configuration:
 
     def __str__(self) -> str:
         return (
+            f"{fixed_width_string(self.design.value, 3, '_')}-"
             f"{fixed_width_string(self.arch.value, 3, '_')}-"
             f"{fixed_width_string(self.parch.value, 3, '_')}-"
             f"{fixed_width_string(self.posenc.value, 3, '_')}-"
             f"{fixed_width_string(self.patchposenc.value, 3, '_')}-"
-            f"{fixed_width_string(self.size.value, 3, '_')}-"
             f"{fixed_width_string(self.level.value, 3, '_')}-"
             f"{'t' if self.do_entropy else 'f'}-"
             f"{fixed_width_string(sum(map(int, self.which_characteristics)), len(str(sum(map(int, CHARACTERISTICS)))), '0', left=True)}-"
@@ -113,11 +116,11 @@ class Configuration:
 
     def _attrs(self) -> tuple[Any, ...]:
         return (
+            self.design.value,
             self.arch.value,
             self.parch.value,
             self.posenc.value,
             self.patchposenc.value,
-            self.size.value,
             self.level.value,
             self.do_entropy,
             tuple(map(int, self.which_characteristics)),
@@ -140,11 +143,11 @@ class Configuration:
         if DEBUG:
             root = root / "tmp"
         parts = [
+            f"design--{self.design.value}",
             f"arch--{self.arch.value}",
             f"parch--{self.parch.value}",
             f"posenc--{self.posenc.value}",
             f"patchposenc--{self.patchposenc.value}",
-            f"size--{self.size.value}",
             f"level--{self.level.value}",
             f"entropy--{self.do_entropy}",
             f"characteristics--{'_'.join(sorted([str(c.name) for c in self.which_characteristics]))}",
@@ -183,23 +186,18 @@ class Configuration:
         # Assumes constant-memory encoder. # O(1)
         # TODO: there appears to be large memory fluctuations here.
         if self.arch == Architecture.VIT:
-            if self.size == ModelSize.SM:  # O(N)
-                return 2048
-            if self.size == ModelSize.MD:  # O(N)
-                return 512
-            if self.size == ModelSize.LG:  # O(N)
-                if self.do_entropy or self.which_characteristics:
-                    return 32
-                if self.level == HierarchicalLevel.NONE:
-                    return 64
-                if self.level == HierarchicalLevel.COARSE:
-                    return 32
-                if self.level == HierarchicalLevel.MIDDLE:
-                    return 32
-                if self.level == HierarchicalLevel.FINE:
-                    return 32
-                print(f"WARNING ({str(self)}): max_per_device_batch_size not found.")
+            if self.do_entropy or self.which_characteristics:
+                return 32
+            if self.level == HierarchicalLevel.NONE:
                 return 64
+            if self.level == HierarchicalLevel.COARSE:
+                return 32
+            if self.level == HierarchicalLevel.MIDDLE:
+                return 32
+            if self.level == HierarchicalLevel.FINE:
+                return 32
+            print(f"WARNING ({str(self)}): max_per_device_batch_size not found.")
+            return 64
 
         raise NotImplementedError(f"ERROR ({str(self)}): batch size not defined for this configuration.")
 
@@ -288,33 +286,26 @@ class Configuration:
 # appears to scale almost perfectly linearly (inversely, however) with sequence length.
 # On the whole, these numbers vary wildly and should be taken with a grain of salt.
 # (Architecture, do_entropy, do_characteristics) : (vl_throughput, tr_throughout)
-THROUGHPUTS: dict[tuple[Architecture, ModelSize, bool, bool], Optional[tuple[float, float]]] = {
-    (Architecture.MCV, ModelSize.MD, False, False) : None,
-    (Architecture.MCV, ModelSize.MD, False, True)  : None,
-    (Architecture.MCV, ModelSize.MD, True,  False) : None,
-    (Architecture.MCV, ModelSize.MD, True,  True)  : None,
+THROUGHPUTS: dict[tuple[Architecture, bool, bool], Optional[tuple[float, float]]] = {
+    (Architecture.MCV, False, False) : None,
+    (Architecture.MCV, False, True)  : None,
+    (Architecture.MCV, True,  False) : None,
+    (Architecture.MCV, True,  True)  : None,
 
-    (Architecture.MC2, ModelSize.MD, False, False) : (675, 450),
-    (Architecture.MC2, ModelSize.MD, False, True)  : (425, 325),
-    (Architecture.MC2, ModelSize.MD, True,  False) : (375, 300),
-    (Architecture.MC2, ModelSize.MD, True,  True)  : (300, 270),
+    (Architecture.MC2, False, False) : (675, 450),
+    (Architecture.MC2, False, True)  : (425, 325),
+    (Architecture.MC2, True,  False) : (375, 300),
+    (Architecture.MC2, True,  True)  : (300, 270),
 
-    (Architecture.MCG, ModelSize.MD, False, False) : (275, 120),
-    (Architecture.MCG, ModelSize.MD, False, True)  : (150, 100),
-    (Architecture.MCG, ModelSize.MD, True,  False) : (150, 100),
-    (Architecture.MCG, ModelSize.MD, True,  True)  : (160,  90),
+    (Architecture.MCG, False, False) : (275, 120),
+    (Architecture.MCG, False, True)  : (150, 100),
+    (Architecture.MCG, True,  False) : (150, 100),
+    (Architecture.MCG, True,  True)  : (160,  90),
 
-    # TODO: recompute for the feedforward_dim = 4x hidden_dim
-    (Architecture.VIT, ModelSize.MD, False, False) : (450, 350),
-    (Architecture.VIT, ModelSize.MD, False, True)  : (275, 225),
-    (Architecture.VIT, ModelSize.MD, True,  False) : (250, 225),
-    (Architecture.VIT, ModelSize.MD, True,  True)  : (275, 225),
-
-    # TODO: recompute for the feedforward_dim = 4x hidden_dim
-    (Architecture.VIT, ModelSize.LG, False, False) : (325, 150),
-    (Architecture.VIT, ModelSize.LG, False, True)  : (150, 100),
-    (Architecture.VIT, ModelSize.LG, True,  False) : (150, 100),
-    (Architecture.VIT, ModelSize.LG, True,  True)  : (150, 100),
+    (Architecture.VIT, False, False) : (325, 150),
+    (Architecture.VIT, False, True)  : (150, 100),
+    (Architecture.VIT, True,  False) : (150, 100),
+    (Architecture.VIT, True,  True)  : (150, 100),
 }
 
 
@@ -333,7 +324,7 @@ class Requirements:
     @property
     def time(self) -> int:
         """Return the number of seconds required for the job (configure)."""
-        key = (self.config.arch, self.config.size, self.config.do_entropy, bool(self.config.which_characteristics))
+        key = (self.config.arch, self.config.do_entropy, bool(self.config.which_characteristics))
 
         if (vl_tr_throughputs := THROUGHPUTS.get(key)) is not None:
             tr_throughput = vl_tr_throughputs[1]
@@ -470,7 +461,6 @@ class ScriptBuilder:
             f"--parch {self.config.parch.value}",
             f"--posenc {self.config.posenc.value}",
             f"--patchposenc {self.config.patchposenc.value}",
-            f"--size {self.config.size.value}",
             f"--level {self.config.level.value}",
             f"--do_entropy {self.config.do_entropy}",
             f"--which_characteristics {' '.join([str(c.name) for c in self.config.which_characteristics])}",
@@ -537,57 +527,48 @@ class ScriptBuilder:
         return f"{round(b / 2**30)}G"
 
 
+def config_valid(config: Configuration) -> bool:
+    """Return True if the configuration is conceptually valid, False otherwise."""
+
+    # When the structure is FLAT, we exlude hierarchical levels, and vice versa.
+    if config.design == Design.FLAT and config.level != HierarchicalLevel.NONE:
+        return False
+    if config.design != Design.FLAT and config.level == HierarchicalLevel.NONE:
+        return False
+
+    # For non-ViT architectures, these settings are irrelevant and we should just include one.
+    if config.arch != Architecture.VIT:
+        if config.parch != inspect.signature(MainArgs).parameters["parch"].default:
+            return False
+        if config.posenc != inspect.signature(MainArgs).parameters["posenc"].default:
+            return False
+        if config.patchposenc != inspect.signature(MainArgs).parameters["patchposenc"].default:
+            return False
+
+    return True
+
+
 def config_fiter(config: Configuration) -> bool:
     """Return True if the configuration should be run, False otherwise."""
-    if not isinstance(config, Configuration):
-        raise TypeError()
 
-    CHARS = (
-        lief.PE.Section.CHARACTERISTICS.MEM_READ,
-        lief.PE.Section.CHARACTERISTICS.MEM_WRITE,
-        lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE,
-    )
+    if not config_valid(config):
+        return False
 
-    # Debug
-    if DEBUG:
-        ...
+    # Design
+    ...
 
     # Architecture
-    if config.arch in (Architecture.MCV, Architecture.MC2, Architecture.MCG) and config.size == ModelSize.LG:
-        return False
-    if config.arch == Architecture.MCV:
-        return False
-    if config.arch in (Architecture.VIT,) and config.size != ModelSize.LG:
-        return False
-    if config.size == ModelSize.SM:
-        return False
-    if config.arch != Architecture.VIT:
-        return False
+    ...
 
     # Structure
-    if config.level != HierarchicalLevel.NONE:
-        return False
-        if config.do_entropy:
-            return False
-        if config.which_characteristics:
-            return False
-
-    # Positional Encoding
-    if config.posenc != PositionalEncodingArchitecture.LEARNED:
-        return False
-    if config.level == HierarchicalLevel.NONE and config.patchposenc != PatchPositionalEncodingArchitecture.BTH:
-        return False
-    if config.level != HierarchicalLevel.NONE and config.patchposenc != PatchPositionalEncodingArchitecture.NONE:
-        return False
+    ...
 
     # Entropy
     if config.do_entropy:
         return False
 
     # Characteristics
-    if config.which_characteristics and not all(c in CHARS for c in config.which_characteristics):
-        return False
-    if config.which_characteristics and len(config.which_characteristics) != 3:
+    if config.which_characteristics:
         return False
 
     return True
@@ -614,19 +595,19 @@ def main() -> None:
         if f.is_file():
             f.unlink()
 
-    configurations = product(
+    stream = product(
+        [d for d in Design],
         [a for a in Architecture],
-        [PatcherArchitecture.EXP, PatcherArchitecture.MEM],
+        [PatcherArchitecture.MEM, PatcherArchitecture.EXP],
         [PositionalEncodingArchitecture.FIXED, PositionalEncodingArchitecture.LEARNED],
         [PatchPositionalEncodingArchitecture.BTH, PatchPositionalEncodingArchitecture.NONE],
-        [s for s in ModelSize],
         [l for l in HierarchicalLevel],
         [True, False],
-        chain.from_iterable(combinations(CHARACTERISTICS, r) for r in range(len(CHARACTERISTICS) + 1)),
+        [(), (lief.PE.Section.CHARACTERISTICS.MEM_READ, lief.PE.Section.CHARACTERISTICS.MEM_WRITE, lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE)],
         [1000000],
         [0],
     )
-    configurations = (Configuration(*config) for config in configurations)
+    configurations = (Configuration(*config) for config in stream)
     configurations = (config for config in configurations if config_fiter(config))
     configurations = sorted(configurations)
 
