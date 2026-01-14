@@ -536,10 +536,11 @@ class TestHierarchicalViTClassifier:
         embeddings = [torch.nn.Embedding(vocab_size, embedding_dim=8 + 2 * i) for i in range(num_structures)]
         filmers = [FiLM(guide_dim, embedding_dim=8 + 2 * i, hidden_size=3) for i in range(num_structures)]
         patchers = [PatchEncoder(in_channels=8 + 2 * i, out_channels=d_model, kernel_size=2, stride=3, patch_size=None, num_patches=2) for i in range(num_structures)]
+        norms = [nn.LayerNorm(p.out_channels) for p in patchers]
         patchposencoders = [PatchPositionalityEncoder(d_model, hidden_size=8) for _ in range(num_structures)]
         backbone = ViT(embedding_dim=d_model, d_model=d_model, nhead=1, num_layers=1, posencoder="fixed", pooling="cls")
         head = ClassifificationHead(d_model, num_classes=num_classes)
-        net = HierarchicalViTClassifier(embeddings, filmers, patchers, patchposencoders, backbone, head)
+        net = HierarchicalViTClassifier(embeddings, filmers, patchers, norms, patchposencoders, backbone, head)
 
         x: list[Optional[Tensor]] = [torch.randint(0, vocab_size, (batch_size, seq_length + i)) for i in range(num_structures)]
         g: list[Optional[Tensor]] = [torch.rand((batch_size, seq_length + i, guide_dim)) for i in range(num_structures)]

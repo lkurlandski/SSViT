@@ -2732,13 +2732,13 @@ class MalConvClassifier(Classifier):
 
 class ViTClassifier(Classifier):
 
-    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, patcher: PatchEncoderBase, patchposencoder: PatchPositionalityEncoder | Identity, backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, patcher: PatchEncoderBase, norm: Optional[nn.LayerNorm], patchposencoder: PatchPositionalityEncoder | Identity, backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__()
 
         self.embedding = embedding
         self.filmer = filmer
         self.patcher = patcher
-        self.norm = nn.LayerNorm(patcher.out_channels)
+        self.norm = norm if norm is not None else nn.LayerNorm(patcher.out_channels)
         self.patchposencoder = patchposencoder
         self.backbone = backbone
         self.head = head
@@ -2905,7 +2905,7 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         and feeds the encoded patches to a shared ViT backbone followed by a classification head.
     """
 
-    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], norms: Sequence[Optional[nn.LayerNorm]], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(patchers)):
@@ -2914,7 +2914,7 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         self.embeddings = nn.ModuleList(embeddings)
         self.filmers = nn.ModuleList(filmers)
         self.patchers = nn.ModuleList(patchers)
-        self.norms = nn.ModuleList([nn.LayerNorm(p.out_channels) for p in patchers])
+        self.norms = nn.ModuleList([n if n is not None else nn.LayerNorm(p.out_channels) for n, p in zip(norms, patchers)])
         self.patchposencoders = nn.ModuleList(patchposencoders)
         self.backbone = backbone
         self.head = head
@@ -3079,9 +3079,25 @@ class StructuralClassifier(nn.Module, ABC):
                     raise ValueError(f"Structure {structure_idx} has no inputs, but is referenced in order for sample {sample_idx}.")
 
 
+class StructuralMalConvClassifier(StructuralClassifier):
+
+    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
+        raise NotImplementedError("StructuralMalConvClassifier is not yet implemented.")
+
+    def forward(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> Tensor:
+        raise NotImplementedError("StructuralMalConvClassifier is not yet implemented.")
+
+    @property
+    def _trunks(self) -> Sequence[tuple[nn.Module, ...]]:
+        raise NotImplementedError("StructuralMalConvClassifier is not yet implemented.")
+
+    def fully_shard(self, **kwds: Any) -> None:
+        raise NotImplementedError("StructuralMalConvClassifier is not yet implemented.")
+
+
 class StructuralViTClassifier(StructuralClassifier):
 
-    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], norms: Sequence[Optional[nn.LayerNorm]], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(patchers)):
@@ -3090,7 +3106,7 @@ class StructuralViTClassifier(StructuralClassifier):
         self.embeddings = nn.ModuleList(embeddings)
         self.filmers = nn.ModuleList(filmers)
         self.patchers = nn.ModuleList(patchers)
-        self.norms = nn.ModuleList([nn.LayerNorm(p.out_channels) for p in patchers])
+        self.norms = nn.ModuleList([n if n is not None else nn.LayerNorm(p.out_channels) for n, p in zip(norms, patchers)])
         self.patchposencoders = nn.ModuleList(patchposencoders)
         self.backbone = backbone
         self.head = head
