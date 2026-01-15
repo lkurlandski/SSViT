@@ -1064,6 +1064,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         router_temperature: float = 1.0,
         router_noise_std: float = 0.0,
         router_mode: Literal["ste", "soft"] = "soft",
+        router_top_k: int = 1,
         load_balance_alpha: float = 0.0,
         patch_batch_size: Optional[int] = None,
     ) -> None:
@@ -1086,6 +1087,10 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             raise ValueError(f"{load_balance_alpha=} must be non-negative.")
         if router_mode not in {"ste", "soft"}:
             raise ValueError(f"{router_mode=} must be one of 'ste' or 'soft'.")
+        if router_top_k <= 0 or router_top_k > num_experts:
+            raise ValueError(f"{router_top_k=} must be in the range [1, {num_experts}].")
+        if router_mode == "ste" and router_top_k != 1:
+            raise ValueError(f"Using `router_mode='ste'` with `router_top_k={router_top_k}` is not supported.")
 
         if num_experts == 1:
             warnings.warn(f"{self.__class__.__name__} instantiated with a single expert. Consider using `PatchEncoderLowMem` instead.")
@@ -1107,6 +1112,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         self.router_mode = router_mode
         self.load_balance_alpha = float(load_balance_alpha)
         self.patch_batch_size = patch_batch_size
+        self.router_top_k = router_top_k
 
         self.probe = nn.Conv1d(in_channels, probe_dim, probe_kernel_size, probe_stride)
         self.router = nn.Sequential(
@@ -1131,8 +1137,11 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         s: str = super().__repr__()  # type: ignore[no-untyped-call]
         add = (
             "("
+            f"num_experts={self.num_experts},"
             f"router_temperature={self.router_temperature}, "
             f"router_noise_std={self.router_noise_std}, "
+            f"router_mode='{self.router_mode}', "
+            f"router_top_k={self.router_top_k}, "
             f"load_balance_alpha={self.load_balance_alpha}"
             ")"
         )
@@ -1166,7 +1175,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             probe_feat: Tensor of shape (B, N, D).
 
         Returns:
-            top1: Tensor (long)  of shape (B, N) indicating the selected expert per patch.
+            dispatch: Tensor (bool) of shape (B, N, E) indicating which experts receive each patch.
             gates: Tensor (float) of shape (B, N, E) gating weights used to scale expert outputs.
             aux:  Tensor (float) of shape (,) indicating the load balancing auxillary loss.
         """
@@ -1187,37 +1196,33 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         # Compute probabilities for gate scaling and auxillary loss.
         probs = torch.softmax(logits / self.router_temperature, dim=-1)  # (B, N, E)
 
+        # TODO: Add a better comment here explaining the two routing modes.
         if self.router_mode == "soft":
-            gates = probs
+            gates = probs                                              # (B, N, E)
+            _, topk_idx = probs.topk(self.router_top_k, dim=-1)        # (B, N, K)
+            dispatch = probs.new_zeros(probs.shape, dtype=torch.bool)  # (B, N, E)
+            dispatch.scatter_(-1, topk_idx, True)                      # (B, N, E)
         elif self.router_mode == "ste":
-            # In STE hard routing, forward is one-hot, backward flows through soft relaxation.
             if self.training:
                 gates = F.gumbel_softmax(logits, tau=self.router_temperature, hard=True, dim=-1)   # (B, N, E)
             else:
                 gates = F.one_hot(torch.argmax(logits, dim=-1), self.num_experts).to(probs.dtype)  # (B, N, E)
+            dispatch = gates > 0                                                                   # (B, N, E)
         else:
             raise RuntimeError("Unreachable.")
-        top1 = gates.argmax(dim=-1)  # (B, N)
 
-        # Switch-style load balancing loss.
-        aux = probs.new_zeros(())
-        if self.load_balance_alpha > 0:
-            if self.router_mode == "soft":
-                assign = F.one_hot(top1, self.num_experts).to(probs.dtype)  # (B, N, E)
-            elif self.router_mode == "ste":
-                assign = gates
-            else:
-                raise RuntimeError("Unreachable.")
+        # Compute load balancing auxillary loss, which encourages even expert usage.
+        assign = dispatch.to(probs.dtype)  # (B, N, E)
+        f = assign.mean(dim=(0, 1))  # (E,)
+        p = probs.mean(dim=(0, 1))   # (E,)
+        aux = self.load_balance_alpha * (self.num_experts * (f * p).sum())
 
-            f = assign.mean(dim=(0, 1))  # (E,)
-            p = probs.mean(dim=(0, 1))   # (E,)
-            aux = self.load_balance_alpha * (self.num_experts * (f * p).sum())
-
+        # Logging.
         self._last_aux_loss = aux
         self._last_entropy = -(probs * (probs.clamp_min(1e-8).log())).sum(dim=-1).mean()
-        self._last_usage = F.one_hot(top1, self.num_experts).float().mean(dim=(0, 1))
+        self._last_usage = dispatch.float().mean(dim=(0, 1))
 
-        return top1, gates, aux
+        return dispatch, gates, aux
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
 
@@ -1237,24 +1242,27 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         r = r.view(B, N, self.probe_dim)  # (B, N, D)
 
         # Route to experts.
-        top1, gates, aux = self._route(r)
-        top1_flat = top1.view(B * N)   # (BN,)
-        gates_flat = gates.view(B * N, self.num_experts)  # (BN,E)
+        dispatch, gates, aux = self._route(r)
+
+        dispatch_flat = dispatch.view(B * N, self.num_experts)    # (BN, E)
+        gates_flat    = gates.view(B * N, self.num_experts)       # (BN, E)
 
         # Expert passes.
         out = z.new_zeros((B * N, C))
         g_e: Tensor
         for e, expert in enumerate(self.experts):
-            idx = (top1_flat == e).nonzero(as_tuple=False).squeeze(-1)
+            # Gather the patches for expert e.
+            idx = dispatch_flat[:, e].nonzero(as_tuple=False).squeeze(-1)  # (n_e,)
             if idx.numel() == 0:
                 continue
             z_e = z.index_select(0, idx)                            # (n_e, E, P)
+            # Run expert and max-pool over time to get one vector per patch.
             g_e = expert(z_e)                                       # (n_e, C, S)
             g_e, _ = g_e.max(dim=-1)                                # (n_e, C)
-            # STE gate factor. Forward is 1.0 for selected expert. Backward provides router grads.
+            # Scale expert output by its gate and accumulate into the output.
             w = gates_flat.index_select(0, idx)[:, e].unsqueeze(-1).to(dtype=g_e.dtype)  # (n_e, 1)
             g_e = g_e * w
-            out.index_copy_(0, idx, g_e)
+            out.index_add_(0, idx, g_e)
 
         # Reshape and return.
         out = out.view(B, N, C)  # (B, N, C)
@@ -1317,12 +1325,12 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             del g_all
 
         # Route to experts.
-        top1, gates, aux = self._route(r)
+        dispatch, gates, aux = self._route(r)
 
         # Expert passes.
         out = r.new_zeros((B, N, C))
         for e, expert in enumerate(self.experts):
-            active = (top1 == e)                                           # (B, N)
+            active = dispatch[..., e]                                      # (B, N)
             mask = active.unsqueeze(-1).expand(B, N, C).reshape(B, N * C)  # (B, NC)
             if not active.any():
                 continue
@@ -1367,7 +1375,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
                 channels=C,
             )
 
-            # STE gate factor.
+            # Gate factor.
             w = gates[..., e].unsqueeze(-1).to(dtype=z.dtype)
             out = out + z * w
 
