@@ -1132,7 +1132,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         s: str = super().__repr__()  # type: ignore[no-untyped-call]
         add = (
             "("
-            f"num_experts={self.num_experts},"
+            f"num_experts={self.num_experts}, "
             f"router_temperature={self.router_temperature}, "
             f"router_noise_std={self.router_noise_std}, "
             f"router_mode='{self.router_mode}', "
