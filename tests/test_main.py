@@ -76,7 +76,7 @@ class TestGetModel:
     def test_flat_transformer(self, parch: PatcherArchitecture, posenc: PositionalEncodingArchitecture, patchposenc: PatchPositionalEncodingArchitecture, num_guides: int, max_length: Optional[int]) -> None:
 
         def _get_model() -> ViTClassifier:
-            return get_model(
+            m = get_model(
                 design=Design.FLAT,
                 arch=Architecture.VIT,
                 parch=parch,
@@ -85,6 +85,8 @@ class TestGetModel:
                 num_guides=num_guides,
                 max_length=max_length,
             )
+            assert isinstance(m, ViTClassifier)
+            return m
 
         if patchposenc == PatchPositionalEncodingArchitecture.ABS:
             with pytest.raises(NotImplementedError):
@@ -158,13 +160,15 @@ class TestGetModel:
     def test_hierarchical_malconv(self, arch: Architecture, num_guides: int, structures: Sequence[HierarchicalStructure], share_embeddings: bool) -> None:
 
         def _get_model() -> HierarchicalMalConvClassifier:
-            return get_model(
+            m = get_model(
                 design=Design.HIERARCHICAL,
                 arch=arch,
                 num_guides=num_guides,
                 structures=structures,
                 share_embeddings=share_embeddings,
             )
+            assert isinstance(m, HierarchicalMalConvClassifier)
+            return m
 
         if len(structures) == 0:
             with pytest.raises(ValueError):
@@ -209,7 +213,7 @@ class TestGetModel:
     def test_hierarchical_transformer(self, parch: PatcherArchitecture, posenc: PositionalEncodingArchitecture, patchposenc: PatchPositionalEncodingArchitecture, num_guides: int, max_length: Optional[int], structures: list[HierarchicalStructure], share_embeddings: bool) -> None:
 
         def _get_model() -> HierarchicalViTClassifier:
-            return get_model(
+            m = get_model(
                 design=Design.HIERARCHICAL,
                 arch=Architecture.VIT,
                 parch=parch,
@@ -220,6 +224,8 @@ class TestGetModel:
                 max_length=max_length,
                 share_embeddings=share_embeddings,
             )
+            assert isinstance(m, HierarchicalViTClassifier)
+            return m
 
         if len(structures) == 0:
             with pytest.raises(ValueError):
@@ -306,7 +312,7 @@ class TestGetModel:
             assert len(ids_embd) == len(structures)
             assert len(ids_film) == len(structures)
 
-    @pytest.skip(reason="Not yet implemented")
+    @pytest.skip(reason="Not yet implemented")  # type: ignore[misc]
     def test_structural_malconv(self) -> None:
         ...
 
@@ -321,7 +327,7 @@ class TestGetModel:
     def test_structural_transformer(self, parch: PatcherArchitecture, posenc: PositionalEncodingArchitecture, patchposenc: PatchPositionalEncodingArchitecture, num_guides: int, max_length: Optional[int], structures: list[HierarchicalStructure], share_embeddings: bool, share_patchers: bool) -> None:
 
         def _get_model() -> StructuralViTClassifier:
-            return get_model(
+            m = get_model(
                 design=Design.STRUCTURAL,
                 arch=Architecture.VIT,
                 parch=parch,
@@ -333,6 +339,8 @@ class TestGetModel:
                 share_embeddings=share_embeddings,
                 share_patchers=share_patchers,
             )
+            assert isinstance(m, StructuralViTClassifier)
+            return m
 
         if len(structures) == 0:
             with pytest.raises(ValueError):
