@@ -1034,7 +1034,6 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         router_temperature: Softmax temperature for routing.
         router_noise_std: Standard deviation of Gaussian noise added to the router logits during training.
         router_mode: Routing mode, either "ste" (straight-through estimator) or "soft" (soft routing).
-        load_balance_alpha: Coefficient for the load balancing auxiliary loss.
         patch_batch_size: Batch size for patch processing during training. If None, uses input batch size.
     """
 
@@ -1065,7 +1064,6 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         router_noise_std: float = 0.0,
         router_mode: Literal["ste", "soft"] = "soft",
         router_top_k: int = 1,
-        load_balance_alpha: float = 0.0,
         patch_batch_size: Optional[int] = None,
     ) -> None:
         super().__init__(in_channels, out_channels, num_patches, patch_size)
@@ -1083,8 +1081,6 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             raise ValueError(f"{router_temperature=} must be positive.")
         if router_noise_std < 0:
             raise ValueError(f"{router_noise_std=} must be non-negative.")
-        if load_balance_alpha < 0:
-            raise ValueError(f"{load_balance_alpha=} must be non-negative.")
         if router_mode not in {"ste", "soft"}:
             raise ValueError(f"{router_mode=} must be one of 'ste' or 'soft'.")
         if router_top_k <= 0 or router_top_k > num_experts:
@@ -1110,7 +1106,6 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         self.router_temperature = float(router_temperature)
         self.router_noise_std = float(router_noise_std)
         self.router_mode = router_mode
-        self.load_balance_alpha = float(load_balance_alpha)
         self.patch_batch_size = patch_batch_size
         self.router_top_k = router_top_k
 
@@ -1141,8 +1136,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             f"router_temperature={self.router_temperature}, "
             f"router_noise_std={self.router_noise_std}, "
             f"router_mode='{self.router_mode}', "
-            f"router_top_k={self.router_top_k}, "
-            f"load_balance_alpha={self.load_balance_alpha}"
+            f"router_top_k={self.router_top_k}"
             ")"
         )
         sub = f"{self.__class__.__name__}("
@@ -1215,7 +1209,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         assign = dispatch.to(probs.dtype)  # (B, N, E)
         f = assign.mean(dim=(0, 1))  # (E,)
         p = probs.mean(dim=(0, 1))   # (E,)
-        aux = self.load_balance_alpha * (self.num_experts * (f * p).sum())
+        aux = self.num_experts * (f * p).sum()
 
         # Logging.
         self._last_aux_loss = aux
