@@ -37,6 +37,7 @@ from src.helpers import MainArgs
 
 
 DEBUG = False
+RESUME = False
 NGPUS: Optional[int] = None
 OROOT = Path("/shared/rc/admalware") if Path("/shared/rc/admalware").exists() else Path.home()
 
@@ -254,6 +255,18 @@ class Configuration:
         return -1
 
     @property
+    def share_embeddings(self) -> bool:
+        if self.design == Design.STRUCTURAL and self.parch == PatcherArchitecture.EXP:
+            return True
+        return False
+
+    @property
+    def share_patchers(self) -> bool:
+        if self.design == Design.STRUCTURAL and self.parch == PatcherArchitecture.EXP:
+            return True
+        return False
+
+    @property
     def max_epochs(self) -> float:
         if DEBUG:
             return 2
@@ -436,8 +449,6 @@ class ScriptBuilder:
         variables = "\n".join([
             f"export OMP_NUM_THREADS={self.reqs.omp_num_threads}",
             f"export PTW_NUM_THREADS={self.reqs.omp_num_threads}",
-            f"export PATCHER_CHANNEL_FACTOR={os.environ.get('PATCHER_CHANNEL_FACTOR', '1')}",
-            f"export EMBEDDING_DIM={os.environ.get('EMBEDDING_DIM', '8')}",
         ])
 
         locals = "\n".join([
@@ -457,11 +468,15 @@ class ScriptBuilder:
             "python",
             "src/main.py",
             f"--outdir \"$OUTDIR\"",
+            f"--resume {RESUME} ",
+            f"--design {self.config.design.value}",
             f"--arch {self.config.arch.value}",
             f"--parch {self.config.parch.value}",
             f"--posenc {self.config.posenc.value}",
             f"--patchposenc {self.config.patchposenc.value}",
             f"--level {self.config.level.value}",
+            f"--share_embeddings {self.config.share_embeddings}",
+            f"--share_patchers {self.config.share_patchers}",
             f"--do_entropy {self.config.do_entropy}",
             f"--which_characteristics {' '.join([str(c.name) for c in self.config.which_characteristics])}",
             f"--max_length {self.config.max_length}",
@@ -577,14 +592,17 @@ def config_fiter(config: Configuration) -> bool:
 def main() -> None:
 
     parser = ArgumentParser(description="Create large batches of experiments.")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--ngpus", type=int, default=None)
     parser.add_argument("--root", type=str, default="auto")
     args = parser.parse_args()
 
+    global RESUME
     global DEBUG
     global NGPUS
     global OROOT
+    RESUME = args.resume
     DEBUG = args.debug
     NGPUS = args.ngpus
     OROOT = Path(args.root) if args.root != "auto" else OROOT
