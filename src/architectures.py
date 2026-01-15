@@ -2776,7 +2776,21 @@ class ViTClassifier(Classifier):
 
     @property
     def last_aux_loss(self) -> Optional[Tensor]:
-        return getattr(self.patcher, "last_aux_loss", None)
+        if isinstance(self.patcher, PatchEncoderLowMemSwitchMoE):
+            return self.patcher.last_aux_loss
+        return None
+
+    @property
+    def last_usage(self) -> Optional[Tensor]:
+        if isinstance(self.patcher, PatchEncoderLowMemSwitchMoE):
+            return self.patcher.last_usage
+        return None
+
+    @property
+    def last_entropy(self) -> Optional[Tensor]:
+        if isinstance(self.patcher, PatchEncoderLowMemSwitchMoE):
+            return self.patcher.last_entropy
+        return None
 
 # -------------------------------------------------------------------------------- #
 # Hierarchical Classifiers
@@ -3007,6 +3021,18 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         self.backbone.fully_shard(**kwds)
         fully_shard(self, **kwds | {"reshard_after_forward": False})
 
+    @property
+    def last_aux_loss(self) -> Optional[Tensor]:
+        raise NotImplementedError()
+
+    @property
+    def last_usage(self) -> Optional[Tensor]:
+        raise NotImplementedError()
+
+    @property
+    def last_entropy(self) -> Optional[Tensor]:
+        raise NotImplementedError()
+
 # -------------------------------------------------------------------------------- #
 # Structural Classifiers
 # -------------------------------------------------------------------------------- #
@@ -3099,6 +3125,10 @@ class StructuralMalConvClassifier(StructuralClassifier):
 
 class StructuralViTClassifier(StructuralClassifier):
 
+    _last_aux_loss: Tensor  # (S,)   Most recent auxiliary loss for load balancing.
+    _last_usage: Tensor     # (S,E)  Most recent expert usage statistic.
+    _last_entropy: Tensor   # (S,)   Most recent routing entropy.
+
     def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], norms: Sequence[Optional[nn.LayerNorm]], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
@@ -3127,9 +3157,16 @@ class StructuralViTClassifier(StructuralClassifier):
         self.C_s: list[int] = C_s
         self.C = self.C_s[0]
 
+        max_num_experts = max([p.num_experts if isinstance(p, PatchEncoderLowMemSwitchMoE) else 0 for p in patchers])
+        self.register_buffer("_last_aux_loss", torch.zeros((self.num_structures,)), persistent=False)
+        self.register_buffer("_last_usage", torch.zeros((self.num_structures, max_num_experts)), persistent=False)
+        self.register_buffer("_last_entropy", torch.zeros((self.num_structures,)), persistent=False)
+
     def forward(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> Tensor:
 
         B = len(order)
+
+        self._maybe_clear_expert_stats()
 
         self._check_forward_inputs(x, g, order)
 
@@ -3152,6 +3189,7 @@ class StructuralViTClassifier(StructuralClassifier):
                 z = self.norms[i](z)                                 # (max(B, B_i), N_i, C)
                 z = self.patchposencoders[i](z, lengths)             # (max(B, B_i), N_i, C)
                 zbs.append(z)
+                self._maybe_log_expert_stats(i)
             zs.append(torch.cat(zbs, dim=0))  # (B_i, N_i, C)
 
         # Reconcile the sample index and the input index.
@@ -3240,3 +3278,36 @@ class StructuralViTClassifier(StructuralClassifier):
                     dummy = dummy + p.view(-1)[0] * 0.0
 
         return out + dummy
+
+    def _maybe_clear_expert_stats(self) -> None:
+        for i in range(self.num_structures):
+            patcher = self.patchers[i]
+            if isinstance(patcher, PatchEncoderLowMemSwitchMoE):
+                self._last_aux_loss[i].zero_()
+                self._last_usage[i, :patcher.num_experts].zero_()
+                self._last_entropy[i].zero_()
+
+    def _maybe_log_expert_stats(self, i: int) -> None:
+        patcher = self.patchers[i]
+        if isinstance(patcher, PatchEncoderLowMemSwitchMoE):
+            self._last_aux_loss[i] = patcher.last_aux_loss
+            self._last_usage[i, :patcher.num_experts] = patcher.last_usage
+            self._last_entropy[i] = patcher.last_entropy
+
+    @property
+    def last_aux_loss(self) -> Optional[Tensor]:
+        if any(isinstance(p, PatchEncoderLowMemSwitchMoE) for p in self.patchers):
+            return self._last_aux_loss
+        return None
+
+    @property
+    def last_usage(self) -> Optional[Tensor]:
+        if any(isinstance(p, PatchEncoderLowMemSwitchMoE) for p in self.patchers):
+            return self._last_usage
+        return None
+
+    @property
+    def last_entropy(self) -> Optional[Tensor]:
+        if any(isinstance(p, PatchEncoderLowMemSwitchMoE) for p in self.patchers):
+            return self._last_entropy
+        return None

@@ -13,6 +13,7 @@ from torch import nn
 from torch.nn import Embedding
 from torch import Tensor
 
+from src.architectures import Identity
 from src.architectures import ClassifificationHead
 from src.architectures import FiLM
 from src.architectures import FiLMNoP
@@ -28,7 +29,10 @@ from src.architectures import MalConvLowMem
 from src.architectures import MalConvGCG
 from src.architectures import MalConvClassifier
 from src.architectures import HierarchicalMalConvClassifier
+from src.architectures import StructuralMalConvClassifier
+from src.architectures import ViTClassifier
 from src.architectures import HierarchicalViTClassifier
+from src.architectures import StructuralViTClassifier
 from src.architectures import PatchPositionalityEncoder
 from src.architectures import _lowmem_max_over_time_streaming
 from src.architectures import _lowmem_patchwise_max_over_time_streaming
@@ -523,8 +527,45 @@ class TestViT:
         assert z.shape == (batch_size, d_model)
 
 
-class TestVitClassifier:
-    ...
+class TestViTClassifier:
+
+    @pytest.mark.parametrize("num_experts", [1, 2, 3, 5])
+    def test_patcher_stats(self, num_experts: int) -> None:
+        vocab_size = 11
+        embedding_dim = 8
+        patcher_channels = 16
+        d_model = 16
+        embedding = Embedding(vocab_size, embedding_dim)
+        filmer = FiLMNoP(0, embedding_dim, 0)
+        norm = nn.LayerNorm(patcher_channels)
+        patchposencoder = Identity()
+        backbone = ViT(patcher_channels, d_model, posencoder="fixed")
+        head = ClassifificationHead(d_model, num_classes=2)
+
+        x = torch.randint(0, vocab_size, (2, 1024))
+        g = None
+
+        patcher = PatchEncoder(embedding_dim, patcher_channels, 4, None)
+        model = ViTClassifier(embedding, filmer, patcher, norm, patchposencoder, backbone, head)
+        assert model.last_aux_loss is None
+        assert model.last_entropy is None
+        assert model.last_usage is None
+
+        model(x, g)
+        assert model.last_aux_loss is None
+        assert model.last_entropy is None
+        assert model.last_usage is None
+
+        patcher = PatchEncoderLowMemSwitchMoE(embedding_dim, patcher_channels, 4, None, num_experts=num_experts)
+        model = ViTClassifier(embedding, filmer, patcher, norm, patchposencoder, backbone, head)
+        assert model.last_aux_loss is not None and model.last_aux_loss.shape == () and (model.last_aux_loss == 0).all()
+        assert model.last_entropy is not None and model.last_entropy.shape == () and (model.last_entropy == 0).all()
+        assert model.last_usage is not None and model.last_usage.shape == (num_experts,) and (model.last_usage == 0).all()
+
+        model(x, g)
+        assert model.last_aux_loss is not None and model.last_aux_loss.shape == () and (model.last_aux_loss >= 0).all()
+        assert model.last_entropy is not None and model.last_entropy.shape == () and (model.last_entropy >= 0).all()
+        assert model.last_usage is not None and model.last_usage.shape == (num_experts,) and (model.last_usage >= 0).all()
 
 
 class TestHierarchicalViTClassifier:
@@ -569,6 +610,58 @@ class TestHierarchicalViTClassifier:
         z = net.forward(x, g)
         assert z.shape == (batch_size, num_classes)
 
+    @pytest.mark.skip(reason="Not implemented yet")
+    def test_patcher_stats(self, num_experts: int) -> None:
+        ...
+
+
+class TestStructuralViTClassifier:
+
+    @pytest.mark.skip(reason="Not implemented yet")
+    def test_forward(self) -> None:
+        ...
+
+    @pytest.mark.parametrize("num_structures", [1, 2, 3, 5])
+    @pytest.mark.parametrize("num_experts", [1, 2, 3, 5])
+    def test_patcher_stats(self, num_structures: int, num_experts: int) -> None:
+        batch_size = 2
+        vocab_size = 11
+        embedding_dim = 8
+        patcher_channels = 16
+        d_model = 16
+        embeddings = [Embedding(vocab_size, embedding_dim) for _ in range(num_structures)]
+        filmers = [FiLMNoP(0, embedding_dim, 0) for _ in range(num_structures)]
+        norms = [nn.LayerNorm(patcher_channels) for _ in range(num_structures)]
+        patchposencoder = [Identity() for _ in range(num_structures)]
+        backbone = ViT(patcher_channels, d_model, posencoder="fixed")
+        head = ClassifificationHead(d_model, num_classes=2)
+
+        x = [torch.randint(0, vocab_size, (batch_size, 1024)) for _ in range(num_structures)]
+        g = [None for _ in range(num_structures)]
+        order = [[(structure_index, local_index) for structure_index in range(num_structures)] for local_index in range(batch_size)]
+
+        patchers = [PatchEncoder(embedding_dim, patcher_channels, 4, None) for _ in range(num_structures)]
+        model = StructuralViTClassifier(embeddings, filmers, patchers, norms, patchposencoder, backbone, head)
+        assert model.last_aux_loss is None
+        assert model.last_entropy is None
+        assert model.last_usage is None
+
+        model(x, g, order)
+        assert model.last_aux_loss is None
+        assert model.last_entropy is None
+        assert model.last_usage is None
+
+        patchers = [PatchEncoderLowMemSwitchMoE(embedding_dim, patcher_channels, 4, None, num_experts=num_experts) for _ in range(num_structures)]
+        model = StructuralViTClassifier(embeddings, filmers, patchers, norms, patchposencoder, backbone, head)
+
+        assert model.last_aux_loss is not None and model.last_aux_loss.shape == (num_structures,) and (model.last_aux_loss == 0).all()
+        assert model.last_entropy is not None and model.last_entropy.shape == (num_structures,) and (model.last_entropy == 0).all()
+        assert model.last_usage is not None and model.last_usage.shape == (num_structures, num_experts) and (model.last_usage == 0).all()
+
+        model(x, g, order)
+        assert model.last_aux_loss is not None and model.last_aux_loss.shape == (num_structures,) and (model.last_aux_loss >= 0).all()
+        assert model.last_entropy is not None and model.last_entropy.shape == (num_structures,) and (model.last_entropy >= 0).all()
+        assert model.last_usage is not None and model.last_usage.shape == (num_structures, num_experts) and (model.last_usage >= 0).all()
 
 # ============================================================================
 # Tests for the low-memory streaming functions.
