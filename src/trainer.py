@@ -553,6 +553,17 @@ def get_last_aux_loss(model: nn.Module) -> Optional[Tensor]:
     return last_aux_loss.sum()
 
 
+def get_last_usage(model: nn.Module) -> Optional[Tensor]:
+    if isinstance(model, (DistributedDataParallel, DataParallel)):
+        model = model.module
+    last_usage = getattr(model, "last_usage", None)
+    if last_usage is None:
+        return None
+    if not isinstance(last_usage, Tensor):
+        raise TypeError("Model's `last_usage` attribute must be a Tensor.")
+    return last_usage
+
+
 class Trainer:
     """
     Trainer class for training models with PyTorch.
