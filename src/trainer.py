@@ -304,6 +304,7 @@ class TrainerArgs:
     chpt_steps: Optional[int] = None
     logg_epochs: Optional[float] = None
     logg_steps: Optional[int] = None
+    assert_auxillary_loss: bool = False
 
     def __post_init__(self) -> None:
         if (self.max_epochs is not None) and (self.max_steps is not None):
@@ -546,6 +547,8 @@ def get_last_aux_loss(model: nn.Module) -> Optional[Tensor]:
         return None
     if not isinstance(last_aux_loss, Tensor):
         raise TypeError("Model's `last_aux_loss` attribute must be a Tensor.")
+    if last_aux_loss.ndim > 0:
+        warnings.warn("Model's `last_aux_loss` attribute has more than 0 dimensions; summing to scalar.")
     return last_aux_loss.sum()
 
 
@@ -1139,6 +1142,8 @@ class Trainer:
 
         if (last_aux_loss := get_last_aux_loss(self.model)) is not None:
             losses["aux_loss"] = last_aux_loss.to(device=device, dtype=dtype)
+        elif self.args.assert_auxillary_loss:
+            raise RuntimeError("An auxillary loss was expected but not found.")
 
         loss = torch.tensor(0.0, dtype=dtype, device=device)
         for k in losses:
