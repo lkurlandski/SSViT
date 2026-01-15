@@ -262,7 +262,6 @@ def get_model(
                 patch_size,
                 num_experts=int(os.environ.get("MOE_NUM_EXPERTS", "1")),
                 router_noise_std=float(os.environ.get("MOE_ROUTER_NOISE_STD", "0.0")),
-                load_balance_alpha=float(os.environ.get("MOE_LOAD_BALANCE_ALPHA", "0.0")),
             )
         raise NotImplementedError(f"{parch}")
 

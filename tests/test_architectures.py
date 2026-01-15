@@ -278,7 +278,6 @@ class TestPatchEncoderLowMemSwitchMoE:
     @pytest.mark.parametrize("router_temperature", [1e-6, 1.0])
     @pytest.mark.parametrize("router_noise_std", [0.0, 0.1])
     @pytest.mark.parametrize("router_top_k", [1, 2, 3])
-    @pytest.mark.parametrize("load_balance_alpha", [0.0, 0.1])
     def test_forward(
         self,
         batch_size: int,
@@ -290,7 +289,6 @@ class TestPatchEncoderLowMemSwitchMoE:
         router_temperature: float,
         router_noise_std: float,
         router_top_k: int,
-        load_balance_alpha: float,
     ) -> None:
 
         in_channels = 8
@@ -320,7 +318,6 @@ class TestPatchEncoderLowMemSwitchMoE:
                 router_temperature=router_temperature,
                 router_noise_std=router_noise_std,
                 router_top_k=router_top_k,
-                load_balance_alpha=load_balance_alpha,
             )
 
         if router_top_k > num_experts:
