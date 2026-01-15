@@ -688,14 +688,16 @@ class Trainer:
             # losses over number of samples and the norms over the number of gradient steps.
             # If no real data was seen, don't average anything because `num_samples` and `grad_steps`
             # will both be 0, so we'll get a ZeroDivisionError. We still want the key in the report, though.
+            # Note that we must consider whether or not real data was seen since the last time we called
+            # `get_report`, not just in this cycle, i.e., we cannot use `anyone_had_real_window` here.
             report = {}
             for k in allresults:
                 report[k] = allresults[k].item()
                 if k in ("tr_loss", "aux_loss", "clf_loss"):
-                    if anyone_had_real_window:
+                    if num_samples > 0:
                         report[k] /= num_samples
                 elif k in ("grad_norm", "param_norm", "param_delta",):
-                    if anyone_had_real_window:
+                    if num_samples > 0:
                         report[k] /= grad_steps
                 elif k not in ("num_samples",):
                     raise KeyError(f"Unknown training metric '{k}' encountered.")
