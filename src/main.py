@@ -17,6 +17,7 @@ from typing import Callable
 from typing import Literal
 from typing import Optional
 from typing import Protocol
+from typing import TypedDict
 from typing import TypeVar
 import warnings
 
@@ -156,6 +157,27 @@ def get_model(
     max_length: Optional[int] = None,
     share_embeddings: bool = False,
     share_patchers: bool = False,
+    *,
+    embedding_dim: int = 8,
+    film_hidden_size: int = 16,
+    patcher_channels: int = 64,
+    num_patches: Optional[int] = 256,
+    patch_size: Optional[int] = 4096,
+    patchposencoder_hidden_size: int = 64,
+    vit_d_model: int = 512,
+    vit_nhead: int = 8,
+    vit_dim_feedforward: int = 2048,
+    vit_num_layers: int = 8,
+    clf_hidden_size: int = 256,
+    clf_num_layers: int = 2,
+    moe_num_experts: int = 1,
+    moe_probe_dim: int = 16,
+    moe_probe_kernel_size: int = 256,
+    moe_probe_stride: int = 256,
+    moe_router_hidden: int = 256,
+    moe_router_temperature: float = 1.0,
+    moe_router_noise_std: float = 0.0,
+    moe_router_top_k: int = 1,
 ) -> Classifier | HierarchicalClassifier | StructuralClassifier:
     """
     Get a pre-configured classification model for the given settings.
@@ -217,16 +239,14 @@ def get_model(
     )
 
     # (Embedding) Build the embedding
-    embedding_dim = 8
     def build_embedding() -> Embedding:
         return Embedding(num_embeddings=384, embedding_dim=embedding_dim, padding_idx=0)
 
     # (FiLM | FiLMNop) Build the filmer
     def build_filmer() -> FiLM | FiLMNoP:
-        hidden_size = 16
         if num_guides == 0:
-            return FiLMNoP(num_guides, embedding_dim, hidden_size)
-        return FiLM(num_guides, embedding_dim, hidden_size)
+            return FiLMNoP(num_guides, embedding_dim, film_hidden_size)
+        return FiLM(num_guides, embedding_dim, film_hidden_size)
 
     # (MalConvBase) Build the malconv
     malconv_channels = 256 if arch == Architecture.MCG else 128
@@ -242,9 +262,10 @@ def get_model(
         raise NotImplementedError(f"{arch}")
 
     # (PatchEncoderBase) Build the patcher
-    patcher_channels = 64
-    num_patches = None if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV) else 256
-    patch_size = 4096 if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV) else None
+    if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV):
+        num_patches = None
+    else:
+        patch_size = None
     def build_patcher(num_patches: Optional[int], patch_size: Optional[int]) -> PatchEncoderBase:
         if parch == PatcherArchitecture.BAS:
             return PatchEncoder(embedding_dim, patcher_channels, num_patches, patch_size)
@@ -260,8 +281,14 @@ def get_model(
                 patcher_channels,
                 num_patches,
                 patch_size,
-                num_experts=int(os.environ.get("MOE_NUM_EXPERTS", "1")),
-                router_noise_std=float(os.environ.get("MOE_ROUTER_NOISE_STD", "0.0")),
+                num_experts=moe_num_experts,
+                probe_dim=moe_probe_dim,
+                probe_kernel_size=moe_probe_kernel_size,
+                probe_stride=moe_probe_stride,
+                router_hidden=moe_router_hidden,
+                router_temperature=moe_router_temperature,
+                router_noise_std=moe_router_noise_std,
+                router_top_k=moe_router_top_k,
             )
         raise NotImplementedError(f"{parch}")
 
@@ -271,21 +298,19 @@ def get_model(
 
     # (PatchPositionalityEncoder | Identity) Build the patchposencoder
     def build_patchposencoder() -> PatchPositionalityEncoder | Identity:
-        hidden_size = 64
         if patchposenc == PatchPositionalEncodingArchitecture.NONE:
             return Identity(autocast=True)
         if patchposenc == PatchPositionalEncodingArchitecture.REL:
-            return PatchPositionalityEncoder(in_channels=patcher_channels, max_length=None, hidden_size=hidden_size)
+            return PatchPositionalityEncoder(in_channels=patcher_channels, max_length=None, hidden_size=patchposencoder_hidden_size)
         if patchposenc == PatchPositionalEncodingArchitecture.BTH:
             if max_length is None:
                 raise ValueError("max_length must be specified when using BTH patch positional encodings.")
-            return PatchPositionalityEncoder(in_channels=patcher_channels, max_length=max_length, hidden_size=hidden_size)
+            return PatchPositionalityEncoder(in_channels=patcher_channels, max_length=max_length, hidden_size=patchposencoder_hidden_size)
         if patchposenc == PatchPositionalEncodingArchitecture.ABS:
             raise NotImplementedError(f"{patchposenc}")
         raise NotImplementedError(f"{patchposenc}")
 
     # (ViT) Build the transformer
-    vit_d_model = 512
     def build_transformer() -> ViT:
         posencname: Literal["none", "fixed", "learned"] = posenc.name.lower()  # type: ignore[assignment]
         if posencname not in ("none", "fixed", "learned"):
@@ -301,9 +326,9 @@ def get_model(
         return ViT(
             embedding_dim=patcher_channels,
             d_model=vit_d_model,
-            nhead=8,
-            dim_feedforward=2048,
-            num_layers=8,
+            nhead=vit_nhead,
+            dim_feedforward=vit_dim_feedforward,
+            num_layers=vit_num_layers,
             posencoder=posencname,
             max_len=max_len,
             activation="gelu",
@@ -318,7 +343,7 @@ def get_model(
             input_size = vit_d_model
         else:
             raise NotImplementedError(f"{arch}")
-        return ClassifificationHead(input_size, num_classes=2, hidden_size=256, num_layers=2, dropout=0.1)
+        return ClassifificationHead(input_size, num_classes=2, hidden_size=clf_hidden_size, num_layers=clf_num_layers, dropout=0.1)
 
     # Helpers
     T = TypeVar("T", bound=Module)
@@ -790,6 +815,7 @@ def main() -> None:
         structures,
         args.max_length,
         args.share_embeddings,
+        **dict(args.model_config),
     ).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8

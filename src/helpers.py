@@ -9,6 +9,7 @@ from dataclasses import fields
 from dataclasses import Field
 from enum import Enum
 from functools import partial
+import json
 import os
 import sys
 from types import GenericAlias
@@ -93,6 +94,7 @@ class MainArgs:
     parch: PatcherArchitecture = PatcherArchitecture.MEM
     posenc: PositionalEncodingArchitecture = PositionalEncodingArchitecture.FIXED
     patchposenc: PatchPositionalEncodingArchitecture = PatchPositionalEncodingArchitecture.NONE
+    model_config_str: str = "{}"
     seed: int = 0
     do_parser: bool = False
     do_entropy: bool = False
@@ -146,6 +148,20 @@ class MainArgs:
             warnings.warn("The Trainer::evaluate method currently hangs with FSDP modules.")
         if self.num_streams > 0:
             warnings.warn("Using multiple data streams leads to substantially larger memory usage than zero streams.")
+
+    @property
+    def model_config(self) -> dict[str, Any]:
+        cls: Optional[str] = None
+        try:
+            d = json.loads(self.model_config_str)
+        except Exception as err:
+            cls = err.__class__.__name__
+        if not isinstance(d, dict):
+            cls = "TypeError"
+        if cls is not None:
+            raise RuntimeError(f"A {cls} occurred while parsing model_config_str: `{self.model_config_str!r}`")
+        assert isinstance(d, dict)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
