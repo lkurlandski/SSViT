@@ -305,6 +305,7 @@ class TrainerArgs:
     logg_epochs: Optional[float] = None
     logg_steps: Optional[int] = None
     assert_auxillary_loss: bool = False
+    auxillary_loss_weight: float = 0.0
 
     def __post_init__(self) -> None:
         if (self.max_epochs is not None) and (self.max_steps is not None):
@@ -1141,7 +1142,7 @@ class Trainer:
             losses["clf_loss"] = clf_loss.to(device=device, dtype=dtype)
 
         if (last_aux_loss := get_last_aux_loss(self.model)) is not None:
-            losses["aux_loss"] = last_aux_loss.to(device=device, dtype=dtype)
+            losses["aux_loss"] = last_aux_loss.to(device=device, dtype=dtype) * self.args.auxillary_loss_weight
         elif self.args.assert_auxillary_loss:
             raise RuntimeError("An auxillary loss was expected but not found.")
 
