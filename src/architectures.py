@@ -1037,10 +1037,6 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         patch_batch_size: Batch size for patch processing during training. If None, uses input batch size.
     """
 
-    _last_aux_loss: Tensor  # ()   Most recent auxiliary loss for load balancing.
-    _last_usage: Tensor     # (E,) Most recent expert usage statistic.
-    _last_entropy: Tensor   # ()   Most recent routing entropy.
-
     def __init__(
         self,
         in_channels: int,
@@ -1121,9 +1117,11 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             for _ in range(num_experts)
         ])
 
-        self.register_buffer("_last_aux_loss", torch.zeros(()), persistent=False)
-        self.register_buffer("_last_usage", torch.zeros((num_experts,)), persistent=False)
-        self.register_buffer("_last_entropy", torch.zeros(()), persistent=False)
+        # NOTE: last_aux_loss will have `.requires_grad is True` but `.grad is None` during training.
+        # After backward, `.grad` will be populated with the gradient value. This is normal.
+        self.last_aux_loss = torch.zeros(())           # ()   Most recent auxiliary loss for load balancing.
+        self.last_usage = torch.zeros((num_experts,))  # (E,) Most recent expert usage statistic.
+        self.last_entropy = torch.zeros(())            # ()   Most recent routing entropy.
 
         _check_lowmem_config(kernel_size, stride, chunk_size, self.overlap)
         _check_lowmem_config(probe_kernel_size, probe_stride, chunk_size, self.probe_overlap)
@@ -1212,9 +1210,9 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         aux = self.num_experts * (f * p).sum()
 
         # Logging.
-        self._last_aux_loss = aux
-        self._last_entropy = -(probs * (probs.clamp_min(1e-8).log())).sum(dim=-1).mean()
-        self._last_usage = dispatch.float().mean(dim=(0, 1))
+        self.last_aux_loss = aux
+        self.last_entropy = -(probs * (probs.clamp_min(1e-8).log())).sum(dim=-1).mean().detach()
+        self.last_usage = dispatch.float().mean(dim=(0, 1)).detach()
 
         return dispatch, gates, aux
 
@@ -1407,18 +1405,6 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
             if expert.bias is not None:
                 dummy = dummy + expert.bias.view(-1)[0] * 0.0
         return out + dummy
-
-    @property
-    def last_aux_loss(self) -> Tensor:
-        return self._last_aux_loss
-
-    @property
-    def last_usage(self) -> Tensor:
-        return self._last_usage
-
-    @property
-    def last_entropy(self) -> Tensor:
-        return self._last_entropy
 
 
 def _lowmem_patchwise_max_over_time_dispatched(
@@ -3125,10 +3111,6 @@ class StructuralMalConvClassifier(StructuralClassifier):
 
 class StructuralViTClassifier(StructuralClassifier):
 
-    _last_aux_loss: Tensor  # (S,)   Most recent auxiliary loss for load balancing.
-    _last_usage: Tensor     # (S,E)  Most recent expert usage statistic.
-    _last_entropy: Tensor   # (S,)   Most recent routing entropy.
-
     def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], norms: Sequence[Optional[nn.LayerNorm]], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
@@ -3157,16 +3139,16 @@ class StructuralViTClassifier(StructuralClassifier):
         self.C_s: list[int] = C_s
         self.C = self.C_s[0]
 
-        max_num_experts = max([p.num_experts if isinstance(p, PatchEncoderLowMemSwitchMoE) else 0 for p in patchers])
-        self.register_buffer("_last_aux_loss", torch.zeros((self.num_structures,)), persistent=False)
-        self.register_buffer("_last_usage", torch.zeros((self.num_structures, max_num_experts)), persistent=False)
-        self.register_buffer("_last_entropy", torch.zeros((self.num_structures,)), persistent=False)
+        self.last_aux_loss: Optional[Tensor] = None  # (S,)   Most recent auxiliary loss for load balancing.
+        self.last_usage: Optional[Tensor] = None     # (S,E)  Most recent expert usage statistic.
+        self.last_entropy: Optional[Tensor] = None   # (S,)   Most recent routing entropy.
+        self._maybe_reset_expert_stats()
 
     def forward(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> Tensor:
 
         B = len(order)
 
-        self._maybe_clear_expert_stats()
+        self._maybe_reset_expert_stats()
 
         self._check_forward_inputs(x, g, order)
 
@@ -3189,7 +3171,7 @@ class StructuralViTClassifier(StructuralClassifier):
                 z = self.norms[i](z)                                 # (max(B, B_i), N_i, C)
                 z = self.patchposencoders[i](z, lengths)             # (max(B, B_i), N_i, C)
                 zbs.append(z)
-                self._maybe_log_expert_stats(i)
+                self._maybe_update_expert_stats(i)
             zs.append(torch.cat(zbs, dim=0))  # (B_i, N_i, C)
 
         # Reconcile the sample index and the input index.
@@ -3279,35 +3261,28 @@ class StructuralViTClassifier(StructuralClassifier):
 
         return out + dummy
 
-    def _maybe_clear_expert_stats(self) -> None:
-        for i in range(self.num_structures):
-            patcher = self.patchers[i]
-            if isinstance(patcher, PatchEncoderLowMemSwitchMoE):
-                self._last_aux_loss[i].zero_()
-                self._last_usage[i, :patcher.num_experts].zero_()
-                self._last_entropy[i].zero_()
+    def _maybe_reset_expert_stats(self) -> None:
+        """
+        If using MoE patch encoders, zero the expert statistics used for monitoring them.
+        """
+        if not any(isinstance(p, PatchEncoderLowMemSwitchMoE) for p in self.patchers):
+            return
+        device = next(self.parameters()).device
+        max_num_experts = max([p.num_experts if isinstance(p, PatchEncoderLowMemSwitchMoE) else 0 for p in self.patchers])
+        self.last_aux_loss = torch.zeros((self.num_structures,), device=device)
+        self.last_usage = torch.zeros((self.num_structures, max_num_experts), device=device)
+        self.last_entropy = torch.zeros((self.num_structures,), device=device)
 
-    def _maybe_log_expert_stats(self, i: int) -> None:
+    def _maybe_update_expert_stats(self, i: int) -> None:
+        """
+        If using MoE patch encoders, update the expert statistics used for monitoring them.
+        """
         patcher = self.patchers[i]
-        if isinstance(patcher, PatchEncoderLowMemSwitchMoE):
-            self._last_aux_loss[i] = patcher.last_aux_loss
-            self._last_usage[i, :patcher.num_experts] = patcher.last_usage
-            self._last_entropy[i] = patcher.last_entropy
-
-    @property
-    def last_aux_loss(self) -> Optional[Tensor]:
-        if any(isinstance(p, PatchEncoderLowMemSwitchMoE) for p in self.patchers):
-            return self._last_aux_loss
-        return None
-
-    @property
-    def last_usage(self) -> Optional[Tensor]:
-        if any(isinstance(p, PatchEncoderLowMemSwitchMoE) for p in self.patchers):
-            return self._last_usage
-        return None
-
-    @property
-    def last_entropy(self) -> Optional[Tensor]:
-        if any(isinstance(p, PatchEncoderLowMemSwitchMoE) for p in self.patchers):
-            return self._last_entropy
-        return None
+        if not isinstance(patcher, PatchEncoderLowMemSwitchMoE):
+            return
+        assert self.last_aux_loss is not None
+        assert self.last_usage is not None
+        assert self.last_entropy is not None
+        self.last_aux_loss[i] += patcher.last_aux_loss
+        self.last_usage[i, :patcher.num_experts] += patcher.last_usage
+        self.last_entropy[i] += patcher.last_entropy
