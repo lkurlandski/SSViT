@@ -460,3 +460,86 @@ class TestCollateFnStructural:
             assert all(x.characteristics.dtype == torch.bool for x in batch.guides)
 
         assert isinstance(batch.structure, StructureMaps)
+
+
+class TestPreprocessor:
+
+    def test_trim_more_than_max_structures_from_index_noop(self) -> None:
+
+        index = [
+            [(101, 110), (111, 150),],       # STRUCT-A
+            [(11, 40),],                     # STRUCT-B
+            [],                              # STRUCT-C
+            [(0, 10), (50, 100), (41,50),],  # STRUCT-D
+            [],                              # STRUCT-E
+        ]
+        print(f"{index=}")
+
+        unkidx = 2
+
+        max_structures = None
+        newindex = Preprocessor.trim_more_than_max_structures_from_index(index, max_structures, unkidx)
+        assert newindex == index
+
+        max_structures = 7
+        newindex = Preprocessor.trim_more_than_max_structures_from_index(index, max_structures, unkidx)
+        assert newindex == index
+
+        max_structures = 6
+        newindex = Preprocessor.trim_more_than_max_structures_from_index(index, max_structures, unkidx)
+        assert newindex == index
+
+        max_structures = 5
+        newindex = Preprocessor.trim_more_than_max_structures_from_index(index, max_structures, unkidx)
+        print(f"{newindex=}")
+        assert newindex == [
+            [],
+            [(11, 40),],
+            [(101, 150)],
+            [(0, 10), (50, 100), (41,50),],
+            [],
+        ]
+
+        max_structures = 4
+        newindex = Preprocessor.trim_more_than_max_structures_from_index(index, max_structures, unkidx)
+        assert newindex == [
+            [],
+            [(11, 40),],
+            [(50, 150)],
+            [(0, 10), (41,50),],
+            [],
+        ]
+
+        max_structures = 3
+        newindex = Preprocessor.trim_more_than_max_structures_from_index(index, max_structures, unkidx)
+        assert newindex == [
+            [],
+            [(11, 40),],
+            [(41, 150)],
+            [(0, 10)],
+            [],
+        ]
+
+        max_structures = 2
+        newindex = Preprocessor.trim_more_than_max_structures_from_index(index, max_structures, unkidx)
+        assert newindex == [
+            [],
+            [],
+            [(11, 150)],
+            [(0, 10)],
+            [],
+        ]
+
+        max_structures = 1
+        newindex = Preprocessor.trim_more_than_max_structures_from_index(index, max_structures, unkidx)
+        assert newindex == [
+            [],
+            [],
+            [(0, 150)],
+            [],
+            [],
+        ]
+
+        max_structures = 0
+        with pytest.raises(ValueError):
+            newindex = Preprocessor.trim_more_than_max_structures_from_index(index, max_structures, unkidx)

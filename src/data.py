@@ -1496,6 +1496,7 @@ class Preprocessor:
         unsafe: bool = False,
         structures_as_guides: bool = False,
         allow_missing_metadata: bool = True,
+        max_structures: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -1507,6 +1508,8 @@ class Preprocessor:
             unsafe: whether to use unsafe memoryview for input buffer.
             structures_as_guides: if True, encode the structure as SemanticGuide, not as a StructureMap.
             allow_missing_metadata: if True, missing metadata will be ignored gracefully.
+            max_structures: maximum number of structures to consider. If None, use all.
+                If provided and more than `max_structures` are found, they will be droppped.
         """
         self.do_entropy = do_entropy
         self.which_characteristics = which_characteristics
@@ -1516,18 +1519,19 @@ class Preprocessor:
         self.unsafe = unsafe
         self.structures_as_guides = structures_as_guides
         self.allow_missing_metadata = allow_missing_metadata
+        self.max_structures = max_structures
         self.guider = SemanticGuider(do_entropy=do_entropy, which_characteristics=which_characteristics)
         self.partitioner = StructurePartitioner(level, structures)
         if self.structures_as_guides and (len(self.structures) == 1 or len(which_characteristics) > 0 or do_entropy):
             raise ValueError("structures_as_guides can only be True when using multiple structures without other guides.")
         self.unkstructure: Optional[HierarchicalStructure] = None
-        if allow_missing_metadata:
+        if allow_missing_metadata or max_structures is not None:
             for s in structures:
                 if s.name in ("ANY", "UNKNOWN", "OTHER"):
                     self.unkstructure = s
                     break
             else:
-                raise RuntimeError("When allow_missing_metadata is True, one of the structures must be ANY, UNKNOWN, or OTHER.")
+                raise RuntimeError("When allow_missing_metadata is True (or max_structures is not None), one of the structures must be ANY, UNKNOWN, or OTHER.")
 
     def __call__(self, name: str, label: int, data: bytes, meta: Optional[pl.DataFrame]) -> FSample:
         if not self.allow_missing_metadata and meta is None:
@@ -1650,7 +1654,43 @@ class Preprocessor:
                 e = row["end"]
                 index[i].append((s, e))
 
+        unkidx = None if self.unkstructure is None else self.structures.index(self.unkstructure)
+        index = self.trim_more_than_max_structures_from_index(index, self.max_structures, unkidx)
+
         return StructureMap(index, lexicon)
+
+    @staticmethod
+    def trim_more_than_max_structures_from_index(index: list[list[tuple[int, int]]], max_structures: Optional[int], unkidx: Optional[int]) -> list[list[tuple[int, int]]]:
+        index = deepcopy(index)
+        if max_structures is None:
+            return index
+        if max_structures <= 0:
+            raise ValueError(f"max_structures must be positive or None. Got {max_structures}.")
+        if unkidx is None:
+            raise RuntimeError("When max_structures is set, unkidx must be provided.")
+
+        flattened_index = sorted([r for sublist in index for r in sublist], key=lambda x: x[0])
+        if len(flattened_index) <= max_structures:
+            return index
+
+        # Beginning and end of a new structure representing all removed structures.
+        beg = flattened_index[max_structures - 1][0]
+        end = flattened_index[-1][1]
+
+        # These are the ranges that will be removed from the index and merged into (beg, end).
+        remove: set[tuple[int, int]] = set(flattened_index[max_structures - 1:])
+
+        # Cleanse each structure's index of the removed ranges.
+        for i in range(len(index)):         # i - structure idx
+            rm = set()
+            for j in range(len(index[i])):  # j - range idx
+                if index[i][j] in remove:
+                    rm.add(j)
+            index[i] = [index[i][j] for j in range(len(index[i])) if j not in rm]
+
+        # Add the new "unknown" structure range and return the new index.
+        index[unkidx].append((beg, end))
+        return index
 
     def get_structure_as_guides(self, meta: Optional[pl.DataFrame], size: int) -> torch.Tensor:
         if meta is None:
@@ -1662,6 +1702,8 @@ class Preprocessor:
             pl.col("group") == "partitions",
             pl.col("level") == self.level.name,
         )
+        if self.max_structures is not None:
+            df_sec = df_sec.sort("start").head(self.max_structures)
 
         n_sec = len(df_sec)
         n_chr = len(self.structures)

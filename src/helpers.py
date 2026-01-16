@@ -107,6 +107,7 @@ class MainArgs:
     vl_num_samples: Optional[int] = None
     ts_num_samples: Optional[int] = None
     max_length: Optional[int] = None
+    max_structures: Optional[int] = None
     num_streams: int = 0
     num_workers: int = 0
     pin_memory: bool = False
