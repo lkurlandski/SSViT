@@ -312,7 +312,7 @@ class TestGetModel:
             assert len(ids_embd) == len(structures)
             assert len(ids_film) == len(structures)
 
-    @pytest.skip(reason="Not yet implemented")  # type: ignore[misc]
+    @pytest.mark.skip(reason="Not yet implemented")
     def test_structural_malconv(self) -> None:
         ...
 
