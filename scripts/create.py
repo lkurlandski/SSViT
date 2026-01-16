@@ -405,8 +405,8 @@ class Requirements:
 
         if self.config.design == Design.FLAT:
             if self.config.parch == PatcherArchitecture.EXP:
-                tr_throughput *= 0.50
-                vl_throughput *= 0.50
+                tr_throughput *= 0.50 * (0.75 ** math.log2(self.config.model_config.get("moe_router_top_k", 1)))
+                vl_throughput *= 0.50 * (0.75 ** math.log2(self.config.model_config.get("moe_router_top_k", 1)))
 
         if self.config.design == Design.HIERARCHICAL:
             if self.config.level == HierarchicalLevel.COARSE:
@@ -419,7 +419,21 @@ class Requirements:
                 tr_throughput *= 0.40
                 vl_throughput *= 0.30
 
-
+        if self.config.design == Design.STRUCTURAL:
+            if self.config.parch == PatcherArchitecture.EXP:
+                tr_throughput *= 0.25 * (0.75 ** math.log2(self.config.model_config.get("moe_router_top_k", 1)))
+                vl_throughput *= 0.25 * (0.75 ** math.log2(self.config.model_config.get("moe_router_top_k", 1)))
+            else:
+                # Manual routing.
+                if self.config.level == HierarchicalLevel.COARSE:
+                    tr_throughput *= 0.75
+                    vl_throughput *= 0.50
+                if self.config.level == HierarchicalLevel.MIDDLE:
+                    tr_throughput *= 0.60
+                    vl_throughput *= 0.40
+                if self.config.level == HierarchicalLevel.FINE:
+                    tr_throughput *= 0.40
+                    vl_throughput *= 0.30
 
         tr_throughput = tr_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
         vl_throughput = vl_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
