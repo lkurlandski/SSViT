@@ -1,23 +1,50 @@
 """
 Quickly analyze an experiment.
+
+Usage:
+    python scripts/quickanal.py [input] [--resfile RESFILE] [--logfile LOGFILE] [--jobid JOBID]
+        [--json] [--quiet] [--verbose]
+        [--no_summary] [--detailed] [--ddetailed]
+        [--include [INCLUDE INCLUDE INCLUDE ...]]
+
+Example:
+    python scripts/quickanal.py 123456 --detailed --include epoch vl_roc vl_prc
 """
 
 from argparse import ArgumentParser
 import json
 from pathlib import Path
+from typing import Callable
 
+import numpy as np
 import pandas as pd
 
+def float_print_json(d: dict[str, float]) -> None:
+    print("{", end="")
+    for i, (k, v) in enumerate(d.items()):
+        if i != 0:
+            print(", ", end="")
+        print(f'"{k}": {v:.4f}', end="")
+    print("}")
+
+DISPLAY = (
+    'display.max_rows', None,
+    'display.max_columns', None,
+    'display.width', None,
+)
+
 parser = ArgumentParser()
-parser.add_argument("input", type=str, nargs="?", default=None)
-parser.add_argument("--resfile", type=Path)
-parser.add_argument("--logfile", type=Path)
-parser.add_argument("--jobid", type=str)
-parser.add_argument("--json", action="store_true")
-parser.add_argument("--detailed", action="store_true")
-parser.add_argument("--ddetailed", action="store_true")
-parser.add_argument("--quiet", action="store_true")
-parser.add_argument("--verbose", action="store_true")
+parser.add_argument("input", type=str, nargs="?", default=None, help="Generic input, i.e., the resfile/logfile/jobid.")
+parser.add_argument("--resfile", type=Path, help="Path to the results.jsonl file.")
+parser.add_argument("--logfile", type=Path, help="Path to the training log file, from which the resfile can be located.")
+parser.add_argument("--jobid", type=str, help="JobId of the experiment, from which the logfile can be located.")
+parser.add_argument("--json", action="store_true", help="Output in JSON format.")
+parser.add_argument("--no_summary", action="store_true", help="Do not print the summary (the 'best' value for every input).")
+parser.add_argument("--detailed", action="store_true", help="Print detailed information (entries where all inputs are non-null).")
+parser.add_argument("--ddetailed", action="store_true", help="Print very detailed information (all entries).")
+parser.add_argument("--include", type=str, nargs="+", default=[], help="Metrics to include in the analysis (aside from 'epoch' and 'glbl_step'). If not provided, all metrics are included.")
+parser.add_argument("--quiet", action="store_true", help="Suppress non-essential output.")
+parser.add_argument("--verbose", action="store_true", help="Print verbose output for debugging.")
 args = parser.parse_args()
 
 ROOT = Path("/home/lk3591/Documents/code/SSViT")
@@ -29,11 +56,15 @@ if args.verbose:
     print(f"{args.resfile=}")
     print(f"{args.logfile=}")
     print(f"{args.jobid=}")
+    print(f"{args.json=}")
+    print(f"{args.no_summary=}")
     print(f"{args.detailed=}")
     print(f"{args.ddetailed=}")
     print(f"{args.quiet=}")
-    print(f"{args.summary=}")
+    print(f"{args.verbose=}")
+    print(f"{args.include=}")
 
+# Determine the type of the generic input.
 if args.input is not None:
     if (p := Path(args.input)).exists():
         with open(p) as fp:
@@ -41,15 +72,17 @@ if args.input is not None:
                 try:
                     json.loads(line.strip())
                     if args.verbose:
-                        print(f"Input inferred to be resfile.")
+                        print("Input inferred to be resfile.")
                     args.resfile = p
-                except:
+                    break
+                except Exception:
                     if args.verbose:
-                        print(f"Input inferred to be logfile.")
+                        print("Input inferred to be logfile.")
                     args.logfile = p
+                    break
     elif args.input.isdigit():
         if args.verbose:
-            print(f"Input inferred to be jobid.")
+            print("Input inferred to be jobid.")
         args.jobid = args.input
     else:
         raise RuntimeError(f"Could not infer the type of generic input {args.input}.")
@@ -92,84 +125,93 @@ if args.logfile is not None:
     if args.verbose:
         print(f"{args.resfile=}")
 
+# Define the metrics to investigate and how to summarize them.
+summary: dict[str, Callable[[np.ndarray], float]] = {  # type: ignore[type-arg]
+    "epoch": np.max,
+    "glbl_step": np.max,
+    "tr_loss": np.min,
+    "vl_loss": np.min,
+    "aux_loss": np.min,
+    "clf_loss": np.min,
+    "vl_aux_loss": np.min,
+    "vl_clf_loss": np.min,
+    "vl_roc": np.max,
+    "vl_prc": np.max,
+    "tr_gpu_mem": np.max,
+    "vl_gpu_mem": np.max,
+    "tr_throughput": np.mean,
+    "vl_throughput": np.mean,
+}
+if "epoch" in args.include:
+    args.include.remove("epoch")
+args.include.insert(0, "epoch")
+if "glbl_step" in args.include:
+    args.include.remove("glbl_step")
+args.include.insert(1, "glbl_step")
+if args.include == ["epoch", "glbl_step"]:
+    args.include = list(summary.keys())
+if len(set(args.include)) != len(args.include):
+    raise RuntimeError("Duplicate entries found in --include.")
+summary = {k: v for k, v in summary.items() if k in args.include}
+if args.verbose:
+    print(f"Tracking metrics: {list(summary.keys())}")
+
 # Process the resfile.
-log = []
+log: list[dict[str, int | float]] = []
 with open(args.resfile) as fp:
     for line in fp:
         d = json.loads(line.strip())
-        log.append(d)
-
+        if "tr_gpu_mem" in d:
+            d["tr_gpu_mem"] = d["tr_gpu_mem"] / (1024 ** 3)  # Convert to GB.
+        if "vl_gpu_mem" in d:
+            d["vl_gpu_mem"] = d["vl_gpu_mem"] / (1024 ** 3)  # Convert to GB.
+        log.append({k: v for k, v in d.items() if k in summary})
+df = pd.DataFrame(log)
 if args.verbose:
     print(f"Found {len(log)} entries.")
 
-# (lower-is-better, best-epoch, value)
-best: dict[str, tuple[bool, int, float]] = {
-    "glbl_step": (None, -1, float("inf")),
-    "tr_loss": (True, -1, float("inf")),
-    "aux_loss": (True, -1, float("inf")),
-    "clf_loss": (True, -1, float("inf")),
-    "vl_loss": (True, -1, float("inf")),
-    "vl_aux_loss": (True, -1, float("inf")),
-    "vl_clf_loss": (True, -1, float("inf")),
-    "vl_roc": (False, -1, -float("inf")),
-    "vl_prc": (False, -1, -float("inf")),
-}
-
-def float_print_json(d: dict[str, float]) -> None:
-    print("{", end="")
-    for i, (k, v) in enumerate(d.items()):
-        if i != 0:
-            print(", ", end="")
-        print(f'"{k}": {v:.4f}', end="")
-    print("}")
-
-
-if args.detailed or args.ddetailed:
+# Print very detailed information, if requested.
+if args.ddetailed:
     if not args.quiet:
         print("Training Details:")
     if args.json:
         for d in log:
-            if not args.ddetailed and not all(k in d for k in best):
-                continue
-            d = {k: d[k] for k in best if k in d}
             float_print_json(d)
     else:
-        df = pd.DataFrame(log)
-        if not args.ddetailed:
-            df = df[df["vl_loss"].notnull()]
-        with pd.option_context('display.max_rows', None, 'display.max_columns', None, 'display.width', None):
-            print(df[[k for k in best if k in df.columns]])
+        with pd.option_context(*DISPLAY):
+            print(df)
 
-for d in log:
-    for k in best:
-        if k not in d:
-            continue
+# Print detailed information, if requested.
+if args.detailed and not args.ddetailed:
+    if not args.quiet:
+        print("Training Details:")
+    if args.json:
+        for d in log:
+            if all(k in d for k in summary):
+                float_print_json(d)
+    else:
+        with pd.option_context(*DISPLAY):
+            print(df.dropna())
 
-        l, e, v = best[k]
-
-        if l and v < d[k]:
-            continue
-        if not l and v > d[k]:
-            continue
-
-        if args.verbose:
-            print(f"Updating {k}: ({best[k]}) -> ", end="")
-
-        best[k] = (l, d["epoch"], d[k])
-
-        if args.verbose:
-            print(f"({best[k]})")
-
-if not args.quiet:
-    print("Training Summary:")
-if args.json:
-    d = {k: e for k, (l, e, v) in best.items() if l is not None}
-    print(d)
-    d = {k: v for k, (l, e, v) in best.items() if l is not None}
-    float_print_json(d)
-else:
-    for k, (l, e, v) in best.items():
-        if l is None:
-            continue
-        print(f"{k} @{e} {v:.4f}")
-
+# Print summary information, if requested.
+if not args.no_summary:
+    if not args.quiet:
+        print("Training Summary:")
+    best = {}
+    for key, func in summary.items():
+        best[key] = func(df[key].dropna().to_numpy())
+    locs = {}
+    for key, val in best.items():
+        locs[key] = next(iter(df["epoch"][df[key] == val].tolist()), -1)
+    if args.json:
+        float_print_json(locs)
+        float_print_json(best)
+    else:
+        longest1 = max(len(key) for key in best.keys())
+        longest2 = max(len(f"{bst:.4f}") for bst in best.values())
+        for key in summary:
+            loc = locs[key]
+            bst = best[key]
+            spaces1 = " " * (longest1 - len(key))
+            spaces2 = " " * (longest2 - len(f"{bst:.4f}"))
+            print(f"{key}:{spaces1} {bst:.4f}{spaces2} (epoch {loc})")
