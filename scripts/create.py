@@ -187,14 +187,11 @@ class Configuration:
 
     @property
     def per_device_batch_size(self) -> int:
-        # I don't really know why, but throughput seems to plateau beyond 256 samples/device.
-        # Unless overridden, cap the per-device batch size at 256.
-        if os.environ.get("USE_MAX_PER_DEVICE_BATCH_SIZE", "0") == "1":
-            return self.max_per_device_batch_size
-        return min(256, self.max_per_device_batch_size)
+        # NOTE: the largest batch size that fits on a single GPU for each architecture
+        # is not nessecarily the same as the batch size that yields the best throughput
+        # and, in general, it seems that increasing the batch size to maximize GPU memory
+        # tends to actually decrease the overall throughput slightly.
 
-    @property
-    def max_per_device_batch_size(self) -> int:
         if self.arch == Architecture.MCV:
             return 64   # O(T)
         if self.arch == Architecture.MC2:
@@ -203,22 +200,22 @@ class Configuration:
             return 256  # O(1)
 
         # Assumes constant-memory encoder. # O(1)
-        # TODO: there appears to be large memory fluctuations here.
-        if self.arch == Architecture.VIT:
-            if self.do_entropy or self.which_characteristics:
-                return 32
-            if self.level == HierarchicalLevel.NONE:
+        if self.arch == Architecture.VIT and self.parch in (PatcherArchitecture.EXP, PatcherArchitecture.MEM):
+            if self.design == Design.FLAT:
+                if self.do_entropy or self.which_characteristics:
+                    return 32
                 return 64
-            if self.level == HierarchicalLevel.COARSE:
+            if self.design == Design.HIERARCHICAL:
+                if self.do_entropy or self.which_characteristics:
+                    return 16
                 return 32
-            if self.level == HierarchicalLevel.MIDDLE:
+            if self.design == Design.STRUCTURAL:
+                if self.do_entropy or self.which_characteristics:
+                    return 32
                 return 32
-            if self.level == HierarchicalLevel.FINE:
-                return 32
-            print(f"WARNING ({str(self)}): max_per_device_batch_size not found.")
-            return 64
 
-        raise NotImplementedError(f"ERROR ({str(self)}): batch size not defined for this configuration.")
+        print(f"WARNING ({str(self)}): per_device_batch_size not found.")
+        return 64
 
     @property
     def num_workers(self) -> int:
@@ -279,6 +276,10 @@ class Configuration:
     @property
     def tf32(self) -> bool:
         return True
+
+    @property
+    def max_structures(self) -> Optional[int]:
+        return 256
 
     @property
     def stopper_patience(self) -> int:
