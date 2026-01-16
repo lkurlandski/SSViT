@@ -81,6 +81,10 @@ TRAINER_SAVE_PREDICTIONS = os.environ.get("TRAINER_SAVE_PREDICTIONS", "0") == "1
 if TRAINER_SAVE_PREDICTIONS:
     warnings.warn("Trainer will save predictions during evaluation.")
 
+TRAINER_SKIP_FIRST_EVAL = os.environ.get("TRAINER_SKIP_FIRST_EVAL", "0") == "1"
+if TRAINER_SKIP_FIRST_EVAL:
+    warnings.warn("Trainer will skip the first evaluation.")
+
 
 def debug_autocast_dtypes(model: nn.Module) -> None:
     def hook(mod, inp, out):  # type: ignore[no-untyped-def]
@@ -548,8 +552,6 @@ def get_last_aux_loss(model: nn.Module) -> Optional[Tensor]:
         return None
     if not isinstance(last_aux_loss, Tensor):
         raise TypeError("Model's `last_aux_loss` attribute must be a Tensor.")
-    if last_aux_loss.ndim > 0:
-        warnings.warn("Model's `last_aux_loss` attribute has more than 0 dimensions; summing to scalar.")
     return last_aux_loss.sum()
 
 
@@ -643,7 +645,7 @@ class Trainer:
         pbar.set_description(f"Epoch {self.epoch_idx} of {self.max_steps / self.steps_per_epoch}")
 
         # Conduct an initial validation and checkpointing on the naked model.
-        if self.glbl_step == 0:
+        if self.glbl_step == 0 and not TRAINER_SKIP_FIRST_EVAL:
             self.run_due_hooks(None, do_eval=True, do_chpt=True, do_logg=True)
 
         # Determine the first mini-batch to train upon.
