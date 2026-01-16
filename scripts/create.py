@@ -7,6 +7,7 @@ import inspect
 from itertools import chain
 from itertools import combinations
 from itertools import product
+import json
 import math
 import os
 from pathlib import Path
@@ -36,8 +37,9 @@ from src.helpers import MainArgs
 # ruff: noqa: F541
 
 
-DEBUG = False
 RESUME = False
+DEBUG = False
+BENCH = False
 NGPUS: Optional[int] = None
 OROOT = Path("/shared/rc/admalware") if Path("/shared/rc/admalware").exists() else Path.home()
 
@@ -63,6 +65,7 @@ class Configuration:
         which_characteristics: tuple[lief.PE.Section.CHARACTERISTICS, ...],
         max_length: int,
         seed: int,
+        model_config: dict[str, str | int | float | bool],
     ) -> None:
         self.design = design
         self.arch = arch
@@ -74,6 +77,7 @@ class Configuration:
         self.which_characteristics = which_characteristics
         self.max_length = max_length
         self.seed = seed
+        self._model_config = model_config
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Configuration):
@@ -102,18 +106,22 @@ class Configuration:
         )
 
     def __str__(self) -> str:
-        return (
-            f"{fixed_width_string(self.design.value, 3, '_')}-"
-            f"{fixed_width_string(self.arch.value, 3, '_')}-"
-            f"{fixed_width_string(self.parch.value, 3, '_')}-"
-            f"{fixed_width_string(self.posenc.value, 3, '_')}-"
-            f"{fixed_width_string(self.patchposenc.value, 3, '_')}-"
-            f"{fixed_width_string(self.level.value, 3, '_')}-"
-            f"{'t' if self.do_entropy else 'f'}-"
-            f"{fixed_width_string(sum(map(int, self.which_characteristics)), len(str(sum(map(int, CHARACTERISTICS)))), '0', left=True)}-"
-            f"{fixed_width_string(self.max_length, 7, '8', left=True)}-"
-            f"{fixed_width_string(self.seed, 1, '_')}"
-        )
+        parts = [
+            fixed_width_string(self.design.value, 3, '_'),
+            fixed_width_string(self.arch.value, 3, '_'),
+            fixed_width_string(self.parch.value, 3, '_'),
+            fixed_width_string(self.posenc.value, 3, '_'),
+            fixed_width_string(self.patchposenc.value, 3, '_'),
+            fixed_width_string(self.level.value, 3, '_'),
+            't' if self.do_entropy else 'f',
+            fixed_width_string(sum(map(int, self.which_characteristics)), len(str(sum(map(int, CHARACTERISTICS)))), '0', left=True),
+            fixed_width_string(self.max_length, 7, '0', left=True),
+            fixed_width_string(self.seed, 1, '_'),
+        ]
+        for key, value in sorted(self.model_config.items()):
+            key = key.replace("moe_", "")
+            parts.append(fixed_width_string(key, 2, "_") + fixed_width_string(value, 2, '_'))
+        return "-".join(parts)
 
     def _attrs(self) -> tuple[Any, ...]:
         return (
@@ -127,6 +135,7 @@ class Configuration:
             tuple(map(int, self.which_characteristics)),
             self.max_length,
             self.seed,
+            tuple(sorted(self.model_config.items())),
         )
 
     def get_gradient_accumulation_steps(self, world_size: int = 1) -> int:
@@ -142,7 +151,9 @@ class Configuration:
     def outdir(self) -> Path:
         root = OROOT / "Documents/code/SSViT/output"
         if DEBUG:
-            root = root / "tmp"
+            root = root / "debug"
+        if BENCH:
+            root = root / "bench"
         parts = [
             f"design--{self.design.value}",
             f"arch--{self.arch.value}",
@@ -153,6 +164,7 @@ class Configuration:
             f"entropy--{self.do_entropy}",
             f"characteristics--{'_'.join(sorted([str(c.name) for c in self.which_characteristics]))}",
             f"max_length--{self.max_length}",
+            f"model_config--{'_'.join(sorted([f'{k}={v}' for k, v in self.model_config.items()]))}",
             f"batch_size--{self.batch_size}",
             f"lr_max--{self.lr_max}",
             f"weight_decay--{self.weight_decay}",
@@ -162,6 +174,12 @@ class Configuration:
             f"seed--{self.seed}",
         ]
         return root.joinpath(*parts)
+
+    @property
+    def model_config(self) -> dict[str, str | int | float | bool]:
+        config: dict[str, str | int | float | bool] = {}
+        config.update(self._model_config)
+        return config
 
     @property
     def batch_size(self) -> int:
@@ -204,7 +222,9 @@ class Configuration:
 
     @property
     def num_workers(self) -> int:
-        return 8
+        if DEBUG:
+            return 1
+        return 4
 
     @property
     def num_threads_per_worker(self) -> int:
@@ -225,6 +245,16 @@ class Configuration:
     @property
     def lr_end(self) -> float:
         return 0.010 * self.lr_max
+
+    @property
+    def auxillary_loss_weight(self) -> float:
+        if self.parch == PatcherArchitecture.EXP:
+            return 0.005
+        return 0.0
+
+    @property
+    def assert_auxillary_loss(self) -> bool:
+        return self.parch == PatcherArchitecture.EXP
 
     @property
     def weight_decay(self) -> float:
@@ -270,11 +300,15 @@ class Configuration:
     def max_epochs(self) -> float:
         if DEBUG:
             return 2
+        if BENCH:
+            return 1
         return 10
 
     @property
     def eval_epochs(self) -> float:
         if DEBUG:
+            return 0.50
+        if BENCH:
             return 1
         return 0.50
 
@@ -282,13 +316,34 @@ class Configuration:
     def chpt_epochs(self) -> float:
         if DEBUG:
             return 1
+        if BENCH:
+            return 1
         return 0.50
 
     @property
     def logg_epochs(self) -> float:
         if DEBUG:
+            return 0.25
+        if BENCH:
             return 1
         return 0.05
+
+    def _num_samples(self, world_size: int) -> Optional[int]:
+        minimum = 1024 * max(self.num_workers, 1) * world_size
+        if DEBUG:
+            return minimum
+        if BENCH:
+            return 4 * minimum
+        return None
+
+    def tr_num_samples(self, world_size: int) -> Optional[int]:
+        return self._num_samples(world_size)
+
+    def vl_num_samples(self, world_size: int) -> Optional[int]:
+        return self._num_samples(world_size)
+
+    def ts_num_samples(self, world_size: int) -> Optional[int]:
+        return self._num_samples(world_size)
 
 
 # Classifier throughput in samples/second on NVIDIA A100. Measurements taken using
@@ -347,19 +402,23 @@ class Requirements:
             tr_throughput = 100
             vl_throughput = 100
 
-        if self.config.level == HierarchicalLevel.COARSE:
-            tr_throughput *= 0.75
-            vl_throughput *= 0.50
-        if self.config.level == HierarchicalLevel.MIDDLE:
-            tr_throughput *= 0.60
-            vl_throughput *= 0.40
-        if self.config.level == HierarchicalLevel.FINE:
-            tr_throughput *= 0.40
-            vl_throughput *= 0.30
+        if self.config.design == Design.FLAT:
+            if self.config.parch == PatcherArchitecture.EXP:
+                tr_throughput *= 0.50
+                vl_throughput *= 0.50
 
-        if self.config.parch == PatcherArchitecture.EXP:
-            tr_throughput *= 0.50
-            vl_throughput *= 0.50
+        if self.config.design == Design.HIERARCHICAL:
+            if self.config.level == HierarchicalLevel.COARSE:
+                tr_throughput *= 0.75
+                vl_throughput *= 0.50
+            if self.config.level == HierarchicalLevel.MIDDLE:
+                tr_throughput *= 0.60
+                vl_throughput *= 0.40
+            if self.config.level == HierarchicalLevel.FINE:
+                tr_throughput *= 0.40
+                vl_throughput *= 0.30
+
+
 
         tr_throughput = tr_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
         vl_throughput = vl_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
@@ -453,6 +512,7 @@ class ScriptBuilder:
 
         locals = "\n".join([
             f"OUTDIR=\"{self.config.outdir}\"",
+            f"CONFIG='{json.dumps(self.config.model_config)}'",
         ])
 
         torchrun = " \\\n".join([
@@ -474,6 +534,7 @@ class ScriptBuilder:
             f"--parch {self.config.parch.value}",
             f"--posenc {self.config.posenc.value}",
             f"--patchposenc {self.config.patchposenc.value}",
+            f"--model_config \"$CONFIG\"",
             f"--level {self.config.level.value}",
             f"--share_embeddings {self.config.share_embeddings}",
             f"--share_patchers {self.config.share_patchers}",
@@ -491,6 +552,8 @@ class ScriptBuilder:
             f"--lr_max {self.config.lr_max}",
             f"--lr_beg {self.config.lr_beg}",
             f"--lr_end {self.config.lr_end}",
+            f"--auxillary_loss_weight {self.config.auxillary_loss_weight}",
+            f"--assert_auxillary_loss {self.config.assert_auxillary_loss}",
             f"--weight_decay {self.config.weight_decay}",
             f"--warmup_ratio {self.config.warmup_ratio}",
             f"--label_smoothing {self.config.label_smoothing}",
@@ -505,14 +568,10 @@ class ScriptBuilder:
             f"--eval_epochs {self.config.eval_epochs}",
             f"--chpt_epochs {self.config.chpt_epochs}",
             f"--logg_epochs {self.config.logg_epochs}",
+            f"--tr_num_samples {self.config.tr_num_samples(self.reqs.world_size)}",
+            f"--vl_num_samples {self.config.vl_num_samples(self.reqs.world_size)}",
+            f"--ts_num_samples {self.config.ts_num_samples(self.reqs.world_size)}",
         ])
-
-        if DEBUG:
-            command += " \\\n" + " \\\n".join([
-                f"--tr_num_samples {1024 * self.config.num_workers * self.reqs.world_size}",
-                f"--vl_num_samples {1024 * self.config.num_workers * self.reqs.world_size}",
-                f"--ts_num_samples {1024 * self.config.num_workers * self.reqs.world_size}",
-            ])
 
         command = torchrun + " \\" + "\n" + command if self.reqs.gpus_per_node > 1 else command
 
@@ -592,18 +651,21 @@ def config_fiter(config: Configuration) -> bool:
 def main() -> None:
 
     parser = ArgumentParser(description="Create large batches of experiments.")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--ngpus", type=int, default=None)
+    parser.add_argument("--resume", action="store_true", help="Resume from existing checkpoints if available.")
+    parser.add_argument("--debug", action="store_true", help="Configuration suitable for debugging.")
+    parser.add_argument("--bench", action="store_true", help="Configuration suitable for benchmarking.")
+    parser.add_argument("--ngpus", type=int, default=None, help="Number of GPUs to use per job.")
     parser.add_argument("--root", type=str, default="auto")
     args = parser.parse_args()
 
     global RESUME
     global DEBUG
+    global BENCH
     global NGPUS
     global OROOT
     RESUME = args.resume
     DEBUG = args.debug
+    BENCH = args.bench
     NGPUS = args.ngpus
     OROOT = Path(args.root) if args.root != "auto" else OROOT
 
@@ -613,19 +675,35 @@ def main() -> None:
         if f.is_file():
             f.unlink()
 
+    model_configs = []
+    for moe_num_experts in [2, 4, 8]:
+        for moe_router_top_k in [1, 2, 4]:
+            if moe_router_top_k > moe_num_experts:
+                continue
+            d = {
+                "moe_num_experts": moe_num_experts,
+                "moe_router_top_k": moe_router_top_k,
+                "moe_probe_dim": 16,
+                "moe_probe_kernel_size": 256,
+                "moe_probe_stride": 256,
+                "moe_router_hidden": 64,
+            }
+            model_configs.append(d)
+
     stream = product(
-        [d for d in Design],
-        [a for a in Architecture],
-        [PatcherArchitecture.MEM, PatcherArchitecture.EXP],
-        [PositionalEncodingArchitecture.FIXED, PositionalEncodingArchitecture.LEARNED],
-        [PatchPositionalEncodingArchitecture.BTH, PatchPositionalEncodingArchitecture.NONE],
-        [l for l in HierarchicalLevel],
-        [True, False],
-        [(), (lief.PE.Section.CHARACTERISTICS.MEM_READ, lief.PE.Section.CHARACTERISTICS.MEM_WRITE, lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE)],
-        [1000000],
+        [Design.FLAT, Design.STRUCTURAL],
+        [Architecture.VIT],
+        [PatcherArchitecture.EXP],
+        [PositionalEncodingArchitecture.FIXED],
+        [PatchPositionalEncodingArchitecture.NONE],
+        [HierarchicalLevel.NONE, HierarchicalLevel.COARSE],
+        [False],
+        [()],
+        [2**20],
         [0],
+        model_configs,
     )
-    configurations = (Configuration(*config) for config in stream)
+    configurations = (Configuration(*config) for config in stream)  # type: ignore[arg-type]
     configurations = (config for config in configurations if config_fiter(config))
     configurations = sorted(configurations)
 
