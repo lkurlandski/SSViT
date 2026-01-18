@@ -42,6 +42,7 @@ DEBUG = False
 BENCH = False
 NGPUS: Optional[int] = None
 OROOT = Path("/shared/rc/admalware") if Path("/shared/rc/admalware").exists() else Path.home()
+HOPPER = False
 
 
 def fixed_width_string(string: Any, width: int, char: str = " ", left: bool = False) -> str:
@@ -395,6 +396,8 @@ class Requirements:
         """Return the number of seconds required for the job (configure)."""
         key = (self.config.arch, self.config.do_entropy, bool(self.config.which_characteristics))
 
+        moe_router_top_k = int(self.config.model_config.get("moe_router_top_k", 1))
+
         if (vl_tr_throughputs := THROUGHPUTS.get(key)) is not None:
             tr_throughput = vl_tr_throughputs[1]
             vl_throughput = vl_tr_throughputs[0]
@@ -405,8 +408,8 @@ class Requirements:
 
         if self.config.design == Design.FLAT:
             if self.config.parch == PatcherArchitecture.EXP:
-                tr_throughput *= 0.50 * (0.75 ** math.log2(self.config.model_config.get("moe_router_top_k", 1)))
-                vl_throughput *= 0.50 * (0.75 ** math.log2(self.config.model_config.get("moe_router_top_k", 1)))
+                tr_throughput *= 0.50 * (0.75 ** math.log2(moe_router_top_k))
+                vl_throughput *= 0.50 * (0.75 ** math.log2(moe_router_top_k))
 
         if self.config.design == Design.HIERARCHICAL:
             if self.config.level == HierarchicalLevel.COARSE:
@@ -421,8 +424,8 @@ class Requirements:
 
         if self.config.design == Design.STRUCTURAL:
             if self.config.parch == PatcherArchitecture.EXP:
-                tr_throughput *= 0.25 * (0.75 ** math.log2(self.config.model_config.get("moe_router_top_k", 1)))
-                vl_throughput *= 0.25 * (0.75 ** math.log2(self.config.model_config.get("moe_router_top_k", 1)))
+                tr_throughput *= 0.25 * (0.75 ** math.log2(moe_router_top_k))
+                vl_throughput *= 0.25 * (0.75 ** math.log2(moe_router_top_k))
             else:
                 # Manual routing.
                 if self.config.level == HierarchicalLevel.COARSE:
@@ -503,12 +506,21 @@ class ScriptBuilder:
             "#!/bin/bash",
         ])
 
+        if HOPPER:
+            partition = "grace"
+            gpu = "gh200"
+            env = "env-grace"
+        else:
+            partition = "tier3"
+            gpu = "a100"
+            env = "env"
+
         slurm = "\n".join([
             f"#SBATCH --account=admalware",
             f"#SBATCH --output=./logs/%x_%j.out",
-            f"#SBATCH --partition=tier3",
+            f"#SBATCH --partition={partition}",
             f"#SBATCH --nodes={self.reqs.nodes}",
-            f"#SBATCH --gpus-per-node=a100:{self.reqs.gpus_per_node}",
+            f"#SBATCH --gpus-per-node={gpu}:{self.reqs.gpus_per_node}",
             f"#SBATCH --ntasks-per-node={self.reqs.ntasks_per_node}",
             f"#SBATCH --cpus-per-task={self.reqs.cpus_per_task}",
             f"#SBATCH --job-name={str(self.config)}",
@@ -517,7 +529,7 @@ class ScriptBuilder:
         ])
 
         environment = "\n".join([
-            "source ./env/bin/activate",
+            f"source ./{env}/bin/activate",
         ])
 
         variables = "\n".join([
@@ -556,6 +568,7 @@ class ScriptBuilder:
             f"--do_entropy {self.config.do_entropy}",
             f"--which_characteristics {' '.join([str(c.name) for c in self.config.which_characteristics])}",
             f"--max_length {self.config.max_length}",
+            f"--max_structures {self.config.max_structures}",
             f"--seed {self.config.seed}",
             f"--num_workers {self.config.num_workers}",
             f"--pin_memory {True if self.config.num_workers > 0 else False}",
@@ -671,6 +684,9 @@ def main() -> None:
     parser.add_argument("--bench", action="store_true", help="Configuration suitable for benchmarking.")
     parser.add_argument("--ngpus", type=int, default=None, help="Number of GPUs to use per job.")
     parser.add_argument("--root", type=str, default="auto")
+    parser.add_argument("--hopper", action="store_true", help="Execute on Hopper GPUs.")
+    parser.add_argument("--no-clean", action="store_true")
+    parser.add_argument("--no-overwrite", action="store_true")
     args = parser.parse_args()
 
     global RESUME
@@ -678,16 +694,21 @@ def main() -> None:
     global BENCH
     global NGPUS
     global OROOT
+    global HOPPER
     RESUME = args.resume
     DEBUG = args.debug
     BENCH = args.bench
     NGPUS = args.ngpus
     OROOT = Path(args.root) if args.root != "auto" else OROOT
+    HOPPER = args.hopper
+
+    if HOPPER and NGPUS > 1:
+        raise ValueError("--ngpus must be one if --hoppper enabled.")
 
     outpath = Path("./run")
     outpath.mkdir(exist_ok=True)
     for f in outpath.iterdir():
-        if f.is_file():
+        if f.is_file() and not args.no_clean:
             f.unlink()
 
     model_configs = []
@@ -741,8 +762,11 @@ def main() -> None:
         builder = ScriptBuilder(config, reqs)
         outfile = (outpath / str(config)).with_suffix(".sh")
         script = builder()
-        outfile.write_text(script)
-        print(f"{outfile}")
+        if outfile.exists() and args.no_overwrite:
+            pass
+        else:
+            outfile.write_text(script)
+            print(f"{outfile}")
 
 
 if __name__ == "__main__":
