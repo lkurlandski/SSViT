@@ -54,3 +54,6 @@ Upon further analysis it seems the issue is more complex than this. Rather than 
 - Add a real logging system with DEBUG, INFO, and WARN modes.
 - There might be O(C^2) memory complexity in the low-mem implementations when computing winner positions.
 - Resuming from a checkpoint saved at the end of one epoch but not before the start of the next epoch requires iterating through the entire epoch.
+- Tests with pin_memory should only run if GPUs available.
+
+j=$(sbatch ./run/job.sh | awk '{print $4}')
