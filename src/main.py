@@ -815,6 +815,7 @@ def main() -> None:
         structures,
         args.max_length,
         args.share_embeddings,
+        args.share_patchers,
         **dict(args.model_config),
     ).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
