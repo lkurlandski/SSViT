@@ -696,9 +696,13 @@ class ParserGuider:
         raise TypeError(f"Unknown LIEF exception type: {type(e)}. Expected one of {ParserGuider.PARSEERRORS}.")
 
 
+# This design is quite clunky, bordering on asinine. Refactor.
+
+
 class HierarchicalLevel(enum.Enum):
     NONE = "none"
     COARSE = "coarse"
+    ROUGH = "rough"
     MIDDLE = "middle"
     FINE = "fine"
 
@@ -717,6 +721,15 @@ class HierarchicalStructureCoarse(HierarchicalStructure):
     OVERLAY   = "overlay"   # Overlay data           (ANY)
     DIRECTORY = "directory" # Directories            (ANY)
     OTHER     = "other"     # All other bytes        (ANY)
+
+
+class HierarchicalStructureRough(HierarchicalStructure):
+    HEADERS   = "headers"   # Headers         (ANY)
+    DNETSEC   = "dnetsec"   # .NET sections   (SECTION)
+    OTHRSEC   = "othrsec"   # Other sections  (SECTION)
+    OVERLAY   = "overlay"   # Overlay data    (ANY)
+    DIRECTORY = "directory" # Directories     (ANY)
+    OTHER     = "other"     # All other bytes (ANY)
 
 
 class HierarchicalStructureMiddle(HierarchicalStructure):
@@ -761,6 +774,7 @@ class HierarchicalStructureFine(HierarchicalStructure):
 LEVEL_STRUCTURE_MAP: dict[HierarchicalLevel, type[HierarchicalStructure]] = {
     HierarchicalLevel.NONE: HierarchicalStructureNone,
     HierarchicalLevel.COARSE: HierarchicalStructureCoarse,
+    HierarchicalLevel.ROUGH: HierarchicalStructureRough,
     HierarchicalLevel.MIDDLE: HierarchicalStructureMiddle,
     HierarchicalLevel.FINE: HierarchicalStructureFine,
 }
@@ -822,6 +836,19 @@ class StructureParser:
             case HierarchicalStructureCoarse.DIRECTORY:
                 ranges = self.get_directory()
             case HierarchicalStructureCoarse.OTHER:
+                ranges = self.get_other()
+            # Rough
+            case HierarchicalStructureRough.HEADERS:
+                ranges = self.get_headers()
+            case HierarchicalStructureRough.DNETSEC:
+                ranges = self.get_dnet_sections()
+            case HierarchicalStructureRough.OTHRSEC:
+                ranges = self.get_othr_sections()
+            case HierarchicalStructureRough.OVERLAY:
+                ranges = self.get_overlay()
+            case HierarchicalStructureRough.DIRECTORY:
+                ranges = self.get_directory()
+            case HierarchicalStructureRough.OTHER:
                 ranges = self.get_other()
             # Middle
             case HierarchicalStructureMiddle.HEADERS:
@@ -1216,6 +1243,12 @@ class StructureParser:
             if r:
                 out.append(r)
         return self._norm(out)
+
+    def get_dnet_sections(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: self._is_dotnet(s)))
+
+    def get_othr_sections(self) -> list[Range]:
+        return self._norm(self._select_sections(lambda s: not self._is_dotnet(s)))
 
     def get_dnet_code(self) -> list[Range]:
         return self._norm(self._select_sections(lambda s: self._is_dotnet(s) and self._is_code(s)))
