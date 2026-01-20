@@ -146,6 +146,11 @@ if STRUCTURES_AS_GUIDES:
     warnings.warn("STRUCTURES_AS_GUIDES is enabled. Hierarchical structures will be used as semantic guides.")
 
 
+MAIN_RUN_PROFILE = os.environ.get("MAIN_RUN_PROFILE", "0") == "1"
+if MAIN_RUN_PROFILE:
+    warnings.warn("MAIN_RUN_PROFILE is enabled. Certain command line arguments will be overridden.")
+
+
 def get_model(
     design: Design,
     arch: Architecture,
@@ -766,6 +771,41 @@ def get_shardwise_stats(datadb: SimpleDB, last_shard: int) -> pd.DataFrame:
     return pd.concat(dfs, ignore_index=True)
 
 
+def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 512) -> None:
+    trainer.args.eval_steps = None
+    trainer.args.eval_epochs = None
+    trainer.args.chpt_steps = None
+    trainer.args.chpt_epochs = None
+    trainer.args.logg_steps = None
+    trainer.args.logg_epochs = None
+
+    skip_first = 0
+    wait = 2
+    warmup = 2
+    active = num_samples // tr_batch_size
+    repeat = 1
+    sched = schedule(skip_first=skip_first, wait=wait, warmup=warmup, active=active, repeat=repeat)
+    total_mini_steps = skip_first + (wait + warmup + active) * repeat
+
+    activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+
+    handler = tensorboard_trace_handler(trainer.args.outdir.as_posix(), worker_name=f"rank-{local_rank()}")
+
+    with profile(
+        activities=activities,
+        schedule=sched,
+        on_trace_ready=handler,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as prof:
+        trainer.train(prof, end_mini_step=total_mini_steps)
+        print("Top Usage (CPU):")
+        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=30))
+        print("Top Usage (CUDA):")
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+
+
 def main() -> None:
 
     lief.logging.set_level(lief.logging.LEVEL.OFF)
@@ -1027,29 +1067,13 @@ def main() -> None:
     print(f"{trainer=}")
     print("", end="", flush=True)
 
+    if MAIN_RUN_PROFILE:
+        main_run_profile(trainer, args.tr_batch_size)
+        return
+
     trainer = trainer()
     return
 
-    trainer.args.eval_steps = None
-    trainer.args.eval_epochs = None
-    trainer.args.chpt_steps = None
-    trainer.args.chpt_epochs = None
-    trainer.args.logg_steps = None
-    trainer.args.logg_epochs = None
-    activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
-    sched = schedule(wait=10, warmup=10, active=20, repeat=1)
-    handler = tensorboard_trace_handler("./tb_trace-5", worker_name=f"rank-{local_rank()}")
-    with profile(
-        activities=activities,
-        schedule=sched,
-        on_trace_ready=handler,
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-    ) as prof:
-        trainer.train(prof)
-        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=30))
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
 
 
 if __name__ == "__main__":
