@@ -671,13 +671,14 @@ class Trainer:
 
         return self
 
-    def train(self, prof: Optional[profile] = None, start_mini_step: int = 0) -> None:
+    def train(self, prof: Optional[profile] = None, start_mini_step: int = 0, end_mini_step: Optional[int] = None) -> None:
         """
         Train the model on the training set.
 
         Args:
             prof: If provided, will profile using this profiler.
             start_mini_step: If provided, will skip mini_batches until this index.
+            end_mini_step: If provided, will break after this index.
         """
         barrier("Trainer::train:before", self.device)
         timer = Timer()
@@ -744,6 +745,8 @@ class Trainer:
                     break
             if mini_step < start_mini_step:
                 continue
+            if mini_step - 1 == end_mini_step:
+                break
             with record_function("stage::transfer"):
                 batch = batch.to(self.device, non_blocking=True)
             with record_function("stage::finalize"):
