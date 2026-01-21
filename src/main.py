@@ -771,7 +771,7 @@ def get_shardwise_stats(datadb: SimpleDB, last_shard: int) -> pd.DataFrame:
     return pd.concat(dfs, ignore_index=True)
 
 
-def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 512) -> None:
+def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 128) -> None:
     if world_size() != 1:
         raise RuntimeError("Profiling only implemented for single worker.")
 
@@ -793,6 +793,14 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 51
     repeat = 1
     sched = schedule(skip_first=skip_first, wait=wait, warmup=warmup, active=active, repeat=repeat)
     total_mini_steps = skip_first + (wait + warmup + active) * repeat
+
+    # from src.profiling import trace_cuda_scalar_conversions
+    # from src.profiling import show_top
+    # with trace_cuda_scalar_conversions() as hits:
+    #     trainer.train(end_mini_step=total_mini_steps)
+    #     print("Most probable CUDA scalar conversions:")
+    #     show_top(hits)
+    # sys.exit(0)
 
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 
@@ -821,7 +829,9 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 51
         tab_gpu = prof.key_averages().table(sort_by="cuda_time_total", row_limit=20)
         print(f"Top Usage (GPU):\n{tab_gpu}")
         file_gpu.write_text(tab_gpu)
-        prof.export_stacks(file_stk.as_posix(), "self_cpu_time_total")
+        if with_stack:
+            print("Exporting stacks...")
+            prof.export_stacks(file_stk.as_posix(), "self_cpu_time_total")
 
 
 def main() -> None:
