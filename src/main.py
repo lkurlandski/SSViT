@@ -772,6 +772,9 @@ def get_shardwise_stats(datadb: SimpleDB, last_shard: int) -> pd.DataFrame:
 
 
 def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 512) -> None:
+    if world_size() != 0:
+        raise RuntimeError("Profiling only implemented for single worker.")
+
     trainer.args.eval_steps = None
     trainer.args.eval_epochs = None
     trainer.args.chpt_steps = None
@@ -779,17 +782,32 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 51
     trainer.args.logg_steps = None
     trainer.args.logg_epochs = None
 
+    # If saving stacks, profile a small number of active windows.
+    with_stack = False
+
     skip_first = 0
     wait = 2
     warmup = 2
-    active = num_samples // tr_batch_size
+    active = 2 if with_stack else num_samples // tr_batch_size
     repeat = 1
     sched = schedule(skip_first=skip_first, wait=wait, warmup=warmup, active=active, repeat=repeat)
     total_mini_steps = skip_first + (wait + warmup + active) * repeat
 
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 
-    handler = tensorboard_trace_handler(trainer.args.outdir.as_posix(), worker_name=f"rank-{local_rank()}")
+    outdir = trainer.args.outdir / "tb_trace"
+    i = -1
+    while True:
+        i += 1
+        file_cpu = outdir / f"cpu-{i}.txt"
+        file_gpu = outdir / f"gpu-{i}.txt"
+        file_stk = outdir / f"stacks-{i}.txt"
+        if file_cpu.exists(): continue
+        if file_gpu.exists(): continue
+        if file_stk.exists(): continue
+        break
+
+    handler = tensorboard_trace_handler(outdir.as_posix())
 
     with profile(
         activities=activities,
@@ -797,13 +815,17 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 51
         on_trace_ready=handler,
         record_shapes=False,
         profile_memory=False,
-        with_stack=False,
+        with_stack=with_stack,
+        experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
     ) as prof:
         trainer.train(prof, end_mini_step=total_mini_steps)
-        print("Top Usage (CPU):")
-        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=30))
-        print("Top Usage (CUDA):")
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+        tab_cpu = prof.key_averages().table(sort_by="cpu_time_total", row_limit=20)
+        print("Top Usage (CPU):\n{tab_cpu}")
+        file_cpu.write_text(tab_cpu)
+        tab_gpu = prof.key_averages().table(sort_by="cuda_time_total", row_limit=20)
+        print("Top Usage (GPU):\n{tab_gpu}")
+        file_gpu.write_text(tab_gpu)
+        prof.export_stacks(file_stk.as_posix(), "self_cpu_time_total")
 
 
 def main() -> None:
