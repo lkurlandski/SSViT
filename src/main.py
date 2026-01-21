@@ -772,7 +772,7 @@ def get_shardwise_stats(datadb: SimpleDB, last_shard: int) -> pd.DataFrame:
 
 
 def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 512) -> None:
-    if world_size() != 0:
+    if world_size() != 1:
         raise RuntimeError("Profiling only implemented for single worker.")
 
     trainer.args.eval_steps = None
@@ -783,7 +783,8 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 51
     trainer.args.logg_epochs = None
 
     # If saving stacks, profile a small number of active windows.
-    with_stack = False
+    with_stack = os.environ.get("WITH_STACK", "0") == "1"
+    print(f"Profiling with{'' if with_stack else 'out'} stack analysis.")
 
     skip_first = 0
     wait = 2
@@ -795,17 +796,12 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 51
 
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 
-    outdir = trainer.args.outdir / "tb_trace"
-    i = -1
-    while True:
+    i = 0
+    while (outdir := trainer.args.outdir / f"tb_trace-{i}").exists():
         i += 1
-        file_cpu = outdir / f"cpu-{i}.txt"
-        file_gpu = outdir / f"gpu-{i}.txt"
-        file_stk = outdir / f"stacks-{i}.txt"
-        if file_cpu.exists(): continue
-        if file_gpu.exists(): continue
-        if file_stk.exists(): continue
-        break
+    file_cpu = outdir / "cpu.txt"
+    file_gpu = outdir / "gpu.txt"
+    file_stk = outdir / "stacks.txt"
 
     handler = tensorboard_trace_handler(outdir.as_posix())
 
@@ -820,10 +816,10 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 51
     ) as prof:
         trainer.train(prof, end_mini_step=total_mini_steps)
         tab_cpu = prof.key_averages().table(sort_by="cpu_time_total", row_limit=20)
-        print("Top Usage (CPU):\n{tab_cpu}")
+        print(f"Top Usage (CPU):\n{tab_cpu}")
         file_cpu.write_text(tab_cpu)
         tab_gpu = prof.key_averages().table(sort_by="cuda_time_total", row_limit=20)
-        print("Top Usage (GPU):\n{tab_gpu}")
+        print(f"Top Usage (GPU):\n{tab_gpu}")
         file_gpu.write_text(tab_gpu)
         prof.export_stacks(file_stk.as_posix(), "self_cpu_time_total")
 
