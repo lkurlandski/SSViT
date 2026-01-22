@@ -170,6 +170,9 @@ df = pd.DataFrame(log)
 if args.verbose:
     print(f"Found {len(log)} entries.")
 
+# Remove missing things from the summary dict.
+summary = {k: v for k, v in summary.items() if k in df.columns}
+
 # Print very detailed information, if requested.
 if args.ddetailed:
     if not args.quiet:
