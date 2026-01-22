@@ -359,7 +359,6 @@ def _lowmem_patchwise_max_over_time_streaming(
     channels: int,
     num_patches: int,
     activations_fn: Callable[[Tensor], Tensor],  # (B,E,L)->(B,C,L_out)
-    patch_active: Optional[torch.Tensor] = None,  # (B, N) bool; update maxima only where True
 ) -> tuple[Tensor, Tensor]:
     """
     Streaming version: never materializes (B,T,E). Returns
@@ -389,10 +388,6 @@ def _lowmem_patchwise_max_over_time_streaming(
 
     step = max(1, chunk_size - overlap)
     start = 0
-
-    if patch_active is not None:
-        check_tensor(patch_active, (B, num_patches), torch.bool)
-        patch_active = patch_active.to(device=ts[0].device)
 
     with torch.no_grad():
         while start < T:
@@ -425,30 +420,38 @@ def _lowmem_patchwise_max_over_time_streaming(
                 patch_idx = torch.div(pos_end, patch_size, rounding_mode="floor")
                 patch_idx.clamp_(0, num_patches - 1)
 
-                # For each patch, update maxima
-                for j in range(num_patches):
-                    mask = (patch_idx == j)                    # (L_out,)
-                    if not mask.any():
-                        continue
-                    # If nobody in the batch is active for this patch, skip work.
-                    if patch_active is not None and not patch_active[:, j].any():
-                        continue
+                # Group L_out positions by patch index and compute per-patch maxima + earliest argmax time.
+                # Shapes:
+                #   g:        (B, C, L_out)
+                #   patch_idx:(L_out,)
+                idx_bc = patch_idx.view(1, 1, L_out).expand(B, channels, L_out)  # (B,C,L_out)
 
-                    g_j = g[..., mask]                         # (B, C, L_j)
-                    v_j, idx_j_local = g_j.max(dim=-1)         # (B, C)
+                # Per-patch max values for this chunk: (B, C, N)
+                v_bc = torch.full((B, channels, num_patches), sentinel, device=device, dtype=g.dtype)
+                v_bc.scatter_reduce_(2, idx_bc, g, reduce="amax", include_self=True)
 
-                    pos_candidates = pos[mask]                 # (L_j,)
-                    # Map local argmax indices to global positions (B,C)
-                    pos_j = pos_candidates[idx_j_local]        # (B, C)
+                # Earliest time index that attains the max (stable tie-break):
+                t = torch.arange(L_out, device=device, dtype=torch.long).view(1, 1, L_out).expand(B, channels, L_out)
+                v_for_t = v_bc.gather(2, idx_bc)  # (B,C,L_out)
+                t_masked = torch.where(g == v_for_t, t, torch.full_like(t, L_out))
 
-                    cur_v = max_vals[:, j, :]                  # (B, C)
-                    cur_p = max_pos[:, j, :]
+                t_bc = torch.full((B, channels, num_patches), L_out, device=device, dtype=torch.long)
+                t_bc.scatter_reduce_(2, idx_bc, t_masked, reduce="amin", include_self=True)
 
-                    upd = v_j > cur_v
-                    if patch_active is not None:
-                        upd = upd & patch_active[:, j].unsqueeze(1)
-                    max_vals[:, j, :] = torch.where(upd, v_j, cur_v)
-                    max_pos[:, j, :]  = torch.where(upd, pos_j, cur_p)
+                # Convert to window-start positions in input space: (B,C,N)
+                pos_bc = start + t_bc * first_stride
+
+                # Reorder to match storage: (B,N,C)
+                v_chunk = v_bc.transpose(1, 2).contiguous()
+                pos_chunk = pos_bc.transpose(1, 2).contiguous()
+
+                # If a patch had no outputs in this chunk, v_chunk stays sentinel; ignore its pos.
+                pos_chunk = pos_chunk.masked_fill(v_chunk == sentinel, 0)
+
+                # Update running maxima across chunks
+                upd = v_chunk > max_vals
+                max_vals = torch.where(upd, v_chunk, max_vals)
+                max_pos  = torch.where(upd, pos_chunk, max_pos)
 
             if end == T:
                 break
@@ -458,9 +461,8 @@ def _lowmem_patchwise_max_over_time_streaming(
     # These will have max_vals == sentinel; set them to zero to avoid blowing up downstream.
     assert sentinel is not None
     mask = (max_vals == sentinel)
-    if mask.any():
-        max_vals = max_vals.masked_fill(mask, 0.0)
-        max_pos = max_pos.masked_fill(mask, 0)
+    max_vals = max_vals.masked_fill(mask, 0.0)
+    max_pos = max_pos.masked_fill(mask, 0)
 
     # Also, clamp the positions to valid window starts.
     max_pos.clamp_(0, max(0, T - rf))

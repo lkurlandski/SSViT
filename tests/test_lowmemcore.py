@@ -261,56 +261,6 @@ class TestLowmemPatchwiseMaxOverTimeStreaming:
         assert torch.equal(max_pos, ref_pos)
         assert (max_vals == 0).any()
 
-    def test_patch_active_masks_patches_when_available(self) -> None:
-        """
-        Forward-compatible: after patch_active=(B,N) is added, verify inactive patches are zero.
-        """
-
-        torch.manual_seed(5)
-
-        B, T, E = 2, 256, 4
-        C = 5
-        rf = stride = 8
-        N = 8
-
-        z = torch.rand(B, T, E, dtype=torch.float32)
-        conv = _make_positive_conv(E, C, rf, stride)
-
-        def activations_fn(x: torch.Tensor) -> torch.Tensor:
-            return conv(x)  # type: ignore[no-any-return]
-
-        full_vals, _ = _lowmem_patchwise_max_over_time_streaming(
-            preprocess=_identity_preprocess,
-            ts=[z],
-            rf=rf,
-            first_stride=stride,
-            chunk_size=128,
-            overlap=64,
-            channels=C,
-            num_patches=N,
-            activations_fn=activations_fn,
-            patch_active=None,
-        )
-
-        patch_active = torch.zeros((B, N), dtype=torch.bool)
-        patch_active[:, ::2] = True
-
-        masked_vals, _ = _lowmem_patchwise_max_over_time_streaming(
-            preprocess=_identity_preprocess,
-            ts=[z],
-            rf=rf,
-            first_stride=stride,
-            chunk_size=128,
-            overlap=64,
-            channels=C,
-            num_patches=N,
-            activations_fn=activations_fn,
-            patch_active=patch_active,
-        )
-
-        assert torch.all(masked_vals[:, 1::2, :] == 0)
-        torch.testing.assert_close(masked_vals[:, ::2, :], full_vals[:, ::2, :], rtol=0, atol=0)
-
 
 class TestScatterGToBC:
 
