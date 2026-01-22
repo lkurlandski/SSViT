@@ -794,14 +794,6 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 12
     sched = schedule(skip_first=skip_first, wait=wait, warmup=warmup, active=active, repeat=repeat)
     total_mini_steps = skip_first + (wait + warmup + active) * repeat
 
-    # from src.profiling import trace_cuda_scalar_conversions
-    # from src.profiling import show_top
-    # with trace_cuda_scalar_conversions() as hits:
-    #     trainer.train(end_mini_step=total_mini_steps)
-    #     print("Most probable CUDA scalar conversions:")
-    #     show_top(hits)
-    # sys.exit(0)
-
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 
     i = 0
