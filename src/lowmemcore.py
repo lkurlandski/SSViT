@@ -684,3 +684,31 @@ def _scatter_g_to_BC(
         g_b = g_all[start:start + u_b]                       # (U_b, C)
         out[b] = g_b[inv, torch.arange(channels, device=g_all.device)]
     return out
+
+
+def _sorted_unique_inverse_1d(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Alternative to torch.unique for 1D tensors that may behave more nicely.
+
+    Essentially equivalent to `torch.unique.(..., return_inverse=True, sorted=Trued)`.
+    """
+    # Ensure long for indexing ops
+    x = x.to(torch.long)
+
+    # sort
+    xs, perm = torch.sort(x)  # (C,), (C,)
+
+    # find group boundaries
+    first = torch.ones_like(xs, dtype=torch.bool)
+    first[1:] = xs[1:] != xs[:-1]
+
+    ux = xs[first]  # (U,)
+
+    # group id for each sorted position: cumsum(first)-1
+    gid = torch.cumsum(first.to(torch.long), dim=0) - 1  # (C,)
+
+    # scatter back to original order
+    inv = torch.empty_like(gid)
+    inv.scatter_(0, perm, gid)
+
+    return ux, inv
