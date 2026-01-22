@@ -1193,12 +1193,15 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         # Route to experts.
         dispatch, gates, aux = self._route(r)
 
+        # Pre-compute the experts' involvement once, to reduce CUDA synchronization in the expert loop.
+        should_dispatch = dispatch.reshape(-1, dispatch.shape[-1]).any(dim=0).tolist()
+
         # Expert passes.
         out = r.new_zeros((B, N, C))
         for e, expert in enumerate(self.experts):
             active = dispatch[..., e]                                      # (B, N)
             mask = active.unsqueeze(-1).expand(B, N, C).reshape(B, N * C)  # (B, NC)
-            if not active.any():
+            if not should_dispatch[e]:
                 continue
 
             max_vals, pos = _lowmem_patchwise_max_over_time_dispatched(
