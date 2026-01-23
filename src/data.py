@@ -1728,23 +1728,18 @@ class Preprocessor:
         return torch.from_numpy(x)
 
 
-# FIXME: remove `change_dtype_after_pad`.
-
-
 class CollateFn:
 
-    def __init__(self, pin_memory: bool, bitpack: bool, min_length: int = 0, change_dtype_after_pad: bool = True) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, min_length: int = 0) -> None:
         """
         Args:
             pin_memory: whether to pin memory of the collated tensors (recommended to use DataLoader(pin_memory=True) instead).
             bitpack: whether to bitpack the semantic guides if not already bitpacked.
             min_length: minimum length to pad the inputs to (must be a multiple of `8`).
-            change_dtype_after_pad: controls where the dtype conversion from uint8 to int16 and addition of 1 takes place.
         """
         self.pin_memory = pin_memory
         self.bitpack = bitpack
         self.min_length = min_length
-        self.change_dtype_after_pad = change_dtype_after_pad
         if self.min_length % 8 != 0:
             raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {min_length}.")
 
@@ -1765,12 +1760,11 @@ class CollateFn:
 
 class CollateFnHierarchical:
 
-    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None, change_dtype_after_pad: bool = True) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None) -> None:
         self.pin_memory = pin_memory
         self.bitpack = bitpack
         self.num_structures = num_structures
         self.min_lengths = [0] * num_structures if min_lengths is None else min_lengths
-        self.change_dtype_after_pad = change_dtype_after_pad
         if any(l % 8 != 0 for l in self.min_lengths):
             raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {self.min_lengths}.")
         if len(self.min_lengths) != self.num_structures:
@@ -1807,12 +1801,11 @@ class CollateFnHierarchical:
 
 class CollateFnStructural:
 
-    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None, change_dtype_after_pad: bool = True) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None) -> None:
         self.pin_memory = pin_memory
         self.bitpack = bitpack
         self.num_structures = num_structures
         self.min_lengths = [0] * num_structures if min_lengths is None else min_lengths
-        self.change_dtype_after_pad = change_dtype_after_pad
 
         if pin_memory or bitpack:
             raise NotImplementedError(f"{self.__class__.__name__} does not support pin_memory or bitpack yet.")
