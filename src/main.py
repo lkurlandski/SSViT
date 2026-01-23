@@ -815,10 +815,12 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 12
         experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
     ) as prof:
         trainer.train(prof, end_mini_step=total_mini_steps)
-        tab_cpu = prof.key_averages().table(sort_by="cpu_time_total", row_limit=20)
+        print("Profiling complete. Computing averages...")
+        averages = prof.key_averages()
+        tab_cpu = averages.table(sort_by="cpu_time_total", row_limit=20)
         print(f"Top Usage (CPU):\n{tab_cpu}")
         file_cpu.write_text(tab_cpu)
-        tab_gpu = prof.key_averages().table(sort_by="cuda_time_total", row_limit=20)
+        tab_gpu = averages.table(sort_by="cuda_time_total", row_limit=20)
         print(f"Top Usage (GPU):\n{tab_gpu}")
         file_gpu.write_text(tab_gpu)
         if with_stack:
