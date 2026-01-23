@@ -41,7 +41,7 @@ RESUME = False
 DEBUG = False
 BENCH = False
 NGPUS: Optional[int] = None
-OROOT = Path("/shared/rc/admalware") if Path("/shared/rc/admalware").exists() else Path.home()
+OROOT = Path("/shared/rc/admalware") if not Path(".server").exists() or Path(".server").read_text().strip() == "rc" else Path.home()
 HOPPER = False
 
 
@@ -164,7 +164,8 @@ class Configuration:
             f"level--{self.level.value}",
             f"entropy--{self.do_entropy}",
             f"characteristics--{'_'.join(sorted([str(c.name) for c in self.which_characteristics]))}",
-            f"max_length--{self.max_length}",
+            f"max_length--{self.truncate_length}",
+            f"max_length_per_structure--{self.max_length_per_structure}",
             f"model_config--{'_'.join(sorted([f'{k}={v}' for k, v in self.model_config.items()]))}",
             f"batch_size--{self.batch_size}",
             f"lr_max--{self.lr_max}",
@@ -280,7 +281,21 @@ class Configuration:
 
     @property
     def max_structures(self) -> Optional[int]:
-        return 256
+        if self.design == Design.STRUCTURAL:
+            return 256
+        return None
+
+    @property
+    def truncate_length(self) -> Optional[int]:
+        if self.design == Design.STRUCTURAL:
+            return None
+        return self.max_length
+
+    @property
+    def max_length_per_structure(self) -> Optional[int]:
+        if self.design == Design.STRUCTURAL:
+            return self.max_length
+        return None
 
     @property
     def stopper_patience(self) -> int:
@@ -438,6 +453,7 @@ class Requirements:
                     tr_throughput *= 0.40
                     vl_throughput *= 0.30
 
+        # NOTE: the scaling via max_length isn't going to work well for structural any more.
         tr_throughput = tr_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
         vl_throughput = vl_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
 
@@ -567,7 +583,8 @@ class ScriptBuilder:
             f"--share_patchers {self.config.share_patchers}",
             f"--do_entropy {self.config.do_entropy}",
             f"--which_characteristics {' '.join([str(c.name) for c in self.config.which_characteristics])}",
-            f"--max_length {self.config.max_length}",
+            f"--max_length {self.config.truncate_length}",
+            f"--max_length_per_structure {self.config.max_length_per_structure}",
             f"--max_structures {self.config.max_structures}",
             f"--seed {self.config.seed}",
             f"--num_workers {self.config.num_workers}",
@@ -712,27 +729,25 @@ def main() -> None:
             f.unlink()
 
     model_configs = []
-    for moe_num_experts in [2, 4, 8]:
-        for moe_router_top_k in [1, 2, 4]:
-            if moe_router_top_k > moe_num_experts:
+    for embedding_dim in [8, 16]:
+        for patcher_channels in [64, 128]:
+            if embedding_dim == 8 and patcher_channels != 64:
+                continue
+            if embedding_dim == 16 and patcher_channels != 128:
                 continue
             d = {
-                "moe_num_experts": moe_num_experts,
-                "moe_router_top_k": moe_router_top_k,
-                "moe_probe_dim": 16,
-                "moe_probe_kernel_size": 256,
-                "moe_probe_stride": 256,
-                "moe_router_hidden": 64,
+                "embedding_dim": embedding_dim,
+                "patcher_channels": patcher_channels,
             }
             model_configs.append(d)
 
     stream = product(
-        [Design.FLAT, Design.STRUCTURAL],
+        [Design.STRUCTURAL],
         [Architecture.VIT],
-        [PatcherArchitecture.EXP],
+        [PatcherArchitecture.MEM],
         [PositionalEncodingArchitecture.FIXED],
         [PatchPositionalEncodingArchitecture.NONE],
-        [HierarchicalLevel.NONE, HierarchicalLevel.COARSE],
+        [HierarchicalLevel.COARSE, HierarchicalLevel.ROUGH, HierarchicalLevel.MIDDLE, HierarchicalLevel.FINE],
         [False],
         [()],
         [2**20],
