@@ -387,6 +387,10 @@ def _lowmem_patchwise_max_over_time_streaming(
     max_vals: torch.Tensor
     max_pos: torch.Tensor
 
+    idx_base: Tensor
+    v_bc: Tensor
+    t_bc: Tensor
+
     step = max(1, chunk_size - overlap)
     start = 0
 
@@ -406,6 +410,11 @@ def _lowmem_patchwise_max_over_time_streaming(
                 sentinel = torch.finfo(dtype).min
                 max_vals = torch.full((B, num_patches, channels), sentinel, device=device, dtype=dtype)
                 max_pos = torch.zeros((B, num_patches, channels), device=device, dtype=torch.long)
+                # Cache maximum possible L_out for this call and reuse arange.
+                L_out_cap = max(0, (chunk_size + overlap - rf) // first_stride + 1)
+                idx_base = torch.arange(L_out_cap, device=device, dtype=torch.long)
+                t_bc = torch.empty((B, channels, num_patches), device=device, dtype=torch.long)
+                v_bc = torch.empty((B, channels, num_patches), device=device, dtype=dtype)
 
             z_chunk = z_chunk.transpose(1, 2).contiguous()  # (B, E, L)
 
@@ -414,7 +423,7 @@ def _lowmem_patchwise_max_over_time_streaming(
                 B_, C_, L_out = g.shape
                 assert B_ == B and C_ == channels
 
-                idx = torch.arange(L_out, device=device)        # (L_out,)
+                idx = idx_base[:L_out]                          # (L_out,)
                 pos = start + idx * first_stride                # (L_out,)
                 pos_end = pos + (rf - 1)                        # (L_out,)
                 # Map each conv output position to a patch index
@@ -428,15 +437,15 @@ def _lowmem_patchwise_max_over_time_streaming(
                 idx_bc = patch_idx.view(1, 1, L_out).expand(B, channels, L_out)  # (B,C,L_out)
 
                 # Per-patch max values for this chunk: (B, C, N)
-                v_bc = torch.full((B, channels, num_patches), sentinel, device=device, dtype=g.dtype)
+                v_bc.fill_(torch.finfo(g.dtype).min)
                 v_bc.scatter_reduce_(2, idx_bc, g, reduce="amax", include_self=True)
 
                 # Earliest time index that attains the max (stable tie-break):
-                t = torch.arange(L_out, device=device, dtype=torch.long).view(1, 1, L_out).expand(B, channels, L_out)
+                t = idx.view(1, 1, L_out).expand(B, channels, L_out)
                 v_for_t = v_bc.gather(2, idx_bc)  # (B,C,L_out)
-                t_masked = torch.where(g == v_for_t, t, torch.full_like(t, L_out))
+                t_masked = t.masked_fill(g != v_for_t, L_out)
 
-                t_bc = torch.full((B, channels, num_patches), L_out, device=device, dtype=torch.long)
+                t_bc.fill_(L_out)
                 t_bc.scatter_reduce_(2, idx_bc, t_masked, reduce="amin", include_self=True)
 
                 # Convert to window-start positions in input space: (B,C,N)
@@ -446,12 +455,9 @@ def _lowmem_patchwise_max_over_time_streaming(
                 v_chunk = v_bc.transpose(1, 2).contiguous()
                 pos_chunk = pos_bc.transpose(1, 2).contiguous()
 
-                # If a patch had no outputs in this chunk, v_chunk stays sentinel; ignore its pos.
-                pos_chunk = pos_chunk.masked_fill(v_chunk == sentinel, 0)
-
                 # Update running maxima across chunks
                 upd = v_chunk > max_vals
-                max_vals = torch.where(upd, v_chunk, max_vals)
+                torch.maximum(max_vals, v_chunk, out=max_vals)
                 max_pos  = torch.where(upd, pos_chunk, max_pos)
 
             if end == T:
@@ -462,8 +468,8 @@ def _lowmem_patchwise_max_over_time_streaming(
     # These will have max_vals == sentinel; set them to zero to avoid blowing up downstream.
     assert sentinel is not None
     mask = (max_vals == sentinel)
-    max_vals = max_vals.masked_fill(mask, 0.0)
-    max_pos = max_pos.masked_fill(mask, 0)
+    max_vals.masked_fill_(mask, 0.0)
+    max_pos.masked_fill_(mask, 0)
 
     # Also, clamp the positions to valid window starts.
     max_pos.clamp_(0, max(0, T - rf))
@@ -497,6 +503,8 @@ def _scatter_g_to_BNC(
         dtype=g_all.dtype,
     )
 
+    col_idx = torch.arange(channels, device=g_all.device).view(1, -1).expand(num_patches, -1)
+
     for b, (start, inv_flat, u_b) in enumerate(meta):
         if inv_flat.numel() != num_patches * channels:
             raise RuntimeError(
@@ -512,11 +520,46 @@ def _scatter_g_to_BNC(
 
         active = inv >= 0
         row_idx = inv.clamp(min=0)
-        col_idx = torch.arange(channels, device=g_all.device).view(1, -1).expand(num_patches, -1)
         gathered = g_b[row_idx, col_idx]                 # (N, C), junk where inv=-1
         out[b] = torch.where(active, gathered, out[b])
 
     return out
+
+
+def _scatter_g_to_BNC_fast(
+    *,
+    g_all: torch.Tensor,                                     # (sum_U, C)
+    meta: list[tuple[int, torch.Tensor, int]],
+    batch_size: int,
+    num_patches: int,
+    channels: int,
+) -> torch.Tensor:
+    device = g_all.device
+    dtype = g_all.dtype
+
+    # Stack inverse maps: (B, N*C) -> (B, N, C)
+    inv_flat = torch.stack([inv for (_, inv, _) in meta], dim=0).to(device=device)
+    inv = inv_flat.view(batch_size, num_patches, channels)
+
+    # Offsets per batch element: (B, 1, 1)
+    starts = torch.tensor([start for (start, _, _) in meta], device=device, dtype=torch.long)
+    starts = starts.view(batch_size, 1, 1)
+
+    active = inv >= 0
+    row = inv.clamp_min(0) + starts  # global row indices into g_all
+
+    # Build linear indices into flattened g_all (row-major): row*C + col
+    col = torch.arange(channels, device=device, dtype=torch.long).view(1, 1, channels)
+    lin = (row * channels + col).reshape(-1)
+
+    gathered = torch.take(g_all.reshape(-1), lin).view(batch_size, num_patches, channels)
+
+    # Zero-out inactive entries (inv == -1)
+    gathered.masked_fill_(~active, 0)
+    return gathered
+
+
+_scatter_g_to_BNC = _scatter_g_to_BNC_fast
 
 
 # -------------------------------------------------------------------------------- #
@@ -582,6 +625,77 @@ def _lowmem_max_over_time_streaming(
 
     max_pos.clamp_(0, max(0, T - rf))
     return max_vals, max_pos
+
+
+def _gather_wins_via_preprocess_batched_dense(
+    *,
+    preprocess: PreprocessFn,
+    ts: Sequence[Tensor],                 # each (B, T, *)
+    positions: Tensor,                    # (B, C) int-like, on same device as ts
+    rf: int,
+    embedding_dim: int,
+    mask: Optional[Tensor] = None,        # (B, C) bool, optional
+    win_chunk: Optional[int] = None,      # windows per chunk (optional)
+) -> tuple[Tensor, list[tuple[int, Tensor, int]]]:
+    """
+    Fixed-shape gather: computes windows for ALL C positions per batch element.
+    Constant memory in T; avoids CUDA dynamic compaction ops entirely.
+    """
+    B, T = ts[0].shape[:2]
+    device = ts[0].device
+    C = positions.shape[1]
+
+    if mask is not None:
+        mask = mask.to(device=device, dtype=torch.bool)
+        # Map inactive entries to any valid position (0). We'll mark them -1 in meta.
+        pos = torch.where(mask, positions, positions.new_zeros(()).expand_as(positions))
+    else:
+        pos = positions
+
+    pos = pos.to(device=device, dtype=torch.long)
+
+    # Build (B*C, rf) time indices
+    ar = torch.arange(rf, device=device, dtype=torch.long)                        # (rf,)
+    time_ix = pos.reshape(B * C, 1) + ar.view(1, rf)                               # (B*C, rf)
+
+    # Linearize indices into flattened time axis: (b*T + t)
+    b_rows = torch.arange(B, device=device, dtype=torch.long).repeat_interleave(C)  # (B*C,)
+    lin = (b_rows.view(-1, 1) * T + time_ix).reshape(-1)                           # (B*C*rf,)
+
+    # (Optional) chunk to limit peak activation memory in preprocess
+    U = B * C
+    if win_chunk is None or win_chunk >= U:
+        chunks = [(0, U)]
+    else:
+        chunks = [(i, min(i + win_chunk, U)) for i in range(0, U, win_chunk)]
+
+    zs: list[Tensor] = []
+    for start, end in chunks:
+        # slice linear indices for this chunk: windows [start:end]
+        lin_chunk = lin.view(U, rf)[start:end].reshape(-1)  # ((end-start)*rf,)
+
+        wins: list[Tensor] = []
+        for t in ts:
+            rest = t.shape[2:]
+            t_flat = t.reshape(B * T, *rest)  # view, no allocation
+            w = t_flat.index_select(0, lin_chunk).reshape(end - start, rf, *rest)
+            wins.append(w)
+
+        z = preprocess(*wins)  # (chunkU, rf, E)
+        if z.shape[-1] != embedding_dim:
+            raise RuntimeError(f"preprocess returned wrong E: {z.shape[-1]} vs {embedding_dim}")
+        zs.append(z)
+
+    z_all = torch.cat(zs, dim=0)                        # (B*C, rf, E)
+    wins_cat = z_all.transpose(1, 2).contiguous()       # (B*C, E, rf)
+
+    # meta is now “identity”: each (b, c) maps to row (b*C + c)
+    inv = torch.arange(C, device=device, dtype=torch.long).expand(B, C)
+    if mask is not None:
+        inv = torch.where(mask, inv, inv.new_full((B, C), -1))
+
+    meta: list[tuple[int, Tensor, int]] = [(b * C, inv[b], C) for b in range(B)]
+    return wins_cat, meta
 
 
 def _gather_wins_via_preprocess_batched(
@@ -668,6 +782,9 @@ def _gather_wins_via_preprocess_batched(
 
     wins_cat = z.transpose(1, 2).contiguous()                 # (ΣU, E, rf)
     return wins_cat, meta
+
+
+_gather_wins_via_preprocess_batched = _gather_wins_via_preprocess_batched_dense
 
 
 def _scatter_g_to_BC(
