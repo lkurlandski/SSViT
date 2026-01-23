@@ -192,6 +192,7 @@ class PreprocessFn(Protocol):
         ...
 
 
+# NOTE: this function is NOT constant memory!
 def _lowmem_patchwise_max_over_time_dispatched(
     *,
     preprocess: PreprocessFn,
