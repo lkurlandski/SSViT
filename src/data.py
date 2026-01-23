@@ -1536,6 +1536,23 @@ class Preprocessor:
             else:
                 raise RuntimeError("When allow_missing_metadata is True (or max_structures is not None), one of the structures must be ANY, UNKNOWN, or OTHER.")
 
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}"
+            "(\n"
+            f"  do_entropy={self.do_entropy},\n"
+            f"  which_characteristics={[c.name for c in self.which_characteristics]},\n"
+            f"  level={self.level.name},\n"
+            f"  structures={[s.name for s in self.structures]},\n"
+            f"  max_length={self.max_length},\n"
+            f"  unsafe={self.unsafe},\n"
+            f"  structures_as_guides={self.structures_as_guides},\n"
+            f"  allow_missing_metadata={self.allow_missing_metadata},\n"
+            f"  max_structures={self.max_structures},\n"
+            f"  max_length_per_structure={self.max_length_per_structure},\n"
+            ")"
+        )
+
     def __call__(self, name: str, label: int, data: bytes, meta: Optional[pl.DataFrame]) -> FSample:
         if not self.allow_missing_metadata and meta is None:
             raise ValueError(f"Metadata is required but missing for sample {name}.")
