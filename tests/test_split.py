@@ -35,7 +35,7 @@ def hamilton_counts(n: int, sizes: tuple[float, float, float]) -> tuple[int, int
 def class_dist(y: np.ndarray, classes: np.ndarray) -> np.ndarray:
     counts = np.array([(y == c).sum() for c in classes], dtype=float)
     s = counts.sum()
-    return counts / s if s > 0 else np.ones_like(counts) / counts.size  # type: ignore[no-any-return]
+    return counts / s if s > 0 else np.ones_like(counts) / counts.size
 
 
 def pairwise_max_abs_diff(dists: list[np.ndarray]) -> float:
