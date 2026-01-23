@@ -12,8 +12,8 @@ uv pip install -r requirements.txt [-r requirements-dev.txt]
 ## Tests
 
 ```
-OMP_NUM_THREADS=1 pytest -n auto --ignore tests/trainer tests/
-OMP_NUM_THREADS=$(nproc --all) pytest -n 1 tests/trainer
+OMP_NUM_THREADS=1 pytest -n auto --ignore tests/test_trainer.py --ignore tests/test_architectures.py --ignore tests/test_patch_encoders.py tests/
+OMP_NUM_THREADS=$(nproc --all) pytest tests/test_trainer.py tests/test_architectures.py tests/test_patch_encoders.py
 ```
 
 ## Lint
@@ -30,6 +30,16 @@ mypy .
 
 ```
 isort --force-single-line-imports .
+```
+
+## Usage
+
+```
+python scripts/create.py
+```
+
+```
+bash run/experiment-0.sh
 ```
 
 ## Notes
@@ -55,5 +65,3 @@ Upon further analysis it seems the issue is more complex than this. Rather than 
 - There might be O(C^2) memory complexity in the low-mem implementations when computing winner positions.
 - Resuming from a checkpoint saved at the end of one epoch but not before the start of the next epoch requires iterating through the entire epoch.
 - Tests with pin_memory should only run if GPUs available.
-
-j=$(sbatch ./run/job.sh | awk '{print $4}')
