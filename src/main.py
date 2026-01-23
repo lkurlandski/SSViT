@@ -904,6 +904,7 @@ def main() -> None:
         unsafe=False,
         structures_as_guides=STRUCTURES_AS_GUIDES,
         max_structures=args.max_structures if args.design == Design.STRUCTURAL else None,
+        max_length_per_structure=args.max_length_per_structure,
     )
     print(f"{preprocessor=}")
 
