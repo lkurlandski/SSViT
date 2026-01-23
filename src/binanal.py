@@ -782,6 +782,7 @@ LEVEL_STRUCTURE_MAP: dict[HierarchicalLevel, type[HierarchicalStructure]] = {
 
 DIRECTORY_STRUCTURES = (
     HierarchicalStructureCoarse.DIRECTORY,
+    HierarchicalStructureRough.DIRECTORY,
     HierarchicalStructureMiddle.DIRECTORY,
     HierarchicalStructureFine.IDATA,
     HierarchicalStructureFine.DELAYIMP,
