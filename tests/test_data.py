@@ -543,3 +543,35 @@ class TestPreprocessor:
         max_structures = 0
         with pytest.raises(ValueError):
             newindex = Preprocessor.trim_more_than_max_structures_from_index(index, max_structures, unkidx)
+
+    def test_truncate_index_to_max_length_per_structure(self) -> None:
+        index = [
+            [(101, 110), (111, 150),],       # STRUCT-A
+            [(11, 40),],                     # STRUCT-B
+            [],                              # STRUCT-C
+            [(0, 10), (50, 100), (41,50),],  # STRUCT-D
+            [],                              # STRUCT-E
+        ]
+        print(f"{index=}")
+
+        max_length_per_structure = None
+        newindex = Preprocessor.truncate_index_to_max_length_per_structure(index, max_length_per_structure)
+        assert newindex == index
+
+        max_length_per_structure = -1
+        with pytest.raises(ValueError):
+            Preprocessor.truncate_index_to_max_length_per_structure(index, max_length_per_structure)
+
+        max_length_per_structure = 0
+        with pytest.raises(ValueError):
+            Preprocessor.truncate_index_to_max_length_per_structure(index, max_length_per_structure)
+
+        max_length_per_structure = 20
+        newindex = Preprocessor.truncate_index_to_max_length_per_structure(index, max_length_per_structure)
+        assert newindex == [
+            [(101, 110), (111, 131)],       # STRUCT-A
+            [(11, 31),],                    # STRUCT-B
+            [],                             # STRUCT-C
+            [(0, 10), (50, 70), (41,50),],  # STRUCT-D
+            [],                             # STRUCT-E
+        ]

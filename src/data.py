@@ -1497,6 +1497,7 @@ class Preprocessor:
         structures_as_guides: bool = False,
         allow_missing_metadata: bool = True,
         max_structures: Optional[int] = None,
+        max_length_per_structure: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -1510,6 +1511,7 @@ class Preprocessor:
             allow_missing_metadata: if True, missing metadata will be ignored gracefully.
             max_structures: maximum number of structures to consider. If None, use all.
                 If provided and more than `max_structures` are found, they will be droppped.
+            max_length_per_structure: maximum length per structure (in bytes). If None, use full length.
         """
         self.do_entropy = do_entropy
         self.which_characteristics = which_characteristics
@@ -1520,6 +1522,7 @@ class Preprocessor:
         self.structures_as_guides = structures_as_guides
         self.allow_missing_metadata = allow_missing_metadata
         self.max_structures = max_structures
+        self.max_length_per_structure = max_length_per_structure
         self.guider = SemanticGuider(do_entropy=do_entropy, which_characteristics=which_characteristics)
         self.partitioner = StructurePartitioner(level, structures)
         if self.structures_as_guides and (len(self.structures) == 1 or len(which_characteristics) > 0 or do_entropy):
@@ -1656,8 +1659,25 @@ class Preprocessor:
 
         unkidx = None if self.unkstructure is None else self.structures.index(self.unkstructure)
         index = self.trim_more_than_max_structures_from_index(index, self.max_structures, unkidx)
+        index = self.truncate_index_to_max_length_per_structure(index, self.max_length_per_structure)
 
         return StructureMap(index, lexicon)
+
+    @staticmethod
+    def truncate_index_to_max_length_per_structure(index: list[list[tuple[int, int]]], max_length_per_structure: Optional[int]) -> list[list[tuple[int, int]]]:
+        index = deepcopy(index)
+        if max_length_per_structure is None:
+            return index
+        if max_length_per_structure <= 0:
+            raise ValueError(f"max_length_per_structure must be positive or None. Got {max_length_per_structure}.")
+
+        for i in range(len(index)):         # i - structure idx
+            for j in range(len(index[i])):  # j - range idx
+                s, e = index[i][j]
+                l = e - s
+                index[i][j] = (s, s + min(l, max_length_per_structure))
+
+        return index
 
     @staticmethod
     def trim_more_than_max_structures_from_index(index: list[list[tuple[int, int]]], max_structures: Optional[int], unkidx: Optional[int]) -> list[list[tuple[int, int]]]:
@@ -1693,6 +1713,9 @@ class Preprocessor:
         return index
 
     def get_structure_as_guides(self, meta: Optional[pl.DataFrame], size: int) -> torch.Tensor:
+        if self.max_length_per_structure is not None:
+            warnings.warn("max_length_per_structure is ignored when using structures_as_guides=True.", RuntimeWarning)
+
         if meta is None:
             if not self.allow_missing_metadata:
                 raise ValueError("Metadata is required but missing.")
