@@ -3,6 +3,7 @@ Tests.
 """
 
 from collections.abc import Generator
+import math
 import os
 from pathlib import Path
 import random
@@ -20,516 +21,95 @@ import torch
 
 from src.simpledb import PAGESIZE
 from src.simpledb import roundup
+from src.simpledb import Sample
+from src.simpledb import SimpleDB
 from src.simpledb import CreateSimpleDB
-from src.simpledb import CreateSimpleDBSample
-from src.simpledb import RandomMappingSimpleDB
-from src.simpledb import ChunkedMappingSimpleDB
-from src.simpledb import IterableSimpleDB
-from src.simpledb import ShardCopier
+from src.simpledb import SimpleDBReader
+from src.simpledb import SimpleDBIterator
+from src.simpledb import MetadataDB
 
-# ---------- helpers ----------
 
-def _mk_bytes(n: int, seed: int) -> bytes:
+def _make_bytes(n: int, seed: int) -> bytes:
     rng = np.random.default_rng(seed)
     return rng.integers(0, 256, size=n, dtype=np.uint8).tobytes()
 
-def _samples(
+
+def _create_samples(
     count: int,
     *,
     min_len: int = 100,
     max_len: int = 10_000,
     seed: int = 0,
-) -> Generator[CreateSimpleDBSample, None, None]:
+) -> Generator[Sample, None, None]:
     rng = random.Random(seed)
     for i in range(count):
         name = f"file-{i:08d}.exe"
         n = rng.randint(min_len, max_len)
-        data = _mk_bytes(n, seed=seed + i)
+        data = _make_bytes(n, seed=seed + i)
         malware = bool(rng.getrandbits(1))
         ts = 1_600_000_000 + i
-        fam: Optional[str] = None if (i % 3 == 0) else f"fam{i % 7}"
-        yield CreateSimpleDBSample(name=name, data=data, malware=malware, timestamp=ts, family=fam)
+        fam = "" if (i % 3 == 0) else f"fam{i % 7}"
+        yield Sample(name=name, data=data, malware=malware, timestamp=ts, family=fam)
 
-# ---------- basic utilities ----------
 
-def test_roundup_basic() -> None:
-    assert roundup(0, PAGESIZE) == 0
-    assert roundup(1, PAGESIZE) == PAGESIZE
-    assert roundup(PAGESIZE - 1, PAGESIZE) == PAGESIZE
-    assert roundup(PAGESIZE, PAGESIZE) == PAGESIZE
-    assert roundup(PAGESIZE + 1, PAGESIZE) == 2 * PAGESIZE
+@pytest.mark.parametrize("num_samples", [1, 1, 2, 3, 10, 100, 1000])
+@pytest.mark.parametrize("shardsize", [-1, 0, 2**10, 2**12, 2**14, 2**16])
+@pytest.mark.parametrize("samples_per_shard", [-1, 0, 1, 2, 5, 10, 100, 1000, 2000])
+def test(tmp_path: Path, num_samples: int, shardsize: int, samples_per_shard: int) -> None:
+    """
+    This essentially tests the SimpleDB, the SimpleDBCreator, and the SimpleDBReader.
+    """
 
-# ---------- building and reading (random mapping) ----------
-
-@pytest.mark.parametrize("backend", ["mmap", "pread"])
-def test_build_one_shard_and_read_random_mapping(tmp_path: Path, backend: Literal["mmap", "pread"]) -> None:
-    if backend == "pread" and not hasattr(os, "preadv"):
-        pytest.skip("preadv not available on this platform")
     root = tmp_path / "db"
-    builder = CreateSimpleDB(root, shardsize=2 * 1024 * 1024)
-    samples = list(_samples(25, min_len=5000, max_len=12_000, seed=123))
+
+    # Generate synthetic samples.
+    samples = list(_create_samples(num_samples))
+
+    # Build a SimpleDB.
+    if (shardsize <= 0) == (samples_per_shard <= 0):
+        with pytest.raises(ValueError):
+            CreateSimpleDB(root, shardsize=shardsize, samples_per_shard=samples_per_shard)
+        return
+    builder = CreateSimpleDB(root, shardsize=shardsize, samples_per_shard=samples_per_shard)
     builder(samples)
 
+    # Verify shard files created as expected.
     data_files = sorted((root / "data").glob("data-*.bin"))
     size_files = sorted((root / "size").glob("size-*.csv"))
     meta_files = sorted((root / "meta").glob("meta-*.csv"))
-    assert len(data_files) == len(size_files) == len(meta_files) == 1
-
-    # shard file padded to page size
-    sz = os.path.getsize(data_files[0])
-    assert sz % PAGESIZE == 0
-
-    db = RandomMappingSimpleDB(root, allow_name_indexing=True, backend=backend, num_open=1).open()
-    try:
-        for idx, s in enumerate(samples):
-            rec = db[idx]
-            # names
-            assert rec.name == s.name
-            # tensor type & length
-            assert isinstance(rec.data, torch.Tensor)
-            assert rec.data.dtype == torch.uint8
-            assert rec.data.numel() == len(s.data)
-            # zero-copy memoryview matches tensor bytes
-            assert isinstance(rec.bview, memoryview)
-            assert bytes(rec.bview) == bytes(rec.data.tolist()) == s.data
-            # meta
-            assert rec.malware == s.malware
-            assert rec.timestamp == s.timestamp
-            if s.family is None:
-                assert rec.family in ("", None)
-            else:
-                assert rec.family == s.family
-
-            # name indexing
-            by_name = db[s.name]
-            assert bytes(by_name.bview) == s.data
-    finally:
-        db.close()
-
-def test_chunked_mapping_within_shard(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    # build enough entries to span multiple shards and then hit same shard repeatedly
-    builder = CreateSimpleDB(root, shardsize=512 * 1024)
-    samples = list(_samples(100, min_len=1024, max_len=4096, seed=42))
-    builder(samples)
-
-    # Build a per-shard index list (by offset) so we can query multiple from same shard
-    size_csv = sorted((root / "size").glob("size-*.csv"))[0]
-    df = pd.read_csv(size_csv).sort_values(["shard", "offset", "idx"])
-    per_shard: dict[int, list[tuple[int, int, int]]] = {}
-    for _, r in df.iterrows():
-        per_shard.setdefault(int(r["shard"]), []).append((int(r["idx"]), int(r["offset"]), int(r["size"])))
-
-    db = ChunkedMappingSimpleDB(root, allow_name_indexing=True).open()
-    try:
-        # take first shard, fetch first 10 entries; ensure bytes match reconstructed bytes from shard file
-        shard0 = min(per_shard.keys())
-        items = per_shard[shard0][:10]
-        data_path = sorted((root / "data").glob("data-*.bin"))[shard0]
-        raw = data_path.read_bytes()
-        for idx, off, ln in items:
-            rec = db[idx]
-            assert bytes(rec.bview) == raw[off:off+ln]
-    finally:
-        db.close()
-
-# ---------- building and reading (iterable) ----------
-
-def test_build_and_stream_iterable(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    # several shards to exercise per-shard streaming
-    builder = CreateSimpleDB(root, shardsize=256 * 1024)
-    s_list = list(_samples(200, min_len=200, max_len=4000, seed=7))
-    builder(s_list)
-
-    # stream everything, reconstruct name->bytes
-    seen = []
-    db = IterableSimpleDB(root).open()
-    try:
-        for rec in db:
-            assert isinstance(rec.data, torch.Tensor)
-            assert rec.data.dtype == torch.uint8
-            # memoryview should match tensor content and be bytes-like
-            assert isinstance(rec.bview, memoryview)
-            assert bytes(rec.bview) == bytes(rec.data.tolist())
-            seen.append((rec.name, bytes(rec.bview)))
-    finally:
-        db.close()
-
-    produced = {name: data for (name, data) in seen}
-    expected = {s.name: s.data for s in s_list}
-    assert produced.keys() == expected.keys()
-    # spot-check a few
-    for key in list(expected.keys())[:10]:
-        assert produced[key] == expected[key]
-
-def test_iterable_streams_in_offset_order_within_shard(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    builder = CreateSimpleDB(root, shardsize=128 * 1024)
-    s_list = list(_samples(80, min_len=512, max_len=4096, seed=99))
-    builder(s_list)
-
-    # Build name -> (shard, offset) lookup from all size csvs
-    name_to_shard_offset: dict[str, tuple[int, int]] = {}
-    for size_csv in sorted((root / "size").glob("size-*.csv")):
-        df = pd.read_csv(size_csv)
-        for _, r in df.iterrows():
-            name_to_shard_offset[str(r["name"])] = (int(r["shard"]), int(r["offset"]))
-
-    db = IterableSimpleDB(root).open()
-    try:
-        last_by_shard: dict[int, int] = {}
-        for rec in db:
-            sh, off = name_to_shard_offset[rec.name]
-            last = last_by_shard.get(sh, -1)
-            assert off >= last, f"Offsets must be non-decreasing within shard {sh}"
-            last_by_shard[sh] = off
-    finally:
-        db.close()
-
-# ---------- rollover & consistency ----------
-
-def test_shards_rollover(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    builder = CreateSimpleDB(root, shardsize=128 * 1024)
-    big_samples = list(_samples(40, min_len=2000, max_len=5000, seed=7))
-    builder(big_samples)
-
-    data_files = sorted((root / "data").glob("data-*.bin"))
-    size_files = sorted((root / "size").glob("size-*.csv"))
-    meta_files = sorted((root / "meta").glob("meta-*.csv"))
-    assert len(data_files) == len(size_files) == len(meta_files) >= 2
-
-    names = [p.name for p in data_files]
-    assert names == sorted(names)
-    assert all(name.startswith("data-") and name.endswith(".bin") for name in names)
-
-    for size_csv, data_bin in zip(size_files, data_files):
-        df = pd.read_csv(size_csv)
-        total = os.path.getsize(data_bin)
-        for _, row in df.iterrows():
-            off, ln = int(row["offset"]), int(row["size"])
-            assert 0 <= off
-            assert off + ln <= total
-
-# ---------- lifecycle contracts ----------
-
-def test_open_close_idempotent_and_context_manager(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    CreateSimpleDB(root)([CreateSimpleDBSample("x.exe", b"\x00", False, 0, None)])
-
-    # idempotent open/close
-    db = RandomMappingSimpleDB(root)
-    db.open()
-    db.open()   # should NOT raise per new API
-    db.close()
-    db.close()  # should NOT raise
-
-    # context manager opens and closes
-    with RandomMappingSimpleDB(root, allow_name_indexing=True, backend="mmap") as db_cm:
-        assert db_cm.is_open
-        _ = db_cm["x.exe"]
-    assert not db_cm.is_open
-
-# ---------- edge cases ----------
-
-def test_oversized_sample_warns_and_is_present(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    big = b"\xff" * (256 * 1024)
-    small = b"\x01\x02"
-    builder = CreateSimpleDB(root, shardsize=64 * 1024)
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        builder([
-            CreateSimpleDBSample("a.exe", small, False, 1, None),
-            CreateSimpleDBSample("big.exe", big, True, 2, "fam"),
-            CreateSimpleDBSample("b.exe", small, False, 3, None),
-        ])
-        assert any("larger than the shard size" in str(x.message) for x in w)
-
-    db = RandomMappingSimpleDB(root, allow_name_indexing=True).open()
-    try:
-        rec = db["big.exe"]
-        assert rec.data.numel() == len(big)
-        assert rec.malware is True
-        assert rec.family == "fam"
-    finally:
-        db.close()
-
-def test_padding_region_is_zeroed(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    e1 = _mk_bytes(1000, 1)
-    e2 = _mk_bytes(2000, 2)
-    # 2 * PAGESIZE ensures both entries (each padded to PAGESIZE) fit in one shard
-    CreateSimpleDB(root, shardsize=PAGESIZE * 2)([
-        CreateSimpleDBSample("x", e1, True, 0),
-        CreateSimpleDBSample("y", e2, False, 0),
-    ])
-    data_files = sorted((root / "data").glob("data-*.bin"))
-    assert len(data_files) == 1
-    shard_size = os.path.getsize(data_files[0])
-    assert shard_size % PAGESIZE == 0
-    raw = (root / "data" / data_files[0].name).read_bytes()
-    sizes = pd.read_csv(sorted((root / "size").glob("size-*.csv"))[0])
-    last = sizes.iloc[-1]
-    pad_start = int(last["offset"]) + int(last["size"])
-    assert all(b == 0 for b in raw[pad_start:])
-
-def test_nan_and_empty_metadata_variants_random_mapping(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    CreateSimpleDB(root)([
-        CreateSimpleDBSample("n1", b"\x00\x01", True, 123, None),
-        CreateSimpleDBSample("n2", b"\x02\x03", False, 456, ""),
-    ])
-    # Inject NaN in family for one row
-    meta_csv = sorted((root / "meta").glob("meta-*.csv"))[0]
-    df = pd.read_csv(meta_csv)
-    df.loc[df["name"] == "n2", "family"] = float("nan")
-    df.to_csv(meta_csv, index=False)
-
-    db = RandomMappingSimpleDB(root, allow_name_indexing=True).open()
-    try:
-        r1 = db["n1"]
-        r2 = db["n2"]
-        assert r1.family in ("", None)
-        assert r2.family in ("", None)  # NaN -> empty/None, but no crash
-    finally:
-        db.close()
-
-def test_duplicate_names_behavior_random_mapping(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    CreateSimpleDB(root)([
-        CreateSimpleDBSample("dup", b"\x00", True, 1, None),
-        CreateSimpleDBSample("dup", b"\x01", False, 2, None),
-    ])
-    # Name indexing builds map in __init__, so duplicate names raise there.
-    with pytest.raises(RuntimeError):
-        RandomMappingSimpleDB(root, allow_name_indexing=True)
-
-def test_mismatched_size_and_meta_rows_on_init_random_mapping(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    CreateSimpleDB(root)([CreateSimpleDBSample("ok", b"\x00\x01", True, 1, None)])
-    # Remove the meta row so idxs don't match
-    meta_csv = sorted((root / "meta").glob("meta-*.csv"))[0]
-    df = pd.read_csv(meta_csv)
-    df = df[df["name"] != "ok"]
-    df.to_csv(meta_csv, index=False)
-    with pytest.raises(RuntimeError, match="different number of rows"):
-        RandomMappingSimpleDB(root)
-
-def test_corrupted_offset_raises_on_init_random_mapping(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    CreateSimpleDB(root)([CreateSimpleDBSample("bad", b"\x00\x01\x02", False, 0, None)])
-    size_csv = sorted((root / "size").glob("size-*.csv"))[0]
-    df = pd.read_csv(size_csv)
-    df.loc[df["name"] == "bad", "offset"] = 10_000_000
-    df.to_csv(size_csv, index=False)
-    with pytest.raises(RuntimeError, match="exceeds the size"):
-        RandomMappingSimpleDB(root)
-
-def test_zero_length_entry_random_mapping(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    CreateSimpleDB(root)([CreateSimpleDBSample("empty", b"", True, 0, None)])
-    db = RandomMappingSimpleDB(root, allow_name_indexing=True).open()
-    try:
-        rec = db["empty"]
-        assert isinstance(rec.data, torch.Tensor)
-        assert rec.data.dtype == torch.uint8
-        assert rec.data.numel() == 0
-        assert bytes(rec.bview) == b""
-    finally:
-        db.close()
-
-
-# ---------- ShardCopier tests ----------
-
-
-def _write_blob(p: Path, n: int, seed: int = 0) -> bytes:
-    rng = np.random.default_rng(seed)
-    b = rng.integers(0, 256, size=n, dtype=np.uint8).tobytes()
-    p.write_bytes(b)
-    return b
-
-def test_shardcopier_wait_vs_now(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """If we don't wait, we get the src; with a reasonable wait, we get the staged path."""
-    srcdir = tmp_path / "src"; srcdir.mkdir()
-    fastdir = tmp_path / "fast"; fastdir.mkdir()
-
-    # Make copy predictably take a moment so wait=0 returns src.
-    orig = ShardCopier._copy_streaming
-    def slow_copy(self: ShardCopier, src: Path) -> Path:
-        time.sleep(0.05)  # small but deterministic delay
-        return orig(self, src)
-    monkeypatch.setattr(ShardCopier, "_copy_streaming", slow_copy, raising=True)
-
-    src1 = srcdir / "a.bin"
-    src2 = srcdir / "b.bin"
-    _write_blob(src1, 256 * 1024, seed=1)
-    _write_blob(src2, 256 * 1024, seed=2)
-
-    c = ShardCopier(fastdir, max_workers=1)
-    try:
-        # Case 1: no wait ⇒ original path
-        c.prefetch(src1)
-        p1 = c.staged_or_src(src1, wait=0.0)
-        assert p1 == src1
-
-        # Case 2: adequate wait ⇒ staged path under fastdir
-        c.prefetch(src2)
-        p2 = c.staged_or_src(src2, wait=1.0)
-        assert p2 != src2 and p2.exists() and p2.parent == fastdir
-        assert p2.read_bytes() == src2.read_bytes()
-    finally:
-        c.close()
-
-def test_shardcopier_atomic_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Destination must not appear until the final os.replace; .part exists mid-copy."""
-    srcdir = tmp_path / "src"; srcdir.mkdir()
-    fastdir = tmp_path / "fast"; fastdir.mkdir()
-    src = srcdir / "x.bin"
-    _write_blob(src, 128 * 1024, seed=3)
-
-    mid_ready = threading.Event()
-    proceed = threading.Event()
-
-    def instrumented_copy(self: ShardCopier, s: Path) -> Path:
-        dst = self.dir / s.name
-        tmp = dst.with_suffix(dst.suffix + ".part")
-        with open(s, "rb", buffering=1024 * 1024) as r, open(tmp, "wb", buffering=1024 * 1024) as w:
-            # write a small prefix so .part exists
-            chunk = r.read(16 * 1024)
-            w.write(chunk); w.flush(); os.fsync(w.fileno())
-            mid_ready.set()
-            proceed.wait(timeout=2.0)
-            shutil.copyfileobj(r, w, length=8 * 1024 * 1024)  # type: ignore[misc]
-            w.flush(); os.fsync(w.fileno())
-        os.replace(tmp, dst)
-        return dst
-
-    monkeypatch.setattr(ShardCopier, "_copy_streaming", instrumented_copy, raising=True)
-
-    c = ShardCopier(fastdir, max_workers=1)
-    try:
-        c.prefetch(src)
-        assert mid_ready.wait(timeout=1.0), "copy should reach mid-point"
-        dst = fastdir / src.name
-        part = dst.with_suffix(dst.suffix + ".part")
-        assert part.exists() and not dst.exists(), "only .part should exist mid-copy"
-        proceed.set()
-        out = c.staged_or_src(src, wait=1.0)
-        assert out == dst and dst.exists()
-        assert not part.exists()
-        assert dst.read_bytes() == src.read_bytes()
-    finally:
-        c.close()
-
-def test_shardcopier_prefetch_idempotent(tmp_path: Path) -> None:
-    fastdir = tmp_path / "fast"; fastdir.mkdir()
-    src = tmp_path / "a.bin"
-    _write_blob(src, 64 * 1024, seed=5)
-
-    c = ShardCopier(fastdir, max_workers=1)
-    try:
-        c.prefetch(src)
-        c.prefetch(src)  # should not schedule a second task
-        # internal detail, but safe to assert in tests:
-        assert len(c.futs) == 1
-        out = c.staged_or_src(src, wait=1.0)
-        assert out.exists() and out.parent == fastdir
-    finally:
-        c.close()
-
-def test_shardcopier_skips_when_up_to_date(tmp_path: Path) -> None:
-    fastdir = tmp_path / "fast"; fastdir.mkdir()
-    src = tmp_path / "z.bin"
-    data = _write_blob(src, 96 * 1024, seed=7)
-
-    c = ShardCopier(fastdir, max_workers=1)
-    try:
-        # First copy
-        c.prefetch(src)
-        dst1 = c.staged_or_src(src, wait=1.0)
-        assert dst1.exists() and dst1.read_bytes() == data
-
-        # Make sure dst mtime is >= src mtime so the short-circuit triggers
-        now_plus = int(time.time()) + 5
-        os.utime(dst1, (now_plus, now_plus))
-
-        # Second "copy" should fast-path and keep the same file untouched
-        c.prefetch(src)
-        dst2 = c.staged_or_src(src, wait=1.0)
-        assert dst2 == dst1
-        # Content still matches source
-        assert dst2.read_bytes() == data
-    finally:
-        c.close()
-
-
-# ---------- IterableSimpleDB + fastdir (copier) ----------
-
-def test_iterable_uses_fastdir_and_preserves_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """IterableSimpleDB with fastdir should produce identical outputs and use at least one staged shard."""
-    root = tmp_path / "db"
-    fastdir = tmp_path / "fast"; fastdir.mkdir()
-
-    # Build enough data to ensure multiple shards
-    builder = CreateSimpleDB(root, shardsize=128 * 1024)
-    s_list = list(_samples(140, min_len=300, max_len=4000, seed=11))
-    builder(s_list)
-
-    # Capture which shardfile paths reach iter_one_shard
-    seen_paths: list[Path] = []
-    orig_iter_one = IterableSimpleDB.iter_one_shard
-
-    def wrapped_iter_one(self, shard_idx: int, shardfile: str):  # type: ignore[no-untyped-def]
-        seen_paths.append(Path(shardfile))
-        yield from orig_iter_one(self, shard_idx, shardfile)
-
-    monkeypatch.setattr(IterableSimpleDB, "iter_one_shard", wrapped_iter_one, raising=True)
-
-    produced = {}
-    db = IterableSimpleDB(root, fastdir=fastdir).open()
-    try:
-        for rec in db:
-            produced[rec.name] = bytes(rec.bview)
-    finally:
-        db.close()
-
-    expected = {s.name: s.data for s in s_list}
-    assert produced.keys() == expected.keys()
-    # spot-check a few bytes for integrity
-    for k in list(expected.keys())[:10]:
-        assert produced[k] == expected[k]
-
-    # Ensure at least one shard path came from fastdir
-    assert any(p.parent == fastdir for p in seen_paths), "no staged shard used; expected at least one"
-
-def test_iterable_fastdir_single_shard_bypass(tmp_path: Path) -> None:
-    """When there's only one shard, the copier path is bypassed per implementation."""
-    root = tmp_path / "db"
-    fastdir = tmp_path / "fast"; fastdir.mkdir()
-
-    # Big shard size to force a single shard
-    builder = CreateSimpleDB(root, shardsize=16 * 1024 * 1024)
-    s_list = [CreateSimpleDBSample(f"s{i}", b"x" * 4096, False, i, None) for i in range(50)]
-    builder(s_list)
-
-    db = IterableSimpleDB(root, fastdir=fastdir).open()
-    try:
-        _ = list(db)  # iterate everything
-    finally:
-        db.close()
-
-    # No data should have been copied into fastdir
-    copied = list(fastdir.glob("*"))
-    assert copied == []
-
-def test_iterable_fastdir_missing_raises(tmp_path: Path) -> None:
-    root = tmp_path / "db"
-    builder = CreateSimpleDB(root, shardsize=64 * 1024)
-    builder([CreateSimpleDBSample("one", b"\x00" * 256, False, 0, None),
-             CreateSimpleDBSample("two", b"\x01" * 512, True, 1, None)])
-
-    missing = tmp_path / "does" / "not" / "exist"
-    with pytest.raises(FileNotFoundError):
-        db = IterableSimpleDB(root, fastdir=missing)
+    if samples_per_shard > 0:
+        num = math.ceil(num_samples / samples_per_shard)
+    elif shardsize > 0:
+        num = 1
+        running = 0
+        for sample in samples:
+            size = roundup(len(sample.data), PAGESIZE)
+            if running + size > shardsize:
+                if running != 0:
+                    num += 1
+                    running = 0
+            running += size
+        num = max(1, num)
+    else:
+        raise ValueError("Either shardsize or samples_per_shard must be positive.")
+    assert len(data_files) == num
+    assert len(size_files) == num
+    assert len(meta_files) == num
+
+    # Read the data back and verify integrity.
+    db = SimpleDB(root)
+    reader = SimpleDBReader(db)
+    for idx, sample in enumerate(samples):
+        rec = reader.get(idx)
+        assert rec.name == sample.name
+        assert rec.data == sample.data
+        assert rec.malware == sample.malware
+        assert rec.timestamp == sample.timestamp
+        assert rec.family == sample.family
+
+        rec = reader.get(sample.name)
+        assert rec.name == sample.name
+        assert rec.data == sample.data
+        assert rec.malware == sample.malware
+        assert rec.timestamp == sample.timestamp
+        assert rec.family == sample.family
