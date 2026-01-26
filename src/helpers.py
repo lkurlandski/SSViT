@@ -158,8 +158,9 @@ class MainArgs:
             d = json.loads(self.model_config_str)
         except Exception as err:
             cls = err.__class__.__name__
-        if not isinstance(d, dict):
-            cls = "TypeError"
+        else:
+            if not isinstance(d, dict):
+                cls = "TypeError"
         if cls is not None:
             raise RuntimeError(f"A {cls} occurred while parsing model_config_str: `{self.model_config_str!r}`")
         assert isinstance(d, dict)
