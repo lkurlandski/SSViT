@@ -734,17 +734,17 @@ class TestDWCSequenceEncoder:
         assert enc.min_length == 1
 
     def test_min_length_padding_zero(self) -> None:
-        enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, kernel_size=7, padding=0, pooling="avg")
+        enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, kernel_size=7, pooling="avg")
         assert enc.min_length == 7
 
     def test_forward_shortest_ok(self) -> None:
-        enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, kernel_size=7, padding=0, pooling="max")
+        enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, kernel_size=7, pooling="max")
         x = torch.randn(2, 8, enc.min_length)
         y = enc(x)
         assert y.shape == (2, 16)
 
     def test_forward_too_short_raises(self) -> None:
-        enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, kernel_size=7, padding=0, pooling="max")
+        enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, kernel_size=7, pooling="max")
         x = torch.randn(1, 8, enc.min_length - 1)
         with pytest.raises(RuntimeError):
             _ = enc(x)
@@ -758,7 +758,6 @@ class TestDWCSequenceEncoder:
             pooling="atn",
             stride=8,
             kernel_size=7,
-            padding=3,
         )
         x = torch.randn(4, 8, 128)
         key_padding_mask = torch.zeros(4, 128, dtype=torch.bool)
