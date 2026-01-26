@@ -40,6 +40,7 @@ import warnings
 import torch
 from torch.distributed.fsdp import fully_shard
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint_sequential
 from torch import nn
 from torch import Tensor
 
@@ -182,6 +183,12 @@ class DWBlock(nn.Module):
         self.norm = nn.GroupNorm(1, dim)
         self.drop = nn.Dropout(drop)
 
+    @property
+    def min_length(self) -> int:
+        k = int(self.dw.kernel_size[0])
+        p = int(self.dw.padding[0])
+        return max(1, k - 2 * p)
+
     def forward(self, x: Tensor) -> Tensor:
         """
         Args:
@@ -211,6 +218,10 @@ class AdaptiveAtnPooling1d(nn.Module):
         super().__init__()
         self.dim = dim
         self.w = nn.Linear(dim, 1)
+
+    @property
+    def min_length(self) -> int:
+        return 1
 
     def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
@@ -250,7 +261,18 @@ class DWCSequenceEncoder(nn.Module):
     See: Liu et al. "A ConvNet for the 2020s" CVPR 2022.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, depth: int, *, kernel_size: int = 7, stride: int = 8, padding: int = 3, pooling: Literal["max", "avg", "atn"]) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        depth: int,
+        *,
+        kernel_size: int = 7,
+        stride: int = 8,
+        padding: int = 3,
+        pooling: Literal["max", "avg", "atn"],
+        checkpoint_segments: int = 0,
+    ) -> None:
         super().__init__()
 
         self.in_channels = in_channels
@@ -260,6 +282,7 @@ class DWCSequenceEncoder(nn.Module):
         self.stride = stride
         self.padding = padding
         self.pooling = pooling
+        self.checkpoint_segments = min(checkpoint_segments, depth) if checkpoint_segments > -1 else depth
 
         self.stem = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding),
@@ -277,6 +300,10 @@ class DWCSequenceEncoder(nn.Module):
         else:
             raise ValueError(f"Unsupported pooling type: {pooling}.")
 
+    @property
+    def min_length(self) -> int:
+        return max(1, self.kernel_size - 2 * self.padding)
+
     def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
         Args:
@@ -293,7 +320,10 @@ class DWCSequenceEncoder(nn.Module):
         C = self.out_channels
 
         x = self.stem(x)    # (B, C, T')
-        x = self.blocks(x)  # (B, C, T')
+        if self._should_checkpoint() and x.requires_grad:
+            x = checkpoint_sequential(self.blocks, self.checkpoint_segments, x, use_reentrant=False)  # type: ignore[no-untyped-call]
+        else:
+            x = self.blocks(x)  # (B, C, T')
 
         if self.pooling == "atn":
             if key_padding_mask is not None:
@@ -304,6 +334,9 @@ class DWCSequenceEncoder(nn.Module):
 
         check_tensor(x, (B, C), FLOATS)
         return x
+
+    def _should_checkpoint(self) -> bool:
+        return self.checkpoint_segments > 0 and self.training and torch.is_grad_enabled()
 
     def _downsample_key_padding_mask(self, key_padding_mask: Tensor, T_out: int) -> Tensor:
         """
