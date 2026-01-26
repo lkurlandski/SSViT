@@ -576,6 +576,7 @@ class PatchEncoder(PatchEncoderBase):
         *,
         kernel_size: int = 64,
         stride: int = 64,
+        pooling: Literal["max", "avg"] = "max",
     ) -> None:
         super().__init__(in_channels, out_channels, num_patches, patch_size)
 
@@ -589,7 +590,13 @@ class PatchEncoder(PatchEncoderBase):
         self.stride = stride
 
         self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride)
-        self.pool = nn.AdaptiveMaxPool1d(1)
+        self.pool: nn.AdaptiveMaxPool1d | nn.AdaptiveAvgPool1d
+        if pooling == "max":
+            self.pool = nn.AdaptiveMaxPool1d(1)
+        elif pooling == "avg":
+            self.pool = nn.AdaptiveAvgPool1d(1)
+        else:
+            raise ValueError(f"Unsupported pooling type: {pooling}.")
 
     @property
     def min_length(self) -> int:

@@ -166,6 +166,9 @@ def get_model(
     embedding_dim: int = 8,
     film_hidden_size: int = 16,
     patcher_channels: int = 64,
+    patcher_kernel_size: int = 64,
+    patcher_stride: int = 64,
+    patcher_pooling: Literal["max", "avg"] = "max",
     num_patches: Optional[int] = 256,
     patch_size: Optional[int] = 4096,
     patchposencoder_hidden_size: int = 64,
@@ -273,19 +276,21 @@ def get_model(
         patch_size = None
     def build_patcher(num_patches: Optional[int], patch_size: Optional[int]) -> PatchEncoderBase:
         if parch == PatcherArchitecture.BAS:
-            return PatchEncoder(embedding_dim, patcher_channels, num_patches, patch_size)
+            return PatchEncoder(embedding_dim, patcher_channels, num_patches, patch_size, kernel_size=patcher_kernel_size, stride=patcher_stride, pooling=patcher_pooling)
         if parch == PatcherArchitecture.CNV:
             return ConvPatchEncoder(embedding_dim, patcher_channels, num_patches, patch_size)
         if parch == PatcherArchitecture.HCV:
             return HierarchicalConvPatchEncoder(embedding_dim, patcher_channels, num_patches, patch_size)
         if parch == PatcherArchitecture.MEM:
-            return PatchEncoderLowMem(embedding_dim, patcher_channels, num_patches, patch_size)
+            return PatchEncoderLowMem(embedding_dim, patcher_channels, num_patches, patch_size, kernel_size=patcher_kernel_size, stride=patcher_stride)
         if parch == PatcherArchitecture.EXP:
             return PatchEncoderLowMemSwitchMoE(
                 embedding_dim,
                 patcher_channels,
                 num_patches,
                 patch_size,
+                kernel_size=patcher_kernel_size,
+                stride=patcher_stride,
                 num_experts=moe_num_experts,
                 probe_dim=moe_probe_dim,
                 probe_kernel_size=moe_probe_kernel_size,

@@ -202,7 +202,7 @@ class Configuration:
             return 256  # O(1)
 
         # Assumes constant-memory encoder. # O(1)
-        if self.arch == Architecture.VIT and self.parch in (PatcherArchitecture.EXP, PatcherArchitecture.MEM):
+        if self.arch == Architecture.VIT and self.parch in (PatcherArchitecture.EXP, PatcherArchitecture.MEM, PatcherArchitecture.BAS):
             if self.design == Design.FLAT:
                 if self.do_entropy or self.which_characteristics:
                     return 32
@@ -459,9 +459,15 @@ class Requirements:
                     tr_throughput *= 0.40
                     vl_throughput *= 0.30
 
+        if self.config.arch == Architecture.VIT and self.config.model_config.get("patcher_pooling", "max") == "avg":
+            vl_throughput *= 0.95
+            tr_throughput *= 0.30
+
         # NOTE: the scaling via max_length isn't going to work well for structural any more.
         tr_throughput = tr_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
         vl_throughput = vl_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
+
+        # print(f"{str(self.config)} throughput: tr={tr_throughput:.1f} vl={vl_throughput:.1f} samples/second")
 
         tr_samples = 2339771 * self.config.max_epochs
         vl_samples = 539882  * self.config.max_epochs / self.config.eval_epochs
@@ -696,6 +702,12 @@ def config_fiter(config: Configuration) -> bool:
     if config.which_characteristics:
         return False
 
+    # Model Config
+    if config.model_config["patcher_pooling"] == "avg" and config.parch != PatcherArchitecture.BAS:
+        return False
+    if config.model_config["patcher_pooling"] == "max" and config.parch != PatcherArchitecture.MEM:
+        return False
+
     return True
 
 
@@ -734,26 +746,19 @@ def main() -> None:
         if f.is_file() and not args.no_clean:
             f.unlink()
 
-    model_configs = []
-    for embedding_dim in [8, 16]:
-        for patcher_channels in [64, 128]:
-            if embedding_dim == 8 and patcher_channels != 64:
-                continue
-            if embedding_dim == 16 and patcher_channels != 128:
-                continue
-            d = {
-                "embedding_dim": embedding_dim,
-                "patcher_channels": patcher_channels,
-            }
-            model_configs.append(d)
+    model_configs = [
+        {"patcher_pooling": "max", "embedding_dim": 8, "patcher_channels": 256, "patcher_kernel_size": 256, "patcher_stride": 64},
+        {"patcher_pooling": "avg", "embedding_dim": 8, "patcher_channels": 256, "patcher_kernel_size": 256, "patcher_stride": 64},
+        {"patcher_pooling": "avg", "embedding_dim": 8, "patcher_channels": 64,  "patcher_kernel_size": 64,  "patcher_stride": 64},
+    ]
 
     stream = product(
         [Design.STRUCTURAL],
         [Architecture.VIT],
-        [PatcherArchitecture.MEM],
+        [PatcherArchitecture.MEM, PatcherArchitecture.BAS],
         [PositionalEncodingArchitecture.FIXED],
         [PatchPositionalEncodingArchitecture.NONE],
-        [HierarchicalLevel.COARSE, HierarchicalLevel.ROUGH, HierarchicalLevel.MIDDLE, HierarchicalLevel.FINE],
+        [HierarchicalLevel.FINE],
         [False],
         [()],
         [2**20],
