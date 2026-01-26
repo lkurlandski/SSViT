@@ -205,8 +205,6 @@ class DWBlock(nn.Module):
 class AdaptiveAtnPooling1d(nn.Module):
     """
     Learned query attention pooling.
-
-    FIXME: this needs a padding mask.
     """
 
     def __init__(self, dim: int):
@@ -214,18 +212,32 @@ class AdaptiveAtnPooling1d(nn.Module):
         self.dim = dim
         self.w = nn.Linear(dim, 1)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
         Args:
             x: Input embeddings of shape (B, C, T).
+            key_padding_mask: Optional mask of shape (B, T) indicating padding positions.
+                These must correspond to the sequence length of the input.
         Returns:
             y: Output embeddings of shape (B, C).
         """
         check_tensor(x, (None, self.dim, None), FLOATS)
+        if key_padding_mask is not None:
+            check_tensor(key_padding_mask, (x.shape[0], x.shape[2]), torch.bool)
         B, C, T = x.shape
+        logits: Tensor
+
         x_t = x.transpose(1, 2)                      # (B, T, C)
         logits = self.w(x_t).squeeze(-1)             # (B, T)
+        if key_padding_mask is not None:
+            neg = torch.finfo(logits.dtype).min
+            logits = logits.masked_fill(key_padding_mask, neg)
+
         a = torch.softmax(logits, dim=-1)            # (B, T)
+        if key_padding_mask is not None:
+            a = a.masked_fill(key_padding_mask, 0.0)
+            a = a / a.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+
         y = torch.sum(x_t * a.unsqueeze(-1), dim=1)  # (B, C)
         check_tensor(y, (B, C), FLOATS)
         return y
@@ -265,21 +277,58 @@ class DWCSequenceEncoder(nn.Module):
         else:
             raise ValueError(f"Unsupported pooling type: {pooling}.")
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
         Args:
             x: Input embeddings of shape (B, E, T).
+            key_padding_mask: Optional mask of shape (B, T) indicating padding positions.
+                These must correspond to the sequence length of the input.
         Returns:
             y: Output embeddings of shape (B, C).
         """
         check_tensor(x, (None, self.in_channels, None), FLOATS)
+        if key_padding_mask is not None:
+            check_tensor(key_padding_mask, (x.shape[0], x.shape[2]), torch.bool)
         B, E, T = x.shape
         C = self.out_channels
+
         x = self.stem(x)    # (B, C, T')
         x = self.blocks(x)  # (B, C, T')
-        x = self.pool(x)    # (B, C)
+
+        if self.pooling == "atn":
+            if key_padding_mask is not None:
+                key_padding_mask = self._downsample_key_padding_mask(key_padding_mask, x.shape[2])
+            x = self.pool(x, key_padding_mask)  # (B, C)
+        else:
+            x = self.pool(x)                    # (B, C)
+
         check_tensor(x, (B, C), FLOATS)
         return x
+
+    def _downsample_key_padding_mask(self, key_padding_mask: Tensor, T_out: int) -> Tensor:
+        """
+        Downsample (B, T) padding mask to (B, T_out) using the stem's (k, s, p).
+        A latent token is padding iff its entire receptive-field window is padding.
+        """
+        # Get valid mask, then downsample via max-pooling
+        valid = (~key_padding_mask).to(dtype=torch.float32).unsqueeze(1)  # (B, 1, T)
+        valid_ds = F.max_pool1d(
+            valid,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+        ).squeeze(1)
+
+        # True where all-padding
+        kp_ds = (valid_ds == 0)
+
+        # Match the stem output length exactly
+        if kp_ds.shape[1] > T_out:
+            kp_ds = kp_ds[:, :T_out]
+        else:
+            kp_ds = F.pad(kp_ds, (0, T_out - kp_ds.shape[1]), value=True)
+
+        return kp_ds
 
 # -------------------------------------------------------------------------------- #
 # FiLM
