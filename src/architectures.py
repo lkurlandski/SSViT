@@ -27,6 +27,7 @@ from abc import ABC
 from abc import abstractmethod
 from collections.abc import Sequence
 from functools import partial
+from inspect import signature
 import math
 import os
 import sys
@@ -267,10 +268,9 @@ class DWCSequenceEncoder(nn.Module):
         out_channels: int,
         depth: int,
         *,
-        kernel_size: int = 7,
-        stride: int = 8,
-        padding: int = 3,
-        pooling: Literal["max", "avg", "atn"],
+        kernel_size: int = 64,
+        stride: int = 64,
+        pooling: Literal["max", "avg", "atn"] = "atn",
         checkpoint_segments: int = 0,
     ) -> None:
         super().__init__()
@@ -280,12 +280,11 @@ class DWCSequenceEncoder(nn.Module):
         self.depth = depth
         self.kernel_size = kernel_size
         self.stride = stride
-        self.padding = padding
         self.pooling = pooling
         self.checkpoint_segments = min(checkpoint_segments, depth) if checkpoint_segments > -1 else depth
 
         self.stem = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding),
+            nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride),
             nn.GELU(),
             nn.GroupNorm(1, out_channels),
         )
@@ -302,7 +301,7 @@ class DWCSequenceEncoder(nn.Module):
 
     @property
     def min_length(self) -> int:
-        return max(1, self.kernel_size - 2 * self.padding)
+        return max(1, self.kernel_size)
 
     def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
@@ -349,7 +348,6 @@ class DWCSequenceEncoder(nn.Module):
             valid,
             kernel_size=self.kernel_size,
             stride=self.stride,
-            padding=self.padding,
         ).squeeze(1)
 
         # True where all-padding
@@ -1577,7 +1575,7 @@ class ViT(nn.Module):
         posencoder: Literal["fixed", "learned", "none"] = "learned",
         max_len: Optional[int] = None,
         activation: str = "gelu",
-        pooling: Literal["mean", "cls"] = "cls",
+        pooling: Literal["mean", "cls"] = "cls",  # NOTE: we use `avg` pooling elsewhere, so this might be confusing...
     ) -> None:
         super().__init__()
 
