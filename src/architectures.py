@@ -259,7 +259,7 @@ class DWCSequenceEncoder(nn.Module):
         if pooling == "max":
             self.pool = nn.Sequential(nn.AdaptiveMaxPool1d(1), nn.Flatten())
         elif pooling == "avg":
-            self.pool = nn.Sequential(nn.AdaptiveMaxPool1d(1), nn.Flatten())
+            self.pool = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
         elif pooling == "atn":
             self.pool = AdaptiveAtnPooling1d(out_channels)
         else:
