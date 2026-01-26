@@ -34,6 +34,9 @@ from src.architectures import ViTClassifier
 from src.architectures import HierarchicalViTClassifier
 from src.architectures import StructuralViTClassifier
 from src.architectures import PatchPositionalityEncoder
+from src.architectures import DWBlock
+from src.architectures import AdaptiveAtnPooling1d
+from src.architectures import DWCSequenceEncoder
 from src.utils import seed_everything
 
 
@@ -657,3 +660,130 @@ class TestStructuralViTClassifier:
         assert model.last_aux_loss is not None and model.last_aux_loss.shape == (num_structures,) and (model.last_aux_loss >= 0).all()
         assert model.last_entropy is not None and model.last_entropy.shape == (num_structures,) and (model.last_entropy >= 0).all()
         assert model.last_usage is not None and model.last_usage.shape == (num_structures, num_experts) and (model.last_usage >= 0).all()
+
+
+
+class TestDWBlock:
+
+    def test_forward_shape_preserves_length(self) -> None:
+        torch.manual_seed(0)
+        m = DWBlock(dim=4, k=7)
+        x = torch.randn(2, 4, 17)
+        y = m(x)
+        assert y.shape == x.shape
+
+    def test_forward_shortest(self) -> None:
+        m = DWBlock(dim=4, k=7)
+        x = torch.randn(1, 4, m.min_length)
+        y = m(x)
+        assert y.shape == x.shape
+
+
+class TestAdaptiveAtnPooling1d:
+
+    def test_min_length(self) -> None:
+        m = AdaptiveAtnPooling1d(dim=4)
+        assert m.min_length == 1
+
+
+    def test_forward_shape(self) -> None:
+        torch.manual_seed(0)
+        m = AdaptiveAtnPooling1d(dim=4)
+        x = torch.randn(3, 4, 11)
+        y = m(x)
+        assert y.shape == (3, 4)
+
+
+    def test_masked_uniform_matches_mean(self) -> None:
+        # Force logits == 0 everywhere => uniform attention over unmasked positions
+        m = AdaptiveAtnPooling1d(dim=2)
+        with torch.no_grad():
+            m.w.weight.zero_()
+            m.w.bias.zero_()
+
+        # (B=1, C=2, T=4)
+        x = torch.tensor([[
+            [1.0, 2.0, 100.0, 200.0],
+            [3.0, 4.0, 300.0, 400.0],
+        ]])  # (1,2,4)
+
+        key_padding_mask = torch.tensor([[False, False, True, True]])
+        y = m(x, key_padding_mask=key_padding_mask)
+
+        expected = torch.tensor([[ (1.0 + 2.0)/2.0, (3.0 + 4.0)/2.0 ]])
+        assert torch.allclose(y, expected, atol=1e-6)
+
+
+    def test_all_masked_returns_zero(self) -> None:
+        m = AdaptiveAtnPooling1d(dim=2)
+        with torch.no_grad():
+            m.w.weight.zero_()
+            m.w.bias.zero_()
+
+        x = torch.randn(1, 2, 5)
+        key_padding_mask = torch.ones(1, 5, dtype=torch.bool)
+        y = m(x, key_padding_mask=key_padding_mask)
+
+        assert torch.allclose(y, torch.zeros_like(y), atol=1e-6)
+
+
+class TestDWCSequenceEncoder:
+
+    def test_min_length_default(self) -> None:
+        enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, pooling="avg")
+        assert enc.min_length == 1
+
+    def test_min_length_padding_zero(self) -> None:
+        enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, kernel_size=7, padding=0, pooling="avg")
+        assert enc.min_length == 7
+
+    def test_forward_shortest_ok(self) -> None:
+        enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, kernel_size=7, padding=0, pooling="max")
+        x = torch.randn(2, 8, enc.min_length)
+        y = enc(x)
+        assert y.shape == (2, 16)
+
+    def test_forward_too_short_raises(self) -> None:
+        enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, kernel_size=7, padding=0, pooling="max")
+        x = torch.randn(1, 8, enc.min_length - 1)
+        with pytest.raises(RuntimeError):
+            _ = enc(x)
+
+    def test_forward_atn_with_mask(self) -> None:
+        torch.manual_seed(0)
+        enc = DWCSequenceEncoder(
+            in_channels=8,
+            out_channels=16,
+            depth=3,
+            pooling="atn",
+            stride=8,
+            kernel_size=7,
+            padding=3,
+        )
+        x = torch.randn(4, 8, 128)
+        key_padding_mask = torch.zeros(4, 128, dtype=torch.bool)
+        key_padding_mask[:, 96:] = True
+
+        y = enc(x, key_padding_mask=key_padding_mask)
+        assert y.shape == (4, 16)
+
+    def test_checkpointing_backward(self) -> None:
+        torch.manual_seed(0)
+        enc = DWCSequenceEncoder(
+            in_channels=8,
+            out_channels=16,
+            depth=4,
+            pooling="atn",
+            checkpoint_segments=2,
+        )
+        enc.train()
+
+        x = torch.randn(2, 8, 256, requires_grad=True)
+        key_padding_mask = torch.zeros(2, 256, dtype=torch.bool)
+
+        y = enc(x, key_padding_mask=key_padding_mask)
+        loss = y.sum()
+        loss.backward()
+
+        assert x.grad is not None
+        assert torch.isfinite(x.grad).all()
