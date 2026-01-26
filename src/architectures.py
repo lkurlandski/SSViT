@@ -167,6 +167,120 @@ class ClassifificationHead(nn.Module):
 
         return z
 
+
+class DWBlock(nn.Module):
+    """
+    Depthwise convolutional block.
+    """
+
+    def __init__(self, dim: int, k: int = 7, expansion: int = 4, drop: float = 0.0) -> None:
+        super().__init__()
+        self.dim = dim
+        self.dw = nn.Conv1d(dim, dim, kernel_size=k, padding=k//2, groups=dim)
+        self.pw1 = nn.Conv1d(dim, dim * expansion, kernel_size=1)
+        self.pw2 = nn.Conv1d(dim * expansion, dim, kernel_size=1)
+        self.norm = nn.GroupNorm(1, dim)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input embeddings of shape (B, C, T).
+        Returns:
+            y: Output embeddings of shape (B, C, T).
+        """
+        check_tensor(x, (None, self.dim, None), FLOATS)
+        B, C, T = x.shape
+        y = self.dw(x)    # (B, C, T)
+        y = self.norm(y)  # (B, C, T)
+        y = self.pw1(y)   # (B, C*expansion, T)
+        y = F.gelu(y)     # (B, C*expansion, T)
+        y = self.drop(y)  # (B, C*expansion, T)
+        y = self.pw2(y)   # (B, C, T)
+        y = x + y         # (B, C, T)
+        check_tensor(y, (B, C, T), FLOATS)
+        return y
+
+
+class AdaptiveAtnPooling1d(nn.Module):
+    """
+    Learned query attention pooling.
+
+    FIXME: this needs a padding mask.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.w = nn.Linear(dim, 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input embeddings of shape (B, C, T).
+        Returns:
+            y: Output embeddings of shape (B, C).
+        """
+        check_tensor(x, (None, self.dim, None), FLOATS)
+        B, C, T = x.shape
+        x_t = x.transpose(1, 2)                      # (B, T, C)
+        logits = self.w(x_t).squeeze(-1)             # (B, T)
+        a = torch.softmax(logits, dim=-1)            # (B, T)
+        y = torch.sum(x_t * a.unsqueeze(-1), dim=1)  # (B, C)
+        check_tensor(y, (B, C), FLOATS)
+        return y
+
+
+class DWCSequenceEncoder(nn.Module):
+    """
+    Sequence encoder using depthwise convolutions.
+
+    See: Liu et al. "A ConvNet for the 2020s" CVPR 2022.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, depth: int, *, kernel_size: int = 7, stride: int = 8, padding: int = 3, pooling: Literal["max", "avg", "atn"]) -> None:
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.depth = depth
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.pooling = pooling
+
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding),
+            nn.GELU(),
+            nn.GroupNorm(1, out_channels),
+        )
+        self.blocks = nn.Sequential(*[DWBlock(out_channels) for _ in range(depth)])
+        self.pool: nn.Module
+        if pooling == "max":
+            self.pool = nn.Sequential(nn.AdaptiveMaxPool1d(1), nn.Flatten())
+        elif pooling == "avg":
+            self.pool = nn.Sequential(nn.AdaptiveMaxPool1d(1), nn.Flatten())
+        elif pooling == "atn":
+            self.pool = AdaptiveAtnPooling1d(out_channels)
+        else:
+            raise ValueError(f"Unsupported pooling type: {pooling}.")
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input embeddings of shape (B, E, T).
+        Returns:
+            y: Output embeddings of shape (B, C).
+        """
+        check_tensor(x, (None, self.in_channels, None), FLOATS)
+        B, E, T = x.shape
+        C = self.out_channels
+        x = self.stem(x)    # (B, C, T')
+        x = self.blocks(x)  # (B, C, T')
+        x = self.pool(x)    # (B, C)
+        check_tensor(x, (B, C), FLOATS)
+        return x
+
 # -------------------------------------------------------------------------------- #
 # FiLM
 # -------------------------------------------------------------------------------- #
