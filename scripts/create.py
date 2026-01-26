@@ -430,6 +430,9 @@ class Requirements:
             if self.config.level == HierarchicalLevel.COARSE:
                 tr_throughput *= 0.75
                 vl_throughput *= 0.50
+            if self.config.level == HierarchicalLevel.ROUGH:
+                tr_throughput *= 0.65
+                vl_throughput *= 0.45
             if self.config.level == HierarchicalLevel.MIDDLE:
                 tr_throughput *= 0.60
                 vl_throughput *= 0.40
@@ -446,6 +449,9 @@ class Requirements:
                 if self.config.level == HierarchicalLevel.COARSE:
                     tr_throughput *= 0.75
                     vl_throughput *= 0.50
+                if self.config.level == HierarchicalLevel.ROUGH:
+                    tr_throughput *= 0.65
+                    vl_throughput *= 0.45
                 if self.config.level == HierarchicalLevel.MIDDLE:
                     tr_throughput *= 0.60
                     vl_throughput *= 0.40
