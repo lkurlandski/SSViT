@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from collections.abc import Sequence
 from copy import deepcopy
 from functools import partial
+from inspect import signature
 import math
 import os
 from pathlib import Path
@@ -75,6 +76,7 @@ from src.architectures import ConvPatchEncoder
 from src.architectures import HierarchicalConvPatchEncoder
 from src.architectures import PatchEncoderLowMem
 from src.architectures import PatchEncoderLowMemSwitchMoE
+from src.architectures import DWCPatchEncoder
 from src.architectures import Classifier
 from src.architectures import MalConvClassifier
 from src.architectures import ViTClassifier
@@ -168,7 +170,8 @@ def get_model(
     patcher_channels: int = 64,
     patcher_kernel_size: int = 64,
     patcher_stride: int = 64,
-    patcher_pooling: Literal["max", "avg"] = "max",
+    patcher_pooling: Literal["max", "avg", "atn"] = "max",
+    patcher_depth: int = 4,
     num_patches: Optional[int] = 256,
     patch_size: Optional[int] = 4096,
     patchposencoder_hidden_size: int = 64,
@@ -299,6 +302,15 @@ def get_model(
                 router_temperature=moe_router_temperature,
                 router_noise_std=moe_router_noise_std,
                 router_top_k=moe_router_top_k,
+            )
+        if parch == PatcherArchitecture.DWC:
+            return DWCPatchEncoder(
+                embedding_dim, patcher_channels, num_patches, patch_size,
+                depth=patcher_depth,
+                kernel_size=patcher_kernel_size,
+                stride=patcher_stride,
+                pooling=patcher_pooling,
+                checkpoint_segments=-1,
             )
         raise NotImplementedError(f"{parch}")
 
