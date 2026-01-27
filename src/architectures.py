@@ -173,6 +173,15 @@ class ClassifificationHead(nn.Module):
 class DWBlock(nn.Module):
     """
     Depthwise convolutional block.
+
+    Notes:
+        S: stride, default 1
+        X: expansion factor, default 4
+        C: dimensionality
+        K: kernel size
+
+    Compute ~ T / S x (C x K + 2 x C^2 x X)
+            ~ T x C^2 x X  # C x K << C^2 x X
     """
 
     def __init__(self, dim: int, k: int = 7, expansion: int = 4, drop: float = 0.0) -> None:
