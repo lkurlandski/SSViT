@@ -77,7 +77,7 @@ ALLOW_PARAM_GRAD_NONE = not CHECK_PARAM_GRAD_NONE or os.environ.get("ALLOW_PARAM
 if ALLOW_PARAM_GRAD_NONE:
     warnings.warn("Parameters are allowed to have no gradients.")
 
-TRAINER_SAVE_PREDICTIONS = os.environ.get("TRAINER_SAVE_PREDICTIONS", "0") == "1"
+TRAINER_SAVE_PREDICTIONS = os.environ.get("TRAINER_SAVE_PREDICTIONS", "1") == "1"
 if TRAINER_SAVE_PREDICTIONS:
     warnings.warn("Trainer will save predictions during evaluation.")
 
@@ -1006,7 +1006,7 @@ class Trainer:
             self.model.train()
 
         # Save the labels, logits, and names if needed.
-        if os.environ.get("TRAINER_SAVE_PREDICTIONS", "1") == "1" and rank() == 0:
+        if TRAINER_SAVE_PREDICTIONS and rank() == 0:
             output = self.args.outdir / f"predictions-{self.glbl_step}"
             output.mkdir(parents=True, exist_ok=True)
             torch.save(labels, (output / "labels.pt").as_posix())
