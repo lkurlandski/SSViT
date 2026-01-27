@@ -216,6 +216,11 @@ class Configuration:
                     return 32
                 return 32
 
+        if self.arch == Architecture.VIT and self.parch == PatcherArchitecture.DWC:
+            if self.model_config.get("patcher_stride", sys.maxsize) <= 64:
+                return 8
+            return 16
+
         print(f"WARNING ({str(self)}): per_device_batch_size not found.")
         return 64
 
@@ -463,6 +468,11 @@ class Requirements:
             vl_throughput *= 0.95
             tr_throughput *= 0.30
 
+        # TODO: this is getting pretty messy.
+        if self.config.arch == Architecture.VIT and self.config.parch == PatcherArchitecture.DWC:
+            vl_throughput = 100
+            tr_throughput = 20
+
         # NOTE: the scaling via max_length isn't going to work well for structural any more.
         tr_throughput = tr_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
         vl_throughput = vl_throughput / (self.config.max_length / 1e6) * self.gpus_per_node * self.nodes
@@ -703,10 +713,7 @@ def config_fiter(config: Configuration) -> bool:
         return False
 
     # Model Config
-    if config.model_config["patcher_pooling"] == "avg" and config.parch != PatcherArchitecture.BAS:
-        return False
-    if config.model_config["patcher_pooling"] == "max" and config.parch != PatcherArchitecture.MEM:
-        return False
+    ...
 
     return True
 
@@ -747,15 +754,18 @@ def main() -> None:
             f.unlink()
 
     model_configs = [
-        {"patcher_pooling": "max", "embedding_dim": 8, "patcher_channels": 256, "patcher_kernel_size": 256, "patcher_stride": 64},
-        {"patcher_pooling": "avg", "embedding_dim": 8, "patcher_channels": 256, "patcher_kernel_size": 256, "patcher_stride": 64},
-        {"patcher_pooling": "avg", "embedding_dim": 8, "patcher_channels": 64,  "patcher_kernel_size": 64,  "patcher_stride": 64},
+        {"patcher_pooling": "atn", "patcher_channels": 64,  "patcher_depth": 4, "patcher_kernel_size": 64,  "patcher_stride": 64},
+        {"patcher_pooling": "atn", "patcher_channels": 128, "patcher_depth": 6, "patcher_kernel_size": 64,  "patcher_stride": 64},
+        {"patcher_pooling": "atn", "patcher_channels": 64,  "patcher_depth": 4, "patcher_kernel_size": 128, "patcher_stride": 128},
+        {"patcher_pooling": "atn", "patcher_channels": 128, "patcher_depth": 6, "patcher_kernel_size": 128, "patcher_stride": 128},
+        {"patcher_pooling": "atn", "patcher_channels": 64,  "patcher_depth": 4, "patcher_kernel_size": 256, "patcher_stride": 256},
+        {"patcher_pooling": "atn", "patcher_channels": 128, "patcher_depth": 6, "patcher_kernel_size": 256, "patcher_stride": 256},
     ]
 
     stream = product(
         [Design.STRUCTURAL],
         [Architecture.VIT],
-        [PatcherArchitecture.MEM, PatcherArchitecture.BAS],
+        [PatcherArchitecture.DWC],
         [PositionalEncodingArchitecture.FIXED],
         [PatchPositionalEncodingArchitecture.NONE],
         [HierarchicalLevel.FINE],
