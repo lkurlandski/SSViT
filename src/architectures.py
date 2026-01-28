@@ -2763,24 +2763,14 @@ class StructuralViTClassifier(StructuralClassifier):
 
         self._check_forward_inputs(x, g, order)
 
-        def preprocess(i: int, x: Tensor, g: Optional[Tensor] = None) -> Tensor:
-            z = self.embeddings[i](x)  # (B, T, E)
-            z = self.filmers[i](z, g) if torch.is_grad_enabled() else self.filmers[i].forward_functional(z, g)  # type: ignore[operator]
-            return z
-
         # Process each structure separately.
         zs: list[Tensor] = []
         for i in range(self.num_structures):
-            preprocess_ = partial(preprocess, i)
             zbs: list[Tensor] = []
             for b in range(0, x[i].shape[0], B):
                 x_i_b = x[i][b:b + B]
                 g_i_b = g[i][b:b + B] if g[i] is not None else None  # type: ignore[index]
-                ts    = (x_i_b, g_i_b) if g_i_b is not None else (x_i_b,)
-                lengths = (x_i_b != 0).sum(dim=1) if self.should_get_lengths else None
-                z = self.patchers[i](preprocess=preprocess_, ts=ts)  # (max(B, B_i), N_i, C)
-                z = self.norms[i](z)                                 # (max(B, B_i), N_i, C)
-                z = self.patchposencoders[i](z, lengths)             # (max(B, B_i), N_i, C)
+                z = self._forward_trunk(i, x_i_b, g_i_b)
                 zbs.append(z)
                 self._maybe_update_expert_stats(i)
             zs.append(torch.cat(zbs, dim=0))  # (B_i, N_i, C)
@@ -2797,6 +2787,22 @@ class StructuralViTClassifier(StructuralClassifier):
         z = self.head(z)                                         # (B, M)
 
         check_tensor(z, (B, self.head.num_classes), FLOATS)
+        return z
+
+    def _forward_trunk(self, i: int, x: Tensor, g: Optional[Tensor]) -> Tensor:
+
+        def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
+            z = self.embeddings[i](x)  # (B, T, E)
+            z = self.filmers[i](z, g) if torch.is_grad_enabled() else self.filmers[i].forward_functional(z, g)  # type: ignore[operator]
+            return z
+
+        ts = (x, g) if g is not None else (x,)
+        lengths = (x != 0).sum(dim=1) if self.should_get_lengths else None
+
+        z = self.patchers[i](preprocess=preprocess, ts=ts)
+        z = self.norms[i](z)
+        z = self.patchposencoders[i](z, lengths)
+
         return z
 
     def reconcile_per_structure_patches(self, zs: list[Tensor], order: list[list[tuple[int, int]]]) -> tuple[Tensor, Tensor]:
