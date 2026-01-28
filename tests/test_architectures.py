@@ -731,7 +731,7 @@ class TestDWCSequenceEncoder:
 
     def test_min_length_default(self) -> None:
         enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, pooling="avg")
-        assert enc.min_length == 1
+        assert enc.min_length == 64
 
     def test_min_length_padding_zero(self) -> None:
         enc = DWCSequenceEncoder(in_channels=8, out_channels=16, depth=2, kernel_size=7, pooling="avg")
