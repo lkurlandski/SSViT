@@ -116,7 +116,6 @@ def _ddp_keepalive(out: Tensor, parameters: Iterable[nn.Parameter]) -> Tensor:
         return out
 
     v = torch.cat(views)
-    print(f"[DEBUG] [_ddp_keepalive]: {tuple(v.shape)}")  # FIXME: remove
     dummy = (v * 0.0).sum()
     return out + dummy * 0.0
 
