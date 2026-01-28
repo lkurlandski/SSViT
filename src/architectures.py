@@ -2731,7 +2731,19 @@ class StructuralViTClassifier(StructuralClassifier):
         patchposencoders: Sequence[PatchPositionalityEncoder | Identity],
         backbone: ViT,
         head: ClassifificationHead,
+        *,
+        batch_sizes: Optional[tuple[int, ...]] = None,
+        pad_to_batch_size: bool = False,
     ) -> None:
+        """
+        Args:
+            batch_sizes (Optional[tuple[int, ...]]): If provided, will execute the per-structure forward
+                with the largest possible batch size from this list. If not provided, will execute the
+                per-structure forward with the batch size set to number of samples passed to the top-level
+                forward method or the number of instances of said structure --- whichever is smaller.
+            pad_to_batch_size: If True, the inputs in the per-structure forward call will be zero padded
+                along the batch dimension to the batch_size.
+        """
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(patchers)):
@@ -2764,6 +2776,10 @@ class StructuralViTClassifier(StructuralClassifier):
         self.last_entropy: Optional[Tensor] = None   # (S,)   Most recent routing entropy.
         self._maybe_reset_expert_stats()
 
+        self.batch_sizes = batch_sizes
+        self.pad_to_batch_size = pad_to_batch_size
+        self._validate_batching_attributes()
+
     def forward(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> Tensor:
 
         B = len(order)
@@ -2772,16 +2788,44 @@ class StructuralViTClassifier(StructuralClassifier):
 
         self._check_forward_inputs(x, g, order)
 
+        self._validate_batching_attributes()
+
         # Process each structure separately.
         zs: list[Tensor] = []
         for i in range(self.num_structures):
             zbs: list[Tensor] = []
-            for b in range(0, x[i].shape[0], B):
-                x_i_b = x[i][b:b + B]
-                g_i_b = g[i][b:b + B] if g[i] is not None else None  # type: ignore[index]
+            # Process the inputs within each structure in batches.
+            B_i = x[i].shape[0]
+            b = 0
+            while b < B_i:
+                # Select the internal batch size for this structure, which is either
+                # the external batch size or the largest batch size possible from an allowlist.
+                remaining = B_i - b
+                if self.batch_sizes is None:
+                    bs = min(B, remaining)
+                else:
+                    bs = max((s for s in self.batch_sizes if s <= remaining), default=min(self.batch_sizes))
+                # Determine how much padding is needed to reach the internal batch size
+                # and how many samples from the internal input are going to be real.
+                real = min(bs, remaining)
+                pad  = bs - real
+                # Slice the inputs for this internal batch and possibly pad them.
+                x_i_b = x[i][b:b + real]
+                g_i_b = g[i][b:b + real] if g[i] is not None else None  # type: ignore[index]
+                if self.pad_to_batch_size:
+                    x_i_b, g_i_b = self._pad_inputs(x_i_b, g_i_b, pad)
+                # Run the inputs through the structure's trunk, remove the pad samples, and collect.
                 z = self._forward_trunk(i, x_i_b, g_i_b)
+                if self.pad_to_batch_size:
+                    z = z[:real]
                 zbs.append(z)
+                # Bookkeeping.
                 self._maybe_update_expert_stats(i)
+                # Increment the internal batch pointer.
+                b += real
+            # Verify we processed the correct number of samples for this structure, concatenate, and collect.
+            if b != B_i:
+                raise RuntimeError(f"Structure {i} processed {b} samples, but expected {B_i}.")
             zs.append(torch.cat(zbs, dim=0))  # (B_i, N_i, C)
 
         # Reconcile the sample index and the input index.
@@ -2813,6 +2857,13 @@ class StructuralViTClassifier(StructuralClassifier):
         z = self.patchposencoders[i](z, lengths)
 
         return z
+
+    @staticmethod
+    def _pad_inputs(x: Tensor, g: Optional[Tensor], pad: int) -> tuple[Tensor, Optional[Tensor]]:
+        x = torch.nn.functional.pad(x, (0, 0, 0, pad), mode="constant", value=0)
+        if g is not None:
+            g = torch.nn.functional.pad(g, (0, 0, 0, pad), mode="constant", value=0.0)
+        return x, g
 
     def reconcile_per_structure_patches(self, zs: list[Tensor], order: list[list[tuple[int, int]]]) -> tuple[Tensor, Tensor]:
         """
@@ -2912,3 +2963,19 @@ class StructuralViTClassifier(StructuralClassifier):
         self.last_aux_loss[i] += patcher.last_aux_loss
         self.last_usage[i, :patcher.num_experts] += patcher.last_usage
         self.last_entropy[i] += patcher.last_entropy
+
+    def _validate_batching_attributes(self) -> None:
+        """
+        Validates that the batching properties are set correctly.
+        """
+        if self.batch_sizes is None:
+            return
+        if len(self.batch_sizes) == 0:
+            raise ValueError("batch_sizes must contain at least one batch size.")
+        if any(s < 1 for s in self.batch_sizes):
+            raise ValueError("All batch sizes in batch_sizes must be at least 1.")
+        if len(set(self.batch_sizes)) != len(self.batch_sizes):
+            raise ValueError("All batch sizes in batch_sizes must be unique.")
+        # This check is absolutely critical. If not met, the entire forward method is invalid.
+        if not self.pad_to_batch_size and 1 not in self.batch_sizes:
+            raise ValueError("If batch_sizes is provided, pad_to_batch_size must be True or 1 must be in batch_sizes.")
