@@ -113,6 +113,7 @@ class MainArgs:
     num_streams: int = 0
     num_workers: int = 0
     pin_memory: bool = False
+    muddy_padded: bool = True
     prefetch_factor: int = 1
     tr_batch_size: int = 1
     vl_batch_size: int = -1

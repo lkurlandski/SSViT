@@ -520,13 +520,13 @@ def wrap_model_fsdp(model: M, mpdtype: torch.dtype, fsdp_offload: bool) -> M:
     return model
 
 
-def get_collate_fn(design: Design, min_lengths: list[int], structures: list[HierarchicalStructure]) -> CollateFn | CollateFnHierarchical | CollateFnStructural:
+def get_collate_fn(design: Design, min_lengths: list[int], structures: list[HierarchicalStructure], muddy_padded: bool) -> CollateFn | CollateFnHierarchical | CollateFnStructural:
     if design == Design.FLAT:
-        return CollateFn(False, False, min_lengths[0])
+        return CollateFn(False, False, min_lengths[0], muddy_padded)
     if design == Design.STRUCTURAL:
-        return CollateFnStructural(False, False, len(structures), min_lengths)
+        return CollateFnStructural(False, False, len(structures), min_lengths, muddy_padded)
     if design == Design.HIERARCHICAL:
-        return CollateFnHierarchical(False, False, len(structures), min_lengths)
+        return CollateFnHierarchical(False, False, len(structures), min_lengths, muddy_padded)
     raise NotImplementedError(f"{design}")
 
 
@@ -594,7 +594,7 @@ def get_padbatch(design: Design, structures: list[HierarchicalStructure], do_par
     def get_inputs(length: int) -> Inputs:
         inputsids = torch.zeros((batch_size, length), dtype=torch.int32)
         lengths = torch.tensor([length] * batch_size, dtype=torch.int32)
-        return Inputs(inputsids, lengths)
+        return Inputs(inputsids, lengths, False)
 
     def get_guides(length: int) -> SemanticGuides:
         parse = torch.zeros((batch_size, length), dtype=torch.bool) if do_parse else None
@@ -985,7 +985,7 @@ def main() -> None:
     print(f"{len(tr_dataset)=}")
     print(f"{len(ts_dataset)=}")
 
-    collate_fn = get_collate_fn(args.design, min_lengths, structures)
+    collate_fn = get_collate_fn(args.design, min_lengths, structures, args.muddy_padded)
     print(f"{collate_fn=}")
 
     tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, min(args.num_workers, len(tr_shards)), collate_fn, args.pin_memory, False, args.prefetch_factor)

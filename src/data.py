@@ -635,10 +635,12 @@ class StructurePartitioner:
 class _InputOrInputs(ABC):
     inputids: Tensor
     lengths: Tensor
+    muddy_padded: bool  # If True, indicates that the data will need to be incremented by 1 during finalization.
 
-    def __init__(self, inputids: Tensor, lengths: Tensor) -> None:
+    def __init__(self, inputids: Tensor, lengths: Tensor, muddy_padded: bool) -> None:
         self.inputids = inputids
         self.lengths = lengths
+        self.muddy_padded = muddy_padded
         self.verify_inputs()
 
     def size(self, dim: int) -> int:
@@ -650,7 +652,7 @@ class _InputOrInputs(ABC):
 
     @property
     def finalized(self) -> bool:
-        return self.inputids.dtype != torch.uint8
+        return self.inputids.dtype != torch.uint8 and not self.muddy_padded
 
     @abstractmethod
     def verify_inputs(self) -> None:
@@ -665,7 +667,7 @@ class _InputOrInputs(ABC):
     @abstractmethod
     def finalize(self, itype: torch.dtype) -> Self:
         """
-        Convert the inputids to the given data type and increment all non-padding ids by 1.
+        Convert the inputids to the given data type and ensure padding is not no longer muddy.
         """
         ...
 
@@ -679,12 +681,12 @@ class _InputOrInputs(ABC):
     def contiguous(self) -> Self:
         inputids = self.inputids.contiguous()
         lengths = self.lengths.clone()
-        return self.__class__(inputids, lengths)
+        return self.__class__(inputids, lengths, self.muddy_padded)
 
     def detach(self) -> Self:
         inputids = self.inputids.detach()
         lengths = self.lengths.clone()
-        return self.__class__(inputids, lengths)
+        return self.__class__(inputids, lengths, self.muddy_padded)
 
     def record_stream(self, s: torch.cuda.Stream) -> None:
         self.inputids.record_stream(s)
@@ -693,19 +695,19 @@ class _InputOrInputs(ABC):
     def clone(self) -> Self:
         inputids = self.inputids.clone()
         lengths = self.lengths.clone()
-        return self.__class__(inputids, lengths)
+        return self.__class__(inputids, lengths, self.muddy_padded)
 
     def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None, non_blocking: bool = False) -> Self:
         inputids = self.inputids.to(device, dtype, non_blocking=non_blocking)
         lengths = self.lengths.clone()
-        return self.__class__(inputids, lengths)
+        return self.__class__(inputids, lengths, self.muddy_padded)
 
     def pin_memory(self) -> Self:
         if self.inputids.is_cuda:
             raise RuntimeError("Cannot pin memory of a CUDA tensor.")
         inputids = self.inputids.pin_memory()
         lengths = self.lengths.clone()
-        return self.__class__(inputids, lengths)
+        return self.__class__(inputids, lengths, self.muddy_padded)
 
 
 class Input(_InputOrInputs):
@@ -721,8 +723,9 @@ class Input(_InputOrInputs):
     def finalize(self, itype: torch.dtype) -> Self:
         inputids = self.inputids.to(itype)
         lengths = self.lengths.clone()
-        inputids[: lengths].add_(1)
-        return self.__class__(inputids, lengths)
+        if self.muddy_padded:
+            inputids[: lengths].add_(1)
+        return self.__class__(inputids, lengths, False)
 
     def select(self, *, mask: Optional[Tensor] = None, idx: Optional[Tensor] = None, ranges: Optional[list[tuple[int, int]]] = None) -> Self:
         if mask is not None:
@@ -745,7 +748,7 @@ class Input(_InputOrInputs):
 
         inputids = slice_tensor(self.inputids)
         lengths = torch.tensor(inputids.size(self.length_axis), dtype=torch.int64)
-        return self.__class__(inputids, lengths)
+        return self.__class__(inputids, lengths, self.muddy_padded)
 
 
 class Inputs(_InputOrInputs):
@@ -761,15 +764,38 @@ class Inputs(_InputOrInputs):
     def finalize(self, itype: torch.dtype) -> Self:
         inputids = self.inputids.to(itype)
         lengths = self.lengths.clone()
-        for i, l in enumerate(lengths):
-            inputids[i, :l].add_(1)
-        return self.__class__(inputids, lengths)
+        if self.muddy_padded:
+            for i, l in enumerate(lengths.cpu().tolist()):
+                inputids[i, :l].add_(1)
+        return self.__class__(inputids, lengths, False)
 
     @classmethod
-    def from_singles(cls, inputs: Sequence[Input], pin_memory: bool = False, min_length: int = 0) -> Inputs:
-        inputids = pad_sequence([i.inputids for i in inputs], True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
+    def from_singles(cls, inputs: Sequence[Input], pin_memory: bool = False, min_length: int = 0, muddy_padded: bool = True) -> Inputs:
+        """
+        Args:
+            inputs: Sequence of Input instances to batch.
+            pin_memory: If True, the resulting tensors will be pinned in memory.
+            min_length: Minimum length to pad the inputs to.
+            muddy_padded: If True, the resulting Inputs will be muddy padded. If False and not already NOT muddy_padded,
+                they will be incremented by 1 prior to padding and upcast.
+        """
+        is_muddy = [i.muddy_padded for i in inputs]
+        if len(set(is_muddy)) != 1:
+            raise ValueError("All Inputs must have the same muddy_padded value to be batched.")
+        all_muddy = is_muddy[0]
+
+        # If the output should be properly padded (not muddy) and the inputs are muddy, increment non-padded regions by 1.
+        # Otherwise, if the output should be muddy, and the inputs are not muddy, raise an error.
+        inps = [i.inputids for i in inputs]
+        if not muddy_padded and all_muddy:
+            inps = [i.to(torch.int16) for i in inps]
+            inps = list(torch._foreach_add(inps, 1))
+        elif not all_muddy:
+            raise ValueError("Cannot create muddy Inputs from non-muddy Input instances.")
+
+        inputids = pad_sequence(inps, True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
         lengths = torch.stack([i.lengths for i in inputs], dim=0)
-        return cls(inputids, lengths)
+        return cls(inputids, lengths, muddy_padded)
 
 
 F = TypeVar("F")                                        # file
@@ -1573,6 +1599,7 @@ class Preprocessor:
         inputs = Input(
             torch.frombuffer(buffer, dtype=torch.uint8),
             torch.tensor(size, dtype=torch.int64),
+            True,
         )
         if not self.structures_as_guides:
             guides = SemanticGuide(
@@ -1770,16 +1797,18 @@ class Preprocessor:
 
 class CollateFn:
 
-    def __init__(self, pin_memory: bool, bitpack: bool, min_length: int = 0) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, min_length: int = 0, muddy_padded: bool = True) -> None:
         """
         Args:
             pin_memory: whether to pin memory of the collated tensors (recommended to use DataLoader(pin_memory=True) instead).
             bitpack: whether to bitpack the semantic guides if not already bitpacked.
             min_length: minimum length to pad the inputs to (must be a multiple of `8`).
+            muddy_padded: whether to use muddy padding technique for the inputs or not.
         """
         self.pin_memory = pin_memory
         self.bitpack = bitpack
         self.min_length = min_length
+        self.muddy_padded = muddy_padded
         if self.min_length % 8 != 0:
             raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {min_length}.")
 
@@ -1787,7 +1816,7 @@ class CollateFn:
         file = [s.file for s in batch]
         name = [s.name for s in batch]
         label = torch.stack([s.label for s in batch])
-        inputs = Inputs.from_singles([s.inputs for s in batch], self.pin_memory, self.min_length)
+        inputs = Inputs.from_singles([s.inputs for s in batch], self.pin_memory, self.min_length, self.muddy_padded)
         guides = [s.guides.compress() if self.bitpack else s.guides for s in batch]
         guides = SemanticGuides.from_singles(guides, self.pin_memory, self.min_length // 8 if guides[0].is_bitpacked else self.min_length)
         structure = [s.structure for s in batch]
@@ -1795,16 +1824,17 @@ class CollateFn:
         return FSamples(file, name, label, inputs, guides, structure)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, min_length={self.min_length})"
+        return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, min_length={self.min_length}, muddy_padded={self.muddy_padded})"
 
 
 class CollateFnHierarchical:
 
-    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None, muddy_padded: bool = True) -> None:
         self.pin_memory = pin_memory
         self.bitpack = bitpack
         self.num_structures = num_structures
         self.min_lengths = [0] * num_structures if min_lengths is None else min_lengths
+        self.muddy_padded = muddy_padded
         if any(l % 8 != 0 for l in self.min_lengths):
             raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {self.min_lengths}.")
         if len(self.min_lengths) != self.num_structures:
@@ -1826,7 +1856,7 @@ class CollateFnHierarchical:
                 g_i_j = batch[j].guides.select(ranges=ranges)
                 xs.append(x_i_j)
                 gs.append(g_i_j.compress() if self.bitpack else g_i_j)
-            xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i])
+            xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i], self.muddy_padded)
             gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8))
             inputs.append(xs)
             guides.append(gs)
@@ -1836,17 +1866,17 @@ class CollateFnHierarchical:
         return HSamples(file, name, label, inputs, guides, structure)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, num_structures={self.num_structures}, min_lengths={self.min_lengths})"
+        return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, num_structures={self.num_structures}, min_lengths={self.min_lengths}, muddy_padded={self.muddy_padded})"
 
 
 class CollateFnStructural:
 
-    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None, muddy_padded: bool = True) -> None:
         self.pin_memory = pin_memory
         self.bitpack = bitpack
         self.num_structures = num_structures
         self.min_lengths = [0] * num_structures if min_lengths is None else min_lengths
-
+        self.muddy_padded = muddy_padded
         if pin_memory or bitpack:
             raise NotImplementedError(f"{self.__class__.__name__} does not support pin_memory or bitpack yet.")
 
@@ -1884,9 +1914,9 @@ class CollateFnStructural:
 
             # Handle empty structure case.
             if len(xs) == 0:
-                xs = [Input(torch.full((self.min_lengths[i],), 0, dtype=torch.uint8), torch.tensor(self.min_lengths[i], dtype=torch.int64))]
+                xs = [Input(torch.full((self.min_lengths[i],), 0, dtype=torch.uint8), torch.tensor(self.min_lengths[i], dtype=torch.int64), True)]
                 gs = [self._create_synthetic_guide(batch[0].guides, self.min_lengths[i] // 8 if self.bitpack else self.min_lengths[i])]
-            xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i])
+            xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i], self.muddy_padded)
             gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8))
             inputs.append(xs)
             guides.append(gs)
@@ -1916,6 +1946,9 @@ class CollateFnStructural:
         if guides.characteristics is not None:
             characteristics = torch.full((length,), 0, dtype=guides.characteristics.dtype)
         return SemanticGuide(parse, entropy, characteristics)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, num_structures={self.num_structures}, min_lengths={self.min_lengths}, muddy_padded={self.muddy_padded})"
 
 
 class CUDAPrefetcher:
