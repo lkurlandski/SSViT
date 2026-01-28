@@ -28,11 +28,13 @@ from abc import abstractmethod
 from collections.abc import Sequence
 from functools import partial
 from inspect import signature
+from itertools import chain
 import math
 import os
 import sys
 from typing import Any
 from typing import Callable
+from typing import Iterable
 from typing import Literal
 from typing import Optional
 from typing import Protocol
@@ -41,6 +43,7 @@ import warnings
 import torch
 from torch.distributed.fsdp import fully_shard
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 from torch.utils.checkpoint import checkpoint_sequential
 from torch import nn
 from torch import Tensor
@@ -92,6 +95,30 @@ def get_model_input_lengths(model: nn.Module) -> tuple[int, int]:
             lo = max(lo, l)
 
     return lo, hi
+
+
+def _ddp_keepalive(out: Tensor, parameters: Iterable[nn.Parameter]) -> Tensor:
+    """
+    Ensure all parameters participate in the autograd graph every step.
+    This avoids DDP 'unused parameter' errors when some trunks have no inputs.
+
+    Usage:
+    >>> out = _ddp_keepalive(out, self.net.parameters()) if self.training else out
+    """
+    if not torch.is_grad_enabled():
+        return out
+
+    views: list[Tensor] = []
+    for p in parameters:
+        views.append(p.reshape(-1)[:1])
+
+    if not views:
+        return out
+
+    v = torch.cat(views)
+    print(f"[DEBUG] [_ddp_keepalive]: {tuple(v.shape)}")  # FIXME: remove
+    dummy = (v * 0.0).sum()
+    return out + dummy * 0.0
 
 
 class Identity(nn.Module):
@@ -1524,6 +1551,7 @@ class PatchEncoderLowMemSwitchMoE(PatchEncoderBase):
         Ensure all expert parameters participate in the autograd graph every step.
         This avoids DDP 'unused parameter' errors when routing skips experts.
         """
+        warnings.warn(f"{self.__class__.__name__}::_ddp_keepalive uses non-vectorized operations and should be re-implemented with the optimized _ddp_keepalive function.")
         if (not self.training) or (not torch.is_grad_enabled()):
             return out
 
@@ -2930,13 +2958,13 @@ class StructuralViTClassifier(StructuralClassifier):
         if (not self.training) or (not torch.is_grad_enabled()):
             return out
 
-        dummy = out.sum() * 0.0
+        parameters = []
         for trunk in self._trunks:
             for mod in trunk:
-                for p in mod.parameters():
-                    dummy = dummy + p.view(-1)[0] * 0.0
+                parameters.append(mod.parameters())
+        out = _ddp_keepalive(out, chain.from_iterable(parameters))
 
-        return out + dummy
+        return out
 
     def _maybe_reset_expert_stats(self) -> None:
         """
