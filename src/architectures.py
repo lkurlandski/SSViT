@@ -2722,7 +2722,16 @@ class StructuralMalConvClassifier(StructuralClassifier):
 
 class StructuralViTClassifier(StructuralClassifier):
 
-    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], norms: Sequence[Optional[nn.LayerNorm]], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(
+        self,
+        embeddings: Sequence[nn.Embedding],
+        filmers: Sequence[FiLM | FiLMNoP],
+        patchers: Sequence[PatchEncoderBase],
+        norms: Sequence[Optional[nn.LayerNorm]],
+        patchposencoders: Sequence[PatchPositionalityEncoder | Identity],
+        backbone: ViT,
+        head: ClassifificationHead,
+    ) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(patchers)):
