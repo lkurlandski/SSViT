@@ -1135,10 +1135,19 @@ class DWCPatchEncoder(PatchEncoderBase):
         pooling: Literal["max", "avg", "atn"] = "atn",
         checkpoint_segments: int = 0,
     ) -> None:
+        """
+        Args:
+            checkpoint_segments: Number of segments for gradient checkpointing.
+                If `-1`, will checkpoint the entire convolutional stack.
+                If `0`,  will disable checkpointing entirely.
+                If `N`,  will pass to DWCSequenceEncoder, which will checkpoint `N` blocks.
+        """
         super().__init__(in_channels, out_channels, num_patches, patch_size)
 
         if patch_size is not None or num_patches != 1:
             raise ValueError(f"{self.__class__.__name__} requires `num_patches`=1 and `patch_size` is None.")
+
+        self.checkpoint_segments = checkpoint_segments
 
         self.conv = DWCSequenceEncoder(
             in_channels=in_channels,
@@ -1147,7 +1156,7 @@ class DWCPatchEncoder(PatchEncoderBase):
             kernel_size=kernel_size,
             stride=stride,
             pooling=pooling,
-            checkpoint_segments=checkpoint_segments,
+            checkpoint_segments=0 if checkpoint_segments == -1 else checkpoint_segments,
         )
 
     @property
@@ -1155,7 +1164,13 @@ class DWCPatchEncoder(PatchEncoderBase):
         return self.conv.min_length
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
-        return self.conv(z.permute(0, 2, 1)).unsqueeze(1)
+        z = z.permute(0, 2, 1)
+        if self.checkpoint_segments == -1:
+            z = checkpoint(self.conv, z, use_reentrant=False)
+        else:
+            z = self.conv(z)
+        z = z.unsqueeze(1)
+        return z
 
     def forward_streaming(self, preprocess: PreprocessFn, ts: Sequence[Tensor]) -> Tensor:
         return self.forward_embeddings(preprocess(*ts))
