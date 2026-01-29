@@ -710,7 +710,7 @@ class _InputOrInputs(ABC):
         if self.inputids.is_cuda:
             raise RuntimeError("Cannot pin memory of a CUDA tensor.")
         inputids = self.inputids.pin_memory()
-        lengths = self.lengths.clone()
+        lengths = self.lengths.pin_memory()
         return self.__class__(inputids, lengths, self.muddy_padded)
 
 
