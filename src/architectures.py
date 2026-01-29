@@ -2777,6 +2777,7 @@ class StructuralViTClassifier(StructuralClassifier):
         *,
         batch_sizes: Optional[tuple[int, ...]] = None,
         pad_to_batch_size: bool = False,
+        do_ddp_keepalive: bool = True,
     ) -> None:
         """
         Args:
@@ -2786,6 +2787,10 @@ class StructuralViTClassifier(StructuralClassifier):
                 forward method or the number of instances of said structure --- whichever is smaller.
             pad_to_batch_size: If True, the inputs in the per-structure forward call will be zero padded
                 along the batch dimension to the batch_size.
+            do_ddp_keepalive: If True, will apply DDP keepalive trick to ensure all trunks participate
+                in the autograd graph even if they have no inputs for a given forward pass. Note that this
+                does entail computational overhead. If False, expect that many trunks will not have gradients;
+                training code must handle this case appropriately, e.g., DDP(find_unused_parameters=True), etc.
         """
         super().__init__(len(embeddings))
 
@@ -2822,6 +2827,8 @@ class StructuralViTClassifier(StructuralClassifier):
         self.batch_sizes = batch_sizes
         self.pad_to_batch_size = pad_to_batch_size
         self._validate_batching_attributes()
+
+        self.do_ddp_keepalive = do_ddp_keepalive
 
     def forward(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> Tensor:
 
@@ -2876,9 +2883,10 @@ class StructuralViTClassifier(StructuralClassifier):
         check_tensor(z, (B, None, self.C), FLOATS)
 
         # Ensure all trunks participate in autograd graph.
-        used = {s for sample in order for (s, _) in sample}
-        unused = tuple(i for i in range(self.num_structures) if i not in used)
-        z = self._ddp_keepalive(z, unused)
+        if self.do_ddp_keepalive:
+            used = {s for sample in order for (s, _) in sample}
+            unused = tuple(i for i in range(self.num_structures) if i not in used)
+            z = self._ddp_keepalive(z, unused)
 
         # Feed concatenated patches to shared ViT backbone and classification head.
         z = self.backbone(z, key_padding_mask=key_padding_mask)  # (B, D)
