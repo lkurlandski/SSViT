@@ -69,14 +69,6 @@ from src.utils import Timer
 from src.utils import check_tensor
 
 
-CHECK_PARAM_GRAD_NONE = os.environ.get("CHECK_PARAM_GRAD_NONE", "1") == "1"
-if not CHECK_PARAM_GRAD_NONE:
-    warnings.warn("Parameters will not be checked for having gradients.")
-
-ALLOW_PARAM_GRAD_NONE = not CHECK_PARAM_GRAD_NONE or os.environ.get("ALLOW_PARAM_GRAD_NONE", "0") == "1"
-if ALLOW_PARAM_GRAD_NONE:
-    warnings.warn("Parameters are allowed to have no gradients.")
-
 TRAINER_DONT_SAVE_PREDICTIONS = os.environ.get("TRAINER_DONT_SAVE_PREDICTIONS", "0") == "1"
 if TRAINER_DONT_SAVE_PREDICTIONS:
     warnings.warn("Trainer will save predictions during evaluation.")
@@ -310,6 +302,7 @@ class TrainerArgs:
     logg_steps: Optional[int] = None
     assert_auxillary_loss: bool = False
     auxillary_loss_weight: float = 0.0
+    param_grad_none: str = "error"
 
     def __post_init__(self) -> None:
         if (self.max_epochs is not None) and (self.max_steps is not None):
@@ -332,6 +325,8 @@ class TrainerArgs:
             raise ValueError("`stopper_mode` must be 'min' or 'max'.")
         if self.stopper_patience < 0:
             self.stopper_patience = float("inf")
+        if self.param_grad_none not in ("error", "warn", "ignore"):
+            raise ValueError("`param_grad_none` must be one of 'error', 'warn', 'allow', or 'ignore'.")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
@@ -774,13 +769,14 @@ class Trainer:
 
             # Check for parameters with no gradients
             # Skip for fake batches, as they take anomalous paths for MoE models and naturally have missing gradients
-            if real and CHECK_PARAM_GRAD_NONE and any(param.grad is None for param in self.model.parameters()):
-                flush()
-                print(f"{'-' * 20} Parameter Summary After Step {self.glbl_step:09} {'-' * 20}")
-                print_parameter_summary(self.model, spaces=2)
-                print(f"{'-' * 80}")
-                if not ALLOW_PARAM_GRAD_NONE:
-                    raise RuntimeError("Some of the parameters have no gradients.")
+            if real and self.args.param_grad_none != "ignore":
+                if any(param.grad is None for param in self.model.parameters()):
+                    flush()
+                    print(f"{'-' * 20} Parameter Summary After Step {self.glbl_step:09} {'-' * 20}")
+                    print_parameter_summary(self.model, spaces=2)
+                    print(f"{'-' * 80}")
+                    if self.args.param_grad_none != "warn":
+                        raise RuntimeError("Some of the parameters have no gradients.")
 
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
