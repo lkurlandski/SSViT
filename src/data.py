@@ -76,6 +76,10 @@ PAD_TO_MULTIPLE_OF = 64
 if PAD_TO_MULTIPLE_OF % 8 != 0:
     raise ValueError("PAD_TO_MULTIPLE_OF must be a multiple of 8.")
 
+MUDDY_PADDED_ADD_ONE_BATCH_SIZE = int(os.environ.get("MUDDY_PADDED_ADD_ONE_BATCH_SIZE", -1))
+if MUDDY_PADDED_ADD_ONE_BATCH_SIZE != -1:
+    warnings.warn(f"Using MUDDY_PADDED_ADD_ONE_BATCH_SIZE={MUDDY_PADDED_ADD_ONE_BATCH_SIZE} may slow down training.")
+
 
 class Name(str):
 
@@ -699,7 +703,7 @@ class _InputOrInputs(ABC):
 
     def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None, non_blocking: bool = False) -> Self:
         inputids = self.inputids.to(device, dtype, non_blocking=non_blocking)
-        lengths = self.lengths.clone()
+        lengths = self.lengths.to(device, non_blocking=non_blocking)
         return self.__class__(inputids, lengths, self.muddy_padded)
 
     def pin_memory(self) -> Self:
@@ -765,8 +769,7 @@ class Inputs(_InputOrInputs):
         inputids = self.inputids.to(itype)
         lengths = self.lengths.clone()
         if self.muddy_padded:
-            for i, l in enumerate(lengths.cpu().tolist()):
-                inputids[i, :l].add_(1)
+            _muddy_pad_add_one_(inputids, lengths, MUDDY_PADDED_ADD_ONE_BATCH_SIZE)
         return self.__class__(inputids, lengths, False)
 
     @classmethod
@@ -796,6 +799,48 @@ class Inputs(_InputOrInputs):
         inputids = pad_sequence(inps, True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
         lengths = torch.stack([i.lengths for i in inputs], dim=0)
         return cls(inputids, lengths, muddy_padded)
+
+
+# Cache arange tensor globally to avoid reallocations and kernel overhead.
+_muddy_pad_pos_cache: dict[torch.device, Tensor] = {}
+
+def _muddy_pad_pos(device: torch.device, length: int) -> Tensor:
+    t = _muddy_pad_pos_cache.get(device)
+    if t is None or t.size(0) < length:
+        t = torch.arange(length, device=device, dtype=torch.int64)
+        _muddy_pad_pos_cache[device] = t
+    return t[0:length]
+
+
+def _muddy_pad_add_one_(inputids: Tensor, lengths: Tensor, batch_size: int) -> None:
+    """
+    Add 1 to all non-padded positions in inputids in-place.
+
+    Args:
+        inputids: Tensor of shape (B, T) containing the input byte ids.
+        lengths: Tensor of shape (B,) containing the lengths of each sequence in inputids.
+        batch_size: If 0, process one sequence at a time, which is memory efficient but slow.
+            If -1, process the full batch at once, which is fast, but requires (B, T) memory.
+    """
+    check_tensor(inputids, (lengths.shape[0], None))
+
+    if not isinstance(batch_size, int):
+        raise TypeError("batch_size must be an integer or None.")
+
+    if batch_size < 0 or batch_size == inputids.shape[0]:
+        pos = _muddy_pad_pos(inputids.device, inputids.shape[1])
+        valid = pos.unsqueeze(0) < lengths.unsqueeze(1)
+        inputids.add_(1)
+        # inputids.add_(valid.to(dtype=inputids.dtype))
+        inputids.masked_fill_(~valid, 0)
+        return
+
+    if batch_size == 0:
+        for i, l in enumerate(lengths.cpu().tolist()):
+            inputids[i, :l].add_(1)
+        return
+
+    raise NotImplementedError("Batched muddy padding with batch_size not equal to 0 or full batch size is not implemented.")
 
 
 F = TypeVar("F")                                        # file

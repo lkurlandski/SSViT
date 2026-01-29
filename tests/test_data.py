@@ -29,8 +29,6 @@ from src.data import FSamples
 from src.data import _HSampleOrSamples
 from src.data import HSample
 from src.data import HSamples
-# from src.data import _SSampleOrSamples
-# from src.data import SSample
 from src.data import SSamples
 from src.data import _SemanticGuideOrSemanticGuides
 from src.data import SemanticGuide
@@ -43,6 +41,7 @@ from src.data import StructurePartitioner
 from src.data import Preprocessor
 from src.data import CollateFn
 from src.data import CollateFnHierarchical
+from src.data import _muddy_pad_add_one_
 from src.bitpacking import packbits
 from src.bitpacking import unpackbits
 
@@ -615,3 +614,57 @@ class TestPreprocessor:
             [(0, 10), (50, 70), (41,50),],  # STRUCT-D
             [],                             # STRUCT-E
         ]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("batch_size", [-1, 0, 1, 2, 3])
+def test__muddy_pad_add_one_(batch_size: int, device: str) -> None:
+    if batch_size > 0:
+        pytest.skip("Not Implemented Yet.")
+        return
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available.")
+        return
+
+    device = torch.device(device)
+
+    x = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5],
+            [6, 0, 7, 0, 0, 0],
+        ],
+        dtype=torch.uint8,
+        device=device,
+    )
+    l = torch.tensor([6, 3], dtype=torch.long, device=device)
+
+    _muddy_pad_add_one_(x, l, batch_size)
+    y = torch.tensor(
+        [
+            [1, 2, 3, 4, 5, 6],
+            [7, 1, 8, 0, 0, 0],
+        ],
+        dtype=torch.uint8,
+        device=device,
+    )
+    assert torch.equal(x, y)
+
+    x = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5, 0],
+            [6, 0, 7, 0, 0, 0, 0],
+        ],
+        dtype=torch.uint8,
+        device=device,
+    )
+    l = torch.tensor([6, 3], dtype=torch.long, device=device)
+    _muddy_pad_add_one_(x, l, batch_size)
+    y = torch.tensor(
+        [
+            [1, 2, 3, 4, 5, 6, 0],
+            [7, 1, 8, 0, 0, 0, 0],
+        ],
+        dtype=torch.uint8,
+        device=device,
+    )
+    assert torch.equal(x, y)
