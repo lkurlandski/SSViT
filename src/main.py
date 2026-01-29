@@ -110,6 +110,7 @@ from src.data import FSamples
 from src.data import HSamples
 from src.data import SSamples
 from src.data import FOrHSamples
+from src.data import PAD_TO_MULTIPLE_OF
 from src.helpers import create_argument_parser_from_dataclass
 from src.helpers import flatten_dataclasses
 from src.helpers import _MTArgs
@@ -122,6 +123,7 @@ from src.helpers import PatchPositionalEncodingArchitecture
 from src.helpers import MainArgs
 from src.simpledb import SimpleDB
 from src.simpledb import MetadataDB
+from src.simpledb import roundup
 from src.trainer import Trainer
 from src.trainer import TrainerArgs
 from src.trainer import EarlyStopper
@@ -164,6 +166,9 @@ def get_model(
     max_length: Optional[int] = None,
     share_embeddings: bool = False,
     share_patchers: bool = False,
+    batch_size: Optional[int] = None,
+    enable_checkpoint: bool = False,
+    enable_compile: bool = False,
     *,
     embedding_dim: int = 8,
     film_hidden_size: int = 16,
@@ -208,6 +213,9 @@ def get_model(
         structures: The hierarchical structures.
         share_embeddings: For hierarchical and structural designs, whether to share embeddings across structures.
         share_patchers: For hierarchical and structural designs, whether to share patchers across structures.
+        batch_size: Compiling models can be done more effectively if the maximum batch size is known ahead of time.
+        enable_checkpoint: Whether to enable activation checkpointing in certain model components to reduce memory usage.
+        enable_compile: Whether to enable compilation for certain model components to improve performance.
 
     Returns:
         The model.
@@ -304,14 +312,23 @@ def get_model(
                 router_top_k=moe_router_top_k,
             )
         if parch == PatcherArchitecture.DWC:
-            return DWCPatchEncoder(
+            model = DWCPatchEncoder(
                 embedding_dim, patcher_channels, num_patches, patch_size,
                 depth=patcher_depth,
                 kernel_size=patcher_kernel_size,
                 stride=patcher_stride,
                 pooling=patcher_pooling,
-                checkpoint_segments=-1,
+                checkpoint_segments=-1 if enable_checkpoint else 0,
             )
+            if enable_compile:
+                model.conv = torch.compile(
+                    model.conv,
+                    fullgraph=True,
+                    dynamic=False,
+                    backend="inductor",
+                    mode="max-autotune-no-cudagraphs",
+                )
+            return model
         raise NotImplementedError(f"{parch}")
 
     # (LayerNorm) Build the norm
@@ -456,7 +473,18 @@ def get_model(
             patchposencoders = _build_modules(build_patchposencoder, num_structures, share_patchers)
             transformer = build_transformer()
             head = build_head()
-            return StructuralViTClassifier(embeddings, filmers, patchers, norms, patchposencoders, transformer, head)
+            # If we're compiling, we need to limit the possible number of
+            # batch sizes seen by the trunks to avoid excessive recompilation.
+            if enable_compile:
+                if batch_size is None:
+                    raise ValueError("When enable_compile is True, batch_size must be specified for StructuralViTClassifier.")
+                batch_sizes = (batch_size, batch_size // 2, batch_size // 4)
+                batch_sizes = tuple(set(filter(lambda x: x > 0, batch_sizes)))
+                pad_to_batch_size = True
+            else:
+                batch_sizes = None
+                pad_to_batch_size = False
+            return StructuralViTClassifier(embeddings, filmers, patchers, norms, patchposencoders, transformer, head, batch_sizes=batch_sizes, pad_to_batch_size=pad_to_batch_size)
 
         raise NotImplementedError(f"{arch}")
 
@@ -895,11 +923,18 @@ def main() -> None:
         args.max_length,
         args.share_embeddings,
         args.share_patchers,
+        args.tr_batch_size,
+        args.enable_checkpoint,
+        args.enable_compile,
         **dict(args.model_config),
     ).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
     min_lengths = [m for m in getattr(model, "min_lengths", [min_length])]
+    # FIXME: implement a better binned-length padding strategy.
+    min_lengths = [roundup(l, PAD_TO_MULTIPLE_OF) for l in min_lengths]
+    if PAD_TO_MULTIPLE_OF > 64:
+        warnings.warn("FIXME padding with a stupidly large multiple may waste memory.")
     print(f"{model=}")
     print(f"{num_parameters=}")
     print(f"{min_length=}")

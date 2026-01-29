@@ -130,6 +130,8 @@ class MainArgs:
     fsdp: bool = False
     fsdp_offload: bool = True
     tf32: bool = False
+    enable_checkpoint: bool = False
+    enable_compile: bool = False
     resume: bool = False
 
     def __post_init__(self) -> None:
