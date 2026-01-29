@@ -131,6 +131,8 @@ class Identity(nn.Module):
     def __init__(self, *args: Any, autocast: bool = False, **kwds: Any) -> None:
         super().__init__()
         self.autocast = autocast
+        if self.autocast:
+            warnings.warn(f"Using {self.__class__.__name__}(autocast=True) is almost certainly a poor decision and this feature will eventually be removed.")
 
     def forward(self, x: Tensor, *args: Any, **kwds: Any) -> Tensor:
         if self.autocast and torch.is_floating_point(x) and torch.is_autocast_enabled():
@@ -473,23 +475,22 @@ class FiLMNoP(nn.Module):
     No-op FiLM layer that does nothing but check the inputs.
     """
 
-    def __init__(self, guide_dim: int, embedding_dim: int, hidden_size: int, fp32: bool = False):
+    def __init__(self, guide_dim: int, embedding_dim: int, hidden_size: int, autocast: bool = False):
         super().__init__()
 
         self.guide_dim = guide_dim
         self.embedding_dim = embedding_dim
         self.hidden_size = hidden_size
-        self.fp32 = fp32
-
-        if self.fp32:
-            raise NotImplementedError()
+        self.autocast = autocast
+        if self.autocast:
+            warnings.warn(f"Using {self.__class__.__name__}(autocast=True) is almost certainly a poor decision and this feature will eventually be removed.")
 
     def forward(self, x: Tensor, g: Literal[None]) -> Tensor:
         check_tensor(x, (None, None, None), FLOATS)
         if g is not None:
             raise ValueError(f"Expected g to be None, got {type(g)} instead.")
 
-        if torch.is_autocast_enabled():
+        if self.autocast and torch.is_floating_point(x) and torch.is_autocast_enabled():
             x = x.to(torch.get_autocast_dtype(x.device.type))
 
         return x

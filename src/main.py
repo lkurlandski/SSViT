@@ -338,7 +338,7 @@ def get_model(
     # (PatchPositionalityEncoder | Identity) Build the patchposencoder
     def build_patchposencoder() -> PatchPositionalityEncoder | Identity:
         if patchposenc == PatchPositionalEncodingArchitecture.NONE:
-            return Identity(autocast=True)
+            return Identity()
         if patchposenc == PatchPositionalEncodingArchitecture.REL:
             return PatchPositionalityEncoder(in_channels=patcher_channels, max_length=None, hidden_size=patchposencoder_hidden_size)
         if patchposenc == PatchPositionalEncodingArchitecture.BTH:
