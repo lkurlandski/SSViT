@@ -767,7 +767,7 @@ class Inputs(_InputOrInputs):
 
     def finalize(self, itype: torch.dtype) -> Self:
         inputids = self.inputids.to(itype)
-        lengths = self.lengths.clone()
+        lengths = self.lengths  # .clone()  # NOTE: cloning lengths is significant overhead here.
         if self.muddy_padded:
             _muddy_pad_add_one_(inputids, lengths, MUDDY_PADDED_ADD_ONE_BATCH_SIZE)
         return self.__class__(inputids, lengths, False)
