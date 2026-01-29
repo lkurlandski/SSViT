@@ -110,14 +110,14 @@ def _ddp_keepalive(out: Tensor, parameters: Iterable[nn.Parameter]) -> Tensor:
 
     views: list[Tensor] = []
     for p in parameters:
-        views.append(p.reshape(-1)[:1])
+        if p.requires_grad:
+            views.append(p.view(-1).select(0, 0))
 
     if not views:
         return out
 
-    v = torch.cat(views)
-    dummy = (v * 0.0).sum()
-    return out + dummy * 0.0
+    dummy = torch.stack(views).sum() * 0.0
+    return out + dummy
 
 
 class Identity(nn.Module):
@@ -2876,7 +2876,9 @@ class StructuralViTClassifier(StructuralClassifier):
         check_tensor(z, (B, None, self.C), FLOATS)
 
         # Ensure all trunks participate in autograd graph.
-        z = self._ddp_keepalive(z)
+        used = {s for sample in order for (s, _) in sample}
+        unused = tuple(i for i in range(self.num_structures) if i not in used)
+        z = self._ddp_keepalive(z, unused)
 
         # Feed concatenated patches to shared ViT backbone and classification head.
         z = self.backbone(z, key_padding_mask=key_padding_mask)  # (B, D)
@@ -2965,16 +2967,18 @@ class StructuralViTClassifier(StructuralClassifier):
         self.backbone.fully_shard(**kwds)
         fully_shard(self, **kwds | {"reshard_after_forward": False})
 
-    def _ddp_keepalive(self, out: torch.Tensor) -> torch.Tensor:
+    def _ddp_keepalive(self, out: torch.Tensor, which: tuple[int, ...]) -> torch.Tensor:
         """
         Ensure all trunk parameters participate in the autograd graph every step.
         This avoids DDP 'unused parameter' errors when some trunks have no inputs.
         """
-        if (not self.training) or (not torch.is_grad_enabled()):
+        if (not self.training) or (not torch.is_grad_enabled()) or (not which):
             return out
 
         parameters = []
-        for trunk in self._trunks:
+        for i, trunk in enumerate(self._trunks):
+            if i not in which:
+                continue
             for mod in trunk:
                 parameters.append(mod.parameters())
         out = _ddp_keepalive(out, chain.from_iterable(parameters))
