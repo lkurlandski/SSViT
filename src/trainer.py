@@ -1162,24 +1162,22 @@ class Trainer:
             loss - The computed loss tensor.
             losses - A dictionary of detached individual loss components.
         """
-        losses: dict[str, Tensor] = {}
-        dtype = outputs.dtype
-        device = outputs.device
+        loss: Tensor                    # Total loss to backpropagate. Critical we don't change dtype, device, or grad status.
+        losses: dict[str, Tensor] = {}  # Individual loss components to log. These can be detached and changed freely.
 
         with torch.autocast(self.device.type, dtype=self.mp_dtype, enabled=self.args.mp16):
             clf_loss: Tensor = self.loss_fn(outputs, batch.get_label())
-            losses["clf_loss"] = clf_loss.to(device=device, dtype=dtype)
+        loss = clf_loss
+        losses["clf_loss"] = clf_loss.detach()
 
         if (last_aux_loss := get_last_aux_loss(self.model)) is not None:
-            losses["aux_loss"] = last_aux_loss.to(device=device, dtype=dtype) * self.args.auxillary_loss_weight
+            if last_aux_loss.device != loss.device or last_aux_loss.dtype != loss.dtype:
+                raise RuntimeError("Auxillary loss has mismatched device or dtype.")
+            last_aux_loss = last_aux_loss * self.args.auxillary_loss_weight
+            loss = loss + last_aux_loss
+            losses["aux_loss"] = last_aux_loss.detach()
         elif self.args.assert_auxillary_loss:
             raise RuntimeError("An auxillary loss was expected but not found.")
-
-        loss = torch.tensor(0.0, dtype=dtype, device=device)
-        for k in losses:
-            loss += losses[k]
-
-        losses = {k: losses[k].detach() for k in losses}
 
         return loss, losses
 
