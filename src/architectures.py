@@ -356,6 +356,11 @@ class DWCSequenceEncoder(nn.Module):
         C = self.out_channels
 
         x = self.stem(x)    # (B, C, T')
+        # The Norm at the end of the stem will upcast to float32, which then propagates
+        # in every subsequent block, leading to a large number of dtype juggling and copies.
+        # To elimiinate this, all we need to do is downcast back to the original dtype here.
+        if torch.is_autocast_enabled():
+            x = x.to(torch.get_autocast_dtype(x.device.type))
         if self._should_checkpoint() and x.requires_grad:
             x = checkpoint_sequential(self.blocks, self.checkpoint_segments, x, use_reentrant=False)  # type: ignore[no-untyped-call]
         else:
