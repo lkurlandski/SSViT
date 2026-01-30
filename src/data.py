@@ -65,6 +65,7 @@ from src.simpledb import SimpleDB
 from src.simpledb import SimpleDBIterator
 from src.simpledb import SimpleDBReader
 from src.simpledb import MetadataDB
+from src.simpledb import roundup
 from src.utils import check_tensor
 from src.utils import pad_sequence
 
@@ -79,6 +80,32 @@ if PAD_TO_MULTIPLE_OF % 8 != 0:
 MUDDY_PADDED_ADD_ONE_BATCH_SIZE = int(os.environ.get("MUDDY_PADDED_ADD_ONE_BATCH_SIZE", -1))
 if MUDDY_PADDED_ADD_ONE_BATCH_SIZE != -1:
     warnings.warn(f"Using MUDDY_PADDED_ADD_ONE_BATCH_SIZE={MUDDY_PADDED_ADD_ONE_BATCH_SIZE} may slow down training.")
+
+
+def _compute_length_to_pad_sequence_to(lengths: Sequence[int], min_length: int, pad_to_multiple_of: int, length_bins: Optional[Sequence[int]] = None) -> int:
+    longest = max(lengths)
+
+    if length_bins is None:
+        length = max(longest, min_length)
+        return roundup(length, pad_to_multiple_of)
+
+    if len(length_bins) == 0:
+        raise ValueError("length_bins cannot be empty.")
+    if any(b % pad_to_multiple_of != 0 for b in length_bins):
+        raise ValueError(f"All length bins must be a multiple of {pad_to_multiple_of}. Got {length_bins}.")
+    if any(b <= 0 for b in length_bins):
+        raise ValueError(f"All length bins must be positive. Got {length_bins}.")
+    if all(b < min_length for b in length_bins):
+        raise ValueError(f"Some length bin must be at least min_length ({min_length}). Got {length_bins}.")
+    if all(b < longest for b in length_bins):
+        raise ValueError(f"Some length bin must be at least as large as the longest sequence length ({longest}). Got {length_bins}.")
+
+    length_bins = sorted(length_bins)
+    for b in length_bins:
+        if b >= longest and b >= min_length:
+            return roundup(b, pad_to_multiple_of)
+
+    raise RuntimeError("Unreachable.")
 
 
 class Name(str):
@@ -377,7 +404,7 @@ class SemanticGuides(_SemanticGuideOrSemanticGuides):
         return 1
 
     @classmethod
-    def from_singles(cls, guides: Sequence[SemanticGuide], pin_memory: bool = False, min_length: int = 0) -> SemanticGuides:
+    def from_singles(cls, guides: Sequence[SemanticGuide], pin_memory: bool = False, min_length: int = 0, length_bins: Optional[Sequence[int]] = None) -> SemanticGuides:
         if len(guides) == 0:
             raise ValueError("Cannot create Guides from empty list.")
 
@@ -386,19 +413,36 @@ class SemanticGuides(_SemanticGuideOrSemanticGuides):
                 raise ValueError("All guides must have the same fields to be batched.")
             return ts  # type: ignore[return-value]
 
+        BATCH_FIRST = True
+        PADDING_SIDE: Literal["left", "right"] = "right"
+        padding_value: int | float | bool
+
         parse = None
         if guides[0].parse is not None:
+            sequences = checked([g.parse for g in guides])
             padding_value = False if guides[0].parse.dtype == torch.bool else 0
             pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if guides[0].parse.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
-            parse = pad_sequence(checked([g.parse for g in guides]), True, padding_value, "right", pin_memory, pad_to_multiple_of, min_length)
+            bins = [b // 8 for b in length_bins] if guides[0].parse.dtype == torch.uint8 and length_bins is not None else length_bins
+            length = _compute_length_to_pad_sequence_to([x.size(0) for x in sequences], min_length, pad_to_multiple_of, bins)
+            parse = pad_sequence(sequences, BATCH_FIRST, padding_value, PADDING_SIDE, pin_memory, pad_to_multiple_of, length)
+
         entropy = None
         if guides[0].entropy is not None:
-            entropy = pad_sequence(checked([g.entropy for g in guides]), True, 0.0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
+            sequences = checked([g.entropy for g in guides])
+            padding_value = 0.0
+            pad_to_multiple_of = PAD_TO_MULTIPLE_OF
+            bins = length_bins
+            length = _compute_length_to_pad_sequence_to([x.size(0) for x in sequences], min_length, pad_to_multiple_of, bins)
+            entropy = pad_sequence(sequences, BATCH_FIRST, padding_value, PADDING_SIDE, pin_memory, pad_to_multiple_of, length)
+
         characteristics = None
         if guides[0].characteristics is not None:
+            sequences = checked([g.characteristics for g in guides])
             padding_value = False if guides[0].characteristics.dtype == torch.bool else 0
             pad_to_multiple_of = PAD_TO_MULTIPLE_OF // 8 if guides[0].characteristics.dtype == torch.uint8 else PAD_TO_MULTIPLE_OF
-            characteristics = pad_sequence(checked([g.characteristics for g in guides]), True, padding_value, "right", pin_memory, pad_to_multiple_of, min_length)
+            bins = [b // 8 for b in length_bins] if guides[0].characteristics.dtype == torch.uint8 and length_bins is not None else length_bins
+            length = _compute_length_to_pad_sequence_to([x.size(0) for x in sequences], min_length, pad_to_multiple_of, bins)
+            characteristics = pad_sequence(sequences, BATCH_FIRST, padding_value, PADDING_SIDE, pin_memory, pad_to_multiple_of, length)
 
         return cls(parse, entropy, characteristics)
 
@@ -773,7 +817,7 @@ class Inputs(_InputOrInputs):
         return self.__class__(inputids, lengths, False)
 
     @classmethod
-    def from_singles(cls, inputs: Sequence[Input], pin_memory: bool = False, min_length: int = 0, muddy_padded: bool = True) -> Inputs:
+    def from_singles(cls, inputs: Sequence[Input], pin_memory: bool = False, min_length: int = 0, length_bins: Optional[Sequence[int]] = None, muddy_padded: bool = True) -> Inputs:
         """
         Args:
             inputs: Sequence of Input instances to batch.
@@ -796,7 +840,8 @@ class Inputs(_InputOrInputs):
         elif not all_muddy:
             raise ValueError("Cannot create muddy Inputs from non-muddy Input instances.")
 
-        inputids = pad_sequence(inps, True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, min_length)
+        length = _compute_length_to_pad_sequence_to([i.size(0) for i in inps], min_length, PAD_TO_MULTIPLE_OF, length_bins)
+        inputids = pad_sequence(inps, True, 0, "right", pin_memory, PAD_TO_MULTIPLE_OF, length)
         lengths = torch.stack([i.lengths for i in inputs], dim=0)
         return cls(inputids, lengths, muddy_padded)
 
@@ -1842,17 +1887,19 @@ class Preprocessor:
 
 class CollateFn:
 
-    def __init__(self, pin_memory: bool, bitpack: bool, min_length: int = 0, muddy_padded: bool = True) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, min_length: int = 0, length_bins: Optional[Sequence[int]] = None, muddy_padded: bool = True) -> None:
         """
         Args:
             pin_memory: whether to pin memory of the collated tensors (recommended to use DataLoader(pin_memory=True) instead).
             bitpack: whether to bitpack the semantic guides if not already bitpacked.
             min_length: minimum length to pad the inputs to (must be a multiple of `8`).
+            length_bins: instead of padding to the minimum length nessicary, pad to the smallest possible length in this collection.
             muddy_padded: whether to use muddy padding technique for the inputs or not.
         """
         self.pin_memory = pin_memory
         self.bitpack = bitpack
         self.min_length = min_length
+        self.length_bins = tuple(length_bins) if length_bins is not None else None
         self.muddy_padded = muddy_padded
         if self.min_length % 8 != 0:
             raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {min_length}.")
@@ -1861,9 +1908,9 @@ class CollateFn:
         file = [s.file for s in batch]
         name = [s.name for s in batch]
         label = torch.stack([s.label for s in batch])
-        inputs = Inputs.from_singles([s.inputs for s in batch], self.pin_memory, self.min_length, self.muddy_padded)
+        inputs = Inputs.from_singles([s.inputs for s in batch], self.pin_memory, self.min_length, self.length_bins, self.muddy_padded)
         guides = [s.guides.compress() if self.bitpack else s.guides for s in batch]
-        guides = SemanticGuides.from_singles(guides, self.pin_memory, self.min_length // 8 if guides[0].is_bitpacked else self.min_length)
+        guides = SemanticGuides.from_singles(guides, self.pin_memory, self.min_length // 8 if guides[0].is_bitpacked else self.min_length, self.length_bins)
         structure = [s.structure for s in batch]
         structure = StructureMaps.from_singles(structure, self.pin_memory, self.min_length)
         return FSamples(file, name, label, inputs, guides, structure)
@@ -1874,11 +1921,12 @@ class CollateFn:
 
 class CollateFnHierarchical:
 
-    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None, muddy_padded: bool = True) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None, length_bins: Optional[Sequence[int]] = None, muddy_padded: bool = True) -> None:
         self.pin_memory = pin_memory
         self.bitpack = bitpack
         self.num_structures = num_structures
         self.min_lengths = [0] * num_structures if min_lengths is None else min_lengths
+        self.length_bins = tuple(length_bins) if length_bins is not None else None
         self.muddy_padded = muddy_padded
         if any(l % 8 != 0 for l in self.min_lengths):
             raise ValueError(f"Due to bitpacking, we require min_length to be a multiple of 8. Got {self.min_lengths}.")
@@ -1901,8 +1949,8 @@ class CollateFnHierarchical:
                 g_i_j = batch[j].guides.select(ranges=ranges)
                 xs.append(x_i_j)
                 gs.append(g_i_j.compress() if self.bitpack else g_i_j)
-            xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i], self.muddy_padded)
-            gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8))
+            xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i], self.length_bins, self.muddy_padded)
+            gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8), self.length_bins)
             inputs.append(xs)
             guides.append(gs)
 
@@ -1916,11 +1964,12 @@ class CollateFnHierarchical:
 
 class CollateFnStructural:
 
-    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None, muddy_padded: bool = True) -> None:
+    def __init__(self, pin_memory: bool, bitpack: bool, num_structures: int, min_lengths: Optional[list[int]] = None, length_bins: Optional[Sequence[int]] = None, muddy_padded: bool = True) -> None:
         self.pin_memory = pin_memory
         self.bitpack = bitpack
         self.num_structures = num_structures
         self.min_lengths = [0] * num_structures if min_lengths is None else min_lengths
+        self.length_bins = tuple(length_bins) if length_bins is not None else None
         self.muddy_padded = muddy_padded
         if pin_memory or bitpack:
             raise NotImplementedError(f"{self.__class__.__name__} does not support pin_memory or bitpack yet.")
@@ -1959,10 +2008,11 @@ class CollateFnStructural:
 
             # Handle empty structure case.
             if len(xs) == 0:
-                xs = [Input(torch.full((self.min_lengths[i],), 0, dtype=torch.uint8), torch.tensor(self.min_lengths[i], dtype=torch.int64), True)]
-                gs = [self._create_synthetic_guide(batch[0].guides, self.min_lengths[i] // 8 if self.bitpack else self.min_lengths[i])]
-            xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i], self.muddy_padded)
-            gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8))
+                length = _compute_length_to_pad_sequence_to([0], self.min_lengths[i], PAD_TO_MULTIPLE_OF, self.length_bins)
+                xs = [Input(torch.full((length,), 0, dtype=torch.uint8), torch.tensor(length, dtype=torch.int64), True)]
+                gs = [self._create_synthetic_guide(batch[0].guides, length // 8 if self.bitpack else length)]
+            xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i], self.length_bins, self.muddy_padded)
+            gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8), self.length_bins)
             inputs.append(xs)
             guides.append(gs)
 
