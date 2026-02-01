@@ -155,8 +155,8 @@ if MAIN_RUN_PROFILE:
     warnings.warn("MAIN_RUN_PROFILE is enabled. Certain command line arguments will be overridden.")
 
 
-COMPILE_MODE_PATCHER:     Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"] = "reduce-overhead"
-COMPILE_MODE_TRANSFORMER: Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"] = "reduce-overhead"
+COMPILE_MODE_PATCHER:     Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"] = "default"
+COMPILE_MODE_TRANSFORMER: Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"] = "default"
 print(f"[INFO] Using compile modes: {COMPILE_MODE_PATCHER=}, {COMPILE_MODE_TRANSFORMER=}")
 
 
