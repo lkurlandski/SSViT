@@ -755,6 +755,12 @@ class Trainer:
             step_in_accum = (mini_step + 1) % self.args.gradient_accumulation_steps
             sync_gradients = (step_in_accum == 0)
 
+            # If using CUDA graphs, mark the beginning of the step.
+            # It is critical that we do this on the first mini-step of each accumulation step.
+            # It took me literal days of debugging to figure this out.
+            if (mini_step + 1) % self.args.gradient_accumulation_steps == 1:
+                torch.compiler.cudagraph_mark_step_begin()
+
             # Compute normalized loss
             with maybe_no_sync(self.model, sync_gradients):
                 with record_function("stage::forward"):
