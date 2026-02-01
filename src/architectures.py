@@ -2874,7 +2874,7 @@ class StructuralViTClassifier(StructuralClassifier):
                 per-structure forward with the batch size set to number of samples passed to the top-level
                 forward method or the number of instances of said structure --- whichever is smaller.
             pad_to_batch_size: If True, the inputs in the per-structure forward call will be zero padded
-                along the batch dimension to the batch_size.
+                along the batch dimension to the next-largest batch size specified in `batch_sizes`.
             do_ddp_keepalive: If True, will apply DDP keepalive trick to ensure all trunks participate
                 in the autograd graph even if they have no inputs for a given forward pass. Note that this
                 does entail computational overhead. If False, expect that many trunks will not have gradients;
@@ -2936,12 +2936,16 @@ class StructuralViTClassifier(StructuralClassifier):
             B_i = x[i].shape[0]
             b = 0
             while b < B_i:
-                # Select the internal batch size for this structure, which is either
-                # the external batch size or the largest batch size possible from an allowlist.
+                # Select the internal batch size for this structure.
                 remaining = B_i - b
                 if self.batch_sizes is None:
+                    # Use all remaining samples as the batch size.
                     bs = min(B, remaining)
+                elif self.pad_to_batch_size:
+                    # Find the smallest batch size that is at least as large as the remaining samples.
+                    bs = min((s for s in self.batch_sizes if s >= remaining), default=max(self.batch_sizes))
                 else:
+                    # Find the largest batch size that is at most as large as the remaining samples.
                     bs = max((s for s in self.batch_sizes if s <= remaining), default=min(self.batch_sizes))
                 # Determine how much padding is needed to reach the internal batch size
                 # and how many samples from the internal input are going to be real.
