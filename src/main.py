@@ -155,6 +155,11 @@ if MAIN_RUN_PROFILE:
     warnings.warn("MAIN_RUN_PROFILE is enabled. Certain command line arguments will be overridden.")
 
 
+COMPILE_MODE_PATCHER:     Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"] = "reduce-overhead"
+COMPILE_MODE_TRANSFORMER: Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"] = "reduce-overhead"
+print(f"[INFO] Using compile modes: {COMPILE_MODE_PATCHER=}, {COMPILE_MODE_TRANSFORMER=}")
+
+
 def get_model(
     design: Design,
     arch: Architecture,
@@ -163,6 +168,7 @@ def get_model(
     patchposenc: PatchPositionalEncodingArchitecture = PatchPositionalEncodingArchitecture.NONE,
     num_guides: int = 0,
     structures: Sequence[HierarchicalStructure] = tuple(),
+    max_structures: Optional[int] = None,
     max_length: Optional[int] = None,
     share_embeddings: bool = False,
     share_patchers: bool = False,
@@ -212,6 +218,7 @@ def get_model(
         max_length: The maximum input length.
         num_guides: The number of semantic guides.
         structures: The hierarchical structures.
+        max_structures: The maximum number of structures to use (design == Design.STRUCTURAL).
         share_embeddings: For hierarchical and structural designs, whether to share embeddings across structures.
         share_patchers: For hierarchical and structural designs, whether to share patchers across structures.
         batch_size: Compiling models can be done more effectively if the maximum batch size is known ahead of time.
@@ -231,6 +238,10 @@ def get_model(
     patchposenc = PatchPositionalEncodingArchitecture(patchposenc)
 
     num_structures = len(structures) if structures is not None else 0
+
+    if enable_compile:
+        if batch_size is None:
+            raise ValueError("When enable_compile is True, batch_size must be specified for StructuralViTClassifier.")
 
     # The original idea was to use different architectures for different structures, for example,
     # CNNs with small strides for shorter structures, like the PE Header. Unfortunately, this does not work
@@ -330,7 +341,7 @@ def get_model(
                     fullgraph=True,
                     dynamic=False,
                     backend="inductor",
-                    mode="max-autotune-no-cudagraphs",
+                    mode=COMPILE_MODE_PATCHER,
                 )
             return model
         raise NotImplementedError(f"{parch}")
@@ -359,14 +370,38 @@ def get_model(
         if posencname not in ("none", "fixed", "learned"):
             raise TypeError(f"Unknown positional encoding: {posencname}")
 
-        max_len = num_patches
-        if posenc == PositionalEncodingArchitecture.LEARNED and num_patches is None:
-            assert patch_size is not None
-            if max_length is None:
-                raise ValueError("max_length must be specified when using a dynamic number of patches and learned positional encodings.")
-            max_len = math.ceil(max_length / patch_size)
+        pooling = "cls"
 
-        return ViT(
+        if design in (Design.FLAT, Design.HIERARCHICAL):
+            max_len = num_patches
+            if posenc == PositionalEncodingArchitecture.LEARNED and num_patches is None:
+                assert patch_size is not None
+                if max_length is None:
+                    raise ValueError("max_length must be specified when using a dynamic number of patches and learned positional encodings.")
+                max_len = math.ceil(max_length / patch_size)
+        if design == Design.STRUCTURAL:
+            max_len = max_structures
+
+        if max_len is None:
+            if posenc == PositionalEncodingArchitecture.LEARNED:
+                raise ValueError("max_len must be specified when using learned positional encodings.")
+            if enable_compile:
+                raise ValueError("max_len must be specified when enable_compile is True.")
+
+        # If we're compiling, we need to limit the number of unique tensor shapes seen by the model.
+        # We'll just let inductor compile a kernel for the maximum batch size, which should cover every batch except the tail.
+        # The ViT will then zero-pad those tail batches.
+        if enable_compile:
+            assert batch_size is not None
+            assert max_len is not None
+            batch_sizes = (batch_size,)
+            seq_lengths = (max_len, max_len // 2, max_len // 4)
+            seq_lengths = tuple(sorted(set(filter(lambda x: x > 0, seq_lengths))))
+        else:
+            batch_sizes = None
+            seq_lengths = None
+
+        model = ViT(
             embedding_dim=patcher_channels,
             d_model=vit_d_model,
             nhead=vit_nhead,
@@ -375,8 +410,28 @@ def get_model(
             posencoder=posencname,
             max_len=max_len,
             activation="gelu",
-            pooling="cls",
+            pooling=pooling,
+            seq_lengths=seq_lengths,
+            batch_sizes=batch_sizes,
         )
+
+        if enable_compile:
+            model.transformer = torch.compile(
+                model.transformer,
+                fullgraph=True,
+                dynamic=False,
+                backend="inductor",
+                mode=COMPILE_MODE_TRANSFORMER,
+            )
+
+        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {pooling=}")
+        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {posencname=}")
+        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {max_len=}")
+        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {batch_sizes=}")
+        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {seq_lengths=}")
+        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {enable_compile=}")
+
+        return model
 
     # (ClassifificationHead) Build the head
     def build_head() -> ClassifificationHead:
@@ -477,19 +532,33 @@ def get_model(
             patchposencoders = _build_modules(build_patchposencoder, num_structures, share_patchers)
             transformer = build_transformer()
             head = build_head()
-            # If we're compiling, we need to limit the possible number of
-            # batch sizes seen by the trunks to avoid excessive recompilation.
+            # If we're compiling, we need to limit the number of unique tensor shapes seen by the model.
+            # CollateFnStructural adds a one-structure pad batch for missing structures, so we let inductor compile a kernel for this shape.
             if enable_compile:
-                if batch_size is None:
-                    raise ValueError("When enable_compile is True, batch_size must be specified for StructuralViTClassifier.")
-                # CollateFnStructural adds a one-structure pad batch for missing structures, so best to keep 1 in the compiled list.
+                assert batch_size is not None
                 batch_sizes = (batch_size, batch_size // 2, 1)
-                batch_sizes = tuple(set(filter(lambda x: x > 0, batch_sizes)))
+                batch_sizes = tuple(sorted(set(filter(lambda x: x > 0, batch_sizes))))
                 pad_to_batch_size = True
             else:
                 batch_sizes = None
                 pad_to_batch_size = False
-            return StructuralViTClassifier(embeddings, filmers, patchers, norms, patchposencoders, transformer, head, batch_sizes=batch_sizes, pad_to_batch_size=pad_to_batch_size, do_ddp_keepalive=do_ddp_keepalive)
+
+            print(f"[rank {rank()}] [INFO] [get_model::construct_structural_model] {batch_sizes=}")
+            print(f"[rank {rank()}] [INFO] [get_model::construct_structural_model] {pad_to_batch_size=}")
+            print(f"[rank {rank()}] [INFO] [get_model::construct_structural_model] {enable_compile=}")
+
+            return StructuralViTClassifier(
+                embeddings,
+                filmers,
+                patchers,
+                norms,
+                patchposencoders,
+                transformer,
+                head,
+                batch_sizes=batch_sizes,
+                pad_to_batch_size=pad_to_batch_size,
+                do_ddp_keepalive=do_ddp_keepalive,
+            )
 
         raise NotImplementedError(f"{arch}")
 
@@ -841,8 +910,8 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 12
 
     skip_first = 0
     wait = 2
-    warmup = 4
-    active = 4
+    warmup = 64
+    active = 16
     repeat = 1
     sched = schedule(skip_first=skip_first, wait=wait, warmup=warmup, active=active, repeat=repeat)
     total_mini_steps = skip_first + (wait + warmup + active) * repeat
@@ -923,7 +992,11 @@ def main() -> None:
     if args.tf32:
         torch.set_float32_matmul_precision("medium")
 
-    torch._dynamo.config.cache_size_limit = 24
+    # Cache = length_bins x structure-batch_sizes + seq_lengths x batch_sizes
+    #       = 6           x 3                     + 3           x 1
+    #       = 18 + 3
+    #       = 21
+    torch._dynamo.config.cache_size_limit = 21
 
     if rank() > 0:
         args.disable_tqdm = True
@@ -948,6 +1021,7 @@ def main() -> None:
         args.patchposenc,
         num_guides,
         structures,
+        args.max_structures,
         args.max_length,
         args.share_embeddings,
         args.share_patchers,
