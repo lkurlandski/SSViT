@@ -836,10 +836,13 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 12
     with_stack = os.environ.get("WITH_STACK", "0") == "1"
     print(f"Profiling with{'' if with_stack else 'out'} stack analysis.")
 
+    with_groups = int(os.environ.get("WITH_GROUPS", "0"))
+    print(f"Profiling with {with_groups} grouped averages.")
+
     skip_first = 0
     wait = 2
-    warmup = 2
-    active = 2 if with_stack else num_samples // tr_batch_size
+    warmup = 4
+    active = 4
     repeat = 1
     sched = schedule(skip_first=skip_first, wait=wait, warmup=warmup, active=active, repeat=repeat)
     total_mini_steps = skip_first + (wait + warmup + active) * repeat
@@ -852,6 +855,7 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 12
     file_cpu = outdir / "cpu.txt"
     file_gpu = outdir / "gpu.txt"
     file_stk = outdir / "stacks.txt"
+    file_grp = outdir / "groups.txt"
 
     handler = tensorboard_trace_handler(outdir.as_posix())
 
@@ -876,6 +880,23 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 12
         if with_stack:
             print("Exporting stacks...")
             prof.export_stacks(file_stk.as_posix(), "self_cpu_time_total")
+
+        if with_groups > 0:
+            print("Computing grouped averages...")
+            averages = prof.key_averages(group_by_stack_n=with_groups)
+            averages = [e for e in averages if e.key in ("aten::copy_", "aten::to", "aten::_to_copy", "aten::to", "aten::add_")]
+            for e in sorted(averages, key=lambda x: x.cpu_time_total, reverse=True)[:with_groups * 2]:
+                print(e.key, e.cpu_time_total, e.count)
+                with open(file_grp, "a") as fp:
+                    print(e.key, e.cpu_time_total, e.count, file=fp)
+                if e.stack:
+                    for s in e.stack[:12]:
+                        print(f"  {s}")
+                        with open(file_grp, "a") as fp:
+                            print(f"  {s}", file=fp)
+                print("-" * 80)
+                with open(file_grp, "a") as fp:
+                    print("-" * 80, file=fp)
 
 
 def main() -> None:
