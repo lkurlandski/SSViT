@@ -169,6 +169,7 @@ def get_model(
     batch_size: Optional[int] = None,
     enable_checkpoint: bool = False,
     enable_compile: bool = False,
+    do_ddp_keepalive: bool = False,
     *,
     embedding_dim: int = 8,
     film_hidden_size: int = 16,
@@ -216,6 +217,9 @@ def get_model(
         batch_size: Compiling models can be done more effectively if the maximum batch size is known ahead of time.
         enable_checkpoint: Whether to enable activation checkpointing in certain model components to reduce memory usage.
         enable_compile: Whether to enable compilation for certain model components to improve performance.
+        do_ddp_keepalive: Whether to enable DDP keepalive (to avoid timeout issues on long iterations).
+
+    TODO: do_ddp_keepalive only applies to StructuralViTClassifier right now. Consider generalizing to other models.
 
     Returns:
         The model.
@@ -484,7 +488,7 @@ def get_model(
             else:
                 batch_sizes = None
                 pad_to_batch_size = False
-            return StructuralViTClassifier(embeddings, filmers, patchers, norms, patchposencoders, transformer, head, batch_sizes=batch_sizes, pad_to_batch_size=pad_to_batch_size)
+            return StructuralViTClassifier(embeddings, filmers, patchers, norms, patchposencoders, transformer, head, batch_sizes=batch_sizes, pad_to_batch_size=pad_to_batch_size, do_ddp_keepalive=do_ddp_keepalive)
 
         raise NotImplementedError(f"{arch}")
 
@@ -535,9 +539,9 @@ def wrap_model_base(model: M, device: torch.device) -> M:
     model = model.to(device)
     return model
 
-def wrap_model_ddp(model: M, device: torch.device, static_graph: bool) -> DistributedDataParallel:
+def wrap_model_ddp(model: M, device: torch.device, **kwds: Any) -> DistributedDataParallel:
     model = model.to(device)
-    model = DistributedDataParallel(model, static_graph=static_graph)
+    model = DistributedDataParallel(model, **kwds)
     return model
 
 def wrap_model_fsdp(model: M, mpdtype: torch.dtype, fsdp_offload: bool) -> M:
@@ -926,6 +930,7 @@ def main() -> None:
         args.tr_batch_size,
         args.enable_checkpoint,
         args.enable_compile,
+        do_ddp_keepalive=False,  # TODO: address unused parameters.
         **dict(args.model_config),
     ).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
@@ -942,7 +947,7 @@ def main() -> None:
 
     wrap_model: Callable[[M], M | DistributedDataParallel]
     if args.ddp:
-        wrap_model = partial(wrap_model_ddp, device=args.device, static_graph=os.environ.get("DDP_STATIC_GRAPH", "0") == "1")
+        wrap_model = partial(wrap_model_ddp, device=args.device, static_graph=False, find_unused_parameters=False)  # TODO: address unused parameters.
     elif args.fsdp:
         wrap_model = partial(wrap_model_fsdp, mpdtype=mpdtype, fsdp_offload=args.fsdp_offload)
     else:
