@@ -1676,6 +1676,8 @@ class ViT(nn.Module):
         max_len: Optional[int] = None,
         activation: str = "gelu",
         pooling: Literal["mean", "cls"] = "cls",  # NOTE: we use `avg` pooling elsewhere, so this might be confusing...
+        seq_lengths: Optional[tuple[int, ...]] = None,
+        batch_sizes: Optional[tuple[int, ...]] = None,
     ) -> None:
         super().__init__()
 
@@ -1712,6 +1714,46 @@ class ViT(nn.Module):
         self.max_len = max_len
         self.pooling = pooling
 
+        # Attributes to fix tensor shapes for compilation.
+        self.seq_lengths = seq_lengths
+        if seq_lengths is not None:
+            if len(seq_lengths) == 0:
+                raise ValueError("If `seq_lengths` is provided, it must be a non-empty tuple of integers.")
+            if max_len is None:
+                raise ValueError("If `seq_lengths` is provided, `max_len` must also be provided.")
+            if any(l > max_len or l < 1 for l in seq_lengths):
+                raise ValueError(f"All `seq_lengths` must be postiive integers less than or equal to `max_len` ({max_len}).")
+            if max(seq_lengths) != max_len:
+                raise ValueError(f"The maximum value in `seq_lengths` ({max(seq_lengths)}) must equal `max_len` ({max_len}).")
+            if self.pooling == "cls":
+                if any((l + 1) % 8 != 0 for l in seq_lengths or []):
+                    warnings.warn(
+                        "For performance, we recommend all tensor dimensions be multiples of 8. "
+                        "When using `pooling='cls'`, a [CLS] token is prepended to the sequence. "
+                        "So we recommend all `seq_lengths` be one less than a multiple of 8."
+                        f"The provided `seq_lengths` are: {seq_lengths}."
+                    )
+            elif self.pooling == "mean":
+                if any((l % 8) != 0 for l in seq_lengths or []):
+                    warnings.warn(
+                        "For performance, we recommend all tensor dimensions be multiples of 8. "
+                        "So we recommend all `seq_lengths` be a multiple of 8."
+                        f"The provided `seq_lengths` are: {seq_lengths}."
+                    )
+
+        self.batch_sizes = batch_sizes
+        if batch_sizes is not None:
+            if len(batch_sizes) == 0:
+                raise ValueError("If `batch_sizes` is provided, it must be a non-empty tuple of integers.")
+            if any(b <= 0 for b in batch_sizes):
+                raise ValueError("All `batch_sizes` must be positive integers.")
+            if any(b % 8 != 0 for b in batch_sizes):
+                warnings.warn(
+                    "For performance, we recommend all tensor dimensions be multiples of 8. "
+                    "So we recommend all `batch_sizes` be a multiple of 8."
+                    f"The provided `batch_sizes` are: {batch_sizes}."
+                )
+
     def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
         Args:
@@ -1724,9 +1766,37 @@ class ViT(nn.Module):
         if key_padding_mask is not None:
             check_tensor(key_padding_mask, (x.shape[0], x.shape[1]), torch.bool)
 
-        z: Tensor
+        z: Tensor = x
 
-        z = self.proj(x)                                   # (B, T, D)
+        B = x.shape[0]
+        T = z.shape[1]
+
+        # Possibly pad along the sequence dimension to a fixed size.
+        T_pad = T
+        if self.seq_lengths is not None:
+            if all(l < T for l in self.seq_lengths):
+                raise ValueError(f"Input sequence length {T} is larger than all configured sequence lengths {self.seq_lengths}.")
+            T_pad = min(l for l in self.seq_lengths if l >= T)
+            z = F.pad(z, (0, 0, 0, T_pad - T))
+            if key_padding_mask is not None:
+                key_padding_mask = F.pad(key_padding_mask, (0, T_pad - T), value=True)
+            else:
+                key_padding_mask = F.pad(torch.zeros((B, T), dtype=torch.bool, device=z.device), (0, T_pad - T), value=True)
+
+        # Possibly pad along the batch dimension to a fixed size.
+        B_pad = B
+        if self.batch_sizes is not None:
+            if all(b < B for b in self.batch_sizes):
+                raise ValueError(f"Input batch size {B} is larger than all configured batch sizes {self.batch_sizes}.")
+            B_pad = min(b for b in self.batch_sizes if b >= B)
+            z = F.pad(z, (0, 0, 0, 0, 0, B_pad - B))
+            if key_padding_mask is not None:
+                key_padding_mask = F.pad(key_padding_mask, (0, 0, 0, B_pad - B), value=True)
+
+        # Project to model dimension.
+        z = self.proj(z)                                   # (B, T, D)
+
+        # Add cls token if needed.
         if self.pooling == "cls":
             assert self.cls_token is not None
             t = self.cls_token.expand(z.shape[0], -1, -1)  # (B, 1, D)
@@ -1734,11 +1804,24 @@ class ViT(nn.Module):
             if key_padding_mask is not None:
                 t = torch.zeros((key_padding_mask.shape[0], 1), dtype=torch.bool, device=key_padding_mask.device)
                 key_padding_mask = torch.cat((t, key_padding_mask), dim=1)  # (B, T+1)
-        z = self.posencoder(z)                             # (B, T, D)
-        z = self.transformer(z, src_key_padding_mask=key_padding_mask)                            # (B, T, D)
+            # T := T + 1
+
+        z = self.posencoder(z)                                          # (B, T, D)
+        z = self.transformer(z, src_key_padding_mask=key_padding_mask)  # (B, T, D)
+
+        # Pooling (B, T, D) -> (B, D)
         if self.pooling == "cls":
-            z = z[:, 0, :].unsqueeze(1)                    # (B, 1, D)
-        z = z.mean(dim=1).to(x.dtype)                      # (B, D)
+            z = z[:, 0, :]
+        else:
+            if key_padding_mask is None:
+                z = z.mean(dim=1)
+            else:
+                valid = (~key_padding_mask).to(z.dtype)
+                denom = valid.sum(dim=1).clamp_min(1.0)
+                z = (z * valid.unsqueeze(-1)).sum(dim=1) / denom.unsqueeze(-1)
+
+        # Remove padding if added.
+        z = z[:B, :]  # (B, D)
 
         check_tensor(z, (x.shape[0], self.d_model), FLOATS)
         return z
