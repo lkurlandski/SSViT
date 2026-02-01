@@ -1170,6 +1170,7 @@ class DWCPatchEncoder(PatchEncoderBase):
 
     def forward_embeddings(self, z: Tensor) -> Tensor:
         z = z.permute(0, 2, 1)
+        z = z.contiguous()
         if self.checkpoint_segments == -1:
             z = checkpoint(self.conv, z, use_reentrant=False)
         else:
@@ -1807,6 +1808,7 @@ class ViT(nn.Module):
             # T := T + 1
 
         z = self.posencoder(z)                                          # (B, T, D)
+        z = z.contiguous()
         z = self.transformer(z, src_key_padding_mask=key_padding_mask)  # (B, T, D)
 
         # Pooling (B, T, D) -> (B, D)
@@ -2954,7 +2956,7 @@ class StructuralViTClassifier(StructuralClassifier):
                 # Slice the inputs for this internal batch and possibly pad them.
                 x_i_b = x[i][b:b + real]
                 g_i_b = g[i][b:b + real] if g[i] is not None else None  # type: ignore[index]
-                if self.pad_to_batch_size:
+                if self.pad_to_batch_size and pad > 0:
                     x_i_b, g_i_b = self._pad_inputs(x_i_b, g_i_b, pad)
                 # Run the inputs through the structure's trunk, remove the pad samples, and collect.
                 z = self._forward_trunk(i, x_i_b, g_i_b)
