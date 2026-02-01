@@ -482,7 +482,8 @@ def get_model(
             if enable_compile:
                 if batch_size is None:
                     raise ValueError("When enable_compile is True, batch_size must be specified for StructuralViTClassifier.")
-                batch_sizes = (batch_size, batch_size // 2, batch_size // 4)
+                # CollateFnStructural adds a one-structure pad batch for missing structures, so best to keep 1 in the compiled list.
+                batch_sizes = (batch_size, batch_size // 2, 1)
                 batch_sizes = tuple(set(filter(lambda x: x > 0, batch_sizes)))
                 pad_to_batch_size = True
             else:
@@ -552,13 +553,13 @@ def wrap_model_fsdp(model: M, mpdtype: torch.dtype, fsdp_offload: bool) -> M:
     return model
 
 
-def get_collate_fn(design: Design, min_lengths: list[int], structures: list[HierarchicalStructure], muddy_padded: bool) -> CollateFn | CollateFnHierarchical | CollateFnStructural:
+def get_collate_fn(design: Design, min_lengths: list[int], length_bins: Optional[Sequence[int]], structures: list[HierarchicalStructure], muddy_padded: bool) -> CollateFn | CollateFnHierarchical | CollateFnStructural:
     if design == Design.FLAT:
-        return CollateFn(False, False, min_lengths[0], muddy_padded)
+        return CollateFn(False, False, min_lengths[0], length_bins, muddy_padded)
     if design == Design.STRUCTURAL:
-        return CollateFnStructural(False, False, len(structures), min_lengths, muddy_padded)
+        return CollateFnStructural(False, False, len(structures), min_lengths, length_bins, muddy_padded)
     if design == Design.HIERARCHICAL:
-        return CollateFnHierarchical(False, False, len(structures), min_lengths, muddy_padded)
+        return CollateFnHierarchical(False, False, len(structures), min_lengths, length_bins, muddy_padded)
     raise NotImplementedError(f"{design}")
 
 
@@ -901,6 +902,8 @@ def main() -> None:
     if args.tf32:
         torch.set_float32_matmul_precision("medium")
 
+    torch._dynamo.config.cache_size_limit = 24
+
     if rank() > 0:
         args.disable_tqdm = True
 
@@ -935,15 +938,16 @@ def main() -> None:
     ).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
     min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
-    min_lengths = [m for m in getattr(model, "min_lengths", [min_length])]
-    # FIXME: implement a better binned-length padding strategy.
-    min_lengths = [roundup(l, PAD_TO_MULTIPLE_OF) for l in min_lengths]
-    if PAD_TO_MULTIPLE_OF > 64:
-        warnings.warn("FIXME padding with a stupidly large multiple may waste memory.")
+    min_lengths = [roundup(l, PAD_TO_MULTIPLE_OF) for l in getattr(model, "min_lengths", [min_length])]
+    length_bins = [max(min_lengths), 4096, 16384, 65536, 262144, 1048576]
     print(f"{model=}")
     print(f"{num_parameters=}")
     print(f"{min_length=}")
     print(f"{min_lengths=}")
+    print(f"{length_bins=}")
+
+    if args.enable_compile and length_bins is None:
+        raise ValueError("When enable_compile is True, length_bins must be specified.")
 
     wrap_model: Callable[[M], M | DistributedDataParallel]
     if args.ddp:
@@ -1025,7 +1029,7 @@ def main() -> None:
     print(f"{len(tr_dataset)=}")
     print(f"{len(ts_dataset)=}")
 
-    collate_fn = get_collate_fn(args.design, min_lengths, structures, args.muddy_padded)
+    collate_fn = get_collate_fn(args.design, min_lengths, length_bins, structures, args.muddy_padded)
     print(f"{collate_fn=}")
 
     tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, min(args.num_workers, len(tr_shards)), collate_fn, args.pin_memory, False, args.prefetch_factor)
