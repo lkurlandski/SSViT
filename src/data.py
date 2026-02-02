@@ -1326,7 +1326,7 @@ class SSamples:
         self.verify_inputs()
 
         if _order_struct is None and _order_local is None and _struct_sizes is None:
-            self._order_struct, self.order_local = _unpack_order_to_tensors(order)
+            self._order_struct, self._order_local = _unpack_order_to_tensors(order)
             self._struct_sizes = torch.tensor([i.size(0) for i in inputs], dtype=torch.int64)
         elif _order_struct is not None and _order_local is not None and _struct_sizes is not None:
             self._order_struct = _order_struct
