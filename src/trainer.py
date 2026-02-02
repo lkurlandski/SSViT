@@ -759,7 +759,7 @@ class Trainer:
             # It is critical that we do this on the first mini-step of each accumulation step.
             # It took me literal days of debugging to figure this out.
             if (mini_step + 1) % self.args.gradient_accumulation_steps == 1:
-                torch.compiler.cudagraph_mark_step_begin()
+                torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
 
             # Compute normalized loss
             with maybe_no_sync(self.model, sync_gradients):

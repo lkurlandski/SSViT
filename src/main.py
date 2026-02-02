@@ -336,7 +336,7 @@ def get_model(
                 checkpoint_segments=-1 if enable_checkpoint else 0,
             )
             if enable_compile:
-                model.conv = torch.compile(
+                model.conv = torch.compile(  # type: ignore[assignment]
                     model.conv,
                     fullgraph=True,
                     dynamic=False,
@@ -370,7 +370,7 @@ def get_model(
         if posencname not in ("none", "fixed", "learned"):
             raise TypeError(f"Unknown positional encoding: {posencname}")
 
-        pooling = "cls"
+        pooling: Literal["cls", "mean"] = "cls"
 
         if design in (Design.FLAT, Design.HIERARCHICAL):
             max_len = num_patches
@@ -416,7 +416,7 @@ def get_model(
         )
 
         if enable_compile:
-            model.transformer = torch.compile(
+            model.transformer = torch.compile(  # type: ignore[assignment]
                 model.transformer,
                 fullgraph=True,
                 dynamic=False,
