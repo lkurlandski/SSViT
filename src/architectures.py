@@ -2772,7 +2772,6 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
 # Structural Classifiers
 # -------------------------------------------------------------------------------- #
 
-
 def _reconcile_per_structure_patches_dynamic(zs: list[Tensor], order: list[list[tuple[int, int]]]) -> tuple[Tensor, Tensor]:
     """
     Reconcile the sample index and the input index.
@@ -2825,143 +2824,77 @@ def _reconcile_per_structure_patches_static(
     zs: list[Tensor],
     order_struct: Tensor,
     order_local: Tensor,
-    *,
-    max_len: Optional[int] = None,
-    pack_to_batch_max: bool = False,
-    pad_value: float = 0.0,
+    struct_sizes: Optional[Tensor],
 ) -> tuple[Tensor, Tensor]:
     """
-    Reconcile structure-local batches into a per-sample packed token sequence.
+    Reconcile the sample index and the input index.
+
+    This function takes a heterogeneous list of latent representations corresponding to different
+    structure encoders and stacks them into a single tensor according to the provided order, into
+    a sample-first, structure-first packed representation of the entire batch.
+
+    Importantly, this function aims to be as efficient as possible by disallowing CUDA
+    synchronization points, reducing the total volume of CUDA kernels, and minimizing
+    the net work executed by kernels. To do so, we need several precomputed tensors on device.
 
     Args:
-        zs:
-            List of length S. Each zs[s] has shape (B_s, L_s, C),
-            where B_s is the number of samples that contain structure s,
-            and L_s is the number of tokens/patches emitted for structure s.
-        order_struct:
-            (B, N) int tensor of structure indices; padded with -1.
-        order_local:
-            (B, N) int tensor of local indices into zs[struct][:, ...]; padded with -1.
-        max_len:
-            If provided, output sequence length M is fixed to this value.
-            You are responsible for ensuring it's >= the longest packed length.
-        pack_to_batch_max:
-            If True and max_len is None, set M = max packed length in the batch.
-            NOTE: if order_struct is on CUDA, this introduces a .item() sync.
-        pad_value:
-            Fill value for padded tokens in z.
+        zs: list of S float Tensors of shape (B_s, 1, C) for each structure s.
+        order_struct: a (B, N) shaped long Tensor of structure indices (padded with -1)
+            containing the same data as `order` but in Tensor form and on device.
+        order_local: a (B, N) shaped long Tensor of local indices (padded with -1)
+            containing the same data as `order` but in Tensor form and on device.
+        struct_sizes: a (S,) shaped long Tensor of sizes of each structure's zs along
+            the batch dimension.
 
     Returns:
-        z: (B, M, C) packed token tensor.
-        key_padding_mask: (B, M) bool tensor; True indicates padding.
+        z: Tensor of shape (B, N, C).
+        key_padding_mask: Tensor of shape (B, N) where True indicates padding positions.
     """
-    if len(zs) == 0:
-        raise ValueError("zs must be non-empty.")
+    B = order_struct.shape[0]
+    N = order_struct.shape[1]
+    S = len(zs)
 
-    if order_struct.shape != order_local.shape:
-        raise ValueError(f"order_struct and order_local must have same shape, got {order_struct.shape} vs {order_local.shape}.")
+    device = order_struct.device
 
-    B, N = order_struct.shape
-    device = zs[0].device
-    dtype = zs[0].dtype
-    C = zs[0].shape[-1]
+    check_tensor(order_struct, (B, N), INTEGERS)
+    check_tensor(order_local, (B, N), INTEGERS)
+    check_tensor(struct_sizes, (S,), INTEGERS) if struct_sizes is not None else None
 
-    # Basic device sanity (cheap checks; avoid silent device mismatch).
-    if order_struct.device != device or order_local.device != device:
-        raise ValueError("order_struct/order_local must be on the same device as zs tensors.")
+    # Concatenate all zs tensors into a single tensor
+    z_concat = torch.cat(zs, dim=0)
 
-    # Per-structure lengths L_s and bank offsets.
-    # L_s is assumed constant across the 0th dim within a structure tensor.
-    lens_py: list[int] = []
-    offs_py: list[int] = []
-    running = 0
-    for z in zs:
-        if z.device != device:
-            raise ValueError("All zs tensors must be on the same device.")
-        if z.dtype != dtype:
-            raise ValueError("All zs tensors must have the same dtype.")
-        if z.shape[-1] != C:
-            raise ValueError("All zs tensors must have the same channel dim C.")
-        Bs, Ls, _ = z.shape
-        lens_py.append(int(Ls))
-        offs_py.append(running)
-        running += int(Bs) * int(Ls)
+    # Get the size of each structure tensor along the first dimension
+    if struct_sizes is None:
+        # NOTE: this will introduce a small CUDA sync if zs are on CUDA
+        struct_sizes = torch.tensor([z.shape[0] for z in zs], dtype=torch.long, device=device)
 
-    lens_t = torch.tensor(lens_py, device=device, dtype=torch.long)   # (S,)
-    offs_t = torch.tensor(offs_py, device=device, dtype=torch.long)   # (S,)
-    L_max = max(lens_py)
+    # Cumulative sum to get offsets [0, B_0, B_0+B_1, ...]
+    zeros = torch.zeros(1, dtype=torch.long, device=device)
+    struct_offsets = torch.cat([zeros, struct_sizes.cumsum(dim=0)[:-1]])
 
-    # Valid entries.
-    valid = order_struct >= 0  # (B, N) bool
+    # Create padding mask first (single kernel)
+    key_padding_mask = (order_struct == -1)
 
-    # Map each order_struct entry to its token length L_s, with invalid entries contributing 0.
-    # (Clamp is safe because valid==False entries are zeroed out.)
-    s_clamped = order_struct.clamp_min(0).to(torch.long)  # (B, N)
-    lens_per_item = lens_t[s_clamped] * valid.to(torch.long)  # (B, N) long
+    # Clamp struct indices to valid range to avoid indexing errors
+    order_struct_safe = order_struct.clamp(min=0)
 
-    # Start offsets for each (b, j) item in the packed sequence.
-    # start[b, j] = sum_{k<j} lens_per_item[b, k]
-    start = lens_per_item.cumsum(dim=1) - lens_per_item  # (B, N) long
-    lengths = lens_per_item.sum(dim=1)  # (B,) long
+    # Gather offsets for each position
+    gathered_offsets = struct_offsets[order_struct_safe]
 
-    # Choose output length M.
-    if max_len is not None:
-        M = int(max_len)
-    elif pack_to_batch_max:
-        # NOTE: if lengths is CUDA, this syncs.
-        M = int(lengths.max().item())
-    else:
-        # No sync: allocate for the maximum possible given N and max structure length.
-        M = int(N * L_max)
+    # Compute flat indices
+    flat_indices = gathered_offsets + order_local
 
-    # If there are no valid items at all, return fully padded.
-    b_item, j_item = valid.nonzero(as_tuple=True)
-    if b_item.numel() == 0:
-        z = zs[0].new_full((B, M, C), pad_value)
-        key_padding_mask = torch.ones((B, M), device=device, dtype=torch.bool)
-        return z, key_padding_mask
+    # Clamp flat indices to valid range (for padding positions, index doesn't matter)
+    flat_indices = flat_indices.clamp(min=0, max=z_concat.shape[0] - 1)
 
-    # Gather per-item indices.
-    s_item = order_struct[b_item, j_item].to(torch.long)   # (K,)
-    l_item = order_local[b_item, j_item].to(torch.long)    # (K,)
-    st_item = start[b_item, j_item]                        # (K,)
-    ln_item = lens_t[s_item]                               # (K,)
+    # Gather from concatenated tensor using advanced indexing
+    z = z_concat[flat_indices]
 
-    # Build a packed "token bank": concatenate all structures flattened as (B_s*L_s, C).
-    # Token index within a structure: l * L_s + t
-    bank = torch.cat([z.reshape(-1, C) for z in zs], dim=0)  # (sum_s B_s*L_s, C)
+    # Squeeze out the singleton dimension
+    z = z.squeeze(2)
 
-    # Expand items into tokens (handles L_s > 1 without Python loops).
-    # item_id: for each token in the batch, which item (0..K-1) it belongs to.
-    K = s_item.numel()
-    item_id = torch.repeat_interleave(torch.arange(K, device=device), ln_item)  # (T,)
-    T = item_id.numel()  # python int, no sync
-
-    # within-token offset (t) for each expanded token.
-    # Compute segment starts in the expanded token array.
-    seg_starts_item = (ln_item.cumsum(0) - ln_item)  # (K,)
-    seg_start = torch.repeat_interleave(seg_starts_item, ln_item)  # (T,)
-    within = torch.arange(T, device=device, dtype=torch.long) - seg_start  # (T,)
-
-    # Output positions.
-    b_tok = b_item[item_id]                      # (T,)
-    pos_tok = st_item[item_id] + within          # (T,)
-    flat_out = b_tok * M + pos_tok               # (T,)
-
-    # Input (bank) positions.
-    s_tok = s_item[item_id]                      # (T,)
-    l_tok = l_item[item_id]                      # (T,)
-    global_in = offs_t[s_tok] + l_tok * lens_t[s_tok] + within  # (T,)
-
-    tok = bank.index_select(0, global_in)        # (T, C)
-
-    # Write into a flattened (B*M, C) output using an out-of-place op (keeps autograd).
-    base = zs[0].new_full((B * M, C), pad_value)
-    z_flat = base.index_copy(0, flat_out, tok)   # (B*M, C)
-    z = z_flat.view(B, M, C)
-
-    # Padding mask (True = padding).
-    key_padding_mask = torch.arange(M, device=device).unsqueeze(0) >= lengths.unsqueeze(1)
+    # Zero out padding positions
+    z = z.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
 
     return z, key_padding_mask
 
@@ -2984,6 +2917,7 @@ class StructuralClassifier(nn.Module, ABC):
         order: list[list[tuple[int, int]]],
         order_struct: Tensor,
         order_local: Tensor,
+        struct_sizes: Tensor,
     ) -> Tensor:
         """
         Args:
@@ -2992,6 +2926,7 @@ class StructuralClassifier(nn.Module, ABC):
             order: the order in which each input should be processed per sample, given as a list of lists of (structure_index, input_index) tuples.
             order_struct: (B, N) int tensor of structure indices; padded with -1.
             order_local: (B, N) int tensor of local indices into zs[struct][:, ...]; padded with -1.
+            struct_sizes: (S,) int tensor of sizes of each structure's zs along the batch dimension.
 
         Returns:
             z: Classification logits of shape (B, M).
@@ -3030,6 +2965,7 @@ class StructuralClassifier(nn.Module, ABC):
         order: list[list[tuple[int, int]]],
         order_struct: Tensor,
         order_local: Tensor,
+        struct_sizes: Tensor,
     ) -> None:
         if not (len(x) == len(g) == self.num_structures):
             raise ValueError(f"Expected {self.num_structures} structures, got {len(x)=} and {len(g)=} instead.")
@@ -3055,6 +2991,7 @@ class StructuralClassifier(nn.Module, ABC):
         max_structures = max(len(o) for o in order)
         check_tensor(order_struct, (len(order), max_structures), INTEGERS)
         check_tensor(order_local,  (len(order), max_structures), INTEGERS)
+        check_tensor(struct_sizes, (self.num_structures,), INTEGERS)
 
 
 class StructuralMalConvClassifier(StructuralClassifier):
@@ -3069,6 +3006,7 @@ class StructuralMalConvClassifier(StructuralClassifier):
         order: list[list[tuple[int, int]]],
         order_struct: Tensor,
         order_local: Tensor,
+        struct_sizes: Tensor,
     ) -> Tensor:
         raise NotImplementedError("StructuralMalConvClassifier is not yet implemented.")
 
@@ -3136,6 +3074,12 @@ class StructuralViTClassifier(StructuralClassifier):
         self.C_s: list[int] = C_s
         self.C = self.C_s[0]
 
+        if not all (p.num_patches == 1 for p in patchers):
+            warnings.warn("Some patchers output more than one patch, so we'll have to use the slower dynamic reconcile method.")
+            self._use_dynamic_reconcile = True
+        else:
+            self._use_dynamic_reconcile = False
+
         self.last_aux_loss: Optional[Tensor] = None  # (S,)   Most recent auxiliary loss for load balancing.
         self.last_usage: Optional[Tensor] = None     # (S,E)  Most recent expert usage statistic.
         self.last_entropy: Optional[Tensor] = None   # (S,)   Most recent routing entropy.
@@ -3154,13 +3098,14 @@ class StructuralViTClassifier(StructuralClassifier):
         order: list[list[tuple[int, int]]],
         order_struct: Tensor,
         order_local: Tensor,
+        struct_sizes: Tensor,
     ) -> Tensor:
 
         B = len(order)
 
         self._maybe_reset_expert_stats()
 
-        self._check_forward_inputs(x, g, order, order_struct, order_local)
+        self._check_forward_inputs(x, g, order, order_struct, order_local, struct_sizes)
 
         self._validate_batching_attributes()
 
@@ -3207,7 +3152,7 @@ class StructuralViTClassifier(StructuralClassifier):
             zs.append(torch.cat(zbs, dim=0))  # (B_i, N_i, C)
 
         # Reconcile the sample index and the input index.
-        z, key_padding_mask = self.reconcile_per_structure_patches(zs, order, order_struct, order_local)  # (B, N, C)
+        z, key_padding_mask = self.reconcile_per_structure_patches(zs, order, order_struct, order_local, struct_sizes)  # (B, N, C)
         check_tensor(z, (B, None, self.C), FLOATS)
 
         # Ensure all trunks participate in autograd graph.
@@ -3252,14 +3197,11 @@ class StructuralViTClassifier(StructuralClassifier):
         order: list[list[tuple[int, int]]],
         order_struct: Tensor,
         order_local: Tensor,
+        struct_sizes: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        if STRUCTURAL_CLASSIFIER_USE_DYNAMIC_RECONCILE:
+        if STRUCTURAL_CLASSIFIER_USE_DYNAMIC_RECONCILE or self._use_dynamic_reconcile:
             return _reconcile_per_structure_patches_dynamic(zs, order)
-        max_len = self.backbone.max_len
-        if self.backbone.seq_lengths is not None:
-            # Select the shortest seq_length longer or equal to the number of structures.
-            max_len = min(l for l in self.backbone.seq_lengths if l >= order_struct.shape[1])
-        return _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=max_len)
+        return _reconcile_per_structure_patches_static(zs, order_struct, order_local, struct_sizes)
 
     @property
     def _trunks(self) -> Sequence[tuple[nn.Module, ...]]:

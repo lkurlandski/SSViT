@@ -1287,8 +1287,8 @@ class SSamples:
     to the samples. So while `file[i]`, `name[i]`, `label[i]`, and `structure[i]` all
     correspond to the `i`-th sample, `inputs[j][i]` does not. Instead, the list `order`
     indicates the location of each sample's inputs within the `inputs` list. So, for
-    example, `order[i]` gives the list of tuples `(j, k)` indicating that the `i`-th
-    sample's `k`-th structure corresponds to `inputs[j]`.
+    example, `order[i][k]` gives the list of tuples `(j, l)` indicating that the `i`-th
+    sample's `k`-th structure corresponds to `inputs[j][l]`.
     """
 
     file: Sequence[StrPath]
@@ -1298,8 +1298,9 @@ class SSamples:
     guides: Sequence[SemanticGuides]
     structure: StructureMaps
     order: Sequence[Sequence[tuple[int, int]]]
-    order_struct: Tensor
-    order_local: Tensor
+    _order_struct: Tensor
+    _order_local: Tensor
+    _struct_sizes: Tensor
 
     def __init__(
         self,
@@ -1313,6 +1314,7 @@ class SSamples:
         *,
         _order_struct: Optional[Tensor] = None,
         _order_local: Optional[Tensor] = None,
+        _struct_sizes: Optional[Tensor] = None,
     ) -> None:
         self.file = file
         self.name = name
@@ -1323,13 +1325,15 @@ class SSamples:
         self.order = order
         self.verify_inputs()
 
-        if _order_struct is None and _order_local is None:
-            self.order_struct, self.order_local = _unpack_order_to_tensors(order)
-        elif _order_struct is not None and _order_local is not None:
-            self.order_struct = _order_struct
-            self.order_local = _order_local
+        if _order_struct is None and _order_local is None and _struct_sizes is None:
+            self._order_struct, self.order_local = _unpack_order_to_tensors(order)
+            self._struct_sizes = torch.tensor([i.size(0) for i in inputs], dtype=torch.int64)
+        elif _order_struct is not None and _order_local is not None and _struct_sizes is not None:
+            self._order_struct = _order_struct
+            self._order_local = _order_local
+            self._struct_sizes = _struct_sizes
         else:
-            raise ValueError("Both or neither of _order_struct and _order_local must be provided.")
+            raise ValueError("All or none of _order_struct, _order_local, and _struct_sizes must be provided.")
 
     def __iter__(self) -> Iterator[Sequence[StrPath] | Sequence[Name] | Tensor | Sequence[Inputs] | Sequence[SemanticGuides] | StructureMaps | Sequence[Sequence[int]] | Sequence[Sequence[tuple[int, int]]]]:
         return iter((self.file, self.name, self.label, self.inputs, self.guides, self.structure, self.order))
@@ -1363,7 +1367,7 @@ class SSamples:
         return [g.allguides for g in self.guides]
 
     def get_otherkwds(self) -> dict[str, Any]:
-        return {"order": self.order, "order_struct": self.order_struct, "order_local": self.order_local}
+        return {"order": self.order, "order_struct": self._order_struct, "order_local": self._order_local, "struct_sizes": self._struct_sizes}
 
     def __len__(self) -> int:
         return len(self.file)
@@ -1414,9 +1418,10 @@ class SSamples:
             guides.append(self.guides[i].detach())
         structure = self.structure.clone()
         order = deepcopy(self.order)
-        _order_struct = self.order_struct.detach()
-        _order_local  = self.order_local.detach()
-        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local)
+        _order_struct = self._order_struct.detach()
+        _order_local  = self._order_local.detach()
+        _struct_sizes = self._struct_sizes.detach()
+        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local, _struct_sizes=_struct_sizes)
 
     def clone(self) -> Self:
         file = deepcopy(self.file)
@@ -1429,9 +1434,10 @@ class SSamples:
             guides.append(self.guides[i].clone())
         structure = self.structure.clone()
         order = deepcopy(self.order)
-        _order_struct = self.order_struct.clone()
-        _order_local  = self.order_local.clone()
-        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local)
+        _order_struct = self._order_struct.clone()
+        _order_local  = self._order_local.clone()
+        _struct_sizes = self._struct_sizes.clone()
+        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local, _struct_sizes=_struct_sizes)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> Self:
         file = deepcopy(self.file)
@@ -1444,9 +1450,10 @@ class SSamples:
             guides.append(self.guides[i].to(device, non_blocking=non_blocking))
         structure = self.structure.clone()
         order = deepcopy(self.order)
-        _order_struct = self.order_struct.to(device, non_blocking=non_blocking)
-        _order_local  = self.order_local.to(device, non_blocking=non_blocking)
-        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local)
+        _order_struct = self._order_struct.to(device, non_blocking=non_blocking)
+        _order_local  = self._order_local.to(device, non_blocking=non_blocking)
+        _struct_sizes = self._struct_sizes.to(device, non_blocking=non_blocking)
+        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local, _struct_sizes=_struct_sizes)
 
     def pin_memory(self) -> Self:
         if self.label.is_cuda or any(inp.is_cuda for inp in self.inputs) or any(guide.is_cuda for guide in self.guides):
@@ -1461,9 +1468,10 @@ class SSamples:
             guides.append(self.guides[i].pin_memory())
         structure = self.structure.clone()
         order = deepcopy(self.order)
-        _order_struct = self.order_struct.pin_memory()
-        _order_local  = self.order_local.pin_memory()
-        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local)
+        _order_struct = self._order_struct.pin_memory()
+        _order_local  = self._order_local.pin_memory()
+        _struct_sizes = self._struct_sizes.pin_memory()
+        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local, _struct_sizes=_struct_sizes)
 
     def compress(self) -> Self:
         file = deepcopy(self.file)
@@ -1476,9 +1484,10 @@ class SSamples:
             guides.append(self.guides[i].compress())
         structure = self.structure.clone()
         order = deepcopy(self.order)
-        _order_struct = self.order_struct.clone()
-        _order_local  = self.order_local.clone()
-        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local)
+        _order_struct = self._order_struct.clone()
+        _order_local  = self._order_local.clone()
+        _struct_sizes = self._struct_sizes.clone()
+        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local, _struct_sizes=_struct_sizes)
 
     def decompress(self) -> Self:
         file = deepcopy(self.file)
@@ -1491,9 +1500,10 @@ class SSamples:
             guides.append(self.guides[i].decompress())
         structure = self.structure.clone()
         order = deepcopy(self.order)
-        _order_struct = self.order_struct.clone()
-        _order_local  = self.order_local.clone()
-        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local)
+        _order_struct = self._order_struct.clone()
+        _order_local  = self._order_local.clone()
+        _struct_sizes = self._struct_sizes.clone()
+        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local, _struct_sizes=_struct_sizes)
 
     def finalize(self, ftype: torch.dtype, itype: torch.dtype, ltype: torch.dtype) -> Self:
         """Finalize the datatypes of the batch."""
@@ -1509,9 +1519,10 @@ class SSamples:
             g.build_allguides()
         structure = self.structure.clone()
         order = deepcopy(self.order)
-        _order_struct = self.order_struct.clone()
-        _order_local  = self.order_local.clone()
-        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local)
+        _order_struct = self._order_struct.clone()
+        _order_local  = self._order_local.clone()
+        _struct_sizes = self._struct_sizes.clone()
+        return self.__class__(file, name, label, inputs, guides, structure, order, _order_struct=_order_struct, _order_local=_order_local, _struct_sizes=_struct_sizes)
 
 
 def _unpack_order_to_tensors(
@@ -1519,7 +1530,7 @@ def _unpack_order_to_tensors(
     *,
     num: Optional[int] = None,
     device: Optional[torch.device] = None,
-    dtype: torch.dtype = torch.int32,
+    dtype: torch.dtype = torch.int64,
     policy: Literal["raise", "warn", "ignore"] = "warn",
 ) -> tuple[Tensor, Tensor]:
     """
