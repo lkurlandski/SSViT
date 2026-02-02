@@ -40,7 +40,6 @@ from src.architectures import DWCSequenceEncoder
 from src.architectures import _reconcile_per_structure_patches_static
 from src.architectures import _reconcile_per_structure_patches_dynamic
 from src.data import _unpack_order_to_tensors
-from src.data import _pack_tensors_to_order
 from src.utils import seed_everything
 
 
@@ -641,6 +640,7 @@ class TestStructuralViTClassifier:
         x = [torch.randint(0, vocab_size, (batch_size, 1024)) for _ in range(num_structures)]
         g = [None for _ in range(num_structures)]
         order = [[(structure_index, local_index) for structure_index in range(num_structures)] for local_index in range(batch_size)]
+        order_struct, order_local = _unpack_order_to_tensors(order)
 
         patchers = [PatchEncoder(embedding_dim, patcher_channels, 4, None) for _ in range(num_structures)]
         model = StructuralViTClassifier(embeddings, filmers, patchers, norms, patchposencoder, backbone, head)
@@ -648,7 +648,7 @@ class TestStructuralViTClassifier:
         assert model.last_entropy is None
         assert model.last_usage is None
 
-        model(x, g, order)
+        model(x, g, order, order_struct, order_local)
         assert model.last_aux_loss is None
         assert model.last_entropy is None
         assert model.last_usage is None
@@ -660,7 +660,7 @@ class TestStructuralViTClassifier:
         assert model.last_entropy is not None and model.last_entropy.shape == (num_structures,) and (model.last_entropy == 0).all()
         assert model.last_usage is not None and model.last_usage.shape == (num_structures, num_experts) and (model.last_usage == 0).all()
 
-        model(x, g, order)
+        model(x, g, order, order_struct, order_local)
         assert model.last_aux_loss is not None and model.last_aux_loss.shape == (num_structures,) and (model.last_aux_loss >= 0).all()
         assert model.last_entropy is not None and model.last_entropy.shape == (num_structures,) and (model.last_entropy >= 0).all()
         assert model.last_usage is not None and model.last_usage.shape == (num_structures, num_experts) and (model.last_usage >= 0).all()
