@@ -37,6 +37,10 @@ from src.architectures import PatchPositionalityEncoder
 from src.architectures import DWBlock
 from src.architectures import AdaptiveAtnPooling1d
 from src.architectures import DWCSequenceEncoder
+from src.architectures import _reconcile_per_structure_patches_static
+from src.architectures import _reconcile_per_structure_patches_dynamic
+from src.data import _unpack_order_to_tensors
+from src.data import _pack_tensors_to_order
 from src.utils import seed_everything
 
 
@@ -786,3 +790,258 @@ class TestDWCSequenceEncoder:
 
         assert x.grad is not None
         assert torch.isfinite(x.grad).all()
+
+
+class TestReconcilePerStructurePatches:
+
+    @staticmethod
+    def _create_inputs() -> tuple[list[Tensor], list[list[tuple[int, int]]]]:
+        zs = [
+            torch.rand((2, 1, 8)),  # (B_0, 1, C)
+            torch.rand((3, 1, 8)),  # (B_1, 1, C)
+            torch.rand((1, 1, 8)),  # (B_2, 1, C)
+        ]
+
+        order = [
+            [(2, 0), (0, 1)],
+            [(0, 0), (1, 1), (1, 0), (1, 2)],
+        ]
+
+        return zs, order
+
+    @staticmethod
+    def _check_outputs(zs: list[Tensor], z: Tensor, k: Tensor, *, length: int = 4) -> None:
+        assert z.shape == (2, length, 8)
+        assert k.shape == (2, length)
+
+        assert z.dtype == torch.float
+        assert k.dtype == torch.bool
+
+        assert torch.allclose(z[0, 0, :], zs[2][0, 0, :])
+        assert torch.allclose(z[0, 1, :], zs[0][1, 0, :])
+        assert torch.allclose(z[1, 0, :], zs[0][0, 0, :])
+        assert torch.allclose(z[1, 1, :], zs[1][1, 0, :])
+        assert torch.allclose(z[1, 2, :], zs[1][0, 0, :])
+
+        assert not k[0, 0].item()
+        assert not k[0, 1].item()
+        assert k[0, 2].item()
+        assert k[0, 3].item()
+        assert not k[1, 0].item()
+        assert not k[1, 1].item()
+        assert not k[1, 2].item()
+        assert not k[1, 3].item()
+
+    def test_dynamic(self) -> None:
+        zs, order = self._create_inputs()
+        z, k = _reconcile_per_structure_patches_dynamic(zs, order)
+        self._check_outputs(zs, z, k)
+
+    def test_static(self) -> None:
+        zs, order = self._create_inputs()
+        order_struct, order_local = _unpack_order_to_tensors(order, num=4, policy="raise")
+
+        z, k = _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=None, pack_to_batch_max=False)
+        self._check_outputs(zs, z, k, length=4)
+
+        z, k = _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=5, pack_to_batch_max=False)
+        self._check_outputs(zs, z, k, length=5)
+
+        z, k = _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=None, pack_to_batch_max=True)
+        self._check_outputs(zs, z, k, length=4)
+
+    def test_static_multitoken(self) -> None:
+        zs = [
+            torch.arange(2*1*4, dtype=torch.float32).view(2, 1, 4),   # (B0=2, L0=1, C=4)
+            torch.arange(3*3*4, dtype=torch.float32).view(3, 3, 4),   # (B1=3, L1=3, C=4)  <-- multi-token
+        ]
+        order = [
+            [(1, 2), (0, 1)],  # sample0: struct1(local2, L=3 tokens), struct0(local1, L=1) => len 4
+            [(0, 0)],          # sample1: struct0(local0, L=1) => len 1
+        ]
+        order_struct, order_local = _unpack_order_to_tensors(order, num=4, policy="raise")
+
+        z, k = _reconcile_per_structure_patches_static(
+            zs, order_struct, order_local,
+            max_len=4*3,         # safe upper bound
+            pack_to_batch_max=False
+        )
+
+        # sample 0 should start with zs[1][2, :, :] then zs[0][1, :, :]
+        assert torch.allclose(z[0, 0:3], zs[1][2])      # 3 tokens
+        assert torch.allclose(z[0, 3:4], zs[0][1])      # 1 token
+        assert k[0, :4].eq(False).all()
+
+    def test_gradients_match_dynamic(self) -> None:
+        torch.manual_seed(0)
+        zs, order = self._create_inputs()
+        zs_dyn = [z.clone().requires_grad_(True) for z in zs]
+        zs_sta = [z.clone().requires_grad_(True) for z in zs]
+
+        z_d, _ = _reconcile_per_structure_patches_dynamic(zs_dyn, order)
+        loss_d = (z_d ** 2).sum()
+        loss_d.backward()  # type: ignore[no-untyped-call]
+
+        order_struct, order_local = _unpack_order_to_tensors(order, num=4, policy="raise")
+        z_s, _ = _reconcile_per_structure_patches_static(zs_sta, order_struct, order_local, max_len=4)
+        loss_s = (z_s ** 2).sum()
+        loss_s.backward()  # type: ignore[no-untyped-call]
+
+        for a, b in zip(zs_dyn, zs_sta):
+            assert a.grad is not None and b.grad is not None
+            assert torch.allclose(a.grad, b.grad)
+
+    def test_static_multitoken_structure(self) -> None:
+        # Make one structure emit multiple tokens per item (L_s > 1).
+        torch.manual_seed(0)
+        zs = [
+            torch.rand((2, 1, 4)),  # struct 0: L0=1
+            torch.rand((3, 3, 4)),  # struct 1: L1=3  <-- multi-token
+            torch.rand((1, 2, 4)),  # struct 2: L2=2
+        ]
+        order = [
+            [(1, 2), (0, 1)],  # sample0: struct1(local2, 3 toks) then struct0(local1, 1 tok) => len 4
+            [(2, 0)],          # sample1: struct2(local0, 2 toks) => len 2
+        ]
+        order_struct, order_local = _unpack_order_to_tensors(order, num=4, policy="raise")
+
+        # Pack-to-batch-max => M = max(4, 2) = 4
+        z, k = _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=None, pack_to_batch_max=True)
+
+        assert z.shape == (2, 4, 4)
+        assert k.shape == (2, 4)
+
+        # sample0: first 3 tokens from zs[1][2], then 1 token from zs[0][1]
+        assert torch.allclose(z[0, 0:3], zs[1][2, 0:3])
+        assert torch.allclose(z[0, 3:4], zs[0][1, 0:1])
+        assert k[0, :4].eq(False).all()
+
+        # sample1: first 2 tokens from zs[2][0], last 2 padded
+        assert torch.allclose(z[1, 0:2], zs[2][0, 0:2])
+        assert k[1, 0].item() is False
+        assert k[1, 1].item() is False
+        assert k[1, 2].item() is True
+        assert k[1, 3].item() is True
+
+    def test_empty_sample_behavior(self) -> None:
+        # One sample has no structures.
+        zs = [
+            torch.rand((2, 1, 8)),
+            torch.rand((2, 1, 8)),
+        ]
+        order = [
+            [],                 # empty
+            [(0, 1), (1, 0)],    # non-empty
+        ]
+
+        # Dynamic currently raises for empty sample; keep that expectation.
+        with pytest.raises(RuntimeError):
+            _reconcile_per_structure_patches_dynamic(zs, order)
+
+        # Static: depending on your chosen semantics, it might:
+        # - raise (matching dynamic), OR
+        # - return an all-padding row for that sample.
+        order_struct, order_local = _unpack_order_to_tensors(order, num=4, policy="raise")
+        try:
+            z, k = _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=4, pack_to_batch_max=False)
+        except RuntimeError:
+            return  # acceptable if you decided to match dynamic semantics
+
+        # If it didn't raise, assert sample0 is entirely padding.
+        assert z.shape == (2, 4, 8)
+        assert k.shape == (2, 4)
+        assert k[0].all().item() is True  # all padding for empty sample
+
+    def test_max_len_too_small_raises(self) -> None:
+        zs, order = self._create_inputs()
+        order_struct, order_local = _unpack_order_to_tensors(order, num=4, policy="raise")
+
+        # True max packed length in this batch is 4; choose smaller.
+        with pytest.raises((RuntimeError, IndexError)):
+            _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=3, pack_to_batch_max=False)
+
+    def test_holes_in_order_tensors(self) -> None:
+        # Explicitly create "holes" (non-trailing -1s). Unpack always pads at tail,
+        # so we construct tensors manually.
+        zs = [
+            torch.rand((2, 1, 8)),  # struct0
+            torch.rand((2, 1, 8)),  # struct1
+        ]
+        # B=2, N=4
+        order_struct = torch.tensor(
+            [
+                [0, -1, 1, -1],  # sample0 has two items with holes
+                [-1, 1, -1, 0],  # sample1 has two items with holes
+            ],
+            dtype=torch.int32,
+        )
+        order_local = torch.tensor(
+            [
+                [1, -1, 0, -1],
+                [-1, 1, -1, 0],
+            ],
+            dtype=torch.int32,
+        )
+
+        z, k = _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=4, pack_to_batch_max=False)
+
+        # For L_s == 1, packed sequence should be in the order of valid positions left-to-right.
+        # sample0 => (0,1) then (1,0)
+        assert torch.allclose(z[0, 0, :], zs[0][1, 0, :])
+        assert torch.allclose(z[0, 1, :], zs[1][0, 0, :])
+        assert k[0, 0].item() is False
+        assert k[0, 1].item() is False
+        assert k[0, 2].item() is True
+        assert k[0, 3].item() is True
+
+        # sample1 => (1,1) then (0,0)
+        assert torch.allclose(z[1, 0, :], zs[1][1, 0, :])
+        assert torch.allclose(z[1, 1, :], zs[0][0, 0, :])
+        assert k[1, 0].item() is False
+        assert k[1, 1].item() is False
+        assert k[1, 2].item() is True
+        assert k[1, 3].item() is True
+
+    def test_bad_indices_raise(self) -> None:
+        zs = [
+            torch.rand((2, 1, 8)),
+            torch.rand((2, 1, 8)),
+        ]
+        # struct index out of range (S=2, so '2' invalid)
+        order_struct = torch.tensor([[2, -1]], dtype=torch.int32)
+        order_local = torch.tensor([[0, -1]], dtype=torch.int32)
+        with pytest.raises((RuntimeError, IndexError)):
+            _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=2, pack_to_batch_max=False)
+
+        # local index out of range (B_s=2 so local=2 invalid)
+        order_struct = torch.tensor([[1, -1]], dtype=torch.int32)
+        order_local = torch.tensor([[2, -1]], dtype=torch.int32)
+        with pytest.raises((RuntimeError, IndexError)):
+            _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=2, pack_to_batch_max=False)
+
+        # negative local index while struct is valid (should be invalid)
+        order_struct = torch.tensor([[0, -1]], dtype=torch.int32)
+        order_local = torch.tensor([[-1, -1]], dtype=torch.int32)
+        with pytest.raises((RuntimeError, IndexError)):
+            _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=2, pack_to_batch_max=False)
+
+    def test_cpu_cuda_parity(self) -> None:
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        torch.manual_seed(0)
+        zs, order = self._create_inputs()
+        order_struct, order_local = _unpack_order_to_tensors(order, num=4, policy="raise")
+
+        # CPU reference
+        z_cpu, k_cpu = _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=None, pack_to_batch_max=True)
+
+        # CUDA run
+        zs_cuda = [z.cuda() for z in zs]
+        order_struct_cuda = order_struct.cuda()
+        order_local_cuda = order_local.cuda()
+
+        z_gpu, k_gpu = _reconcile_per_structure_patches_static(zs_cuda, order_struct_cuda, order_local_cuda, max_len=None, pack_to_batch_max=True)
+
+        assert torch.allclose(z_cpu, z_gpu.cpu())
+        assert torch.equal(k_cpu, k_gpu.cpu())
