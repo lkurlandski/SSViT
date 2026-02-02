@@ -67,6 +67,11 @@ from src.utils import pad_sequence
 # mypy: disable-error-code=no-any-return
 
 
+STRUCTURAL_CLASSIFIER_USE_DYNAMIC_RECONCILE = os.environ.get("STRUCTURAL_CLASSIFIER_USE_DYNAMIC_RECONCILE", "0") == "1"
+if STRUCTURAL_CLASSIFIER_USE_DYNAMIC_RECONCILE:
+    warnings.warn("Using dynamic reconcile for structural classifier. This may have performance implications.")
+
+
 NORMS: dict[str, type[nn.Module]] = {
     "layer": nn.LayerNorm,
     "rms": nn.RMSNorm,
@@ -2972,12 +2977,22 @@ class StructuralClassifier(nn.Module, ABC):
         self.num_structures = num_structures
 
     @abstractmethod
-    def forward(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> Tensor:
+    def forward(
+        self,
+        x: list[Tensor],
+        g: list[Optional[Tensor]],
+        order: list[list[tuple[int, int]]],
+        order_struct: Tensor,
+        order_local: Tensor,
+    ) -> Tensor:
         """
         Args:
             x: Input tensors of shape (B, T_i) for each structure i. None if no input for that structure.
             g: FiLM conditioning vectors of shape (B, T_i, G) for each structure i. None if no input for that structure or not using guides.
             order: the order in which each input should be processed per sample, given as a list of lists of (structure_index, input_index) tuples.
+            order_struct: (B, N) int tensor of structure indices; padded with -1.
+            order_local: (B, N) int tensor of local indices into zs[struct][:, ...]; padded with -1.
+
         Returns:
             z: Classification logits of shape (B, M).
         """
@@ -3008,7 +3023,14 @@ class StructuralClassifier(nn.Module, ABC):
     def max_lengths(self) -> list[int]:
         return [l[1] for l in self._get_min_max_lengths()]
 
-    def _check_forward_inputs(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> None:
+    def _check_forward_inputs(
+        self,
+        x: list[Tensor],
+        g: list[Optional[Tensor]],
+        order: list[list[tuple[int, int]]],
+        order_struct: Tensor,
+        order_local: Tensor,
+    ) -> None:
         if not (len(x) == len(g) == self.num_structures):
             raise ValueError(f"Expected {self.num_structures} structures, got {len(x)=} and {len(g)=} instead.")
 
@@ -3030,13 +3052,24 @@ class StructuralClassifier(nn.Module, ABC):
                 if x[structure_idx].shape[0] <= 0:
                     raise ValueError(f"Structure {structure_idx} has no inputs, but is referenced in order for sample {sample_idx}.")
 
+        max_structures = max(len(o) for o in order)
+        check_tensor(order_struct, (len(order), max_structures), INTEGERS)
+        check_tensor(order_local,  (len(order), max_structures), INTEGERS)
+
 
 class StructuralMalConvClassifier(StructuralClassifier):
 
     def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
         raise NotImplementedError("StructuralMalConvClassifier is not yet implemented.")
 
-    def forward(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> Tensor:
+    def forward(
+        self,
+        x: list[Tensor],
+        g: list[Optional[Tensor]],
+        order: list[list[tuple[int, int]]],
+        order_struct: Tensor,
+        order_local: Tensor,
+    ) -> Tensor:
         raise NotImplementedError("StructuralMalConvClassifier is not yet implemented.")
 
     @property
@@ -3114,13 +3147,20 @@ class StructuralViTClassifier(StructuralClassifier):
 
         self.do_ddp_keepalive = do_ddp_keepalive
 
-    def forward(self, x: list[Tensor], g: list[Optional[Tensor]], order: list[list[tuple[int, int]]]) -> Tensor:
+    def forward(
+        self,
+        x: list[Tensor],
+        g: list[Optional[Tensor]],
+        order: list[list[tuple[int, int]]],
+        order_struct: Tensor,
+        order_local: Tensor,
+    ) -> Tensor:
 
         B = len(order)
 
         self._maybe_reset_expert_stats()
 
-        self._check_forward_inputs(x, g, order)
+        self._check_forward_inputs(x, g, order, order_struct, order_local)
 
         self._validate_batching_attributes()
 
@@ -3167,7 +3207,7 @@ class StructuralViTClassifier(StructuralClassifier):
             zs.append(torch.cat(zbs, dim=0))  # (B_i, N_i, C)
 
         # Reconcile the sample index and the input index.
-        z, key_padding_mask = self.reconcile_per_structure_patches(zs, order)  # (B, N, C)
+        z, key_padding_mask = self.reconcile_per_structure_patches(zs, order, order_struct, order_local)  # (B, N, C)
         check_tensor(z, (B, None, self.C), FLOATS)
 
         # Ensure all trunks participate in autograd graph.
@@ -3206,8 +3246,20 @@ class StructuralViTClassifier(StructuralClassifier):
             g = torch.nn.functional.pad(g, (0, 0, 0, pad), mode="constant", value=0.0)
         return x, g
 
-    def reconcile_per_structure_patches(self, zs: list[Tensor], order: list[list[tuple[int, int]]]) -> tuple[Tensor, Tensor]:
-        return _reconcile_per_structure_patches_dynamic(zs, order)
+    def reconcile_per_structure_patches(
+        self,
+        zs: list[Tensor],
+        order: list[list[tuple[int, int]]],
+        order_struct: Tensor,
+        order_local: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if STRUCTURAL_CLASSIFIER_USE_DYNAMIC_RECONCILE:
+            return _reconcile_per_structure_patches_dynamic(zs, order)
+        max_len = self.backbone.max_len
+        if self.backbone.seq_lengths is not None:
+            # Select the shortest seq_length longer or equal to the number of structures.
+            max_len = min(l for l in self.backbone.seq_lengths if l >= order_struct.shape[1])
+        return _reconcile_per_structure_patches_static(zs, order_struct, order_local, max_len=max_len)
 
     @property
     def _trunks(self) -> Sequence[tuple[nn.Module, ...]]:
