@@ -1487,6 +1487,83 @@ class SSamples:
         return self.__class__(file, name, label, inputs, guides, structure, order)
 
 
+def _unpack_order_to_tensors(
+    order: list[list[tuple[int, int]]],
+    *,
+    num: int,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.int32,
+    policy: Literal["raise", "warn", "ignore"] = "warn",
+) -> tuple[Tensor, Tensor]:
+    """
+    Unpack the per-sample orderings into fixed-size tensors with padding.
+
+    Args:
+        order: List of length B, each element is a list of (structure_index, local_index) tuples.
+        num: Maximum number of structures to keep per sample.
+        device: Device for the output tensors.
+        dtype: Data type for the output tensors.
+        policy: Policy for handling samples with more than `num` structures.
+
+    Returns:
+        order_struct: (B, N) int tensor of structure indices, -1 padded.
+        order_local:  (B, N) int tensor of local indices, -1 padded
+    """
+    B = len(order)
+    order_struct = torch.full((B, num), -1, dtype=dtype, device=device)
+    order_local  = torch.full((B, num), -1, dtype=dtype, device=device)
+
+    for b, items in enumerate(order):
+        if len(items) == 0:
+            continue
+        if len(items) > num:
+            if policy == "raise":
+                raise ValueError(f"Order for sample {b} has {len(items)} items, which exceeds the maximum allowed {num}.")
+            elif policy == "warn":
+                warnings.warn(f"Order for sample {b} has {len(items)} items, which exceeds the maximum allowed {num}.")
+            elif policy == "ignore":
+                items = items[:num]
+            else:
+                raise ValueError(f"Invalid policy: {policy}")
+        s, l = zip(*items)
+        order_struct[b, :len(items)] = torch.tensor(s, dtype=dtype, device=device)
+        order_local[b, :len(items)]  = torch.tensor(l, dtype=dtype, device=device)
+
+    return order_struct, order_local
+
+
+def _pack_tensors_to_order(
+    order_struct: Tensor,
+    order_local: Tensor,
+) -> list[list[tuple[int, int]]]:
+    """
+    Pack the order tensors back into a list of lists of tuples.
+
+    Args:
+        order_struct: (B, N) int tensor of structure indices, -1 padded.
+        order_local:  (B, N) int tensor of local indices, -1 padded.
+
+    Returns:
+        order: List of length B, each element is a list of (structure_index, local_index) tuples.
+    """
+    B, N = order_struct.shape
+
+    order_struct: list[list[int]] = order_struct.detach().cpu().tolist()
+    order_local: list[list[int]]  = order_local.detach().cpu().tolist()
+
+    order: list[list[tuple[int, int]]] = []
+    for b in range(B):
+        items: list[tuple[int, int]] = []
+        for n in range(N):
+            s = order_struct[b][n]
+            l = order_local[b][n]
+            if s == -1 or l == -1:
+                continue
+            items.append((s, l))
+        order.append(items)
+    return order
+
+
 FOrHSample  = FSample | HSample
 FOrHSamples = FSamples | HSamples | SSamples
 
