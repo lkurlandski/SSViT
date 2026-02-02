@@ -1324,7 +1324,7 @@ class SSamples:
         self.verify_inputs()
 
         if _order_struct is None and _order_local is None:
-            self.order_struct, self.order_local = _unpack_order_to_tensors(order, num=max(len(o) for o in order))
+            self.order_struct, self.order_local = _unpack_order_to_tensors(order)
         elif _order_struct is not None and _order_local is not None:
             self.order_struct = _order_struct
             self.order_local = _order_local
@@ -1517,7 +1517,7 @@ class SSamples:
 def _unpack_order_to_tensors(
     order: Sequence[Sequence[tuple[int, int]]],
     *,
-    num: int,
+    num: Optional[int] = None,
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.int32,
     policy: Literal["raise", "warn", "ignore"] = "warn",
@@ -1537,6 +1537,8 @@ def _unpack_order_to_tensors(
         order_local:  (B, N) int tensor of local indices, -1 padded
     """
     B = len(order)
+    num = max(len(o) for o in order) if num is None else num
+
     order_struct = torch.full((B, num), -1, dtype=dtype, device=device)
     order_local  = torch.full((B, num), -1, dtype=dtype, device=device)
 
