@@ -224,7 +224,7 @@ class DWBlock(nn.Module):
         self.pw1 = nn.Conv1d(dim, dim * expansion, kernel_size=1)
         self.pw2 = nn.Conv1d(dim * expansion, dim, kernel_size=1)
         self.norm = nn.GroupNorm(1, dim)
-        self.drop = nn.Dropout(drop)
+        self.drop = nn.Dropout(drop) if drop > 0.0 else nn.Identity()
 
     @property
     def min_length(self) -> int:
