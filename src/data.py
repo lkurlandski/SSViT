@@ -2033,7 +2033,15 @@ class CollateFn:
         return FSamples(file, name, label, inputs, guides, structure)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, min_length={self.min_length}, muddy_padded={self.muddy_padded})"
+        return (
+            f"{self.__class__.__name__}(\n"
+            f"  pin_memory={self.pin_memory},\n"
+            f"  bitpack={self.bitpack},\n"
+            f"  min_length={self.min_length},\n"
+            f"  length_bins={self.length_bins},\n"
+            f"  muddy_padded={self.muddy_padded},\n"
+            ")"
+        )
 
 
 class CollateFnHierarchical:
@@ -2076,7 +2084,16 @@ class CollateFnHierarchical:
         return HSamples(file, name, label, inputs, guides, structure)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, num_structures={self.num_structures}, min_lengths={self.min_lengths}, muddy_padded={self.muddy_padded})"
+        return (
+            f"{self.__class__.__name__}(\n"
+            f"  pin_memory={self.pin_memory},\n"
+            f"  bitpack={self.bitpack},\n"
+            f"  num_structures={self.num_structures},\n"
+            f"  min_lengths={self.min_lengths},\n"
+            f"  length_bins={self.length_bins},\n"
+            f"  muddy_padded={self.muddy_padded},\n"
+            ")"
+        )
 
 
 class CollateFnStructural:
@@ -2160,7 +2177,16 @@ class CollateFnStructural:
         return SemanticGuide(parse, entropy, characteristics)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(pin_memory={self.pin_memory}, bitpack={self.bitpack}, num_structures={self.num_structures}, min_lengths={self.min_lengths}, muddy_padded={self.muddy_padded})"
+        return (
+            f"{self.__class__.__name__}(\n"
+            f"  pin_memory={self.pin_memory},\n"
+            f"  bitpack={self.bitpack},\n"
+            f"  num_structures={self.num_structures},\n"
+            f"  min_lengths={self.min_lengths},\n"
+            f"  length_bins={self.length_bins},\n"
+            f"  muddy_padded={self.muddy_padded},\n"
+            ")"
+        )
 
 
 class CUDAPrefetcher:
