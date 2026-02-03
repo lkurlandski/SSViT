@@ -909,8 +909,8 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 12
     print(f"Profiling with {with_groups} grouped averages.")
 
     skip_first = 0
-    wait = 2
-    warmup = 64
+    wait = 0
+    warmup = 16
     active = 16
     repeat = 1
     sched = schedule(skip_first=skip_first, wait=wait, warmup=warmup, active=active, repeat=repeat)
@@ -996,7 +996,8 @@ def main() -> None:
     #       = 6           x 3                     + 3           x 1
     #       = 18 + 3
     #       = 21
-    torch._dynamo.config.cache_size_limit = 21
+    # Multiple by two: once for with-grad and once for without-grad.
+    torch._dynamo.config.cache_size_limit = 21 * 2
 
     if rank() > 0:
         args.disable_tqdm = True
@@ -1252,7 +1253,6 @@ def main() -> None:
 
     trainer = trainer()
     return
-
 
 
 if __name__ == "__main__":
