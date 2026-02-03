@@ -255,6 +255,8 @@ class DWBlock(nn.Module):
 class AdaptiveAtnPooling1d(nn.Module):
     """
     Learned query attention pooling.
+
+    TODO: rewrite using 1x1 conv to avoid the transpose.
     """
 
     def __init__(self, dim: int):
@@ -1667,6 +1669,8 @@ class ViT(nn.Module):
     Vision Transformer.
 
     See: Dosovitskiy "An image is worth 16x16 words: Transformers for image recognition at scale" ICLR 2021.
+
+    NOTE: the flash attention backend does not support a key padding mask.
     """
 
     cls_token: Optional[nn.Parameter]
