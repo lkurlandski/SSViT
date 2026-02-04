@@ -1157,7 +1157,7 @@ class DWCPatchEncoder(PatchEncoderBase):
         super().__init__(in_channels, out_channels, num_patches, patch_size)
 
         if patch_size is not None or num_patches != 1:
-            raise ValueError(f"{self.__class__.__name__} requires `num_patches`=1 and `patch_size` is None.")
+            raise NotImplementedError(f"{self.__class__.__name__} requires `num_patches`=1 and `patch_size` is None.")
 
         self.checkpoint_segments = checkpoint_segments
 

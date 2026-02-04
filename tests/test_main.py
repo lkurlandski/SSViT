@@ -14,6 +14,7 @@ from src.architectures import PatchEncoder
 from src.architectures import ConvPatchEncoder
 from src.architectures import HierarchicalConvPatchEncoder
 from src.architectures import PatchEncoderLowMem
+from src.architectures import DWCPatchEncoder
 from src.architectures import PatchEncoderLowMemSwitchMoE
 from src.architectures import PatchPositionalityEncoder
 from src.architectures import SinusoidalPositionalEncoding
@@ -88,6 +89,11 @@ class TestGetModel:
             assert isinstance(m, ViTClassifier)
             return m
 
+        if parch == PatcherArchitecture.DWC:
+            with pytest.raises(NotImplementedError):
+                _get_model()
+            return
+
         if patchposenc == PatchPositionalEncodingArchitecture.ABS:
             with pytest.raises(NotImplementedError):
                 _get_model()
@@ -116,6 +122,8 @@ class TestGetModel:
             assert isinstance(model.patcher, PatchEncoderLowMem)
         elif parch == PatcherArchitecture.EXP:
             assert isinstance(model.patcher, PatchEncoderLowMemSwitchMoE)
+        elif parch == PatcherArchitecture.DWC:
+            assert isinstance(model.patcher, DWCPatchEncoder)
         else:
             raise NotImplementedError()
 
@@ -232,6 +240,11 @@ class TestGetModel:
                 _get_model()
             return
 
+        if parch == PatcherArchitecture.DWC:
+            with pytest.raises(NotImplementedError):
+                _get_model()
+            return
+
         if patchposenc == PatchPositionalEncodingArchitecture.ABS:
             with pytest.raises(NotImplementedError):
                 _get_model()
@@ -266,6 +279,8 @@ class TestGetModel:
             assert all(isinstance(patcher, PatchEncoderLowMem) for patcher in model.patchers)
         elif parch == PatcherArchitecture.EXP:
             assert all(isinstance(patcher, PatchEncoderLowMemSwitchMoE) for patcher in model.patchers)
+        elif parch == PatcherArchitecture.DWC:
+            assert all(isinstance(patcher, DWCPatchEncoder) for patcher in model.patchers)
         else:
             raise NotImplementedError()
 
@@ -322,9 +337,10 @@ class TestGetModel:
     @pytest.mark.parametrize("num_guides", [0, 3, 7])
     @pytest.mark.parametrize("max_length", [None, 2 ** 20, 2 ** 22])
     @pytest.mark.parametrize("structures", [[], list(HierarchicalStructureNone), list(HierarchicalStructureCoarse)])
+    @pytest.mark.parametrize("max_structures", [None, 15, 16, 17])
     @pytest.mark.parametrize("share_embeddings", [False, True])
     @pytest.mark.parametrize("share_patchers", [False, True])
-    def test_structural_transformer(self, parch: PatcherArchitecture, posenc: PositionalEncodingArchitecture, patchposenc: PatchPositionalEncodingArchitecture, num_guides: int, max_length: Optional[int], structures: list[HierarchicalStructure], share_embeddings: bool, share_patchers: bool) -> None:
+    def test_structural_transformer(self, parch: PatcherArchitecture, posenc: PositionalEncodingArchitecture, patchposenc: PatchPositionalEncodingArchitecture, num_guides: int, max_length: Optional[int], structures: list[HierarchicalStructure], max_structures: Optional[int], share_embeddings: bool, share_patchers: bool) -> None:
 
         def _get_model() -> StructuralViTClassifier:
             m = get_model(
@@ -335,6 +351,7 @@ class TestGetModel:
                 patchposenc=patchposenc,
                 num_guides=num_guides,
                 structures=structures,
+                max_structures=max_structures,
                 max_length=max_length,
                 share_embeddings=share_embeddings,
                 share_patchers=share_patchers,
@@ -357,7 +374,12 @@ class TestGetModel:
                 _get_model()
             return
 
-        if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV) and posenc == PositionalEncodingArchitecture.LEARNED and max_length is None:
+        if posenc == PositionalEncodingArchitecture.LEARNED and max_structures is None:
+            with pytest.raises(ValueError):
+                _get_model()
+            return
+
+        if posenc == PositionalEncodingArchitecture.LEARNED and max_structures is None:
             with pytest.raises(ValueError):
                 _get_model()
             return
@@ -381,6 +403,8 @@ class TestGetModel:
             assert all(isinstance(patcher, PatchEncoderLowMem) for patcher in model.patchers)
         elif parch == PatcherArchitecture.EXP:
             assert all(isinstance(patcher, PatchEncoderLowMemSwitchMoE) for patcher in model.patchers)
+        elif parch == PatcherArchitecture.DWC:
+            assert all(isinstance(patcher, DWCPatchEncoder) for patcher in model.patchers)
         else:
             raise NotImplementedError()
 
@@ -390,11 +414,7 @@ class TestGetModel:
             assert isinstance(model.backbone.posencoder, SinusoidalPositionalEncoding)
         elif posenc == PositionalEncodingArchitecture.LEARNED:
             assert isinstance(model.backbone.posencoder, LearnedPositionalEncoding)
-            if parch in (PatcherArchitecture.CNV, PatcherArchitecture.HCV):
-                assert max_length is not None
-                assert model.backbone.posencoder.max_len == math.ceil(max_length / 4096) + 1
-            else:
-                assert model.backbone.posencoder.max_len == 256 + 1
+            assert model.backbone.posencoder.max_len == max_structures + 1
         else:
             raise NotImplementedError()
 
