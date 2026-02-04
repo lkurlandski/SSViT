@@ -647,7 +647,7 @@ class Trainer:
             self._next_logg_step = self.glbl_step + self.logg_steps
 
         pbar = tqdm(total=self.max_epochs - self.epoch_idx, disable=self.args.disable_tqdm, leave=False, unit="step")
-        pbar.set_description(f"Epoch {self.epoch_idx} of {self.max_steps / self.steps_per_epoch}")
+        pbar.set_description(f"Epoch {self.epoch_idx} of {self.max_steps / self.steps_per_epoch} (Step {self.glbl_step} / {self.max_steps})")
 
         # Conduct an initial validation and checkpointing on the naked model.
         if self.glbl_step == 0 and not TRAINER_SKIP_FIRST_EVAL:
@@ -667,7 +667,7 @@ class Trainer:
             start_mini_step = 0
             self.epoch_idx += 1
             pbar.update(1)
-            pbar.set_description(f"Epoch {self.epoch_idx} of {self.max_steps / self.steps_per_epoch}")
+            pbar.set_description(f"Epoch {self.epoch_idx} of {self.max_steps / self.steps_per_epoch} (Step {self.glbl_step} / {self.max_steps})")
             if self.epoch_idx >= int(os.environ.get("TRAINER_EARLY_TERMINATE", f"{sys.maxsize}")):
                 self.print("Early termination triggered.")
                 break
@@ -1440,6 +1440,7 @@ class Trainer:
             # JSON-serializable metadata
             meta = {
                 "glbl_step": self.glbl_step,
+                "epoch_idx": self.epoch_idx,
                 "_next_eval_step": self._next_eval_step,
                 "_next_chpt_step": self._next_chpt_step,
                 "_next_logg_step": self._next_logg_step,
@@ -1534,12 +1535,13 @@ class Trainer:
             scheduler = scheduler_init(optimizer)
 
         # Load the simple objects first that don't require complex state dict handling.
-        meta = json.loads((path / "meta.json").read_text())
+        meta: dict[str, Any] = json.loads((path / "meta.json").read_text())
         glbl_step = meta["glbl_step"]
+        epoch_idx = meta.get("epoch_idx", -42)
         _next_eval_step = meta["_next_eval_step"]
         _next_chpt_step = meta["_next_chpt_step"]
         _next_logg_step = meta["_next_logg_step"]
-        args = pickle.loads((path / "args.pickle").read_bytes())
+        args: TrainerArgs = pickle.loads((path / "args.pickle").read_bytes())
         log = pickle.loads((path / "log.pickle").read_bytes())
         stopper = pickle.loads((path / "stopper.pickle").read_bytes())
         if (rng_cpu := torch.load(path / "rng-cpu.pt", map_location="cpu")) is not None:
@@ -1593,7 +1595,7 @@ class Trainer:
             device,
         )
         trainer.glbl_step = glbl_step
-        trainer.epoch_idx = glbl_step // trainer.steps_per_epoch
+        trainer.epoch_idx = epoch_idx
         trainer._next_eval_step = _next_eval_step
         trainer._next_chpt_step = _next_chpt_step
         trainer._next_logg_step = _next_logg_step
