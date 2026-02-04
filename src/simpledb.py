@@ -96,13 +96,22 @@ class SimpleDB:
         - family (str): the malware family of the entry. If not available, is empty string.
     """
 
-    def __init__(self, dir_root: Path, check: bool = True) -> None:
-        self.dir_root = dir_root
-        self.dir_data = dir_root / "data"
-        self.dir_size = dir_root / "size"
-        self.dir_meta = dir_root / "meta"
+    def __init__(self, dir_root: Path | str, check: bool = True) -> None:
+        self.dir_root = Path(dir_root)
+        self.dir_data = self.dir_root / "data"
+        self.dir_size = self.dir_root / "size"
+        self.dir_meta = self.dir_root / "meta"
         if check:
             self._check()
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(\n"
+            f"  dir_root={self.dir_root.as_posix()},\n"
+            f"  num_shards={self.num_shards},\n"
+            f"  num_samples={sum(self.num_samples_per_shard)},\n"
+            f")"
+        )
 
     def _check(self) -> None:
         if not (len(self.files_data) == len(self.files_size) == len(self.files_meta)):
@@ -445,14 +454,25 @@ class MetadataDB:
     Utility to access metadata stored in parquets in shard-by-shard access patterns.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path | str) -> None:
         """
         Args:
             root: Path to the root directory containing the metadata files.
         """
-        self.files = sorted(root.glob("*.parquet"), key=lambda p: p.stem.split("_")[-1])
+        self.root = Path(root)
+        self.files = sorted(self.root.glob("*.parquet"), key=lambda p: p.stem.split("_")[-1])
         self.shard = -1
         self.df = pl.DataFrame()
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(\n"
+            f"  root={self.root.as_posix()},\n"
+            f"  files=[ ... ({len(self.files)})],\n"
+            f"  shard={self.shard},\n"
+            f"  db={self.df.__class__.__name__},\n"
+            ")"
+        )
 
     def get(self, name: str, shard: int) -> pl.DataFrame:
         """

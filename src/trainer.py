@@ -11,6 +11,7 @@ from collections.abc import Iterable
 from collections.abc import Mapping
 import contextlib
 from dataclasses import dataclass
+from dataclasses import fields
 from functools import partial
 import gc
 import hashlib
@@ -327,6 +328,15 @@ class TrainerArgs:
             self.stopper_patience = float("inf")
         if self.param_grad_none not in ("error", "warn", "ignore"):
             raise ValueError("`param_grad_none` must be one of 'error', 'warn', 'allow', or 'ignore'.")
+
+    def __repr__(self) -> str:
+        parts = []
+        parts.append(f"{self.__class__.__name__}(")
+        for field in fields(self):
+            value = getattr(self, field.name)
+            parts.append(f"  {field.name}={value},")
+        parts.append(")")
+        return "\n".join(parts)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:

@@ -1682,13 +1682,13 @@ class IterableSimpleDBDataset(IterableDataset[FSample]):
 
         return (
             f"{self.__class__.__name__}"
-            "("
-            f"db={self.db.__class__.__name__}, "
-            f"metadb={self.metadb.__class__.__name__}, "
-            f"preprocessor={self.preprocessor.__class__.__name__}, "
-            f"shards={display_shards()}, "
-            f"shuffle={self.shuffle}, "
-            f"poolsize={self.poolsize}"
+            "(\n"
+            f"  db={self.db.__class__.__name__},\n"
+            f"  metadb={self.metadb.__class__.__name__},\n"
+            f"  preprocessor={self.preprocessor.__class__.__name__},\n"
+            f"  shards={display_shards()},\n"
+            f"  shuffle={self.shuffle},\n"
+            f"  poolsize={self.poolsize},\n"
             ")"
         )
 
