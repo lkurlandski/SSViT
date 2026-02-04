@@ -132,6 +132,10 @@ class MainArgs:
     tf32: bool = False
     enable_checkpoint: bool = False
     enable_compile: bool = False
+    static_shapes_bin_patcher_seq_lengths: bool = False
+    static_shapes_bin_patcher_batch_sizes: bool = False
+    static_shapes_bin_backbone_batch_sizes: bool = False
+    static_shapes_bin_backbone_seq_lengths: bool = False
     resume: bool = False
 
     def __post_init__(self) -> None:
