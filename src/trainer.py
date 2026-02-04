@@ -634,6 +634,8 @@ class Trainer:
     def __call__(self) -> Self:
         if self.glbl_step < 0:
             raise RuntimeError("glbl_step must be non-negative.")
+        if self.epoch_idx < 0:
+            raise RuntimeError("epoch_idx must be non-negative.")
 
         self.args.outdir.mkdir(parents=True, exist_ok=True)
         self.monitor.start()
@@ -660,6 +662,8 @@ class Trainer:
             mini_steps_into_epoch = steps_into_epoch * self.args.gradient_accumulation_steps
             start_mini_step = 1 + mini_steps_into_epoch
             self.print(f"[INFO] [rank {rank()}] [Trainer::train] {steps_into_epoch=} {mini_steps_into_epoch=} {start_mini_step=}")
+            if steps_into_epoch < 0 or mini_steps_into_epoch < 0 or start_mini_step < 0:
+                raise RuntimeError("Calculated negative values(s) when trying to resume mid-epoch training.")
 
         # Continuously train the model on the training set until finished.
         while not self._done:
@@ -1380,6 +1384,11 @@ class Trainer:
     def _update_cons(self, results: Mapping[str, int | float]) -> None:
         if rank() != 0:
             return
+        d = self.round_and_filter_results_dict(results)
+        self.print(d)
+
+    @staticmethod
+    def round_and_filter_results_dict(results: Mapping[str, int | float]) -> dict[str, int | float]:
         d = {}
         d["epoch"] = round(results["epoch"], 2)
         d["glbl_step"] = int(results["glbl_step"])
@@ -1409,7 +1418,7 @@ class Trainer:
             d["vl_time"] = round(results["vl_time"], 0)
             d["vl_samples"] = int(results["vl_samples"])
             d["vl_throughput"] = round(results["vl_throughput"], 2)
-        self.print(d)
+        return d
 
     def to_checkpoint(self, path: str | Path) -> None:
         """
@@ -1537,12 +1546,14 @@ class Trainer:
         # Load the simple objects first that don't require complex state dict handling.
         meta: dict[str, Any] = json.loads((path / "meta.json").read_text())
         glbl_step = meta["glbl_step"]
-        epoch_idx = meta.get("epoch_idx", -42)
+        epoch_idx = meta.get("epoch_idx", None)
         _next_eval_step = meta["_next_eval_step"]
         _next_chpt_step = meta["_next_chpt_step"]
         _next_logg_step = meta["_next_logg_step"]
         args: TrainerArgs = pickle.loads((path / "args.pickle").read_bytes())
         log = pickle.loads((path / "log.pickle").read_bytes())
+        if epoch_idx is None:
+            epoch_idx = log[-1]["epoch"]
         stopper = pickle.loads((path / "stopper.pickle").read_bytes())
         if (rng_cpu := torch.load(path / "rng-cpu.pt", map_location="cpu")) is not None:
             torch.random.set_rng_state(rng_cpu)
