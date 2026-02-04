@@ -3035,17 +3035,15 @@ class StructuralViTClassifier(StructuralClassifier):
         head: ClassifificationHead,
         *,
         batch_sizes: Optional[Sequence[int]] = None,
-        pad_to_batch_size: bool = False,
         do_ddp_keepalive: bool = True,
     ) -> None:
         """
         Args:
-            batch_sizes (Optional[tuple[int, ...]]): If provided, will execute the per-structure forward
-                with the largest possible batch size from this list. If not provided, will execute the
+            batch_sizes (Optional[Sequence[int, ...]]): If not provided, will execute the
                 per-structure forward with the batch size set to number of samples passed to the top-level
                 forward method or the number of instances of said structure --- whichever is smaller.
-            pad_to_batch_size: If True, the inputs in the per-structure forward call will be zero padded
-                along the batch dimension to the next-largest batch size specified in `batch_sizes`.
+                If provided, will zero-pad each structure's input to the next highest batch size
+                found in this list.
             do_ddp_keepalive: If True, will apply DDP keepalive trick to ensure all trunks participate
                 in the autograd graph even if they have no inputs for a given forward pass. Note that this
                 does entail computational overhead. If False, expect that many trunks will not have gradients;
@@ -3090,7 +3088,6 @@ class StructuralViTClassifier(StructuralClassifier):
         self._maybe_reset_expert_stats()
 
         self.batch_sizes = tuple(batch_sizes) if batch_sizes is not None else None
-        self.pad_to_batch_size = pad_to_batch_size
         self._validate_batching_attributes()
 
         self.do_ddp_keepalive = do_ddp_keepalive
@@ -3126,12 +3123,9 @@ class StructuralViTClassifier(StructuralClassifier):
                 if self.batch_sizes is None:
                     # Use all remaining samples as the batch size.
                     bs = min(B, remaining)
-                elif self.pad_to_batch_size:
+                else:
                     # Find the smallest batch size that is at least as large as the remaining samples.
                     bs = min((s for s in self.batch_sizes if s >= remaining), default=max(self.batch_sizes))
-                else:
-                    # Find the largest batch size that is at most as large as the remaining samples.
-                    bs = max((s for s in self.batch_sizes if s <= remaining), default=min(self.batch_sizes))
                 # Determine how much padding is needed to reach the internal batch size
                 # and how many samples from the internal input are going to be real.
                 real = min(bs, remaining)
@@ -3139,12 +3133,10 @@ class StructuralViTClassifier(StructuralClassifier):
                 # Slice the inputs for this internal batch and possibly pad them.
                 x_i_b = x[i][b:b + real]
                 g_i_b = g[i][b:b + real] if g[i] is not None else None  # type: ignore[index]
-                if self.pad_to_batch_size and pad > 0:
-                    x_i_b, g_i_b = self._pad_inputs(x_i_b, g_i_b, pad)
+                x_i_b, g_i_b = self._pad_inputs(x_i_b, g_i_b, pad)
                 # Run the inputs through the structure's trunk, remove the pad samples, and collect.
                 z = self._forward_trunk(i, x_i_b, g_i_b)
-                if self.pad_to_batch_size:
-                    z = z[:real]
+                z = z[:real]
                 zbs.append(z)
                 # Bookkeeping.
                 self._maybe_update_expert_stats(i)
@@ -3190,6 +3182,8 @@ class StructuralViTClassifier(StructuralClassifier):
 
     @staticmethod
     def _pad_inputs(x: Tensor, g: Optional[Tensor], pad: int) -> tuple[Tensor, Optional[Tensor]]:
+        if pad <= 0:
+            return x, g
         x = torch.nn.functional.pad(x, (0, 0, 0, pad), mode="constant", value=0)
         if g is not None:
             g = torch.nn.functional.pad(g, (0, 0, 0, pad), mode="constant", value=0.0)
@@ -3277,6 +3271,3 @@ class StructuralViTClassifier(StructuralClassifier):
             raise ValueError("All batch sizes in batch_sizes must be at least 1.")
         if len(set(self.batch_sizes)) != len(self.batch_sizes):
             raise ValueError("All batch sizes in batch_sizes must be unique.")
-        # This check is absolutely critical. If not met, the entire forward method is invalid.
-        if not self.pad_to_batch_size and 1 not in self.batch_sizes:
-            raise ValueError("If batch_sizes is provided, pad_to_batch_size must be True or 1 must be in batch_sizes.")
