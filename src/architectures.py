@@ -1686,8 +1686,8 @@ class ViT(nn.Module):
         max_len: Optional[int] = None,
         activation: str = "gelu",
         pooling: Literal["mean", "cls"] = "cls",  # NOTE: we use `avg` pooling elsewhere, so this might be confusing...
-        seq_lengths: Optional[tuple[int, ...]] = None,
-        batch_sizes: Optional[tuple[int, ...]] = None,
+        seq_lengths: Optional[Sequence[int]] = None,
+        batch_sizes: Optional[Sequence[int]] = None,
     ) -> None:
         super().__init__()
 
@@ -1725,7 +1725,7 @@ class ViT(nn.Module):
         self.pooling = pooling
 
         # Attributes to fix tensor shapes for compilation.
-        self.seq_lengths = seq_lengths
+        self.seq_lengths = tuple(seq_lengths) if seq_lengths is not None else None
         if seq_lengths is not None:
             if len(seq_lengths) == 0:
                 raise ValueError("If `seq_lengths` is provided, it must be a non-empty tuple of integers.")
@@ -1751,7 +1751,7 @@ class ViT(nn.Module):
                         f"The provided `seq_lengths` are: {seq_lengths}."
                     )
 
-        self.batch_sizes = batch_sizes
+        self.batch_sizes = tuple(batch_sizes) if batch_sizes is not None else None
         if batch_sizes is not None:
             if len(batch_sizes) == 0:
                 raise ValueError("If `batch_sizes` is provided, it must be a non-empty tuple of integers.")
@@ -3034,7 +3034,7 @@ class StructuralViTClassifier(StructuralClassifier):
         backbone: ViT,
         head: ClassifificationHead,
         *,
-        batch_sizes: Optional[tuple[int, ...]] = None,
+        batch_sizes: Optional[Sequence[int]] = None,
         pad_to_batch_size: bool = False,
         do_ddp_keepalive: bool = True,
     ) -> None:
@@ -3089,7 +3089,7 @@ class StructuralViTClassifier(StructuralClassifier):
         self.last_entropy: Optional[Tensor] = None   # (S,)   Most recent routing entropy.
         self._maybe_reset_expert_stats()
 
-        self.batch_sizes = batch_sizes
+        self.batch_sizes = tuple(batch_sizes) if batch_sizes is not None else None
         self.pad_to_batch_size = pad_to_batch_size
         self._validate_batching_attributes()
 
