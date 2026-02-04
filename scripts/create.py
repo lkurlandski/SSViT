@@ -156,6 +156,7 @@ class Configuration:
         ]
         for key, value in sorted(self.model_config.items()):
             key = key.replace("moe_", "")
+            key = key.replace("patcher_", "")
             parts.append(fixed_width_string(key, 2, "_") + fixed_width_string(value, 2, '_'))
         return "-".join(parts)
 
@@ -252,8 +253,6 @@ class Configuration:
                 return 32
 
         if self.arch == Architecture.VIT and self.parch == PatcherArchitecture.DWC:
-            if int(self.model_config.get("patcher_stride", sys.maxsize)) <= 64:
-                return 8
             return 16
 
         print(f"WARNING ({str(self)}): per_device_batch_size not found.")
@@ -396,7 +395,7 @@ class Configuration:
     @property
     def max_structures(self) -> Optional[int]:
         if self.design == Design.STRUCTURAL:
-            return 256
+            return 255  # [CLS] pooling inserts one additional token.
         return None
 
     @property
@@ -458,6 +457,30 @@ class Configuration:
         if BENCH:
             return 1
         return 0.05
+
+    @property
+    def enable_checkpoint(self) -> bool:
+        return False
+
+    @property
+    def enable_compile(self) -> bool:
+        return False
+
+    @property
+    def static_shapes_bin_patcher_seq_lengths(self) -> bool:
+        return False
+
+    @property
+    def static_shapes_bin_patcher_batch_sizes(self) -> bool:
+        return False
+
+    @property
+    def static_shapes_bin_backbone_seq_lengths(self) -> bool:
+        return False
+
+    @property
+    def static_shapes_bin_backbone_batch_sizes(self) -> bool:
+        return False
 
     def _num_samples(self, world_size: int) -> Optional[int]:
         minimum = 1024 * max(self.num_workers, 1) * world_size
@@ -628,6 +651,7 @@ class ScriptBuilder:
             f"--seed {self.config.seed}",
             f"--num_workers {self.config.num_workers}",
             f"--pin_memory {True if self.config.num_workers > 0 else False}",
+            f"--muddy_padded {True}",
             f"--gradient_accumulation_steps {self.config.get_gradient_accumulation_steps(self.reqs.world_size)}",
             f"--tr_batch_size {self.config.per_device_batch_size}",
             f"--vl_batch_size {self.config.per_device_batch_size}",
@@ -648,6 +672,13 @@ class ScriptBuilder:
             f"--ddp {self.reqs.gpus_per_node > 1}",
             f"--mp16 {self.config.mp16}",
             f"--tf32 {self.config.tf32}",
+            f"--enable_checkpoint {self.config.enable_checkpoint}",
+            f"--enable_compile {self.config.enable_compile}",
+            f"--static_shapes_bin_patcher_seq_lengths {self.config.static_shapes_bin_patcher_seq_lengths}",
+            f"--static_shapes_bin_patcher_batch_sizes {self.config.static_shapes_bin_patcher_batch_sizes}",
+            f"--static_shapes_bin_backbone_seq_lengths {self.config.static_shapes_bin_backbone_seq_lengths}",
+            f"--static_shapes_bin_backbone_batch_sizes {self.config.static_shapes_bin_backbone_batch_sizes}",
+            f"--param_grad_none {'error'}",  # FIXME: unused parameters.
             f"--max_epochs {self.config.max_epochs}",
             f"--eval_epochs {self.config.eval_epochs}",
             f"--chpt_epochs {self.config.chpt_epochs}",
@@ -771,12 +802,10 @@ def main() -> None:
             f.unlink()
 
     model_configs = [
-        {"patcher_pooling": "atn", "patcher_channels": 64,  "patcher_depth": 4, "patcher_kernel_size": 64,  "patcher_stride": 64},
-        {"patcher_pooling": "atn", "patcher_channels": 128, "patcher_depth": 6, "patcher_kernel_size": 64,  "patcher_stride": 64},
-        {"patcher_pooling": "atn", "patcher_channels": 64,  "patcher_depth": 4, "patcher_kernel_size": 128, "patcher_stride": 128},
-        {"patcher_pooling": "atn", "patcher_channels": 128, "patcher_depth": 6, "patcher_kernel_size": 128, "patcher_stride": 128},
-        {"patcher_pooling": "atn", "patcher_channels": 64,  "patcher_depth": 4, "patcher_kernel_size": 256, "patcher_stride": 256},
-        {"patcher_pooling": "atn", "patcher_channels": 128, "patcher_depth": 6, "patcher_kernel_size": 256, "patcher_stride": 256},
+        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 64,  "patcher_stride": 64},
+        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 128,  "patcher_stride": 128},
+        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 256,  "patcher_stride": 256},
+        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 512,  "patcher_stride": 512},
     ]
 
     stream = product(
@@ -795,6 +824,35 @@ def main() -> None:
     configurations = (Configuration(*config) for config in stream)  # type: ignore[arg-type]
     configurations = (config for config in configurations if config_fiter(config))
     configurations = sorted(configurations)
+
+    configurations.extend([
+        Configuration(
+            design=Design.STRUCTURAL,
+            arch=Architecture.VIT,
+            parch=PatcherArchitecture.BAS,
+            posenc=PositionalEncodingArchitecture.FIXED,
+            patchposenc=PatchPositionalEncodingArchitecture.NONE,
+            level=HierarchicalLevel.FINE,
+            do_entropy=False,
+            which_characteristics=tuple(),
+            max_length=2**20,
+            seed=0,
+            model_config={"patcher_pooling": "avg", "embedding_dim": 8, "patcher_channels": 256, "patcher_kernel_size": 256, "patcher_stride": 64},
+        ),
+        Configuration(
+            design=Design.STRUCTURAL,
+            arch=Architecture.VIT,
+            parch=PatcherArchitecture.BAS,
+            posenc=PositionalEncodingArchitecture.FIXED,
+            patchposenc=PatchPositionalEncodingArchitecture.NONE,
+            level=HierarchicalLevel.FINE,
+            do_entropy=False,
+            which_characteristics=tuple(),
+            max_length=2**20,
+            seed=0,
+            model_config={"patcher_pooling": "avg", "embedding_dim": 8, "patcher_channels": 64, "patcher_kernel_size": 64, "patcher_stride": 64},
+        )
+    ])
 
     alloutdirs: set[str] = set()
     allconfigs: set[str] = set()
