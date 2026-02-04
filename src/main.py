@@ -10,6 +10,8 @@ from inspect import signature
 import math
 import os
 from pathlib import Path
+from pprint import pformat
+from pprint import pprint
 import sys
 import time
 from typing import cast
@@ -155,11 +157,6 @@ if MAIN_RUN_PROFILE:
     warnings.warn("MAIN_RUN_PROFILE is enabled. Certain command line arguments will be overridden.")
 
 
-COMPILE_MODE_PATCHER:     Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"] = "default"
-COMPILE_MODE_TRANSFORMER: Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"] = "default"
-print(f"[INFO] Using compile modes: {COMPILE_MODE_PATCHER=}, {COMPILE_MODE_TRANSFORMER=}")
-
-
 def get_model(
     design: Design,
     arch: Architecture,
@@ -201,6 +198,9 @@ def get_model(
     moe_router_temperature: float = 1.0,
     moe_router_noise_std: float = 0.0,
     moe_router_top_k: int = 1,
+    patcher_batch_sizes: Optional[Sequence[int]] = None,
+    backbone_seq_lengths: Optional[Sequence[int]] = None,
+    backbone_batch_sizes: Optional[Sequence[int]] = None,
 ) -> Classifier | HierarchicalClassifier | StructuralClassifier:
     """
     Get a pre-configured classification model for the given settings.
@@ -227,6 +227,7 @@ def get_model(
         do_ddp_keepalive: Whether to enable DDP keepalive (to avoid timeout issues on long iterations).
 
     TODO: do_ddp_keepalive only applies to StructuralViTClassifier right now. Consider generalizing to other models.
+    TODO: do_ddp_keepalive is compute intensive and stupid and should be removed at some point in the future.
 
     Returns:
         The model.
@@ -341,7 +342,7 @@ def get_model(
                     fullgraph=True,
                     dynamic=False,
                     backend="inductor",
-                    mode=COMPILE_MODE_PATCHER,
+                    mode="default",
                 )
             return model
         raise NotImplementedError(f"{parch}")
@@ -388,19 +389,6 @@ def get_model(
             if enable_compile:
                 raise ValueError("max_len must be specified when enable_compile is True.")
 
-        # If we're compiling, we need to limit the number of unique tensor shapes seen by the model.
-        # We'll just let inductor compile a kernel for the maximum batch size, which should cover every batch except the tail.
-        # The ViT will then zero-pad those tail batches.
-        if enable_compile:
-            assert batch_size is not None
-            assert max_len is not None
-            batch_sizes = (batch_size,)
-            seq_lengths = (max_len, max_len // 2, max_len // 4)
-            seq_lengths = tuple(sorted(set(filter(lambda x: x > 0, seq_lengths))))
-        else:
-            batch_sizes = None
-            seq_lengths = None
-
         model = ViT(
             embedding_dim=patcher_channels,
             d_model=vit_d_model,
@@ -411,8 +399,8 @@ def get_model(
             max_len=max_len,
             activation="gelu",
             pooling=pooling,
-            seq_lengths=seq_lengths,
-            batch_sizes=batch_sizes,
+            seq_lengths=backbone_seq_lengths,
+            batch_sizes=backbone_batch_sizes,
         )
 
         if enable_compile:
@@ -421,15 +409,8 @@ def get_model(
                 fullgraph=True,
                 dynamic=False,
                 backend="inductor",
-                mode=COMPILE_MODE_TRANSFORMER,
+                mode="default",
             )
-
-        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {pooling=}")
-        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {posencname=}")
-        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {max_len=}")
-        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {batch_sizes=}")
-        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {seq_lengths=}")
-        print(f"[rank {rank()}] [INFO] [get_model::build_transformer] {enable_compile=}")
 
         return model
 
@@ -532,21 +513,6 @@ def get_model(
             patchposencoders = _build_modules(build_patchposencoder, num_structures, share_patchers)
             transformer = build_transformer()
             head = build_head()
-            # If we're compiling, we need to limit the number of unique tensor shapes seen by the model.
-            # CollateFnStructural adds a one-structure pad batch for missing structures, so we let inductor compile a kernel for this shape.
-            if enable_compile:
-                assert batch_size is not None
-                batch_sizes = (batch_size, batch_size // 2, 1)
-                batch_sizes = tuple(sorted(set(filter(lambda x: x > 0, batch_sizes))))
-                pad_to_batch_size = True
-            else:
-                batch_sizes = None
-                pad_to_batch_size = False
-
-            print(f"[rank {rank()}] [INFO] [get_model::construct_structural_model] {batch_sizes=}")
-            print(f"[rank {rank()}] [INFO] [get_model::construct_structural_model] {pad_to_batch_size=}")
-            print(f"[rank {rank()}] [INFO] [get_model::construct_structural_model] {enable_compile=}")
-
             return StructuralViTClassifier(
                 embeddings,
                 filmers,
@@ -555,8 +521,7 @@ def get_model(
                 patchposencoders,
                 transformer,
                 head,
-                batch_sizes=batch_sizes,
-                pad_to_batch_size=pad_to_batch_size,
+                batch_sizes=patcher_batch_sizes,
                 do_ddp_keepalive=do_ddp_keepalive,
             )
 
@@ -992,13 +957,6 @@ def main() -> None:
     if args.tf32:
         torch.set_float32_matmul_precision("medium")
 
-    # Cache = length_bins x structure-batch_sizes + seq_lengths x batch_sizes
-    #       = 6           x 3                     + 3           x 1
-    #       = 18 + 3
-    #       = 21
-    # Multiple by two: once for with-grad and once for without-grad.
-    torch._dynamo.config.cache_size_limit = 21 * 2
-
     if rank() > 0:
         args.disable_tqdm = True
 
@@ -1011,8 +969,85 @@ def main() -> None:
     num_guides = len(args.which_characteristics) + (1 if args.do_entropy else 0)
     if STRUCTURES_AS_GUIDES:
         num_guides = len(structures)
-    print(f"{structures=}")
+    print(f"structures={pformat(structures)}")
     print(f"{num_guides=}")
+
+    ################################################################################
+    # Static Shape Logic (BEG).
+    ################################################################################
+
+    patcher_seq_lengths = None   # Lengths that inputs (bytes) may take
+    patcher_batch_sizes = None   # Batch sizes that inputs (bytes) may take
+    backbone_seq_lengths = None  # Lengths that backbone (transformer) may take
+    backbone_batch_sizes = None  # Batch sizes that backbone (transformer) may take
+
+    # patcher_seq_lengths
+    if args.enable_compile or args.static_shapes_bin_patcher_seq_lengths:
+        if args.design == Design.FLAT:
+            if args.max_length is None:
+                raise RuntimeError(f"When using static shapes with the {args.design} design, max_length must be specified.")
+            longest = args.max_length
+        else:
+            if args.max_length_per_structure is None:
+                raise RuntimeError(f"When using static shapes with the {args.design} design, max_length must be specified.")
+            longest = args.max_length_per_structure
+        patcher_seq_lengths = [1024, 4096, 16384, 65536, 262144, 1048576, 4194304, longest]
+        patcher_seq_lengths = sorted(set(filter(lambda x: x <= longest, patcher_seq_lengths)))
+    # patcher_batch_sizes
+    if args.enable_compile or args.static_shapes_bin_patcher_batch_sizes:
+        patcher_batch_sizes = [args.tr_batch_size, args.tr_batch_size // 2, args.ts_batch_size, args.ts_batch_size // 2, 1]
+        patcher_batch_sizes = sorted(set(filter(lambda x: x > 0, patcher_batch_sizes)))
+    # backbone_seq_lengths
+    if args.enable_compile or args.static_shapes_bin_backbone_seq_lengths:
+        if args.design == Design.STRUCTURAL:
+            if args.max_structures is None:
+                raise RuntimeError(f"When using static shapes with the {args.design} design, max_structures must be specified.")
+            max_len = args.max_structures
+        else:
+            max_len = args.model_config.get("num_patches") or signature(get_model).parameters["num_patches"].default
+        backbone_seq_lengths = [max_len, max_len // 2, max_len // 4]
+        backbone_seq_lengths = sorted(set(filter(lambda x: x > 0, backbone_seq_lengths)))
+    # backbone_batch_sizes
+    if args.enable_compile or args.static_shapes_bin_backbone_batch_sizes:
+        backbone_batch_sizes = [args.tr_batch_size, args.ts_batch_size]
+        backbone_batch_sizes = sorted(set(filter(lambda x: x > 0, backbone_batch_sizes)))
+
+    # Allow overwriting from CLI.
+    patcher_seq_lengths = args.model_config.get("patcher_seq_lengths", patcher_seq_lengths)
+    patcher_batch_sizes = args.model_config.get("patcher_batch_sizes", patcher_batch_sizes)
+    backbone_seq_lengths = args.model_config.get("backbone_seq_lengths", backbone_seq_lengths)
+    backbone_batch_sizes = args.model_config.get("backbone_batch_sizes", backbone_batch_sizes)
+
+    print(f"{patcher_seq_lengths=}")
+    print(f"{patcher_batch_sizes=}")
+    print(f"{backbone_seq_lengths=}")
+    print(f"{backbone_batch_sizes=}")
+
+    if patcher_seq_lengths is not None and len(patcher_seq_lengths) == 0:
+        raise RuntimeError("No valid patcher sequence lengths could be determined.")
+    if patcher_batch_sizes is not None and len(patcher_batch_sizes) == 0:
+        raise RuntimeError("No valid patcher batch sizes could be determined.")
+    if backbone_seq_lengths is not None and len(backbone_seq_lengths) == 0:
+        raise RuntimeError("No valid backbone sequence lengths could be determined.")
+    if backbone_batch_sizes is not None and len(backbone_batch_sizes) == 0:
+        raise RuntimeError("No valid backbone batch sizes could be determined.")
+
+    # Need one compiled kernel per unique shape times two (with/without grad).
+    if args.enable_compile:
+        assert patcher_seq_lengths is not None
+        assert patcher_batch_sizes is not None
+        assert backbone_seq_lengths is not None
+        assert backbone_batch_sizes is not None
+        cache_size_for_patchers = len(patcher_seq_lengths)  * len(patcher_batch_sizes)
+        cache_size_for_backbone = len(backbone_seq_lengths) * len(backbone_batch_sizes)
+        torch._dynamo.config.cache_size_limit = 2 * (cache_size_for_patchers + cache_size_for_backbone)
+        print(f"{cache_size_for_patchers=}")
+        print(f"{cache_size_for_backbone=}")
+        print(f"{torch._dynamo.config.cache_size_limit=}")
+
+    ################################################################################
+    # Static Shape Logic (END).
+    ################################################################################
 
     model = get_model(
         args.design,
@@ -1029,25 +1064,23 @@ def main() -> None:
         args.tr_batch_size,
         args.enable_checkpoint,
         args.enable_compile,
-        do_ddp_keepalive=False,  # TODO: address unused parameters.
+        do_ddp_keepalive=False,
+        patcher_batch_sizes=patcher_batch_sizes,
+        backbone_seq_lengths=backbone_seq_lengths,
+        backbone_batch_sizes=backbone_batch_sizes,
         **dict(args.model_config),
     ).to("cpu")
     num_parameters = count_parameters(model, requires_grad=False)
-    min_length = math.ceil(get_model_input_lengths(model)[0] / 8) * 8
+    min_length = roundup(get_model_input_lengths(model)[0], PAD_TO_MULTIPLE_OF)
     min_lengths = [roundup(l, PAD_TO_MULTIPLE_OF) for l in getattr(model, "min_lengths", [min_length])]
-    length_bins = [max(min_lengths), 4096, 16384, 65536, 262144, 1048576]
     print(f"{model=}")
     print(f"{num_parameters=}")
     print(f"{min_length=}")
     print(f"{min_lengths=}")
-    print(f"{length_bins=}")
-
-    if args.enable_compile and length_bins is None:
-        raise ValueError("When enable_compile is True, length_bins must be specified.")
 
     wrap_model: Callable[[M], M | DistributedDataParallel]
     if args.ddp:
-        wrap_model = partial(wrap_model_ddp, device=args.device, static_graph=False, find_unused_parameters=False)  # TODO: address unused parameters.
+        wrap_model = partial(wrap_model_ddp, device=args.device, static_graph=False, find_unused_parameters=False)
     elif args.fsdp:
         wrap_model = partial(wrap_model_fsdp, mpdtype=mpdtype, fsdp_offload=args.fsdp_offload)
     else:
@@ -1100,11 +1133,11 @@ def main() -> None:
     print(f"tr_shards=[0, ..., {tr_last_shard}]")
     print(f"ts_shards=[0, ..., {ts_last_shard}]")
 
-    tr_stats_df = get_shardwise_stats(tr_datadb, tr_last_shard)
-    ts_stats_df = get_shardwise_stats(ts_datadb, ts_last_shard)
-    with pd.option_context("display.max_rows", 4, "display.max_columns", None):
-        print(f"tr_stats_df=\n{tr_stats_df}")
-        print(f"ts_stats_df=\n{ts_stats_df}")
+    # tr_stats_df = get_shardwise_stats(tr_datadb, tr_last_shard)
+    # ts_stats_df = get_shardwise_stats(ts_datadb, ts_last_shard)
+    # with pd.option_context("display.max_rows", 4, "display.max_columns", None):
+    #     print(f"tr_stats_df=\n{tr_stats_df}")
+    #     print(f"ts_stats_df=\n{ts_stats_df}")
 
     # Split the shards between distributed workers.
     if world_size() > 1:
@@ -1125,7 +1158,7 @@ def main() -> None:
     print(f"{len(tr_dataset)=}")
     print(f"{len(ts_dataset)=}")
 
-    collate_fn = get_collate_fn(args.design, min_lengths, length_bins, structures, args.muddy_padded)
+    collate_fn = get_collate_fn(args.design, min_lengths, patcher_seq_lengths, structures, args.muddy_padded)
     print(f"{collate_fn=}")
 
     tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, min(args.num_workers, len(tr_shards)), collate_fn, args.pin_memory, False, args.prefetch_factor)
@@ -1223,10 +1256,22 @@ def main() -> None:
         )
         if rank() == 0:
             print("Retrieved a trainer from checkpoint. Current log: ")
+            keys = {"epoch", "step", "tr_loss", "vl_loss", "vl_roc", "vl_prc"}
             for d in trainer.log:
-                print(d)
-        if trainer.args.outdir != args.outdir:
-            trainer.args.outdir = Path(args.outdir)
+                print({k: v for k, v in Trainer.round_and_filter_results_dict(d).items() if k in keys})
+        # Updates to the saved training args should be applied with care.
+        attrs = [
+            "outdir",
+            "gradient_accumulation_steps",
+            "eval_epochs", "eval_steps",
+            "chpt_epochs", "chpt_steps",
+            "logg_epochs", "logg_steps",
+        ]
+        for attr in attrs:
+            if getattr(trainer.args, attr) != getattr(args, attr):
+                print(f"[NOTE] Loaded trainer mismatch (`{attr}`). Updating ({getattr(trainer.args, attr)} --> {getattr(args, attr)}).")
+                setattr(trainer.args, attr, getattr(args, attr))
+
     else:
         wmodel = wrap_model(model)
         params = decay_aware_param_groups(wmodel, args.weight_decay)
