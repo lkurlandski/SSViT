@@ -817,6 +817,8 @@ class Trainer:
                     results["param_delta"] += (flat_params_aft - flat_params_bef).norm().detach()
                     flat_params_bef = flat_params_aft
                 else:
+                    # Otherwise, just zero the gradients to free up some memory.
+                    self.optimizer.zero_grad()
                     # Do this dumb shit to ensure we don't get a KeyError in other places.
                     results["grad_steps"] += 0
                     results["grad_norm"] += 0.0
@@ -837,7 +839,7 @@ class Trainer:
                 should_prepare_report = any((do_eval, do_chpt, do_logg))
                 # Free up memory before validation to keep GPU memory usage lower
                 if do_eval:
-                    del batch, outputs, loss
+                    del batch, outputs, loss, losses
                     gc.collect()
                 # Close the progress bar if we're going to stop training right after this
                 if do_eval and isinstance(iterable, tqdm) and (mini_step + 1 == len(iterable) or not anyone_had_real_window):
