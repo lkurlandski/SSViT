@@ -807,6 +807,7 @@ class Trainer:
                     print(f"{'-' * 80}")
                     if self.args.param_grad_none != "warn":
                         raise RuntimeError("Some of the parameters have no gradients.")
+                    self.args.param_grad_none = "ignore"  # Only print this information once.
 
             # Update model weights and possibly run hooks (validation, checkpointing, etc.)
             if sync_gradients:
