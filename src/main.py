@@ -1084,7 +1084,7 @@ def main() -> None:
 
     wrap_model: Callable[[M], M | DistributedDataParallel]
     if args.ddp:
-        wrap_model = partial(wrap_model_ddp, device=args.device, static_graph=False, find_unused_parameters=False)
+        wrap_model = partial(wrap_model_ddp, device=args.device, static_graph=False, find_unused_parameters=args.find_unused_parameters)
     elif args.fsdp:
         wrap_model = partial(wrap_model_fsdp, mpdtype=mpdtype, fsdp_offload=args.fsdp_offload)
     else:

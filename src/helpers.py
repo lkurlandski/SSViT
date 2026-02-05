@@ -136,6 +136,7 @@ class MainArgs:
     static_shapes_bin_patcher_batch_sizes: bool = False
     static_shapes_bin_backbone_batch_sizes: bool = False
     static_shapes_bin_backbone_seq_lengths: bool = False
+    find_unused_parameters: bool = False
     resume: bool = False
 
     def __post_init__(self) -> None:
