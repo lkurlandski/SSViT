@@ -855,7 +855,7 @@ def get_shardwise_stats(datadb: SimpleDB, last_shard: int) -> pd.DataFrame:
     return pd.concat(dfs, ignore_index=True)
 
 
-def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 128) -> None:
+def main_run_profile(trainer: Trainer, tr_batch_size, num_samples: int = 512) -> None:
     if world_size() != 1:
         raise RuntimeError("Profiling only implemented for single worker.")
 
@@ -873,13 +873,17 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 12
     with_groups = int(os.environ.get("WITH_GROUPS", "0"))
     print(f"Profiling with {with_groups} grouped averages.")
 
-    skip_first = 0
-    wait = 0
-    warmup = 16
-    active = 16
-    repeat = 1
-    sched = schedule(skip_first=skip_first, wait=wait, warmup=warmup, active=active, repeat=repeat)
-    total_mini_steps = skip_first + (wait + warmup + active) * repeat
+    warmup = num_samples // tr_batch_size
+    active = num_samples // tr_batch_size
+    sched = schedule(wait=0, warmup=warmup, active=active, repeat=1)
+    total_mini_steps = warmup + active
+
+    print(f"Profiling for {total_mini_steps} mini-steps.")
+    print(f"  {warmup=}")
+    print(f"  {active=}")
+    print(f"  {trainer.args.gradient_accumulation_steps}")
+    print(f"  {tr_batch_size=}")
+    print(f"  {num_samples=}")
 
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 
