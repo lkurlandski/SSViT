@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import sys
 from typing import Any
+from typing import Literal
 from typing import Optional
 from typing import Iterable
 import warnings
@@ -210,6 +211,7 @@ class Configuration:
             f"label_smoothing--{self.label_smoothing}",
             f"max_epochs--{self.max_epochs}",
             f"seed--{self.seed}",
+            f"update_embedding_steps--{self.update_embedding_steps}",
         ]
         return root.joinpath(*parts)
 
@@ -482,6 +484,22 @@ class Configuration:
     def static_shapes_bin_backbone_batch_sizes(self) -> bool:
         return False
 
+    @property
+    def update_embedding_steps(self) -> int:
+        return 16
+
+    @property
+    def find_unused_parameters(self) -> bool:
+        if self.update_embedding_steps > 1:
+            return True
+        return False
+
+    @property
+    def param_grad_none(self) -> Literal["raise", "warn", "ignore"]:
+        if self.find_unused_parameters:
+            return "ignore"
+        return "warn"
+
     def _num_samples(self, world_size: int) -> Optional[int]:
         minimum = 1024 * max(self.num_workers, 1) * world_size
         if DEBUG:
@@ -678,7 +696,9 @@ class ScriptBuilder:
             f"--static_shapes_bin_patcher_batch_sizes {self.config.static_shapes_bin_patcher_batch_sizes}",
             f"--static_shapes_bin_backbone_seq_lengths {self.config.static_shapes_bin_backbone_seq_lengths}",
             f"--static_shapes_bin_backbone_batch_sizes {self.config.static_shapes_bin_backbone_batch_sizes}",
-            f"--param_grad_none {'error'}",  # FIXME: unused parameters.
+            f"--update_embedding_steps {self.config.update_embedding_steps}",
+            f"--param_grad_none {self.config.param_grad_none}",
+            f"--find_unused_parameters {self.config.find_unused_parameters}",
             f"--max_epochs {self.config.max_epochs}",
             f"--eval_epochs {self.config.eval_epochs}",
             f"--chpt_epochs {self.config.chpt_epochs}",
@@ -851,7 +871,20 @@ def main() -> None:
             max_length=2**20,
             seed=0,
             model_config={"patcher_pooling": "avg", "embedding_dim": 8, "patcher_channels": 64, "patcher_kernel_size": 64, "patcher_stride": 64},
-        )
+        ),
+        Configuration(
+            design=Design.STRUCTURAL,
+            arch=Architecture.VIT,
+            parch=PatcherArchitecture.MEM,
+            posenc=PositionalEncodingArchitecture.FIXED,
+            patchposenc=PatchPositionalEncodingArchitecture.NONE,
+            level=HierarchicalLevel.FINE,
+            do_entropy=False,
+            which_characteristics=tuple(),
+            max_length=2**20,
+            seed=0,
+            model_config={"patcher_pooling": "max", "embedding_dim": 8, "patcher_channels": 64, "patcher_kernel_size": 64, "patcher_stride": 64},
+        ),
     ])
 
     alloutdirs: set[str] = set()
