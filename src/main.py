@@ -855,7 +855,7 @@ def get_shardwise_stats(datadb: SimpleDB, last_shard: int) -> pd.DataFrame:
     return pd.concat(dfs, ignore_index=True)
 
 
-def main_run_profile(trainer: Trainer, tr_batch_size, num_samples: int = 512) -> None:
+def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 512) -> None:
     if world_size() != 1:
         raise RuntimeError("Profiling only implemented for single worker.")
 
@@ -881,7 +881,7 @@ def main_run_profile(trainer: Trainer, tr_batch_size, num_samples: int = 512) ->
     print(f"Profiling for {total_mini_steps} mini-steps.")
     print(f"  {warmup=}")
     print(f"  {active=}")
-    print(f"  {trainer.args.gradient_accumulation_steps}")
+    print(f"  {trainer.args.gradient_accumulation_steps=}")
     print(f"  {tr_batch_size=}")
     print(f"  {num_samples=}")
 
