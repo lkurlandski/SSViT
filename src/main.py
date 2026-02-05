@@ -1271,6 +1271,9 @@ def main() -> None:
             if getattr(trainer.args, attr) != getattr(args, attr):
                 print(f"[NOTE] Loaded trainer mismatch (`{attr}`). Updating ({getattr(trainer.args, attr)} --> {getattr(args, attr)}).")
                 setattr(trainer.args, attr, getattr(args, attr))
+        # Patch the padbatch to account for changes to the data module.
+        # TODO: we should probably try to improve this aspect of the system. Its a little unreliable.
+        trainer.padbatch = padbatch
 
     else:
         wmodel = wrap_model(model)
