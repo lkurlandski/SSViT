@@ -304,6 +304,7 @@ class TrainerArgs:
     assert_auxillary_loss: bool = False
     auxillary_loss_weight: float = 0.0
     param_grad_none: str = "error"
+    update_embedding_steps: int = 1
 
     def __post_init__(self) -> None:
         if (self.max_epochs is not None) and (self.max_steps is not None):
@@ -743,6 +744,7 @@ class Trainer:
         mini_step = -1           # mini-step within this epoch
         real: bool               # whether the current mini-batch has real data
         batch: Batch             # current mini-batch
+        embeddings_require_grad: Optional[bool] = None
 
         iterator = iter(iterable)
         timer.start()
@@ -760,6 +762,14 @@ class Trainer:
                 batch = batch.to(self.device, non_blocking=True)
             with record_function("stage::finalize"):
                 batch = batch.finalize(self.mp_dtype, torch.int32, torch.int64)
+
+            # TODO: remove the hasattr check after deprecating older TrainerArgs versions
+            # NOTE: if using ddp, `find_unused_parameters` must be True for this to work properly
+            if hasattr(self.args, "update_embedding_steps") and self.args.update_embedding_steps > 1:
+                embeddings_require_grad = ((mini_step // self.args.gradient_accumulation_steps) % self.args.update_embedding_steps) == 0
+                for module in self.model.modules():
+                    if isinstance(module, (nn.Embedding, nn.EmbeddingBag)):
+                        module.weight.requires_grad_(embeddings_require_grad)
 
             # Determine if this is a real or padded batch of data.
             had_real_window |= bool(real)
