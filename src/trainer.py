@@ -659,10 +659,27 @@ class Trainer:
         # Determine the first mini-batch to train upon.
         start_mini_step = 0
         if self.glbl_step > 0:
+            self.print(f"[INFO] [rank {rank()}] [Trainer::__call__] [Compute Resume Steps] {self.glbl_step=}")
+            self.print(f"[INFO] [rank {rank()}] [Trainer::__call__] [Compute Resume Steps] {self.epoch_idx=}")
+            self.print(f"[INFO] [rank {rank()}] [Trainer::__call__] [Compute Resume Steps] {self.steps_per_epoch=}")
+            self.print(f"[INFO] [rank {rank()}] [Trainer::__call__] [Compute Resume Steps] {self.args.gradient_accumulation_steps=}")
+            self.print(f"[INFO] [rank {rank()}] [Trainer::__call__] [Compute Resume Steps] {self.epoch_idx=}")
+            # If the computed steps_into_epoch is larger than the actual steps_per_epoch, then we know that
+            # the checkpoint was created at the end of an epoch but before epoch_idx was incremented, so we
+            # increment epoch_idx here and set steps_into_epoch to 0 to correctly resume at the beginning of the next epoch.
             steps_into_epoch = self.glbl_step - (self.epoch_idx * self.steps_per_epoch)
-            mini_steps_into_epoch = steps_into_epoch * self.args.gradient_accumulation_steps
-            start_mini_step = 1 + mini_steps_into_epoch
-            self.print(f"[INFO] [rank {rank()}] [Trainer::train] {steps_into_epoch=} {mini_steps_into_epoch=} {start_mini_step=}")
+            if steps_into_epoch >= self.steps_per_epoch:
+                mini_steps_into_epoch = 0
+                start_mini_step = 0
+                self.epoch_idx += 1
+            else:
+                mini_steps_into_epoch = steps_into_epoch * self.args.gradient_accumulation_steps
+                start_mini_step = 1 + mini_steps_into_epoch
+            # The logic is a bit complicated, so I'm just going to print out the computed values for debugging.
+            self.print(f"[INFO] [rank {rank()}] [Trainer::__call__] [Compute Resume Steps] {steps_into_epoch=}")
+            self.print(f"[INFO] [rank {rank()}] [Trainer::__call__] [Compute Resume Steps] {mini_steps_into_epoch=}")
+            self.print(f"[INFO] [rank {rank()}] [Trainer::__call__] [Compute Resume Steps] {start_mini_step=}")
+            self.print(f"[INFO] [rank {rank()}] [Trainer::__call__] [Compute Resume Steps] {self.epoch_idx=}")
             if steps_into_epoch < 0 or mini_steps_into_epoch < 0 or start_mini_step < 0:
                 raise RuntimeError("Calculated negative values(s) when trying to resume mid-epoch training.")
 
