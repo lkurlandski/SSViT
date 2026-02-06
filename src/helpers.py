@@ -138,6 +138,8 @@ class MainArgs:
     static_shapes_bin_backbone_seq_lengths: bool = False
     find_unused_parameters: bool = False
     resume: bool = False
+    resume_checkpoint: Optional[str] = None
+    embedding_freeze: bool = False
 
     def __post_init__(self) -> None:
         if self.tr_batch_size == 1 or self.vl_batch_size == 1 or self.ts_batch_size == 1:

@@ -1084,6 +1084,8 @@ def main() -> None:
 
     wrap_model: Callable[[M], M | DistributedDataParallel]
     if args.ddp:
+        if (args.embedding_freeze or args.update_embedding_steps != 1) and not args.find_unused_parameters:
+            warnings.warn("Freezing embedding layers or periodically updating it with DDP probably requires find_unused_parameters=True.")
         wrap_model = partial(wrap_model_ddp, device=args.device, static_graph=False, find_unused_parameters=args.find_unused_parameters)
     elif args.fsdp:
         wrap_model = partial(wrap_model_fsdp, mpdtype=mpdtype, fsdp_offload=args.fsdp_offload)
@@ -1239,7 +1241,10 @@ def main() -> None:
     print(f"{stopper=}")
 
     checkpoint = None
-    if args.resume and args.outdir.exists():
+    if args.resume_checkpoint is not None:
+        checkpoint = Path(args.resume_checkpoint)
+        print(f"Resuming from checkpoint: {checkpoint}")
+    elif args.resume and args.outdir.exists():
         checkpoints = num_sort_files(args.outdir.glob("checkpoint-*"), lstrip="checkpoint-", rstrip="")
         if len(checkpoints) > 0:
             checkpoint = checkpoints[-1]
@@ -1260,12 +1265,14 @@ def main() -> None:
         )
         if rank() == 0:
             print("Retrieved a trainer from checkpoint. Current log: ")
-            keys = {"epoch", "step", "tr_loss", "vl_loss", "vl_roc", "vl_prc"}
+            keys = {"epoch", "glbl_step", "tr_loss", "vl_loss", "vl_roc", "vl_prc"}
             for d in trainer.log:
                 print({k: v for k, v in Trainer.round_and_filter_results_dict(d).items() if k in keys})
         # Updates to the saved training args should be applied with care.
+        # TODO: this is pretty annoying, it might be better to make a blocklist rather than an allowlist.
         attrs = [
             "outdir",
+            "param_grad_none",
             "gradient_accumulation_steps",
             "eval_epochs", "eval_steps",
             "chpt_epochs", "chpt_steps",
@@ -1298,6 +1305,18 @@ def main() -> None:
         )
     print(f"{trainer=}")
     print("", end="", flush=True)
+
+    # Freeze/unfreeze the embeddings if current specifications mismatch
+    # It would be better to do this when we create the nn.Embedding layer,
+    # but can create mismatches if we try to resume training with a different
+    # embedding specification, particularly when loading the optimizer state dict.
+    # Therefore, its safer to just adjust the requires_grad here, and make sure we
+    # specifiy find_unused_parameters=True when using DDP.
+    for name, module in trainer.model.named_modules():
+        if isinstance(module, (nn.Embedding, nn.EmbeddingBag)):
+            if module.weight.requires_grad == args.embedding_freeze:
+                print(f"Adjusting {module.__class__.__name__} `{name}` `requires_grad` ({module.weight.requires_grad} --> {not module.weight.requires_grad}).")
+                module.weight.requires_grad_(not module.weight.requires_grad)
 
     if MAIN_RUN_PROFILE:
         main_run_profile(trainer, args.tr_batch_size)
