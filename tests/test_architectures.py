@@ -16,6 +16,7 @@ from torch import Tensor
 from src.architectures import Identity
 from src.architectures import ClassifificationHead
 from src.architectures import FiLM
+from src.architectures import FiLMBool
 from src.architectures import SinusoidalPositionalEncoding
 from src.architectures import PatchEncoderBase
 from src.architectures import PatchEncoder
@@ -366,11 +367,17 @@ class TestMalConvClassifier:
     @pytest.mark.parametrize("batch_size", [1, 2, 3, 5])
     @pytest.mark.parametrize("seq_length", [1, 2, 3, 11, 17, 53])
     @pytest.mark.parametrize("guide_dim", [0, 3])
-    def test_forward(self, cls: type[MalConv | MalConvLowMem | MalConvGCG], batch_size: int, seq_length: int, guide_dim: int, vocab_size: int = 11, channels: int = 7, num_classes: int = 2) -> None:
+    @pytest.mark.parametrize("bool_guides", [False, True])
+    def test_forward(self, cls: type[MalConv | MalConvLowMem | MalConvGCG], batch_size: int, seq_length: int, guide_dim: int, bool_guides: bool, vocab_size: int = 11, channels: int = 7, num_classes: int = 2) -> None:
+        if guide_dim == 0 and bool_guides:
+            return  # Already tested.
+
         embedding = torch.nn.Embedding(vocab_size, 8)
-        filmer: FiLM | Identity
+        filmer: FiLM | FiLMBool | Identity
         if guide_dim == 0:
             filmer = Identity(guide_dim, embedding_dim=8, hidden_size=3)
+        elif bool_guides:
+            filmer = FiLMBool(guide_dim, embedding_dim=8, hidden_size=3)
         else:
             filmer = FiLM(guide_dim, embedding_dim=8, hidden_size=3)
         backbone = cls(embedding_dim=8, channels=channels, kernel_size=3, stride=3)
@@ -380,6 +387,8 @@ class TestMalConvClassifier:
         x = torch.randint(0, vocab_size, (batch_size, seq_length))
         if guide_dim == 0:
             g = None
+        elif bool_guides:
+            g = torch.randint(0, 2, (batch_size, seq_length, guide_dim)).bool()
         else:
             g = torch.rand((batch_size, seq_length, guide_dim))
 
