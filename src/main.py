@@ -65,7 +65,6 @@ from src.architectures import get_model_input_lengths
 from src.architectures import Identity
 from src.architectures import ClassifificationHead
 from src.architectures import FiLM
-from src.architectures import FiLMNoP
 from src.architectures import MalConvBase
 from src.architectures import MalConv
 from src.architectures import MalConvLowMem
@@ -279,10 +278,10 @@ def get_model(
     def build_embedding() -> Embedding:
         return Embedding(num_embeddings=384, embedding_dim=embedding_dim, padding_idx=0)
 
-    # (FiLM | FiLMNop) Build the filmer
-    def build_filmer() -> FiLM | FiLMNoP:
+    # (FiLM | Identity) Build the filmer
+    def build_filmer() -> FiLM | Identity:
         if num_guides == 0:
-            return FiLMNoP(num_guides, embedding_dim, film_hidden_size)
+            return Identity()
         return FiLM(num_guides, embedding_dim, film_hidden_size)
 
     # (MalConvBase) Build the malconv

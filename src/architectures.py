@@ -144,6 +144,9 @@ class Identity(nn.Module):
             x = x.to(torch.get_autocast_dtype(x.device.type))
         return x
 
+    @torch.no_grad()
+    def forward_functional(self, x: Tensor, *args: Any, **kwds: Any) -> Tensor:
+        return self.forward(x, *args, **kwds)
 
 # -------------------------------------------------------------------------------- #
 # Other
@@ -539,45 +542,6 @@ class FiLM(nn.Module):
 
         check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), FLOATS)
         return z
-
-
-class FiLMNoP(nn.Module):
-    """
-    No-op FiLM layer that does nothing but check the inputs.
-    """
-
-    def __init__(self, guide_dim: int, embedding_dim: int, hidden_size: int, autocast: bool = False):
-        super().__init__()
-
-        self.guide_dim = guide_dim
-        self.embedding_dim = embedding_dim
-        self.hidden_size = hidden_size
-        self.autocast = autocast
-        if self.autocast:
-            warnings.warn(f"Using {self.__class__.__name__}(autocast=True) is almost certainly a poor decision and this feature will eventually be removed.")
-
-    def forward(self, x: Tensor, g: Literal[None]) -> Tensor:
-        check_tensor(x, (None, None, None), FLOATS)
-        if g is not None:
-            raise ValueError(f"Expected g to be None, got {type(g)} instead.")
-
-        if self.autocast and torch.is_floating_point(x) and torch.is_autocast_enabled():
-            x = x.to(torch.get_autocast_dtype(x.device.type))
-
-        return x
-
-    @torch.no_grad()
-    def forward_functional(self, x: Tensor, g: Literal[None]) -> Tensor:
-        """
-        Functional version for low-memory streaming scans.
-        """
-        if g is not None:
-            raise ValueError(f"Expected g to be None, got {type(g)} instead.")
-
-        if torch.is_autocast_enabled():
-            x = x.to(torch.get_autocast_dtype(x.device.type))
-
-        return x
 
 
 class FiLMBool(nn.Module):
@@ -2539,7 +2503,7 @@ class Classifier(nn.Module, ABC):
 
 class MalConvClassifier(Classifier):
 
-    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, backbone: MalConvBase, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMBool | Identity, backbone: MalConvBase, head: ClassifificationHead) -> None:
         super().__init__()
 
         self.embedding = embedding
@@ -2571,7 +2535,7 @@ class MalConvClassifier(Classifier):
 
 class ViTClassifier(Classifier):
 
-    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMNoP, patcher: PatchEncoderBase, norm: Optional[nn.LayerNorm], patchposencoder: PatchPositionalityEncoder | Identity, backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMBool | Identity, patcher: PatchEncoderBase, norm: Optional[nn.LayerNorm], patchposencoder: PatchPositionalityEncoder | Identity, backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__()
 
         self.embedding = embedding
@@ -2702,7 +2666,7 @@ class HierarchicalMalConvClassifier(HierarchicalClassifier):
         and averages these hidden representations before feeding them to a classification head.
     """
 
-    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMBool | Identity], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(backbones)):
@@ -2758,7 +2722,7 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         and feeds the encoded patches to a shared ViT backbone followed by a classification head.
     """
 
-    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], patchers: Sequence[PatchEncoderBase], norms: Sequence[Optional[nn.LayerNorm]], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMBool | Identity], patchers: Sequence[PatchEncoderBase], norms: Sequence[Optional[nn.LayerNorm]], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(patchers)):
@@ -3098,7 +3062,7 @@ class StructuralClassifier(nn.Module, ABC):
 
 class StructuralMalConvClassifier(StructuralClassifier):
 
-    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMNoP], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMBool | Identity], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
         raise NotImplementedError("StructuralMalConvClassifier is not yet implemented.")
 
     def forward(
@@ -3125,7 +3089,7 @@ class StructuralViTClassifier(StructuralClassifier):
     def __init__(
         self,
         embeddings: Sequence[nn.Embedding],
-        filmers: Sequence[FiLM | FiLMNoP],
+        filmers: Sequence[FiLM | FiLMBool | Identity],
         patchers: Sequence[PatchEncoderBase],
         norms: Sequence[Optional[nn.LayerNorm]],
         patchposencoders: Sequence[PatchPositionalityEncoder | Identity],

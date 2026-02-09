@@ -20,7 +20,6 @@ from src.architectures import PatchPositionalityEncoder
 from src.architectures import SinusoidalPositionalEncoding
 from src.architectures import LearnedPositionalEncoding
 from src.architectures import FiLM
-from src.architectures import FiLMNoP
 from src.architectures import MalConv
 from src.architectures import MalConvLowMem
 from src.architectures import MalConvGCG
@@ -64,7 +63,7 @@ class TestGetModel:
             raise NotImplementedError()
 
         if num_guides == 0:
-            assert isinstance(model.filmer, FiLMNoP)
+            assert isinstance(model.filmer, Identity)
         else:
             assert isinstance(model.filmer, FiLM)
             assert model.filmer.guide_dim == num_guides
@@ -156,7 +155,7 @@ class TestGetModel:
             raise NotImplementedError()
 
         if num_guides == 0:
-            assert isinstance(model.filmer, FiLMNoP)
+            assert isinstance(model.filmer, Identity)
         else:
             assert isinstance(model.filmer, FiLM)
             assert model.filmer.guide_dim == num_guides
@@ -197,7 +196,7 @@ class TestGetModel:
             raise NotImplementedError()
 
         if num_guides == 0:
-            assert all(isinstance(filmer, FiLMNoP) for filmer in model.filmers)
+            assert all(isinstance(filmer, Identity) for filmer in model.filmers)
         else:
             assert all(isinstance(filmer, FiLM) for filmer in model.filmers)
             assert all(filmer.guide_dim == num_guides for filmer in model.filmers)
@@ -313,7 +312,7 @@ class TestGetModel:
             raise NotImplementedError()
 
         if num_guides == 0:
-            assert all(isinstance(filmer, FiLMNoP) for filmer in model.filmers)
+            assert all(isinstance(filmer, Identity) for filmer in model.filmers)
         else:
             assert all(isinstance(filmer, FiLM) for filmer in model.filmers)
             assert all(filmer.guide_dim == num_guides for filmer in model.filmers)
@@ -434,7 +433,7 @@ class TestGetModel:
             raise NotImplementedError()
 
         if num_guides == 0:
-            assert all(isinstance(filmer, FiLMNoP) for filmer in model.filmers)
+            assert all(isinstance(filmer, Identity) for filmer in model.filmers)
         else:
             assert all(isinstance(filmer, FiLM) for filmer in model.filmers)
             assert all(filmer.guide_dim == num_guides for filmer in model.filmers)

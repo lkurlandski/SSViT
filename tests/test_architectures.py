@@ -16,7 +16,6 @@ from torch import Tensor
 from src.architectures import Identity
 from src.architectures import ClassifificationHead
 from src.architectures import FiLM
-from src.architectures import FiLMNoP
 from src.architectures import SinusoidalPositionalEncoding
 from src.architectures import PatchEncoderBase
 from src.architectures import PatchEncoder
@@ -369,9 +368,9 @@ class TestMalConvClassifier:
     @pytest.mark.parametrize("guide_dim", [0, 3])
     def test_forward(self, cls: type[MalConv | MalConvLowMem | MalConvGCG], batch_size: int, seq_length: int, guide_dim: int, vocab_size: int = 11, channels: int = 7, num_classes: int = 2) -> None:
         embedding = torch.nn.Embedding(vocab_size, 8)
-        filmer: FiLM | FiLMNoP
+        filmer: FiLM | Identity
         if guide_dim == 0:
-            filmer = FiLMNoP(guide_dim, embedding_dim=8, hidden_size=3)
+            filmer = Identity(guide_dim, embedding_dim=8, hidden_size=3)
         else:
             filmer = FiLM(guide_dim, embedding_dim=8, hidden_size=3)
         backbone = cls(embedding_dim=8, channels=channels, kernel_size=3, stride=3)
@@ -400,9 +399,9 @@ class TestMalConvClassifier:
     @pytest.mark.parametrize("guide_dim", [0, 3])
     def test_gradients(self, cls: type[MalConv | MalConvLowMem | MalConvGCG], batch_size: int, seq_length: int, guide_dim: int, vocab_size: int = 11, channels: int = 7, num_classes: int = 2) -> None:
         embedding = torch.nn.Embedding(vocab_size, 8)
-        filmer: FiLM | FiLMNoP
+        filmer: FiLM | Identity
         if guide_dim == 0:
-            filmer = FiLMNoP(guide_dim, embedding_dim=8, hidden_size=3)
+            filmer = Identity(guide_dim, embedding_dim=8, hidden_size=3)
         else:
             filmer = FiLM(guide_dim, embedding_dim=8, hidden_size=3)
         backbone = cls(embedding_dim=8, channels=channels, kernel_size=3, stride=3)
@@ -537,7 +536,7 @@ class TestViTClassifier:
         patcher_channels = 16
         d_model = 16
         embedding = Embedding(vocab_size, embedding_dim)
-        filmer = FiLMNoP(0, embedding_dim, 0)
+        filmer = Identity(0, embedding_dim, 0)
         norm = nn.LayerNorm(patcher_channels)
         patchposencoder = Identity()
         backbone = ViT(patcher_channels, d_model, posencoder="fixed")
@@ -632,7 +631,7 @@ class TestStructuralViTClassifier:
         patcher_channels = 16
         d_model = 16
         embeddings = [Embedding(vocab_size, embedding_dim) for _ in range(num_structures)]
-        filmers = [FiLMNoP(0, embedding_dim, 0) for _ in range(num_structures)]
+        filmers = [Identity(0, embedding_dim, 0) for _ in range(num_structures)]
         norms = [nn.LayerNorm(patcher_channels) for _ in range(num_structures)]
         patchposencoder = [Identity() for _ in range(num_structures)]
         backbone = ViT(patcher_channels, d_model, posencoder="fixed")
