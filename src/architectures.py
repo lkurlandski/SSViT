@@ -580,7 +580,20 @@ class FiLMBool(nn.Module):
         """
         Functional version for low-memory streaming scans.
         """
-        raise NotImplementedError("Functional version of FiLMBool is not implemented yet.")
+        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
+        check_tensor(g, (x.shape[0], x.shape[1], self.guide_dim), torch.bool)
+
+        x = x.detach()
+        g = g.detach()
+        w = self.table.weight.detach()
+
+        pid = _pack_bits_along_last_dimension(g, torch.int32)
+        film = F.embedding(pid, w)
+        gamma, beta = film.chunk(2, dim=-1)
+        z = torch.addcmul(beta, x, gamma)
+
+        check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), FLOATS)
+        return z
 
 # -------------------------------------------------------------------------------- #
 # Positional Encodings
@@ -2525,7 +2538,7 @@ class Classifier(nn.Module, ABC):
     def _check_forward_inputs(self, x: Tensor, g: Optional[Tensor]) -> None:
         check_tensor(x, (None, None), INTEGERS)
         if g is not None:
-            check_tensor(g, (x.shape[0], x.shape[1], None), FLOATS)
+            check_tensor(g, (x.shape[0], x.shape[1], None), FLOATS + (torch.bool,))
 
 
 class MalConvClassifier(Classifier):
@@ -2676,7 +2689,7 @@ class HierarchicalClassifier(nn.Module, ABC):
                 continue
             check_tensor(x[i], (x_ref.shape[0], None), INTEGERS)  # type: ignore[arg-type]
             if g[i] is not None:
-                check_tensor(g[i], (x_ref.shape[0], x[i].shape[1], None), FLOATS)  # type: ignore[union-attr,arg-type]
+                check_tensor(g[i], (x_ref.shape[0], x[i].shape[1], None), FLOATS + (torch.bool,))  # type: ignore[union-attr,arg-type]
 
 
 class HierarchicalMalConvClassifier(HierarchicalClassifier):
@@ -3049,7 +3062,7 @@ class StructuralClassifier(nn.Module, ABC):
             check_tensor(x[i], (x[i].shape[0], x[i].shape[1]), INTEGERS)
             if g[i] is not None:
                 assert isinstance(g[i], Tensor)
-                check_tensor(g[i], (x[i].shape[0], x[i].shape[1], None), FLOATS)  # type: ignore[arg-type]
+                check_tensor(g[i], (x[i].shape[0], x[i].shape[1], None), FLOATS + (torch.bool,))  # type: ignore[arg-type]
 
         if len(order) <= 0:
             raise ValueError("Order must indicate at least one sample.")
