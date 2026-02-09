@@ -2478,6 +2478,33 @@ class MalConvGCG(MalConvBase):
 # Classifiers
 # -------------------------------------------------------------------------------- #
 
+
+def _embed_and_augment_inputs(
+    x: Tensor,
+    g: Optional[Tensor] = None,
+    *,
+    embedding: nn.Embedding | AugmentedEmbedding,
+    filmer: FiLM | FiLMBool | Identity,
+) -> Tensor:
+    if isinstance(filmer, (FiLM, FiLMBool)) and g is None:
+        raise RuntimeError("FiLM conditioning vector `g` must be provided when using FiLM or FiLMBool filmer.")
+
+    z: Tensor  # (B, T, E)
+
+    if isinstance(embedding, AugmentedEmbedding):
+        z = embedding(x, g)
+    else:
+        z = embedding(x)
+
+    if torch.is_grad_enabled():
+        z = filmer(z, g)
+    else:
+        # This is required to make things work with mixed precision.
+        z = filmer.forward_functional(z, g)  # type: ignore[arg-type]
+
+    return z
+
+
 class Classifier(nn.Module, ABC):
 
     @abstractmethod
@@ -2503,7 +2530,7 @@ class Classifier(nn.Module, ABC):
 
 class MalConvClassifier(Classifier):
 
-    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMBool | Identity, backbone: MalConvBase, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: nn.Embedding | AugmentedEmbedding, filmer: FiLM | FiLMBool | Identity, backbone: MalConvBase, head: ClassifificationHead) -> None:
         super().__init__()
 
         self.embedding = embedding
@@ -2514,13 +2541,9 @@ class MalConvClassifier(Classifier):
     def forward(self, x: Tensor, g: Optional[Tensor]) -> Tensor:
         self._check_forward_inputs(x, g)
 
-        def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
-            z = self.embedding(x)  # (B, T, E)
-            z = self.filmer(z, g) if torch.is_grad_enabled() else self.filmer.forward_functional(z, g)  # type: ignore[arg-type]
-            return z
-
         ts = (x, g) if g is not None else (x,)
 
+        preprocess = partial(_embed_and_augment_inputs, embedding=self.embedding, filmer=self.filmer)
         z = self.backbone(preprocess=preprocess, ts=ts)  # (B, D)
         z = self.head(z)                                 # (B, M)
 
@@ -2535,7 +2558,7 @@ class MalConvClassifier(Classifier):
 
 class ViTClassifier(Classifier):
 
-    def __init__(self, embedding: nn.Embedding, filmer: FiLM | FiLMBool | Identity, patcher: PatchEncoderBase, norm: Optional[nn.LayerNorm], patchposencoder: PatchPositionalityEncoder | Identity, backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: nn.Embedding | AugmentedEmbedding, filmer: FiLM | FiLMBool | Identity, patcher: PatchEncoderBase, norm: Optional[nn.LayerNorm], patchposencoder: PatchPositionalityEncoder | Identity, backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__()
 
         self.embedding = embedding
@@ -2551,16 +2574,12 @@ class ViTClassifier(Classifier):
     def forward(self, x: Tensor, g: Optional[Tensor]) -> Tensor:
         self._check_forward_inputs(x, g)
 
-        def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
-            z = self.embedding(x)  # (B, T, E)
-            z = self.filmer(z, g) if torch.is_grad_enabled() else self.filmer.forward_functional(z, g)  # type: ignore[arg-type]
-            return z
-
         lengths = None
         if self.should_get_lengths:
             lengths = (x != 0).sum(dim=1)  # (B,)
 
         ts = (x, g) if g is not None else (x,)
+        preprocess = partial(_embed_and_augment_inputs, embedding=self.embedding, filmer=self.filmer)
         z = self.patcher(preprocess=preprocess, ts=ts)  # (B, N, C)
         z = self.norm(z)                                # (B, N, C)
         z = self.patchposencoder(z, lengths)            # (B, N, C)
@@ -2666,7 +2685,7 @@ class HierarchicalMalConvClassifier(HierarchicalClassifier):
         and averages these hidden representations before feeding them to a classification head.
     """
 
-    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMBool | Identity], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding | AugmentedEmbedding], filmers: Sequence[FiLM | FiLMBool | Identity], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(backbones)):
@@ -2684,13 +2703,8 @@ class HierarchicalMalConvClassifier(HierarchicalClassifier):
         for i in range(self.num_structures):
             if x[i] is None:
                 continue
-
-            def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
-                z = self.embeddings[i](x)  # (B, T, E)
-                z = self.filmers[i](z, g) if torch.is_grad_enabled() else self.filmers[i].forward_functional(z, g)  # type: ignore[operator]
-                return z
-
             ts: tuple[Tensor, ...] = (x[i], g[i]) if g[i] is not None else (x[i],)  # type: ignore[assignment]
+            preprocess = partial(_embed_and_augment_inputs, embedding=self.embeddings[i], filmer=self.filmers[i])  # type: ignore[arg-type]
             z = self.backbones[i](preprocess=preprocess, ts=ts)  # (B, C)
             zs.append(z)
 
@@ -2722,7 +2736,7 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         and feeds the encoded patches to a shared ViT backbone followed by a classification head.
     """
 
-    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMBool | Identity], patchers: Sequence[PatchEncoderBase], norms: Sequence[Optional[nn.LayerNorm]], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding | AugmentedEmbedding], filmers: Sequence[FiLM | FiLMBool | Identity], patchers: Sequence[PatchEncoderBase], norms: Sequence[Optional[nn.LayerNorm]], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(patchers)):
@@ -2763,11 +2777,6 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         """
         self._check_forward_inputs(x, g)
 
-        def preprocess(i: int, x: Tensor, g: Optional[Tensor] = None) -> Tensor:
-            z = self.embeddings[i](x)  # (B, T, E)
-            z = self.filmers[i](z, g) if torch.is_grad_enabled() else self.filmers[i].forward_functional(z, g)  # type: ignore[operator]
-            return z
-
         # Process each structure separately.
         zs: list[Optional[Tensor]] = []
         for i in range(self.num_structures):
@@ -2776,8 +2785,8 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
                 continue
             lengths = (x[i] != 0).sum(dim=1) if self.should_get_lengths else None  # type: ignore[union-attr]
             ts = (x[i], g[i]) if g[i] is not None else (x[i],)
-            preprocess_ = partial(preprocess, i)
-            z = self.patchers[i](preprocess=preprocess_, ts=ts)  # (B, N, C)
+            preprocess = partial(_embed_and_augment_inputs, embedding=self.embeddings[i], filmer=self.filmers[i])  # type: ignore[arg-type]
+            z = self.patchers[i](preprocess=preprocess, ts=ts)   # (B, N, C)
             z = self.norms[i](z)                                 # (B, N, C)
             z = self.patchposencoders[i](z, lengths)             # (B, N, C)
             zs.append(z)
@@ -3062,7 +3071,7 @@ class StructuralClassifier(nn.Module, ABC):
 
 class StructuralMalConvClassifier(StructuralClassifier):
 
-    def __init__(self, embeddings: Sequence[nn.Embedding], filmers: Sequence[FiLM | FiLMBool | Identity], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[nn.Embedding | AugmentedEmbedding], filmers: Sequence[FiLM | FiLMBool | Identity], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
         raise NotImplementedError("StructuralMalConvClassifier is not yet implemented.")
 
     def forward(
@@ -3088,7 +3097,7 @@ class StructuralViTClassifier(StructuralClassifier):
 
     def __init__(
         self,
-        embeddings: Sequence[nn.Embedding],
+        embeddings: Sequence[nn.Embedding | AugmentedEmbedding],
         filmers: Sequence[FiLM | FiLMBool | Identity],
         patchers: Sequence[PatchEncoderBase],
         norms: Sequence[Optional[nn.LayerNorm]],
@@ -3228,14 +3237,9 @@ class StructuralViTClassifier(StructuralClassifier):
 
     def _forward_trunk(self, i: int, x: Tensor, g: Optional[Tensor]) -> Tensor:
 
-        def preprocess(x: Tensor, g: Optional[Tensor] = None) -> Tensor:
-            z = self.embeddings[i](x)  # (B, T, E)
-            z = self.filmers[i](z, g) if torch.is_grad_enabled() else self.filmers[i].forward_functional(z, g)  # type: ignore[operator]
-            return z
-
         ts = (x, g) if g is not None else (x,)
         lengths = (x != 0).sum(dim=1) if self.should_get_lengths else None
-
+        preprocess = partial(_embed_and_augment_inputs, embedding=self.embeddings[i], filmer=self.filmers[i])  # type: ignore[arg-type]
         z = self.patchers[i](preprocess=preprocess, ts=ts)
         z = self.norms[i](z)
         z = self.patchposencoders[i](z, lengths)
