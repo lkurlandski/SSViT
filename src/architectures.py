@@ -414,6 +414,65 @@ class DWCSequenceEncoder(nn.Module):
 # FiLM
 # -------------------------------------------------------------------------------- #
 
+
+_pack_bits_along_last_dimension_cache: dict[tuple[torch.device, int], Tensor] = {}
+
+
+def _pack_bits_along_last_dimension(g: Tensor, dtype: torch.dtype) -> Tensor:
+    check_tensor(g, (None, None, None), torch.bool)
+    key = (g.device, g.shape[-1])
+    if (shifts := _pack_bits_along_last_dimension_cache.get(key)) is None:
+        shifts = torch.arange(g.shape[-1], device=g.device, dtype=dtype)
+        _pack_bits_along_last_dimension_cache[key] = shifts
+    return (g.to(dtype) << shifts).sum(dim=-1)
+
+
+class AugmentedEmbedding(nn.Module):
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, guide_dim: int, padding_idx: Optional[int] = None) -> None:
+        super().__init__()
+
+        self.padding_idx = padding_idx
+        self.num_embeddings = num_embeddings  # V
+        self.embedding_dim = embedding_dim    # E
+        self.guide_dim = guide_dim            # G
+        self.num_patterns = 1 << guide_dim    # P
+
+        self.base = nn.Embedding(num_embeddings, embedding_dim, padding_idx)
+        self.cond = nn.Embedding(self.num_patterns, 2 * embedding_dim)
+
+    def forward(self, x: Tensor, g: Tensor) -> Tensor:
+        """
+        Args:
+            x: Integer input indices of shape (B, T).
+            g: Boolean conditioning vector of shape (B, T, G).
+
+        Returns:
+            z: Modulated embeddings of shape (B, T, E).
+        """
+        check_tensor(x, (None, None), (torch.int64, torch.int32))
+        check_tensor(g, (x.shape[0], x.shape[1], self.guide_dim), torch.bool)
+
+        pid = _pack_bits_along_last_dimension(g, dtype=torch.int32)
+
+        if self.padding_idx is not None:
+            pad_mask = (x == self.padding_idx)
+            pid = pid.masked_fill(pad_mask, 0)
+
+        gb = self.cond.weight.view(self.num_patterns, 2, self.embedding_dim)
+        gamma = gb[:, 0, :]  # (P,E)
+        beta  = gb[:, 1, :]  # (P,E)
+
+        mod = self.base.weight[None, :, :] * gamma[:, None, :] + beta[:, None, :]
+        weight = mod.view(self.num_patterns * self.num_embeddings, self.embedding_dim)
+
+        idx = x + pid * self.num_embeddings
+        z = F.embedding(idx, weight, padding_idx=self.padding_idx)
+
+        check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), FLOATS)
+        return z
+
+
 class FiLM(nn.Module):
     """
     Feature-wise linear modulation (FiLM) layer.
@@ -519,6 +578,45 @@ class FiLMNoP(nn.Module):
             x = x.to(torch.get_autocast_dtype(x.device.type))
 
         return x
+
+
+class FiLMBool(nn.Module):
+    """
+    A faster variant of FiLM for boolean guides.
+    """
+
+    def __init__(self, guide_dim: int, embedding_dim: int, hidden_size: int) -> None:
+        super().__init__()
+
+        self.table = nn.Embedding(1 << guide_dim, 2 * embedding_dim)
+
+        self.guide_dim = guide_dim
+        self.embedding_dim = embedding_dim
+        self.hidden_size = hidden_size
+
+    def forward(self, x: Tensor, g: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input embeddings of shape (B, T, E).
+            g: Boolean FiLM conditioning vector of shape (B, T, G).
+
+        Returns:
+            z: FiLM modulated embeddings of shape (B, T, E).
+        """
+        check_tensor(x, (None, None, self.embedding_dim), FLOATS)
+        check_tensor(g, (x.shape[0], x.shape[1], self.guide_dim), torch.bool)
+        pid = _pack_bits_along_last_dimension(g, torch.int32)
+        film: Tensor = self.table(pid)
+        gamma, beta = film.chunk(2, dim=-1)
+        z = torch.addcmul(beta, x, gamma)
+        return z
+
+    @torch.no_grad()
+    def forward_functional(self, x: Tensor, g: Tensor) -> Tensor:
+        """
+        Functional version for low-memory streaming scans.
+        """
+        raise NotImplementedError("Functional version of FiLMBool is not implemented yet.")
 
 # -------------------------------------------------------------------------------- #
 # Positional Encodings
