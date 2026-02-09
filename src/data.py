@@ -1514,7 +1514,7 @@ class SSamples:
         guides: list[SemanticGuides] = []
         for i in range(self.num_structures):
             inputs.append(self.inputs[i].finalize(itype))
-            guides.append(self.guides[i].decompress().to(dtype=ftype))
+            guides.append(self.guides[i].decompress())
         for g in guides:
             g.build_allguides()
         structure = self.structure.clone()

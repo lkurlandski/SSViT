@@ -65,6 +65,8 @@ from src.architectures import get_model_input_lengths
 from src.architectures import Identity
 from src.architectures import ClassifificationHead
 from src.architectures import FiLM
+from src.architectures import FiLMBool
+from src.architectures import AugmentedEmbedding
 from src.architectures import MalConvBase
 from src.architectures import MalConv
 from src.architectures import MalConvLowMem
@@ -275,14 +277,20 @@ def get_model(
     )
 
     # (Embedding) Build the embedding
-    def build_embedding() -> Embedding:
-        return Embedding(num_embeddings=384, embedding_dim=embedding_dim, padding_idx=0)
+    def build_embedding() -> Embedding | AugmentedEmbedding:
+        num_embeddings = 384
+        padding_idx = 0
+        if num_guides > 0:
+            return AugmentedEmbedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim, guide_dim=num_guides, padding_idx=padding_idx)
+        return Embedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim, padding_idx=padding_idx)
 
     # (FiLM | Identity) Build the filmer
-    def build_filmer() -> FiLM | Identity:
-        if num_guides == 0:
-            return Identity()
-        return FiLM(num_guides, embedding_dim, film_hidden_size)
+    def build_filmer() -> FiLM | FiLMBool | Identity:
+        # On successive iterations of model design, its become apparent
+        # that fusing the embedding augmentations into the embedding layer itself
+        # (i.e., using AugmentedEmbedding) is much more efficient than applying FiLM
+        # along the raw sequence dimension. Hence, we just return Identity here.
+        return Identity()
 
     # (MalConvBase) Build the malconv
     malconv_channels = 256 if arch == Architecture.MCG else 128
