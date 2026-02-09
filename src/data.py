@@ -2113,8 +2113,8 @@ class CollateFnStructural:
         name = [s.name for s in batch]
         label = torch.stack([s.label for s in batch])
 
-        inputs = []
-        guides = []
+        inputs: list[Inputs] = []
+        guides: list[SemanticGuides] = []
         per_sample_entries: list[list[tuple[int, int, int]]] = [[] for _ in range(len(batch))]
         for i in range(self.num_structures):
             xs: list[Input] = []
@@ -2144,7 +2144,7 @@ class CollateFnStructural:
             if len(xs) == 0:
                 length = _compute_length_to_pad_sequence_to([0], self.min_lengths[i], PAD_TO_MULTIPLE_OF, self.length_bins)
                 xs = [Input(torch.full((length,), 0, dtype=torch.uint8), torch.tensor(length, dtype=torch.int64), True)]
-                gs = [self._create_synthetic_guide(batch[0].guides, length // 8 if self.bitpack else length)]
+                gs = [self._create_synthetic_guide(batch[0].guides, length // 8 if batch[0].guides.is_bitpacked else length)]
             xs = Inputs.from_singles(xs, self.pin_memory, self.min_lengths[i], self.length_bins, self.muddy_padded)
             gs = SemanticGuides.from_singles(gs, self.pin_memory, int(self.min_lengths[i] / 8), self.length_bins)
             inputs.append(xs)
@@ -2161,19 +2161,26 @@ class CollateFnStructural:
 
         structure = [s.structure for s in batch]
         structure = StructureMaps.from_singles(structure, self.pin_memory)
+
+        for i in range(self.num_structures):
+            assert inputs[i].inputids.dim() == 2
+            assert guides[i].parse is None or guides[i].parse.dim() == 3
+            assert guides[i].entropy is None or guides[i].entropy.dim() == 2
+            assert guides[i].characteristics is None or guides[i].characteristics.dim() == 3
+
         return SSamples(file, name, label, inputs, guides, structure, order)
 
     @staticmethod
     def _create_synthetic_guide(guides: SemanticGuide, length: int) -> SemanticGuide:
         parse = None
         if guides.parse is not None:
-            parse = torch.full((length,), 0, dtype=guides.parse.dtype)
+            parse = torch.full((length, guides.parse.shape[-1]), 0, dtype=guides.parse.dtype)
         entropy = None
         if guides.entropy is not None:
             entropy = torch.full((length,), 0, dtype=guides.entropy.dtype)
         characteristics = None
         if guides.characteristics is not None:
-            characteristics = torch.full((length,), 0, dtype=guides.characteristics.dtype)
+            characteristics = torch.full((length, guides.characteristics.shape[-1]), 0, dtype=guides.characteristics.dtype)
         return SemanticGuide(parse, entropy, characteristics)
 
     def __repr__(self) -> str:
