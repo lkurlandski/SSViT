@@ -934,7 +934,6 @@ class Trainer:
         alllogits: list[Tensor] = []  # [(B, C)]  list of two-dimensional tensors, num-samples x num-classes
         allnames: list[Tensor] = []   # [(B, F)]  list of two-dimensional tensors, num-samples x name-length
 
-        usage: Optional[torch.Tensor] = None            # FIXME: remove
         with torch.no_grad():
             for mini_step, real, batch in iterable:
                 batch = batch.to(self.device, non_blocking=True).finalize(self.mp_dtype, torch.int32, torch.int64)
@@ -947,20 +946,6 @@ class Trainer:
                     alllabels.append(batch.get_label())
                     alllogits.append(outputs)
                     allnames.append(torch.tensor([name.encode("latin1") for name in batch.get_names()], dtype=torch.uint8))
-                    u = get_last_usage(self.model)       # FIXME: remove
-                    if usage is None:                    # FIXME: remove
-                        usage = u                        # FIXME: remove
-                    elif u is not None:                  # FIXME: remove
-                        usage += u                       # FIXME: remove
-                    else:                                # FIXME: remove
-                        raise RuntimeError()             # FIXME: remove
-
-        if rank() == 0 and usage is not None:            # FIXME: remove
-            if usage.ndim == 2:                          # FIXME: remove
-                usage = usage.sum(dim=0)                 # FIXME: remove
-            usage = (usage / usage.sum()).to("cpu")      # FIXME: remove
-            use = " ".join([f"{e:.5f}" for e in usage])  # FIXME: remove
-            self.print(f"Usage: {use}")                  # FIXME: remove
 
         # self.print(f"[INFO] [rank {rank()}] [Trainer::evaluate] {mini_step=} num_real={len(alllabels)} num_fake={mini_step + 1 - len(alllabels)}")
         if mini_step < 0:
