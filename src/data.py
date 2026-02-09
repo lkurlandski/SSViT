@@ -2164,9 +2164,9 @@ class CollateFnStructural:
 
         for i in range(self.num_structures):
             assert inputs[i].inputids.dim() == 2
-            assert guides[i].parse is None or guides[i].parse.dim() == 3
-            assert guides[i].entropy is None or guides[i].entropy.dim() == 2
-            assert guides[i].characteristics is None or guides[i].characteristics.dim() == 3
+            assert guides[i].parse is None or guides[i].parse.dim() == 3                      # type: ignore[union-attr]
+            assert guides[i].entropy is None or guides[i].entropy.dim() == 2                  # type: ignore[union-attr]
+            assert guides[i].characteristics is None or guides[i].characteristics.dim() == 3  # type: ignore[union-attr]
 
         return SSamples(file, name, label, inputs, guides, structure, order)
 
