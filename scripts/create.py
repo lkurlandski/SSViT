@@ -103,7 +103,6 @@ class Configuration:
         max_length: int,
         seed: int,
         model_config: dict[str, str | int | float | bool],
-        resume_checkpoint: Optional[str] = None,
     ) -> None:
         self.design = design
         self.arch = arch
@@ -116,7 +115,6 @@ class Configuration:
         self.max_length = max_length
         self.seed = seed
         self._model_config = model_config
-        self.resume_checkpoint = resume_checkpoint
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Configuration):
@@ -488,17 +486,11 @@ class Configuration:
 
     @property
     def update_embedding_steps(self) -> int:
-        return -1
-
-    @property
-    def embedding_freeze(self) -> bool:
-        return True
+        return 16
 
     @property
     def find_unused_parameters(self) -> bool:
-        if self.update_embedding_steps != 1:
-            return True
-        if self.embedding_freeze:
+        if self.update_embedding_steps > 1:
             return True
         return False
 
@@ -642,8 +634,7 @@ class ScriptBuilder:
         ])
 
         locals = "\n".join([
-            f"RESDIR=\"{self.config.resume_checkpoint}\"",
-            f"OUTDIR=\"$RESDIR/embedding_freeze--{self.config.embedding_freeze}\"",
+            f"OUTDIR=\"{self.config.outdir}\"",
             f"CONFIG='{json.dumps(self.config.model_config)}'",
         ])
 
@@ -661,7 +652,6 @@ class ScriptBuilder:
             "src/main.py",
             f"--outdir \"$OUTDIR\"",
             f"--resume {RESUME} ",
-            f"--resume_checkpoint \"$RESDIR\"",
             f"--design {self.config.design.value}",
             f"--arch {self.config.arch.value}",
             f"--parch {self.config.parch.value}",
@@ -707,7 +697,6 @@ class ScriptBuilder:
             f"--static_shapes_bin_backbone_seq_lengths {self.config.static_shapes_bin_backbone_seq_lengths}",
             f"--static_shapes_bin_backbone_batch_sizes {self.config.static_shapes_bin_backbone_batch_sizes}",
             f"--update_embedding_steps {self.config.update_embedding_steps}",
-            f"--embedding_freeze {self.config.embedding_freeze}",
             f"--param_grad_none {self.config.param_grad_none}",
             f"--find_unused_parameters {self.config.find_unused_parameters}",
             f"--max_epochs {self.config.max_epochs}",
@@ -832,11 +821,35 @@ def main() -> None:
         if f.is_file() and not args.no_clean:
             f.unlink()
 
-    configurations = [
+    model_configs = [
+        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 64,  "patcher_stride": 64},
+        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 128,  "patcher_stride": 128},
+        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 256,  "patcher_stride": 256},
+        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 512,  "patcher_stride": 512},
+    ]
+
+    stream = product(
+        [Design.STRUCTURAL],
+        [Architecture.VIT],
+        [PatcherArchitecture.DWC],
+        [PositionalEncodingArchitecture.FIXED],
+        [PatchPositionalEncodingArchitecture.NONE],
+        [HierarchicalLevel.FINE],
+        [False],
+        [()],
+        [2**20],
+        [0],
+        model_configs,
+    )
+    configurations = (Configuration(*config) for config in stream)  # type: ignore[arg-type]
+    configurations = (config for config in configurations if config_fiter(config))
+    configurations = sorted(configurations)
+
+    configurations.extend([
         Configuration(
             design=Design.STRUCTURAL,
             arch=Architecture.VIT,
-            parch=PatcherArchitecture.DWC,
+            parch=PatcherArchitecture.BAS,
             posenc=PositionalEncodingArchitecture.FIXED,
             patchposenc=PatchPositionalEncodingArchitecture.NONE,
             level=HierarchicalLevel.FINE,
@@ -844,8 +857,7 @@ def main() -> None:
             which_characteristics=tuple(),
             max_length=2**20,
             seed=0,
-            model_config={"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 64,  "patcher_stride": 64},
-            resume_checkpoint="/shared/rc/admalware/Documents/code/SSViT/output/design--structural/arch--vit/parch--dwc/posenc--fixed/patchposenc--none/level--fine/entropy--False/characteristics--/max_length--None/max_length_per_structure--1048576/model_config--patcher_channels=64_patcher_depth=2_patcher_kernel_size=64_patcher_pooling=atn_patcher_stride=64/batch_size--1024/lr_max--0.000316/weight_decay--0.001/warmup_ratio--0.1/label_smoothing--0.0/max_epochs--10/seed--0/checkpoint-4576",
+            model_config={"patcher_pooling": "avg", "embedding_dim": 8, "patcher_channels": 256, "patcher_kernel_size": 256, "patcher_stride": 64},
         ),
         Configuration(
             design=Design.STRUCTURAL,
@@ -859,7 +871,6 @@ def main() -> None:
             max_length=2**20,
             seed=0,
             model_config={"patcher_pooling": "avg", "embedding_dim": 8, "patcher_channels": 64, "patcher_kernel_size": 64, "patcher_stride": 64},
-            resume_checkpoint="/shared/rc/admalware/Documents/code/SSViT/output/design--structural/arch--vit/parch--bas/posenc--fixed/patchposenc--none/level--fine/entropy--False/characteristics--/max_length--None/max_length_per_structure--1048576/model_config--embedding_dim=8_patcher_channels=64_patcher_kernel_size=64_patcher_pooling=avg_patcher_stride=64/batch_size--1024/lr_max--0.000316/weight_decay--0.001/warmup_ratio--0.1/label_smoothing--0.0/max_epochs--10/seed--0/checkpoint-4576",
         ),
         Configuration(
             design=Design.STRUCTURAL,
@@ -873,13 +884,8 @@ def main() -> None:
             max_length=2**20,
             seed=0,
             model_config={"patcher_pooling": "max", "embedding_dim": 8, "patcher_channels": 64, "patcher_kernel_size": 64, "patcher_stride": 64},
-            resume_checkpoint="/shared/rc/admalware/Documents/code/SSViT/output/design--structural/arch--vit/parch--mem/posenc--fixed/patchposenc--none/level--fine/entropy--False/characteristics--/max_length--None/max_length_per_structure--1048576/model_config--embedding_dim=8_patcher_channels=64/batch_size--1024/lr_max--0.000316/weight_decay--0.001/warmup_ratio--0.1/label_smoothing--0.0/max_epochs--10/seed--0/checkpoint-4572",
         ),
-    ]
-
-    for config in configurations:
-        if not Path(config.resume_checkpoint).exists():
-            raise FileNotFoundError(f"Checkpoint not found at {config.resume_checkpoint} for configuration {str(config)}.")
+    ])
 
     alloutdirs: set[str] = set()
     allconfigs: set[str] = set()
