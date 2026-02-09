@@ -137,6 +137,7 @@ from src.trainer import mp_dtype
 from src.trainer import is_dist
 from src.trainer import largest_possible_dataloader_length
 from src.trainer import freeze_or_unfreeze_embeddings_
+from src.trainer import TRAINER_FREEZE_EMBEDDINGS
 from src.utils import num_sort_files
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
@@ -856,7 +857,7 @@ def get_shardwise_stats(datadb: SimpleDB, last_shard: int) -> pd.DataFrame:
     return pd.concat(dfs, ignore_index=True)
 
 
-def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 512) -> None:
+def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 1024) -> None:
     if world_size() != 1:
         raise RuntimeError("Profiling only implemented for single worker.")
 
@@ -866,6 +867,9 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 51
     trainer.args.chpt_epochs = None
     trainer.args.logg_steps = None
     trainer.args.logg_epochs = None
+
+    if TRAINER_FREEZE_EMBEDDINGS:
+        freeze_or_unfreeze_embeddings_(trainer.model, freeze=True, verbose=True)
 
     # If saving stacks, profile a small number of active windows.
     with_stack = os.environ.get("WITH_STACK", "0") == "1"
