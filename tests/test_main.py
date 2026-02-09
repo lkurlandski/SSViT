@@ -414,6 +414,7 @@ class TestGetModel:
             assert isinstance(model.backbone.posencoder, SinusoidalPositionalEncoding)
         elif posenc == PositionalEncodingArchitecture.LEARNED:
             assert isinstance(model.backbone.posencoder, LearnedPositionalEncoding)
+            assert max_structures is not None
             assert model.backbone.posencoder.max_len == max_structures + 1
         else:
             raise NotImplementedError()
