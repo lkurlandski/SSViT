@@ -136,6 +136,7 @@ from src.trainer import world_size
 from src.trainer import mp_dtype
 from src.trainer import is_dist
 from src.trainer import largest_possible_dataloader_length
+from src.trainer import freeze_or_unfreeze_embeddings_
 from src.utils import num_sort_files
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
@@ -1312,11 +1313,7 @@ def main() -> None:
     # embedding specification, particularly when loading the optimizer state dict.
     # Therefore, its safer to just adjust the requires_grad here, and make sure we
     # specifiy find_unused_parameters=True when using DDP.
-    for name, module in trainer.model.named_modules():
-        if isinstance(module, (nn.Embedding, nn.EmbeddingBag)):
-            if module.weight.requires_grad == args.embedding_freeze:
-                print(f"Adjusting {module.__class__.__name__} `{name}` `requires_grad` ({module.weight.requires_grad} --> {not module.weight.requires_grad}).")
-                module.weight.requires_grad_(not module.weight.requires_grad)
+    freeze_or_unfreeze_embeddings_(trainer.model, freeze=args.embedding_freeze, verbose=True)
 
     if MAIN_RUN_PROFILE:
         main_run_profile(trainer, args.tr_batch_size)

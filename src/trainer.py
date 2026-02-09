@@ -78,6 +78,10 @@ TRAINER_SKIP_FIRST_EVAL = os.environ.get("TRAINER_SKIP_FIRST_EVAL", "0") == "1"
 if TRAINER_SKIP_FIRST_EVAL:
     warnings.warn("Trainer will skip the first evaluation.")
 
+TRAINER_FREEZE_EMBEDDINGS = os.environ.get("TRAINER_FREEZE_EMBEDDINGS", "0") == "1"
+if TRAINER_FREEZE_EMBEDDINGS:
+    warnings.warn("Trainer will freeze embeddings from the start of training.")
+
 
 def debug_autocast_dtypes(model: nn.Module) -> None:
     def hook(mod, inp, out):  # type: ignore[no-untyped-def]
@@ -305,6 +309,7 @@ class TrainerArgs:
     auxillary_loss_weight: float = 0.0
     param_grad_none: str = "error"
     update_embedding_steps: int = 1
+    freeze_embedding_epoch: int = -1
 
     def __post_init__(self) -> None:
         if (self.max_epochs is not None) and (self.max_steps is not None):
@@ -329,6 +334,8 @@ class TrainerArgs:
             self.stopper_patience = float("inf")
         if self.param_grad_none not in ("error", "warn", "ignore"):
             raise ValueError("`param_grad_none` must be one of 'error', 'warn', 'allow', or 'ignore'.")
+        if self.freeze_embedding_epoch != -1 and self.update_embedding_steps > 1:
+            raise ValueError(f"Using {self.update_embedding_steps=} would override the embedding freezing induced by {self.freeze_embedding_epoch=}")
 
     def __repr__(self) -> str:
         parts = []
@@ -572,6 +579,20 @@ def get_last_usage(model: nn.Module) -> Optional[Tensor]:
     return last_usage
 
 
+def freeze_or_unfreeze_embeddings_(model: nn.Module, *, freeze: bool, verbose: bool = False) -> None:
+    """
+    In-place freeze or unfreeze all embedding layers in the model by setting their `weight.requires_grad` attribute.
+    `verbose=True` will only print if a change is actually made to a layer's `requires_grad` attribute.
+    """
+    requires_grad = not freeze
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Embedding, nn.EmbeddingBag)):
+            if module.weight.requires_grad != requires_grad:
+                if verbose:
+                    print(f"[INFO] [rank {rank()}] [freeze_or_unfreeze_embeddings_]: Adjusting {module.__class__.__name__} `{name}` `requires_grad` ({module.weight.requires_grad} --> {requires_grad}).")
+                module.weight.requires_grad_(requires_grad)
+
+
 class Trainer:
     """
     Trainer class for training models with PyTorch.
@@ -685,6 +706,8 @@ class Trainer:
 
         # Continuously train the model on the training set until finished.
         while not self._done:
+            if self.epoch_idx >= self.args.freeze_embedding_epoch or TRAINER_FREEZE_EMBEDDINGS:
+                freeze_or_unfreeze_embeddings_(self.model, freeze=True, verbose=(rank() == 0))
             self.train(start_mini_step=start_mini_step)
             start_mini_step = 0
             self.epoch_idx += 1
@@ -780,13 +803,11 @@ class Trainer:
             with record_function("stage::finalize"):
                 batch = batch.finalize(self.mp_dtype, torch.int32, torch.int64)
 
-            # TODO: remove the hasattr check after deprecating older TrainerArgs versions
             # NOTE: if using ddp, `find_unused_parameters` must be True for this to work properly
-            if hasattr(self.args, "update_embedding_steps") and self.args.update_embedding_steps > 1:
+            if self.args.update_embedding_steps > 1:
                 embeddings_require_grad = ((mini_step // self.args.gradient_accumulation_steps) % self.args.update_embedding_steps) == 0
-                for module in self.model.modules():
-                    if isinstance(module, (nn.Embedding, nn.EmbeddingBag)):
-                        module.weight.requires_grad_(embeddings_require_grad)
+                verbose = (rank() == 0 and mini_step < self.args.update_embedding_steps * self.args.gradient_accumulation_steps)
+                freeze_or_unfreeze_embeddings_(self.model, freeze=not embeddings_require_grad, verbose=verbose)
 
             # Determine if this is a real or padded batch of data.
             had_real_window |= bool(real)
