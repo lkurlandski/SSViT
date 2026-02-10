@@ -177,6 +177,7 @@ def get_model(
     enable_compile: bool = False,
     do_ddp_keepalive: bool = False,
     *,
+    semantic_context_mode: Optional[Literal["aug", "flm", "flm-bool"]] = "aug",
     embedding_dim: int = 8,
     film_hidden_size: int = 16,
     patcher_channels: int = 64,
@@ -247,6 +248,11 @@ def get_model(
         if batch_size is None:
             raise ValueError("When enable_compile is True, batch_size must be specified for StructuralViTClassifier.")
 
+    if semantic_context_mode is None and num_guides > 0:
+        raise ValueError("When semantic_context_mode is None num_guides must be 0.")
+    if semantic_context_mode is not None and semantic_context_mode not in ("aug", "flm", "flm-bool"):
+        raise ValueError(f"Invalid semantic_context_mode: {semantic_context_mode}")
+
     # The original idea was to use different architectures for different structures, for example,
     # CNNs with small strides for shorter structures, like the PE Header. Unfortunately, this does not work
     # that well in practice because the stuctures that should be short can actually be quite long due to
@@ -280,7 +286,7 @@ def get_model(
     def build_embedding() -> Embedding | AugmentedEmbedding:
         num_embeddings = 384
         padding_idx = 0
-        if num_guides > 0:
+        if num_guides > 0 and semantic_context_mode == "aug":
             return AugmentedEmbedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim, guide_dim=num_guides, padding_idx=padding_idx)
         return Embedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim, padding_idx=padding_idx)
 
@@ -289,8 +295,18 @@ def get_model(
         # On successive iterations of model design, its become apparent
         # that fusing the embedding augmentations into the embedding layer itself
         # (i.e., using AugmentedEmbedding) is much more efficient than applying FiLM
-        # along the raw sequence dimension. Hence, we just return Identity here.
-        return Identity()
+        # along the raw sequence dimension.
+        if num_guides == 0:
+            return Identity()
+        if semantic_context_mode is None:
+            return Identity()
+        if semantic_context_mode == "aug":
+            return Identity()
+        if semantic_context_mode == "flm":
+            return FiLM(num_guides, embedding_dim, film_hidden_size)
+        if semantic_context_mode == "flm-bool":
+            return FiLMBool(num_guides, embedding_dim, film_hidden_size)
+        raise RuntimeError(f"Invalid semantic_context_mode: {semantic_context_mode}")
 
     # (MalConvBase) Build the malconv
     malconv_channels = 256 if arch == Architecture.MCG else 128

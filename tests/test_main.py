@@ -44,12 +44,28 @@ from src.helpers import PatchPositionalEncodingArchitecture
 from src.main import get_model
 
 
+# Using smaller values speeds up the tests.
+GET_MODEL_KWDS = {
+    "semantic_context_mode": "flm",
+    "patcher_channels": 8,
+    "patcher_kernel_size": 8,
+    "patcher_stride": 8,
+    "patcher_depth": 1,
+    "vit_d_model": 16,
+    "vit_nhead": 1,
+    "vit_dim_feedforward": 64,
+    "vit_num_layers": 1,
+    "clf_hidden_size": 16,
+    "clf_num_layers": 1,
+}
+
+
 class TestGetModel:
 
     @pytest.mark.parametrize("arch", [Architecture.MCV, Architecture.MC2, Architecture.MCG])
     @pytest.mark.parametrize("num_guides", [0, 3, 7])
     def test_flat_malconv(self, arch: Architecture, num_guides: int) -> None:
-        model = get_model(Design.FLAT, arch, num_guides=num_guides)
+        model = get_model(Design.FLAT, arch, num_guides=num_guides, **GET_MODEL_KWDS)  # type: ignore[arg-type]
 
         assert isinstance(model, MalConvClassifier)
 
@@ -84,6 +100,7 @@ class TestGetModel:
                 patchposenc=patchposenc,
                 num_guides=num_guides,
                 max_length=max_length,
+                **GET_MODEL_KWDS,  # type: ignore[arg-type]
             )
             assert isinstance(m, ViTClassifier)
             return m
@@ -173,6 +190,7 @@ class TestGetModel:
                 num_guides=num_guides,
                 structures=structures,
                 share_embeddings=share_embeddings,
+                **GET_MODEL_KWDS,  # type: ignore[arg-type]
             )
             assert isinstance(m, HierarchicalMalConvClassifier)
             return m
@@ -230,6 +248,7 @@ class TestGetModel:
                 structures=structures,
                 max_length=max_length,
                 share_embeddings=share_embeddings,
+                **GET_MODEL_KWDS,  # type: ignore[arg-type]
             )
             assert isinstance(m, HierarchicalViTClassifier)
             return m
@@ -354,6 +373,7 @@ class TestGetModel:
                 max_length=max_length,
                 share_embeddings=share_embeddings,
                 share_patchers=share_patchers,
+                **GET_MODEL_KWDS,  # type: ignore[arg-type]
             )
             assert isinstance(m, StructuralViTClassifier)
             return m
