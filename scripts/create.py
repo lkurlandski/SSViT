@@ -41,7 +41,7 @@ from src.helpers import MainArgs
 DEBUG: bool
 BENCH: bool
 NGPUS: int
-GPU: Literal["a100", "gh200", "nvidia_h200", "nvidia_h100_80gb_hbm3"]
+GPU: Literal["a100", "h100", "gh200", "nvidia_h200", "nvidia_h100_80gb_hbm3"]
 SYSTEM: Literal["mkwics", "rc", "empire"]
 
 
@@ -598,7 +598,7 @@ class ScriptBuilder:
         ])
 
         account: str   = "admalware"
-        partition: str = ""
+        partition: str = "tier3"
         env: str       = "env"
 
         if SYSTEM == "empire":
@@ -789,7 +789,7 @@ def main() -> None:
     parser.add_argument("--debug", action="store_true", help="Configuration suitable for debugging.")
     parser.add_argument("--bench", action="store_true", help="Configuration suitable for benchmarking.")
     parser.add_argument("--system", type=str, default="mkwics", choices=["mkwics", "rc", "empire"])
-    parser.add_argument("--gpu", type=str, default="a100", choices=["a100", "gh200", "nvidia_h200", "nvidia_h100_80gb_hbm3"])
+    parser.add_argument("--gpu", type=str, default="a100", choices=["a100", "h100", "gh200", "nvidia_h200", "nvidia_h100_80gb_hbm3"])
     parser.add_argument("--ngpus", type=int, default=1, help="Number of GPUs to use per job.")
     parser.add_argument("--no-clean", action="store_true", help="Do not remove existing outfiles.")
     parser.add_argument("--no-overwrite", action="store_true", help="Do not overwrite existing outfile.")
@@ -807,7 +807,7 @@ def main() -> None:
     SYSTEM = args.system
 
     if SYSTEM == "rc":
-        assert GPU in ("a100", "gh200"), GPU
+        assert GPU in ("a100", "h100", "gh200"), GPU
     if SYSTEM == "empire":
         assert GPU in ("nvidia_h200", "nvidia_h100_80gb_hbm3"), GPU
 
