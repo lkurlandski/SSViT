@@ -38,12 +38,11 @@ from src.helpers import MainArgs
 # ruff: noqa: F541
 
 
-RESUME = False
-DEBUG = False
-BENCH = False
-NGPUS: Optional[int] = None
-OROOT = Path("/shared/rc/admalware") if not Path(".server").exists() or Path(".server").read_text().strip() == "rc" else Path.home()
-HOPPER = False
+DEBUG: bool
+BENCH: bool
+NGPUS: int
+GPU: Literal["a100", "gh200", "nvidia_h200", "nvidia_h100_80gb_hbm3"]
+SYSTEM: Literal["mkwics", "rc", "empire"]
 
 
 TR_SAMPLES = 2339771
@@ -156,13 +155,24 @@ class Configuration:
 
     @property
     def outdir(self) -> Path:
-        root = OROOT / "Documents/code/SSViT/output"
+        # TODO: it would be cleaner to separate the output root from the outdir.
+        if SYSTEM == "mkwics":
+            root = Path("/home/lk3591/")
+        elif SYSTEM == "rc":
+            root = Path("/shared/rc/admalware")
+        elif SYSTEM == "empire":
+            root = Path("/mnt/home/lkurlandski/")
+        else:
+            raise ValueError(SYSTEM)
+
+        root /= "Documents/code/SSViT/output"
         if DEBUG:
             root = root / "debug"
         elif BENCH:
             root = root / "bench"
         else:
             root /= "00"
+
         parts = [
             f"design--{self.design.value}",
             f"arch--{self.arch.value}",
@@ -181,9 +191,10 @@ class Configuration:
             f"warmup_ratio--{self.warmup_ratio}",
             f"label_smoothing--{self.label_smoothing}",
             f"max_epochs--{self.max_epochs}",
-            f"seed--{self.seed}",
             f"freeze_embedding_epoch--{self.freeze_embedding_epoch}",
+            f"seed--{self.seed}",
         ]
+
         return root.joinpath(*parts)
 
     @property
@@ -191,6 +202,10 @@ class Configuration:
         config: dict[str, str | int | float | bool] = {}
         config.update(self._model_config)
         return config
+
+    @property
+    def resume(self) -> bool:
+        return False
 
     @property
     def batch_size(self) -> int:
@@ -582,13 +597,18 @@ class ScriptBuilder:
             "#!/bin/bash",
         ])
 
-        if HOPPER:
-            partition = "grace"
-            gpu = "gh200"
-            env = "env-grace"
-        else:
+
+        if SYSTEM == "rc" and GPU == "a100":
             partition = "tier3"
-            gpu = "a100"
+            env = "env"
+        elif SYSTEM == "rc" and GPU == "gh200":
+            partition = "grace"
+            env = "env-grace"
+        elif SYSTEM == "empire":
+            env = "env"
+            partition = "rit"
+        else:
+            partition = "none"
             env = "env"
 
         slurm = "\n".join([
@@ -596,7 +616,7 @@ class ScriptBuilder:
             f"#SBATCH --output=./logs/%x_%j.out",
             f"#SBATCH --partition={partition}",
             f"#SBATCH --nodes={self.reqs.nodes}",
-            f"#SBATCH --gpus-per-node={gpu}:{self.reqs.gpus_per_node}",
+            f"#SBATCH --gpus-per-node={GPU}:{self.reqs.gpus_per_node}",
             f"#SBATCH --ntasks-per-node={self.reqs.ntasks_per_node}",
             f"#SBATCH --cpus-per-task={self.reqs.cpus_per_task}",
             f"#SBATCH --job-name={str(self.config)}",
@@ -631,7 +651,7 @@ class ScriptBuilder:
             "python",
             "src/main.py",
             f"--outdir \"$OUTDIR\"",
-            f"--resume {RESUME} ",
+            f"--resume {self.config.resume} ",
             f"--design {self.config.design.value}",
             f"--arch {self.config.arch.value}",
             f"--parch {self.config.parch.value}",
@@ -768,31 +788,30 @@ def config_fiter(config: Configuration) -> bool:
 def main() -> None:
 
     parser = ArgumentParser(description="Create large batches of experiments.")
-    parser.add_argument("--resume", action="store_true", help="Resume from existing checkpoints if available.")
     parser.add_argument("--debug", action="store_true", help="Configuration suitable for debugging.")
     parser.add_argument("--bench", action="store_true", help="Configuration suitable for benchmarking.")
-    parser.add_argument("--ngpus", type=int, default=None, help="Number of GPUs to use per job.")
-    parser.add_argument("--root", type=str, default="auto")
-    parser.add_argument("--hopper", action="store_true", help="Execute on Hopper GPUs.")
-    parser.add_argument("--no-clean", action="store_true")
-    parser.add_argument("--no-overwrite", action="store_true")
+    parser.add_argument("--system", type=str, default="mkwics", choices=["mkwics", "rc", "empire"])
+    parser.add_argument("--gpu", type=str, default="a100", choices=["a100", "gh200", "nvidia_h200", "nvidia_h100_80gb_hbm3"])
+    parser.add_argument("--ngpus", type=int, default=1, help="Number of GPUs to use per job.")
+    parser.add_argument("--no-clean", action="store_true", help="Do not remove existing outfiles.")
+    parser.add_argument("--no-overwrite", action="store_true", help="Do not overwrite existing outfile.")
     args = parser.parse_args()
 
-    global RESUME
     global DEBUG
     global BENCH
     global NGPUS
-    global OROOT
-    global HOPPER
-    RESUME = args.resume
-    DEBUG = args.debug
-    BENCH = args.bench
-    NGPUS = args.ngpus
-    OROOT = Path(args.root) if args.root != "auto" else OROOT
-    HOPPER = args.hopper
+    global SYSTEM
+    global GPU
+    DEBUG  = args.debug
+    BENCH  = args.bench
+    NGPUS  = args.ngpus
+    GPU    = args.gpu
+    SYSTEM = args.system
 
-    if HOPPER and NGPUS > 1:
-        raise ValueError("--ngpus must be one if --hoppper enabled.")
+    if SYSTEM == "rc":
+        assert GPU in ("a100", "gh200"), GPU
+    if SYSTEM == "empire":
+        assert GPU in ("nvidia_h200", "nvidia_h100_80gb_hbm3"), GPU
 
     outpath = Path("./run")
     outpath.mkdir(exist_ok=True)
