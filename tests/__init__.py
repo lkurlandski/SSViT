@@ -6,6 +6,11 @@ from itertools import chain
 from pathlib import Path
 import os
 
+import lief
+
+lief.logging.disable()
+lief.disable_leak_warning() 
+
 
 NUM_FILES = int(os.environ.get("SSVIT_TESTS_NUM_FILES", "8"))
 FILES = sorted(
