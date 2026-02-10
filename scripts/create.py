@@ -50,37 +50,6 @@ TR_SAMPLES = 2339771
 VL_SAMPLES =  539882
 
 
-# Classifier throughput in samples/second on NVIDIA A100. Measurements taken using
-# a sequence length of 1_000_000 and various logical batch sizes, e.g., 128 and 256.
-# From experiments, throughput appears to scale linearly with batch size, but only
-# up until a certain point, past which it plateaus; therefore, its less critical to
-# consider the exact batch size used in these measurements. By constast, throughput
-# appears to scale almost perfectly linearly (inversely, however) with sequence length.
-# On the whole, these numbers vary wildly and should be taken with a grain of salt.
-# (Architecture, do_entropy, do_characteristics) : (vl_throughput, tr_throughout)
-THROUGHPUTS: dict[tuple[Architecture, bool, bool], Optional[tuple[float, float]]] = {
-    (Architecture.MCV, False, False) : None,
-    (Architecture.MCV, False, True)  : None,
-    (Architecture.MCV, True,  False) : None,
-    (Architecture.MCV, True,  True)  : None,
-
-    (Architecture.MC2, False, False) : (675, 450),
-    (Architecture.MC2, False, True)  : (425, 325),
-    (Architecture.MC2, True,  False) : (375, 300),
-    (Architecture.MC2, True,  True)  : (300, 270),
-
-    (Architecture.MCG, False, False) : (275, 120),
-    (Architecture.MCG, False, True)  : (150, 100),
-    (Architecture.MCG, True,  False) : (150, 100),
-    (Architecture.MCG, True,  True)  : (160,  90),
-
-    (Architecture.VIT, False, False) : (325, 150),
-    (Architecture.VIT, False, True)  : (150, 100),
-    (Architecture.VIT, True,  False) : (150, 100),
-    (Architecture.VIT, True,  True)  : (150, 100),
-}
-
-
 def fixed_width_string(string: Any, width: int, char: str = " ", left: bool = False) -> str:
     string = str(string)
     if left:
@@ -190,8 +159,10 @@ class Configuration:
         root = OROOT / "Documents/code/SSViT/output"
         if DEBUG:
             root = root / "debug"
-        if BENCH:
+        elif BENCH:
             root = root / "bench"
+        else:
+            root /= "00"
         parts = [
             f"design--{self.design.value}",
             f"arch--{self.arch.value}",
@@ -211,7 +182,7 @@ class Configuration:
             f"label_smoothing--{self.label_smoothing}",
             f"max_epochs--{self.max_epochs}",
             f"seed--{self.seed}",
-            f"update_embedding_steps--{self.update_embedding_steps}",
+            f"freeze_embedding_epoch--{self.freeze_embedding_epoch}",
         ]
         return root.joinpath(*parts)
 
@@ -261,66 +232,54 @@ class Configuration:
         return 64
 
     def get_throughput(self) -> tuple[float, float]:
-        key = (self.arch, self.do_entropy, bool(self.which_characteristics))
 
-        if (vl_tr_throughputs := THROUGHPUTS.get(key)) is not None:
-            tr_throughput = vl_tr_throughputs[1]
-            vl_throughput = vl_tr_throughputs[0]
-        else:
-            print(f"WARNING ({str(self)}): throughput benchmark not found.")
-            tr_throughput = 100
-            vl_throughput = 100
+        # Throughputs for the FLAT model on 1MiB input length.
+        match self.arch:
+            case Architecture.MCV:
+                tr_throughput = 100.00
+                vl_throughput = 100.00
+            case Architecture.MC2:
+                tr_throughput = 450.00
+                vl_throughput = 675.00
+            case Architecture.MCG:
+                tr_throughput = 120.00
+                vl_throughput = 275.00
+            case Architecture.VIT:
+                tr_throughput = 150.00
+                vl_throughput = 325.00
+            case _:
+                raise NotImplementedError(self.arch)
 
-        moe_router_top_k = int(self.model_config.get("moe_router_top_k", 1))
-
-        if self.design == Design.FLAT:
-            if self.parch == PatcherArchitecture.EXP:
-                tr_throughput *= 0.50 * (0.75 ** math.log2(moe_router_top_k))
-                vl_throughput *= 0.50 * (0.75 ** math.log2(moe_router_top_k))
-
-        if self.design == Design.HIERARCHICAL:
-            if self.level == HierarchicalLevel.COARSE:
+        # Adjust based on hierarchical level.
+        match self.level:
+            case HierarchicalLevel.NONE:
+                tr_throughput *= 1.00
+                vl_throughput *= 1.00
+            case HierarchicalLevel.COARSE:
                 tr_throughput *= 0.75
                 vl_throughput *= 0.50
-            if self.level == HierarchicalLevel.ROUGH:
+            case HierarchicalLevel.ROUGH:
                 tr_throughput *= 0.65
                 vl_throughput *= 0.45
-            if self.level == HierarchicalLevel.MIDDLE:
+            case HierarchicalLevel.MIDDLE:
                 tr_throughput *= 0.60
                 vl_throughput *= 0.40
-            if self.level == HierarchicalLevel.FINE:
+            case HierarchicalLevel.FINE:
                 tr_throughput *= 0.40
                 vl_throughput *= 0.30
+            case _:
+                raise NotImplementedError(self.level)
 
-        if self.design == Design.STRUCTURAL:
-            if self.parch == PatcherArchitecture.EXP:
-                tr_throughput *= 0.25 * (0.75 ** math.log2(moe_router_top_k))
-                vl_throughput *= 0.25 * (0.75 ** math.log2(moe_router_top_k))
-            else:
-                # Manual routing.
-                if self.level == HierarchicalLevel.COARSE:
-                    tr_throughput *= 0.75
-                    vl_throughput *= 0.50
-                if self.level == HierarchicalLevel.ROUGH:
-                    tr_throughput *= 0.65
-                    vl_throughput *= 0.45
-                if self.level == HierarchicalLevel.MIDDLE:
-                    tr_throughput *= 0.60
-                    vl_throughput *= 0.40
-                if self.level == HierarchicalLevel.FINE:
-                    tr_throughput *= 0.40
-                    vl_throughput *= 0.30
+        # Non-constant memory patcher architectures descrease throughput by around 4x.
+        match self.parch:
+            case PatcherArchitecture.MEM:
+                tr_throughput *= 1.00
+                vl_throughput *= 1.00
+            case _:
+                tr_throughput *= 0.25
+                vl_throughput *= 0.25
 
-        if self.arch == Architecture.VIT and self.model_config.get("patcher_pooling", "max") == "avg":
-            vl_throughput *= 0.95
-            tr_throughput *= 0.30
-
-        # NOTE: this is getting pretty messy.
-        if self.arch == Architecture.VIT and self.parch == PatcherArchitecture.DWC:
-            vl_throughput = 100
-            tr_throughput = 20
-
-        # NOTE: the scaling via max_length isn't going to work well for structural any more.
+        # Adjust based on input length (compute scales roughly linearly).
         tr_throughput = tr_throughput / (self.max_length / 2 ** 20)
         vl_throughput = vl_throughput / (self.max_length / 2 ** 20)
 
@@ -376,7 +335,7 @@ class Configuration:
 
     @property
     def warmup_ratio(self) -> float:
-        return 0.10
+        return 0.05
 
     @property
     def label_smoothing(self) -> float:
@@ -434,7 +393,7 @@ class Configuration:
             return 2
         if BENCH:
             return 1
-        return 10
+        return 20
 
     @property
     def eval_epochs(self) -> float:
@@ -442,7 +401,7 @@ class Configuration:
             return 0.50
         if BENCH:
             return 1
-        return 0.50
+        return 1.0
 
     @property
     def chpt_epochs(self) -> float:
@@ -486,11 +445,17 @@ class Configuration:
 
     @property
     def update_embedding_steps(self) -> int:
-        return 16
+        return 1
+
+    @property
+    def freeze_embedding_epoch(self) -> int:
+        return 1
 
     @property
     def find_unused_parameters(self) -> bool:
         if self.update_embedding_steps > 1:
+            return True
+        if self.freeze_embedding_epoch != -1:
             return True
         return False
 
@@ -533,15 +498,30 @@ class Requirements:
     @property
     def time(self) -> int:
         """Return the number of seconds required for the job (configure)."""
+        return int(6 * 24 * 3600 / self.world_size)  # FIXME
 
         tr_throughput = self.config.tr_throughput * self.world_size
         vl_throughput = self.config.vl_throughput * self.world_size
 
-        tr_samples = TR_SAMPLES * self.config.max_epochs
-        vl_samples = VL_SAMPLES  * self.config.max_epochs / self.config.eval_epochs
+        tr_seconds = 0
+        vl_seconds = 0
 
-        tr_seconds = tr_samples / tr_throughput
-        vl_seconds = vl_samples / vl_throughput
+        # Using a non-constant-memory encoder with frozen embeddings speeds up training by about 4x.
+        # This increments the time by the slow period before boosting the tr_throughput value.
+        if self.config.freeze_embedding_epoch != -1 and self.config.parch != PatcherArchitecture.MEM:
+            tr_samples = TR_SAMPLES * self.config.freeze_embedding_epoch
+            tr_seconds += tr_samples / tr_throughput
+            tr_throughput *= 4
+
+        tr_samples = TR_SAMPLES * (self.config.max_epochs - max(self.config.freeze_embedding_epoch, 0))
+        vl_samples = VL_SAMPLES * self.config.max_epochs / self.config.eval_epochs
+
+        tr_seconds += tr_samples / tr_throughput
+        vl_seconds += vl_samples / vl_throughput
+
+        if self.config.freeze_embedding_epoch != -1:
+            tr_samples = TR_SAMPLES * self.config.freeze_embedding_epoch
+            tr_seconds += tr_samples / (tr_throughput / 4)  # Assume 4x speedup when freezing embedding.
 
         add = 0.50 * 3600
         mul = 0.15
@@ -697,6 +677,7 @@ class ScriptBuilder:
             f"--static_shapes_bin_backbone_seq_lengths {self.config.static_shapes_bin_backbone_seq_lengths}",
             f"--static_shapes_bin_backbone_batch_sizes {self.config.static_shapes_bin_backbone_batch_sizes}",
             f"--update_embedding_steps {self.config.update_embedding_steps}",
+            f"--freeze_embedding_epoch {self.config.freeze_embedding_epoch}",
             f"--param_grad_none {self.config.param_grad_none}",
             f"--find_unused_parameters {self.config.find_unused_parameters}",
             f"--max_epochs {self.config.max_epochs}",
@@ -773,12 +754,10 @@ def config_fiter(config: Configuration) -> bool:
     ...
 
     # Entropy
-    if config.do_entropy:
-        return False
+    ...
 
     # Characteristics
-    if config.which_characteristics:
-        return False
+    ...
 
     # Model Config
     ...
@@ -821,71 +800,54 @@ def main() -> None:
         if f.is_file() and not args.no_clean:
             f.unlink()
 
-    model_configs = [
-        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 64,  "patcher_stride": 64},
-        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 128,  "patcher_stride": 128},
-        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 256,  "patcher_stride": 256},
-        {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 512,  "patcher_stride": 512},
-    ]
+    DESIGNS      = [Design.STRUCTURAL]
+    ARCHS        = [Architecture.VIT]
+    POSENCS      = [PositionalEncodingArchitecture.FIXED]
+    PATCHPOSENCS = [PatchPositionalEncodingArchitecture.NONE]
+    LEVELS       = [HierarchicalLevel.FINE]
+    DO_ENTROPYS  = [False]
+    WHICH_CHARS  = [tuple(), (lief.PE.Section.CHARACTERISTICS.MEM_READ, lief.PE.Section.CHARACTERISTICS.MEM_WRITE, lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE)]
+    MAX_LENGTHS  = [2**20]
+    SEEDS        = [0]
 
+    model_configs = [
+        # {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 64,  "patcher_stride": 64},
+        {"patcher_pooling": "avg", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 64,  "patcher_stride": 64},
+    ]
     stream = product(
-        [Design.STRUCTURAL],
-        [Architecture.VIT],
+        DESIGNS,
+        ARCHS,
         [PatcherArchitecture.DWC],
-        [PositionalEncodingArchitecture.FIXED],
-        [PatchPositionalEncodingArchitecture.NONE],
-        [HierarchicalLevel.FINE],
-        [False],
-        [()],
-        [2**20],
-        [0],
+        POSENCS,
+        PATCHPOSENCS,
+        LEVELS,
+        DO_ENTROPYS,
+        WHICH_CHARS,
+        MAX_LENGTHS,
+        SEEDS,
         model_configs,
     )
+
+    model_configs = [
+        # {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 64,  "patcher_stride": 64},
+        {"patcher_pooling": "avg", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 64,  "patcher_stride": 64},
+    ]
+    stream = chain(stream, product(
+        DESIGNS,
+        ARCHS,
+        [PatcherArchitecture.BAS],
+        POSENCS,
+        PATCHPOSENCS,
+        LEVELS,
+        DO_ENTROPYS,
+        WHICH_CHARS,
+        MAX_LENGTHS,
+        SEEDS,
+        model_configs,
+    ))
     configurations = (Configuration(*config) for config in stream)  # type: ignore[arg-type]
     configurations = (config for config in configurations if config_fiter(config))
     configurations = sorted(configurations)
-
-    configurations.extend([
-        Configuration(
-            design=Design.STRUCTURAL,
-            arch=Architecture.VIT,
-            parch=PatcherArchitecture.BAS,
-            posenc=PositionalEncodingArchitecture.FIXED,
-            patchposenc=PatchPositionalEncodingArchitecture.NONE,
-            level=HierarchicalLevel.FINE,
-            do_entropy=False,
-            which_characteristics=tuple(),
-            max_length=2**20,
-            seed=0,
-            model_config={"patcher_pooling": "avg", "embedding_dim": 8, "patcher_channels": 256, "patcher_kernel_size": 256, "patcher_stride": 64},
-        ),
-        Configuration(
-            design=Design.STRUCTURAL,
-            arch=Architecture.VIT,
-            parch=PatcherArchitecture.BAS,
-            posenc=PositionalEncodingArchitecture.FIXED,
-            patchposenc=PatchPositionalEncodingArchitecture.NONE,
-            level=HierarchicalLevel.FINE,
-            do_entropy=False,
-            which_characteristics=tuple(),
-            max_length=2**20,
-            seed=0,
-            model_config={"patcher_pooling": "avg", "embedding_dim": 8, "patcher_channels": 64, "patcher_kernel_size": 64, "patcher_stride": 64},
-        ),
-        Configuration(
-            design=Design.STRUCTURAL,
-            arch=Architecture.VIT,
-            parch=PatcherArchitecture.MEM,
-            posenc=PositionalEncodingArchitecture.FIXED,
-            patchposenc=PatchPositionalEncodingArchitecture.NONE,
-            level=HierarchicalLevel.FINE,
-            do_entropy=False,
-            which_characteristics=tuple(),
-            max_length=2**20,
-            seed=0,
-            model_config={"patcher_pooling": "max", "embedding_dim": 8, "patcher_channels": 64, "patcher_kernel_size": 64, "patcher_stride": 64},
-        ),
-    ])
 
     alloutdirs: set[str] = set()
     allconfigs: set[str] = set()
@@ -901,7 +863,7 @@ def main() -> None:
             raise RuntimeError(f"ERROR ({str(config.outdir)}): duplicate output directory detected.")
         alloutdirs.add(str(config.outdir))
         if config.outdir.exists() and any(config.outdir.iterdir()) and not DEBUG:
-            print(f"WARNING ({str(config)}): output directory exists at {str(config.outdir)}.")
+            print(f"WARNING ({str(config)}): output directory exists.")
 
         builder = ScriptBuilder(config, reqs)
         outfile = (outpath / str(config)).with_suffix(".sh")
