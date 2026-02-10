@@ -597,22 +597,20 @@ class ScriptBuilder:
             "#!/bin/bash",
         ])
 
+        account: str   = "admalware"
+        partition: str = ""
+        env: str       = "env"
 
-        if SYSTEM == "rc" and GPU == "a100":
-            partition = "tier3"
-            env = "env"
-        elif SYSTEM == "rc" and GPU == "gh200":
+        if SYSTEM == "empire":
+            account   = "rit"
+            partition = "rit"
+
+        if SYSTEM == "rc" and GPU == "gh200":
             partition = "grace"
             env = "env-grace"
-        elif SYSTEM == "empire":
-            env = "env"
-            partition = "rit"
-        else:
-            partition = "none"
-            env = "env"
 
         slurm = "\n".join([
-            f"#SBATCH --account=admalware",
+            f"#SBATCH --account={account}",
             f"#SBATCH --output=./logs/%x_%j.out",
             f"#SBATCH --partition={partition}",
             f"#SBATCH --nodes={self.reqs.nodes}",
