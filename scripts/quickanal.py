@@ -14,7 +14,9 @@ Example:
 from argparse import ArgumentParser
 import json
 from pathlib import Path
+import subprocess
 from typing import Callable
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -33,29 +35,32 @@ DISPLAY = (
     'display.width', None,
 )
 
+
 parser = ArgumentParser()
 parser.add_argument("input", type=str, nargs="?", default=None, help="Generic input, i.e., the resfile/logfile/jobid.")
 parser.add_argument("--resfile", type=Path, help="Path to the results.jsonl file.")
 parser.add_argument("--logfile", type=Path, help="Path to the training log file, from which the resfile can be located.")
 parser.add_argument("--jobid", type=str, help="JobId of the experiment, from which the logfile can be located.")
+parser.add_argument("--system", type=str, default=None, required=False, choices=["mkwics", "rc", "empire"])
 parser.add_argument("--json", action="store_true", help="Output in JSON format.")
 parser.add_argument("--no_summary", action="store_true", help="Do not print the summary (the 'best' value for every input).")
 parser.add_argument("--detailed", action="store_true", help="Print detailed information (entries where all inputs are non-null).")
 parser.add_argument("--ddetailed", action="store_true", help="Print very detailed information (all entries).")
-parser.add_argument("--include", type=str, nargs="+", default=[], help="Metrics to include in the analysis (aside from 'epoch' and 'glbl_step'). If not provided, all metrics are included.")
+parser.add_argument("--include", type=str, nargs="+",
+    default=["tr_loss", "vl_loss", "vl_roc", "vl_prc", "tr_gpu_mem", "vl_gpu_mem", "tr_throughput", "vl_throughput"],
+    choices=["tr_loss", "vl_loss", "aux_loss", "clf_loss", "vl_aux_loss", "vl_clf_loss", "vl_roc", "vl_prc", "tr_gpu_mem", "vl_gpu_mem", "tr_throughput", "vl_throughput"],
+    help="Metrics to include in the analysis (aside from 'epoch' and 'glbl_step'). If not provided, all metrics are included.")
 parser.add_argument("--quiet", action="store_true", help="Suppress non-essential output.")
 parser.add_argument("--verbose", action="store_true", help="Print verbose output for debugging.")
 args = parser.parse_args()
 
-ROOT = Path("/home/lk3591/Documents/code/SSViT")
-LOGS = ROOT / "logs"
-BULK = Path("/shared/rc/admalware/Documents/code/SSViT")
 
 if args.verbose:
     print(f"{args.input=}")
     print(f"{args.resfile=}")
     print(f"{args.logfile=}")
     print(f"{args.jobid=}")
+    print(f"{args.system=}")
     print(f"{args.json=}")
     print(f"{args.no_summary=}")
     print(f"{args.detailed=}")
@@ -63,6 +68,40 @@ if args.verbose:
     print(f"{args.quiet=}")
     print(f"{args.verbose=}")
     print(f"{args.include=}")
+
+
+def detect_system() -> Literal["mkwics", "rc", "empire"]:
+    if subprocess.run(["squeue"], capture_output=True, text=True).returncode != 0:
+        return "mkwics"
+    if subprocess.run(["whoami"], capture_output=True, text=True).stdout == "lk3591":
+        return "rc"
+    return "empire"
+
+
+SYSTEM = args.system if args.system is not None else detect_system()
+if args.verbose:
+    print(f"{SYSTEM=}")
+
+if SYSTEM == "mkwics":
+    ROOT = Path("/home/lk3591/Documents/code/SSViT")
+    LOGS = ROOT / "logs"
+    BULK = ROOT
+elif SYSTEM == "rc":
+    ROOT = Path("/home/lk3591/Documents/code/SSViT")
+    LOGS = ROOT / "logs"
+    BULK = Path("/shared/rc/admalware/Documents/code/SSViT")
+    root = Path("/shared/rc/admalware")
+elif SYSTEM == "empire":
+    ROOT = Path("/mnt/home/lkurlandski/Documents/code/SSViT")
+    LOGS = ROOT / "logs"
+    BULK = ROOT
+else:
+    raise ValueError(SYSTEM)
+if args.verbose:
+    print(f"{ROOT=}")
+    print(f"{LOGS=}")
+    print(f"{BULK=}")
+
 
 # Determine the type of the generic input.
 if args.input is not None:
@@ -167,6 +206,7 @@ with open(args.resfile) as fp:
             d["vl_gpu_mem"] = d["vl_gpu_mem"] / (1024 ** 3)  # Convert to GB.
         log.append({k: v for k, v in d.items() if k in summary})
 df = pd.DataFrame(log)
+df = df[[c for c in summary.keys() if c in df.columns]]
 if args.verbose:
     print(f"Found {len(log)} entries.")
 
