@@ -939,9 +939,11 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 10
         averages = prof.key_averages()
         tab_cpu = averages.table(sort_by="cpu_time_total", row_limit=20)
         print(f"Top Usage (CPU):\n{tab_cpu}")
+        tab_cpu = averages.table(sort_by="cpu_time_total", row_limit=-1)
         file_cpu.write_text(tab_cpu)
         tab_gpu = averages.table(sort_by="cuda_time_total", row_limit=20)
         print(f"Top Usage (GPU):\n{tab_gpu}")
+        tab_gpu = averages.table(sort_by="cuda_time_total", row_limit=-1)
         file_gpu.write_text(tab_gpu)
         if with_stack:
             print("Exporting stacks...")
