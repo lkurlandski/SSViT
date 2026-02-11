@@ -73,7 +73,7 @@ if args.verbose:
 def detect_system() -> Literal["mkwics", "rc", "empire"]:
     if subprocess.run(["squeue"], capture_output=True, text=True).returncode != 0:
         return "mkwics"
-    if subprocess.run(["whoami"], capture_output=True, text=True).stdout == "lk3591":
+    if subprocess.run(["whoami"], capture_output=True, text=True).stdout.strip() == "lk3591":
         return "rc"
     return "empire"
 
