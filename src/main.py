@@ -935,6 +935,7 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 10
         experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
     ) as prof:
         trainer.train(prof, end_mini_step=total_mini_steps)
+        torch.cuda.profiler.stop()  # type: ignore[no-untyped-call]
         print("Profiling complete. Computing averages...")
         averages = prof.key_averages()
         tab_cpu = averages.table(sort_by="cpu_time_total", row_limit=20)
@@ -950,10 +951,37 @@ def main_run_profile(trainer: Trainer, tr_batch_size: int, num_samples: int = 10
             prof.export_stacks(file_stk.as_posix(), "self_cpu_time_total")
 
         if with_groups > 0:
+            OPS = (
+                # # Copies
+                "aten::copy_",
+                "aten::to",
+                "aten::_to_copy",
+                "aten::clone",
+                # # Views
+                "aten::reshape",
+                "aten::contiguous",
+                "aten::view",
+                "aten::flatten",
+                "aten::transpose",
+                "aten::permute",
+                "aten::t",
+                # # Allocations
+                "aten::empty",
+                "aten::empty_like",
+                "aten::zeros",
+                "aten::zeros_like",
+                "aten::ones",
+                "aten::ones_like",
+                # # Simplemath
+                "aten::add_",
+                # Transfers
+                "cudaMemcpyAsync",
+                "cudaMemsetAsync",
+            )
             print("Computing grouped averages...")
             averages = prof.key_averages(group_by_stack_n=with_groups)
-            averages = [e for e in averages if e.key in ("aten::copy_", "aten::to", "aten::_to_copy", "aten::to", "aten::add_")]
-            for e in sorted(averages, key=lambda x: x.cpu_time_total, reverse=True)[:with_groups * 2]:
+            averages = [e for e in averages if e.key in OPS]
+            for e in sorted(averages, key=lambda x: x.cpu_time_total, reverse=True):
                 print(e.key, e.cpu_time_total, e.count)
                 with open(file_grp, "a") as fp:
                     print(e.key, e.cpu_time_total, e.count, file=fp)
