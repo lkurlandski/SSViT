@@ -601,8 +601,6 @@ def control_torch_profiler_for_nsys_profiling_(want_nsys: bool, nsys_on: bool) -
     elif not want_nsys and nsys_on:
         torch.cuda.profiler.stop()  # type: ignore[no-untyped-call]
         nsys_on = False
-    else:
-        raise RuntimeError(f"Invalid combination of want_nsys={want_nsys} and nsys_on={nsys_on}.")
     return nsys_on
 
 
