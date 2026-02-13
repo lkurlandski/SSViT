@@ -61,6 +61,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.optim.optimizer import ParamsT
 from torch.profiler import record_function
 from torch.profiler import profile
+from torch.profiler import ProfilerAction
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torch.utils.data import IterableDataset
@@ -593,6 +594,18 @@ def freeze_or_unfreeze_embeddings_(model: nn.Module, *, freeze: bool, verbose: b
                 module.weight.requires_grad_(requires_grad)
 
 
+def control_torch_profiler_for_nsys_profiling_(want_nsys: bool, nsys_on: bool) -> bool:
+    if want_nsys and not nsys_on:
+        torch.cuda.profiler.start() # type: ignore[no-untyped-call]
+        nsys_on = True
+    elif not want_nsys and nsys_on:
+        torch.cuda.profiler.stop()  # type: ignore[no-untyped-call]
+        nsys_on = False
+    else:
+        raise RuntimeError(f"Invalid combination of want_nsys={want_nsys} and nsys_on={nsys_on}.")
+    return nsys_on
+
+
 class Trainer:
     """
     Trainer class for training models with PyTorch.
@@ -785,11 +798,18 @@ class Trainer:
         real: bool               # whether the current mini-batch has real data
         batch: Batch             # current mini-batch
         embeddings_require_grad: Optional[bool] = None
+        want_nsys = False
+        nsys_on   = False
 
         iterator = iter(iterable)
         timer.start()
         while True:
-            with record_function("stage::prepare"):
+            if prof is not None:
+                want_nsys = prof.schedule(mini_step + 1) in (ProfilerAction.RECORD, ProfilerAction.RECORD_AND_SAVE)
+                nsys_on = control_torch_profiler_for_nsys_profiling_(want_nsys, nsys_on)
+                print(f"[INFO] [rank {rank()}] [Trainer::train] mini_step={mini_step + 1} {want_nsys=} {nsys_on=}")
+
+            with record_function("stage::prepare"), torch.cuda.nvtx.range("stage::prepare"):
                 try:
                     mini_step, real, batch = next(iterator)
                 except StopIteration:
@@ -798,9 +818,9 @@ class Trainer:
                 continue
             if mini_step - 1 == end_mini_step:
                 break
-            with record_function("stage::transfer"):
+            with record_function("stage::transfer"), torch.cuda.nvtx.range("stage::transfer"):
                 batch = batch.to(self.device, non_blocking=True)
-            with record_function("stage::finalize"):
+            with record_function("stage::finalize"), torch.cuda.nvtx.range("stage::finalize"):
                 batch = batch.finalize(self.mp_dtype, torch.int32, torch.int64)
 
             # NOTE: if using ddp, `find_unused_parameters` must be True for this to work properly
@@ -825,11 +845,12 @@ class Trainer:
 
             # Compute normalized loss
             with maybe_no_sync(self.model, sync_gradients):
-                with record_function("stage::forward"):
+                with record_function("stage::forward"), torch.cuda.nvtx.range("stage::forward"):
                     outputs = self.forward(batch)
                 loss, losses = self.compute_loss(batch, outputs)
                 loss = loss * int(real) / self.args.gradient_accumulation_steps
-                with record_function("stage::backward"):
+                # NOTE: for nsys profiling, we may need the torch.autograd.profiler.emit_nvtx() manager.
+                with record_function("stage::backward"), torch.cuda.nvtx.range("stage::backward"):
                     self.scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
                 results["tr_loss"] += loss.detach() * len(batch) * self.args.gradient_accumulation_steps
                 for lossname in losses:
@@ -860,7 +881,7 @@ class Trainer:
                 if anyone_had_real_window:
                     results["grad_steps"] += 1
                     # Take an optimization step
-                    with record_function("stage::step"):
+                    with record_function("stage::step"), torch.cuda.nvtx.range("stage::step"):
                         grad_norm = self.step(grad_scale=grad_scale)
                     results["grad_norm"] += grad_norm.detach()
                     # Compute parameter delta
@@ -919,8 +940,6 @@ class Trainer:
                 had_real_window = False
 
             if prof is not None:
-                if not isinstance(prof, profile):
-                    raise TypeError("prof must be a torch.profiler.profile instance.")
                 prof.step()  # type: ignore[no-untyped-call]
 
             # Stop if we've reached the maximum number of global steps
