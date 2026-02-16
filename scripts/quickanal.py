@@ -47,8 +47,8 @@ parser.add_argument("--no_summary", action="store_true", help="Do not print the 
 parser.add_argument("--detailed", action="store_true", help="Print detailed information (entries where all inputs are non-null).")
 parser.add_argument("--ddetailed", action="store_true", help="Print very detailed information (all entries).")
 parser.add_argument("--include", type=str, nargs="+",
-    default=["tr_loss", "vl_loss", "vl_roc", "vl_prc", "tr_gpu_mem", "vl_gpu_mem", "tr_throughput", "vl_throughput"],
-    choices=["tr_loss", "vl_loss", "aux_loss", "clf_loss", "vl_aux_loss", "vl_clf_loss", "vl_roc", "vl_prc", "tr_gpu_mem", "vl_gpu_mem", "tr_throughput", "vl_throughput"],
+    default=["tr_loss", "vl_loss", "vl_roc", "vl_prc", "tr_gpu_mem", "vl_gpu_mem", "tr_throughput", "vl_throughput", "lr"],
+    choices=["tr_loss", "vl_loss", "aux_loss", "clf_loss", "vl_aux_loss", "vl_clf_loss", "vl_roc", "vl_prc", "tr_gpu_mem", "vl_gpu_mem", "tr_throughput", "vl_throughput", "lr"],
     help="Metrics to include in the analysis (aside from 'epoch' and 'glbl_step'). If not provided, all metrics are included.")
 parser.add_argument("--quiet", action="store_true", help="Suppress non-essential output.")
 parser.add_argument("--verbose", action="store_true", help="Print verbose output for debugging.")
@@ -168,6 +168,7 @@ if args.logfile is not None:
 summary: dict[str, Callable[[np.ndarray], float]] = {  # type: ignore[type-arg]
     "epoch": np.max,
     "glbl_step": np.max,
+    "lr": np.mean,
     "tr_loss": np.min,
     "vl_loss": np.min,
     "aux_loss": np.min,
