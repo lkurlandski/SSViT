@@ -86,6 +86,10 @@ TRAINER_FREEZE_EMBEDDINGS = os.environ.get("TRAINER_FREEZE_EMBEDDINGS", "0") == 
 if TRAINER_FREEZE_EMBEDDINGS:
     warnings.warn("Trainer will freeze embeddings from the start of training.")
 
+TRAINER_EARLY_TERMINATE = int(os.environ.get("TRAINER_EARLY_TERMINATE", f"{sys.maxsize}"))
+if TRAINER_EARLY_TERMINATE != sys.maxsize:
+    warnings.warn(f"Trainer will early terminate after {TRAINER_EARLY_TERMINATE} epochs.")
+
 
 def debug_autocast_dtypes(model: nn.Module) -> None:
     def hook(mod, inp, out):  # type: ignore[no-untyped-def]
@@ -484,6 +488,22 @@ class NCycleLR:
 
         self.sched = self._create_scheduler(self.cycle_idx)
 
+    def __repr__(self) -> str:
+        parts = [
+            f"optimizer={self.optimizer.__class__.__name__}(...)",
+            f"total_steps={self.total_steps}",
+            f"max_lr={self.max_lr}",
+            f"n_cycles={self.n_cycles}",
+            f"cycle_length_mult={self.cycle_length_mult}",
+            f"max_lr_gamma={self.max_lr_gamma}",
+            f"cycle_total_steps={self.cycle_total_steps}",
+            f"cycle_max_lrs={self.cycle_max_lrs}",
+            f"milestones={self.milestones}",
+        ]
+        parts = [f"  {s}" for s in parts]
+        args = ",\n".join(parts)
+        return f"{self.__class__.__name__}(\n{args},\n)"
+
     def _create_scheduler(self, i: int) -> OneCycleLR:
         return OneCycleLR(
             self.optimizer,
@@ -595,6 +615,13 @@ class NCycleLR:
             s += steps_i
             milestones.append(s)
         return milestones
+
+
+class ImplementsLRScheduler(Protocol):
+    def step(self) -> None: ...
+    def get_last_lr(self) -> list[float]: ...
+    def state_dict(self) -> dict[str, Any]: ...
+    def load_state_dict(self, sd: dict[str, Any]) -> None: ...
 
 
 def mp_dtype(mp16: bool, device: torch.device) -> torch.dtype:
@@ -779,7 +806,7 @@ class Trainer:
         padbatch: Batch,
         loss_fn: Module,
         optimizer: Optional[Optimizer] = None,
-        scheduler: Optional[LRScheduler] = None,
+        scheduler: Optional[LRScheduler | ImplementsLRScheduler] = None,
         stopper: Optional[EarlyStopper] = None,
         device: Optional[torch.device] = None,
     ) -> None:
@@ -885,7 +912,7 @@ class Trainer:
             self.epoch_idx += 1
             pbar.update(1)
             pbar.set_description(f"Epoch {self.epoch_idx} of {self.max_steps / self.steps_per_epoch} (Step {self.glbl_step} / {self.max_steps})")
-            if self.epoch_idx >= int(os.environ.get("TRAINER_EARLY_TERMINATE", f"{sys.maxsize}")):
+            if self.epoch_idx >= TRAINER_EARLY_TERMINATE:
                 self.print("Early termination triggered.")
                 break
 
@@ -1713,8 +1740,8 @@ class Trainer:
         optimizer: Optional[Optimizer] = None,
         optimizer_init: Optional[Callable[[ParamsT], Optimizer]] = None,
         get_param_groups: Callable[[Module], ParamsT] = lambda m: m.parameters(),
-        scheduler: Optional[LRScheduler] = None,
-        scheduler_init: Optional[Callable[[Optimizer], LRScheduler]] = None,
+        scheduler: Optional[LRScheduler | ImplementsLRScheduler] = None,
+        scheduler_init: Optional[Callable[[Optimizer], LRScheduler | ImplementsLRScheduler]] = None,
         device: Optional[torch.device] = None,
     ) -> Trainer:
         """

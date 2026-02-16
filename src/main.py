@@ -139,6 +139,8 @@ from src.trainer import is_dist
 from src.trainer import largest_possible_dataloader_length
 from src.trainer import freeze_or_unfreeze_embeddings_
 from src.trainer import TRAINER_FREEZE_EMBEDDINGS
+from src.trainer import NCycleLR
+from src.trainer import ImplementsLRScheduler
 from src.utils import num_sort_files
 from src.utils import seed_everything
 from src.utils import get_optimal_num_worker_threads
@@ -1261,7 +1263,7 @@ def main() -> None:
     warmup_steps = int(total_steps * args.warmup_ratio)
     print(f"[rank {rank()}] {total_steps=}, {warmup_steps=}")
 
-    scheduler_init: Callable[[Optimizer], LRScheduler]
+    scheduler_init: Callable[[Optimizer], LRScheduler | ImplementsLRScheduler]
     if args.sched == Scheduler.NONE:
         scheduler_init = partial(LambdaLR,
             lr_lambda=lambda _: 1.0,
@@ -1276,6 +1278,18 @@ def main() -> None:
             final_div_factor=args.lr_beg / args.lr_end,
         )
         print("scheduler=OneCycleLR(")
+    elif args.sched == Scheduler.NCLR:
+        scheduler_init = partial(NCycleLR,
+            max_lr=args.lr_max,
+            total_steps=total_steps,
+            pct_start=args.warmup_ratio,
+            div_factor=args.lr_max / args.lr_beg,
+            final_div_factor=args.lr_beg / args.lr_end,
+            n_cycles=args.lr_nclr_ncycles,
+            cycle_length_mult=args.lr_nclr_cycle_length_mult,
+            max_lr_gamma=args.lr_nclr_max_lr_gamma,
+        )
+        print("scheduler=NCycleLR(")
     elif args.sched == Scheduler.CUST:
         scheduler_init = partial(get_lr_scheduler,
             lr_beg=args.lr_beg,
@@ -1349,6 +1363,7 @@ def main() -> None:
         params = decay_aware_param_groups(wmodel, args.weight_decay)
         optimizer = optimizer_init(params)
         scheduler = scheduler_init(optimizer)
+        print(f"{scheduler=}")
         trainer = Trainer(
             args=rargs,
             model=wmodel,

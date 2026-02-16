@@ -73,6 +73,7 @@ class Scheduler(Enum):
     NONE = "none"  # Fixed learning rate
     CUST = "cust"  # Custom schduler
     OCLR = "oclr"  # One Cycle Learning Rate
+    NCLR = "nclr"  # NCycle Learning Rate
 
 
 def any_to_section_characteristic(s: lief.PE.Section.CHARACTERISTICS | int | str) -> lief.PE.Section.CHARACTERISTICS:
@@ -122,6 +123,9 @@ class MainArgs:
     lr_beg: float = 1e-5
     lr_max: float = 1e-3
     lr_end: float = 1e-6
+    lr_nclr_ncycles: int = -1
+    lr_nclr_max_lr_gamma: float = 0.50
+    lr_nclr_cycle_length_mult: float = 1.0
     warmup_ratio: float = 0.00
     weight_decay: float = 1e-2
     label_smoothing: float = 0.0
@@ -161,6 +165,12 @@ class MainArgs:
             warnings.warn("The Trainer::evaluate method currently hangs with FSDP modules.")
         if self.num_streams > 0:
             warnings.warn("Using multiple data streams leads to substantially larger memory usage than zero streams.")
+        if self.sched == Scheduler.NCLR:
+            if any(x <= 0 for x in (self.lr_nclr_ncycles, self.lr_nclr_max_lr_gamma, self.lr_nclr_cycle_length_mult)):
+                raise ValueError(
+                    "`lr_nclr_ncycles`, `lr_nclr_max_lr_gamma`, and `lr_nclr_cycle_length_mult` must be set for NCLR scheduler. "
+                    f"Got lr_nclr_ncycles={self.lr_nclr_ncycles}, lr_nclr_max_lr_gamma={self.lr_nclr_max_lr_gamma}, lr_nclr_cycle_length_mult={self.lr_nclr_cycle_length_mult}."
+                )
 
     @property
     def model_config(self) -> dict[str, Any]:
