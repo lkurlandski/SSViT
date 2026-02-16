@@ -4,6 +4,7 @@ Train and validation loops.
 
 from __future__ import annotations
 from argparse import Namespace
+import bisect
 from collections import defaultdict
 from collections.abc import Collection
 from collections.abc import Generator
@@ -16,6 +17,7 @@ from functools import partial
 import gc
 import hashlib
 import itertools
+import inspect
 import json
 import math
 import os
@@ -58,6 +60,7 @@ from torch.optim import Optimizer
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.optim.optimizer import ParamsT
 from torch.profiler import record_function
 from torch.profiler import profile
@@ -434,6 +437,164 @@ class EarlyStopper:
     @property
     def stop(self) -> bool:
         return self._stop
+
+
+class NCycleLR:
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        total_steps: int,
+        max_lr: float | Sequence[float],
+        n_cycles: int,
+        cycle_length_mult: float = 1.0,
+        max_lr_gamma: Optional[float] = None,
+        *,
+        pct_start: float = inspect.signature(OneCycleLR).parameters["pct_start"].default,
+        anneal_strategy: Literal["cos", "linear"] = inspect.signature(OneCycleLR).parameters["anneal_strategy"].default,
+        cycle_momentum: bool = inspect.signature(OneCycleLR).parameters["cycle_momentum"].default,
+        base_momentum: float | list[float] = inspect.signature(OneCycleLR).parameters["base_momentum"].default,
+        max_momentum: float | list[float] = inspect.signature(OneCycleLR).parameters["max_momentum"].default,
+        div_factor: float = inspect.signature(OneCycleLR).parameters["div_factor"].default,
+        final_div_factor: float = inspect.signature(OneCycleLR).parameters["final_div_factor"].default,
+        three_phase: bool = inspect.signature(OneCycleLR).parameters["three_phase"].default,
+    ) -> None:
+        self.optimizer = optimizer
+        self.total_steps = total_steps
+        self.max_lr = max_lr if isinstance(max_lr, Sequence) else [float(max_lr)] * len(optimizer.param_groups)
+        self.n_cycles = n_cycles
+        self.cycle_length_mult = cycle_length_mult
+        self.max_lr_gamma = 1.0 / final_div_factor if max_lr_gamma is None else max_lr_gamma
+        self.cycle_kwds = {
+            "pct_start": pct_start,
+            "anneal_strategy": anneal_strategy,
+            "cycle_momentum": cycle_momentum,
+            "base_momentum": base_momentum,
+            "max_momentum": max_momentum,
+            "div_factor": div_factor,
+            "final_div_factor": final_div_factor,
+            "three_phase": three_phase,
+        }
+        self.cycle_total_steps = NCycleLR._compute_cycle_total_steps(self.total_steps, self.n_cycles, self.cycle_length_mult)
+        self.cycle_max_lrs     = NCycleLR._compute_cycle_max_lrs(self.n_cycles, self.max_lr_gamma, self.max_lr)
+        self.milestones        = NCycleLR._compute_cycle_milestones(self.cycle_total_steps)
+
+        self.global_step = 0
+        self.cycle_idx   = 0
+
+        self.sched = self._create_scheduler(self.cycle_idx)
+
+    def _create_scheduler(self, i: int) -> OneCycleLR:
+        return OneCycleLR(
+            self.optimizer,
+            max_lr=self.cycle_max_lrs[i],
+            total_steps=self.cycle_total_steps[i],
+            **self.cycle_kwds,  # type: ignore[arg-type]
+        )
+
+    def step(self) -> None:
+        if self.global_step >= self.total_steps:
+            raise ValueError(f"Stepped {self.global_step} times; total_steps={self.total_steps}")
+
+        new_cycle = bisect.bisect_right(self.milestones, self.global_step)
+        if new_cycle != self.cycle_idx:
+            self.cycle_idx = new_cycle
+            self.sched = self._create_scheduler(self.cycle_idx)
+
+        self.sched.step()
+        self.global_step += 1
+
+    def get_last_lr(self) -> list[float]:
+        return self.sched.get_last_lr()
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "global_step": self.global_step,
+            "cycle_idx": self.cycle_idx,
+            "sched": self.sched.state_dict(),
+            "milestones": self.milestones,
+            "cycle_total_steps": self.cycle_total_steps,
+            "cycle_max_lrs": self.cycle_max_lrs,
+            "max_lr_gamma": self.max_lr_gamma,
+            "cycle_kwds": self.cycle_kwds,
+            "total_steps": self.total_steps,
+            "n_cycles": self.n_cycles,
+        }
+
+    def load_state_dict(self, sd: dict[str, Any]) -> None:
+        self.global_step = sd["global_step"]
+        self.cycle_idx = sd["cycle_idx"]
+        self.milestones = sd["milestones"]
+        self.cycle_total_steps = sd["cycle_total_steps"]
+        self.cycle_max_lrs = sd["cycle_max_lrs"]
+        self.max_lr_gamma = sd["max_lr_gamma"]
+        self.cycle_kwds = sd["cycle_kwds"]
+        self.total_steps = sd["total_steps"]
+        self.n_cycles = sd["n_cycles"]
+
+        self.sched = self._create_scheduler(self.cycle_idx)
+        self.sched.load_state_dict(sd["sched"])
+        last_lrs = self.sched.get_last_lr()
+        for g, lr in zip(self.optimizer.param_groups, last_lrs):
+            g["lr"] = lr
+
+    @staticmethod
+    def _compute_cycle_total_steps(total_steps: int, n_cycles: int, cycle_length_mult: float) -> list[int]:
+        if n_cycles < 1:
+            raise ValueError("n_cycles must be >= 1.")
+        if total_steps < n_cycles:
+            raise ValueError(f"total_steps ({total_steps}) must be >= n_cycles ({n_cycles}).")
+        if cycle_length_mult <= 0:
+            raise ValueError("cycle_length_mult must be > 0.")
+
+        weights = [cycle_length_mult ** i for i in range(n_cycles)]
+        denom = sum(weights)
+        raw = [total_steps * (w / denom) for w in weights]
+
+        floors = [int(math.floor(x)) for x in raw]
+        steps = [max(1, s) for s in floors]
+
+        # Fix sum by distributing remaining steps to the largest fractional parts.
+        missing = total_steps - sum(steps)
+        fracs = [x - math.floor(x) for x in raw]
+
+        if missing > 0:
+            order = sorted(range(n_cycles), key=lambda i: fracs[i], reverse=True)
+            for k in range(missing):
+                steps[order[k % n_cycles]] += 1
+        elif missing < 0:
+            # Remove steps starting from smallest fractional parts, but never go below 1.
+            order = sorted(range(n_cycles), key=lambda i: fracs[i])
+            to_remove = -missing
+            idx = 0
+            while to_remove > 0:
+                i = order[idx % n_cycles]
+                if steps[i] > 1:
+                    steps[i] -= 1
+                    to_remove -= 1
+                idx += 1
+
+        assert sum(steps) == total_steps
+        assert all(s >= 1 for s in steps)
+        return steps
+
+    @staticmethod
+    def _compute_cycle_max_lrs(n_cycles: int, max_lr_gamma: float, max_lr: Sequence[float]) -> list[list[float]]:
+        cycle_max_lrs: list[list[float]] = []
+        for i in range(n_cycles):
+            scale = (max_lr_gamma ** i)
+            cycle_max_lrs.append([lr * scale for lr in max_lr])
+        return cycle_max_lrs
+
+    @staticmethod
+    def _compute_cycle_milestones(cycle_total_steps: list[int]) -> list[int]:
+        # Determine the milestones at which to switch schedulers.
+        milestones = []
+        s = 0
+        for steps_i in cycle_total_steps[:-1]:
+            s += steps_i
+            milestones.append(s)
+        return milestones
 
 
 def mp_dtype(mp16: bool, device: torch.device) -> torch.dtype:
