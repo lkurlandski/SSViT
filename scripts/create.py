@@ -11,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any
 from typing import Literal
@@ -523,7 +524,7 @@ class Requirements:
     @property
     def time(self) -> int:
         """Return the number of seconds required for the job (configure)."""
-        return int(6 * 24 * 3600 / self.world_size)  # FIXME
+        return int(12 * 24 * 3600 / self.world_size)  # FIXME
 
         tr_throughput = self.config.tr_throughput * self.world_size
         vl_throughput = self.config.vl_throughput * self.world_size
@@ -795,12 +796,20 @@ def config_fiter(config: Configuration) -> bool:
     return True
 
 
+def detect_system() -> Literal["mkwics", "rc", "empire"]:
+    if subprocess.run(["squeue"], shell=True, capture_output=True, text=True).returncode != 0:
+        return "mkwics"
+    if subprocess.run(["whoami"], shell=True, capture_output=True, text=True).stdout.strip() == "lk3591":
+        return "rc"
+    return "empire"
+
+
 def main() -> None:
 
     parser = ArgumentParser(description="Create large batches of experiments.")
     parser.add_argument("--debug", action="store_true", help="Configuration suitable for debugging.")
     parser.add_argument("--bench", action="store_true", help="Configuration suitable for benchmarking.")
-    parser.add_argument("--system", type=str, default="mkwics", choices=["mkwics", "rc", "empire"])
+    parser.add_argument("--system", type=str, default=None, choices=["mkwics", "rc", "empire"])
     parser.add_argument("--gpu", type=str, default="a100", choices=["a100", "h100", "gh200", "nvidia_h200", "nvidia_h100_80gb_hbm3"])
     parser.add_argument("--ngpus", type=int, default=1, help="Number of GPUs to use per job.")
     parser.add_argument("--no-clean", action="store_true", help="Do not remove existing outfiles.")
@@ -816,7 +825,7 @@ def main() -> None:
     BENCH  = args.bench
     NGPUS  = args.ngpus
     GPU    = args.gpu
-    SYSTEM = args.system
+    SYSTEM = args.system if args.system is not None else detect_system()
 
     if SYSTEM == "rc":
         assert GPU in ("a100", "h100", "gh200"), GPU
