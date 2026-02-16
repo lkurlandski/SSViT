@@ -171,7 +171,7 @@ class Configuration:
         elif BENCH:
             root = root / "bench"
         else:
-            root /= "00"
+            root /= "01"
 
         parts = [
             f"design--{self.design.value}",
@@ -187,6 +187,8 @@ class Configuration:
             f"model_config--{'_'.join(sorted([f'{k}={v}' for k, v in self.model_config.items()]))}",
             f"batch_size--{self.batch_size}",
             f"lr_max--{self.lr_max}",
+            f"lr_nclr_ncycles--{self.lr_nclr_ncycles}",
+            f"lr_nclr_max_lr_gamma--{self.lr_nclr_max_lr_gamma}",
             f"weight_decay--{self.weight_decay}",
             f"warmup_ratio--{self.warmup_ratio}",
             f"label_smoothing--{self.label_smoothing}",
@@ -320,7 +322,7 @@ class Configuration:
 
     @property
     def sched(self) -> Scheduler:
-        return Scheduler.OCLR
+        return Scheduler.NCLR
 
     @property
     def lr_max(self) -> float:
@@ -333,6 +335,14 @@ class Configuration:
     @property
     def lr_end(self) -> float:
         return 0.010 * self.lr_max
+
+    @property
+    def lr_nclr_ncycles(self) -> int:
+        return 3
+
+    @property
+    def lr_nclr_max_lr_gamma(self) -> float:
+        return 0.50
 
     @property
     def auxillary_loss_weight(self) -> float:
@@ -408,7 +418,7 @@ class Configuration:
             return 2
         if BENCH:
             return 1
-        return 20
+        return 30
 
     @property
     def eval_epochs(self) -> float:
@@ -676,6 +686,8 @@ class ScriptBuilder:
             f"--lr_max {self.config.lr_max}",
             f"--lr_beg {self.config.lr_beg}",
             f"--lr_end {self.config.lr_end}",
+            f"--lr_nclr_ncycles {self.config.lr_nclr_ncycles}",
+            f"--lr_nclr_max_lr_gamma {self.config.lr_nclr_max_lr_gamma}",
             f"--auxillary_loss_weight {self.config.auxillary_loss_weight}",
             f"--assert_auxillary_loss {self.config.assert_auxillary_loss}",
             f"--weight_decay {self.config.weight_decay}",
@@ -823,7 +835,7 @@ def main() -> None:
     PATCHPOSENCS = [PatchPositionalEncodingArchitecture.NONE]
     LEVELS       = [HierarchicalLevel.FINE]
     DO_ENTROPYS  = [False]
-    WHICH_CHARS  = [tuple(), (lief.PE.Section.CHARACTERISTICS.MEM_READ, lief.PE.Section.CHARACTERISTICS.MEM_WRITE, lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE)]
+    WHICH_CHARS  = [tuple()]
     MAX_LENGTHS  = [2**20]
     SEEDS        = [0]
 
@@ -845,23 +857,6 @@ def main() -> None:
         model_configs,
     )
 
-    model_configs = [
-        # {"patcher_pooling": "atn", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 64,  "patcher_stride": 64},
-        {"patcher_pooling": "avg", "patcher_channels": 64, "patcher_depth": 2, "patcher_kernel_size": 64,  "patcher_stride": 64},
-    ]
-    stream = chain(stream, product(
-        DESIGNS,
-        ARCHS,
-        [PatcherArchitecture.BAS],
-        POSENCS,
-        PATCHPOSENCS,
-        LEVELS,
-        DO_ENTROPYS,
-        WHICH_CHARS,
-        MAX_LENGTHS,
-        SEEDS,
-        model_configs,
-    ))
     configurations = (Configuration(*config) for config in stream)  # type: ignore[arg-type]
     configurations = (config for config in configurations if config_fiter(config))
     configurations = sorted(configurations)
