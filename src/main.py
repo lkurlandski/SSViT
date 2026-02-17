@@ -685,6 +685,10 @@ def get_padbatch(design: Design, structures: list[HierarchicalStructure], do_par
     name = [Name("0" * 64)] * batch_size
     label = torch.zeros(batch_size, dtype=torch.int64)
 
+    if design == Design.FLAT and not STRUCTURES_AS_GUIDES and len(structures) > 0:
+        warnings.warn(f"Non-empty structures provided to get_padbatch for {design}. These will be ignored.")
+        structures = []
+
     def get_inputs(length: int) -> Inputs:
         inputsids = torch.zeros((batch_size, length), dtype=torch.int32)
         lengths = torch.tensor([length] * batch_size, dtype=torch.int32)
@@ -1306,7 +1310,15 @@ def main() -> None:
     print(")")
     print(f"{scheduler_init=}")
 
-    padbatch = get_padbatch(args.design, structures, args.do_parser, args.do_entropy, args.which_characteristics, min_lengths, args.vl_batch_size)
+    padbatch = get_padbatch(
+        args.design,
+        structures if args.design != Design.FLAT else [],
+        args.do_parser,
+        args.do_entropy,
+        args.which_characteristics,
+        min_lengths,
+        args.vl_batch_size,
+    )
     print(f"{padbatch=}")
 
     stopper = EarlyStopper(args.stopper_patience, args.stopper_threshold, args.stopper_mode)  # type: ignore[arg-type]
