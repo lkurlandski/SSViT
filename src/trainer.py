@@ -905,7 +905,7 @@ class Trainer:
 
         # Continuously train the model on the training set until finished.
         while not self._done:
-            if self.epoch_idx >= self.args.freeze_embedding_epoch or TRAINER_FREEZE_EMBEDDINGS:
+            if self.args.freeze_embedding_epoch >= 0 and self.epoch_idx >= self.args.freeze_embedding_epoch or TRAINER_FREEZE_EMBEDDINGS:
                 freeze_or_unfreeze_embeddings_(self.model, freeze=True, verbose=(rank() == 0))
             self.train(start_mini_step=start_mini_step)
             start_mini_step = 0
