@@ -993,7 +993,6 @@ class Trainer:
             if prof is not None:
                 want_nsys = prof.schedule(mini_step + 1) in (ProfilerAction.RECORD, ProfilerAction.RECORD_AND_SAVE)
                 nsys_on = control_torch_profiler_for_nsys_profiling_(want_nsys, nsys_on)
-                print(f"[INFO] [rank {rank()}] [Trainer::train] mini_step={mini_step + 1} {want_nsys=} {nsys_on=}")
 
             with record_function("stage::prepare"), torch.cuda.nvtx.range("stage::prepare"):
                 try:
