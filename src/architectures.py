@@ -670,6 +670,22 @@ class ShardedTokenEmbedding(nn.Module):
             mean = block.mean(dim=0, keepdim=True)
             block.copy_(mean.expand_as(block))
 
+    @staticmethod
+    def tie_and_freeze_sharded_rows_(model: nn.Module) -> None:
+        """
+        Convenience function to handle sharded rows of all instances of ShardedTokenEmbedding in a model.
+        """
+        for m in model.modules():
+            if isinstance(m, ShardedTokenEmbedding):
+                m.zero_frozen_rows_()
+                m.tie_shards_()
+
+    def print_tied_rows(self) -> None:
+        for tok, (lo, nu) in self._shard_blocks.items():
+            hi = lo + nu
+            eq = [torch.equal(self.embedding.weight[lo], self.embedding.weight[i]) for i in range(lo, hi)]
+            print(f"{tok=} {lo=} {hi=} {nu=} {any(eq)=} {all(eq)=} which={[i for i, e in enumerate(eq) if e] if not all(eq) else '[...]'}")
+
 
 class FiLM(nn.Module):
     """

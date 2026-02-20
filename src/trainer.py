@@ -70,6 +70,7 @@ from torch.utils.data import Dataset
 from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
+from src.architectures import ShardedTokenEmbedding
 from src.utils import Timer
 from src.utils import check_tensor
 
@@ -344,6 +345,7 @@ class TrainerArgs:
             raise ValueError("`param_grad_none` must be one of 'error', 'warn', 'allow', or 'ignore'.")
         if self.freeze_embedding_epoch != -1 and self.update_embedding_steps > 1:
             raise ValueError(f"Using {self.update_embedding_steps=} would override the embedding freezing induced by {self.freeze_embedding_epoch=}")
+        self.disable_tqdm = self.disable_tqdm if "TRAINER_DISABLE_TQDM" not in os.environ else os.environ["TRAINER_DISABLE_TQDM"] == "1"
 
     def __repr__(self) -> str:
         parts = []
@@ -1468,6 +1470,7 @@ class Trainer:
             self.scheduler.step()
             warnings.resetwarnings()
         self.optimizer.zero_grad()
+        ShardedTokenEmbedding.tie_and_freeze_sharded_rows_(self.model)
         self.glbl_step += 1
         return norm
 
