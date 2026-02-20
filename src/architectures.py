@@ -523,8 +523,6 @@ class ShardedTokenEmbedding(nn.Module):
     ) -> None:
         super().__init__()
 
-        self._count_forward = 0  # FIXME
-
         self.shard_tokens = dict(sorted(shard_tokens.items(), key=lambda x: x[0])) if isinstance(shard_tokens, Mapping) else {}
         self.num_embeddings_conceptual = num_embeddings
         self.num_embeddings_internal   = num_embeddings + sum(self.shard_tokens.values())
@@ -599,13 +597,11 @@ class ShardedTokenEmbedding(nn.Module):
         self.register_buffer("row_mask", row_mask, persistent=False)
 
         # Cache for positions
-        # self.register_buffer("_pos_cache", torch.empty(0, dtype=torch.int32), persistent=False)
         self._pos_cache = torch.empty(0, dtype=torch.int32)
         if self.max_T is not None:
             self._pos(self.max_T, self.embedding.weight.device)
 
         # Cache for rows
-        # self.register_buffer("_row_cache", torch.empty(0, dtype=torch.int32), persistent=False)
         self._row_cache = torch.empty(0, dtype=torch.int32)
         if self.max_B is not None:
             self._row(self.max_B, self.embedding.weight.device)
@@ -632,10 +628,6 @@ class ShardedTokenEmbedding(nn.Module):
         Args:
             input: A tensor of shape (B, T) containing token IDs in the range [0, num_embeddings_conceptual).
         """
-        self._count_forward += 1
-        # if self._count_forward >= 570:
-        #     print(f"[rank {torch.distributed.get_rank()}] [ShardedTokenEmbedding::forward] [{self._count_forward}] [input] shape={tuple(input.shape)=} dtype={input.dtype} device={input.device} max={input.max()} min={input.min()}")
-
         check_tensor(input, (None, None), (torch.int64, torch.int32))
 
         B = input.shape[0]
@@ -648,10 +640,6 @@ class ShardedTokenEmbedding(nn.Module):
         base = self.base_map[input]
         mask = self.mask_map[input]
 
-        # if self._count_forward >= 570:
-        #     print(f"[rank {torch.distributed.get_rank()}] [ShardedTokenEmbedding::forward] [{self._count_forward}] [base] shape={tuple(base.shape)=} dtype={base.dtype} device={base.device} max={base.max()} min={base.min()}")
-        #     print(f"[rank {torch.distributed.get_rank()}] [ShardedTokenEmbedding::forward] [{self._count_forward}] [mask] shape={tuple(mask.shape)=} dtype={mask.dtype} device={mask.device} max={mask.max()} min={mask.min()}")
-
         pos = self._pos(T, device)             # (T,)
         row = self._row(B, device).view(B, 1)  # (B, 1)
         shard = pos.view(1, T) + row           # (B, T)
@@ -660,9 +648,6 @@ class ShardedTokenEmbedding(nn.Module):
 
         base.add_(shard)
         remapped = base
-
-        # if self._count_forward >= 570:
-        #     print(f"[rank {torch.distributed.get_rank()}] [ShardedTokenEmbedding::forward] [{self._count_forward}] [remapped] shape={tuple(base.shape)=} dtype={base.dtype} device={base.device} max={base.max()} min={base.min()}")
 
         weight = self.embedding.weight * self.row_mask.to(self.embedding.weight.dtype)
         return F.embedding(remapped, weight)
