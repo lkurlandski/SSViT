@@ -25,6 +25,7 @@ Notations (ViT):
 from __future__ import annotations
 from abc import ABC
 from abc import abstractmethod
+from collections.abc import Mapping
 from collections.abc import Sequence
 from functools import partial
 from inspect import signature
@@ -474,6 +475,215 @@ class AugmentedEmbedding(nn.Module):
 
         check_tensor(z, (x.shape[0], x.shape[1], self.embedding_dim), FLOATS)
         return z
+
+
+class ShardedTokenEmbedding(nn.Module):
+    """
+    Shard selected token IDs into multiple embedding rows.
+
+    Args:
+        num_embeddings: number of embeddings (conceptually).
+        embedding_dim: embedding dimension.
+        padding_idx: token ID or sequence of token IDs to use as padding.
+        shard_tokens: mapping from token id to number of shards (power of two) for that token.
+        row_hash_stride: large integer stride for hashing tokens to rows.
+        max_T: optional maximum input length (faciliate static graphs)
+        max_B: optional maximum batch size (facilitate static graphs)
+
+    Usage:
+        >>> embedding = ShardedTokenEmbedding(...)
+        >>> output = embedding(input)
+        >>> loss = criterion(output, target)
+        >>> loss.backward()
+        >>> optimizer.step()
+        >>> embedding.zero_frozen_rows_()  # NOTE: optional, zero frozen rows if decoupled weight decay in use.
+        >>> embedding.tie_shards_()        # NOTE: optional, keep sharded rows aligned.
+    """
+
+    num_embeddings_conceptual: int  # Number of embeddings this module conceptually represents.
+    num_embeddings_internal: int    # Number of embeddings this modules actually instantiates.
+    base_map: Tensor                # Maps conceptual token ID to base row index.
+    mask_map: Tensor                # Maps conceptual token ID to bitmask for hashing to shards.
+    padding_idx_conceptual: Tensor  # Conceptual token IDs to use as padding.
+    padding_idx_internal: Tensor    # Frozen row indices corresponding to padding tokens and sharded conceptual tokens.
+    row_mask: Tensor                # Frozen-row multiplier mask (1 for trainable rows, 0 for frozen rows).
+    _pos_cache: Tensor              # Cache for position indices.
+    _row_cache: Tensor              # Cache for row indices.
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: Sequence[int] | int = tuple(),
+        shard_tokens: Optional[Mapping[int, int]] = None,
+        row_hash_stride: int = 1315423911,
+        max_T: Optional[int] = None,
+        max_B: Optional[int] = None,
+        **kwds: Any,
+    ) -> None:
+        super().__init__()
+
+        self._count_forward = 0  # FIXME
+
+        self.shard_tokens = dict(sorted(shard_tokens.items(), key=lambda x: x[0])) if isinstance(shard_tokens, Mapping) else {}
+        self.num_embeddings_conceptual = num_embeddings
+        self.num_embeddings_internal   = num_embeddings + sum(self.shard_tokens.values())
+        self.padding_idx = tuple(sorted(padding_idx)) if isinstance(padding_idx, Sequence) else (padding_idx,)
+        self.embedding_dim = embedding_dim
+        self.row_hash_stride = row_hash_stride
+        self.max_T = max_T
+        self.max_B = max_B
+
+        if self.num_embeddings_conceptual > 2 ** 31 - 1 or self.num_embeddings_internal > 2 ** 31 - 1:
+            raise ValueError(f"num_embeddings_conceptual and num_embeddings_internal must be <= 2^31-1 due to int32 hashing. Got {self.num_embeddings_conceptual=} and {self.num_embeddings_internal=}.")
+
+        # Validate padding tokens.
+        for tok in self.padding_idx:
+            if tok < 0 or tok >= num_embeddings:
+                raise ValueError(f"padding token id {tok} out of range for num_embeddings={num_embeddings}.")
+        if len(set(self.padding_idx)) != len(self.padding_idx):
+            raise ValueError(f"padding_idx contains duplicates: {padding_idx=}")
+        # Validate shard tokens.
+        for tok, m in self.shard_tokens.items():
+            if m < 2:
+                raise ValueError(f"num_shards for token {tok} must be >= 2 (got {m}).")
+            if (m & (m - 1)) != 0:
+                raise ValueError(f"num_shards for token {tok} must be power-of-two (got {m}).")
+            if tok < 0 or tok >= num_embeddings:
+                raise ValueError(f"token id {tok} out of range for num_embeddings={num_embeddings}.")
+        if len(set(self.shard_tokens.keys())) != len(self.shard_tokens):
+            raise ValueError(f"shard_tokens contains duplicate keys: {shard_tokens=}")
+
+        # Maps conceptual token to base row index.
+        self.base_map = torch.arange(self.num_embeddings_conceptual, dtype=torch.int32)
+
+        # Maps conceptual token to mask for hashing.
+        self.mask_map = torch.zeros(self.num_embeddings_conceptual, dtype=torch.int32)
+
+        # Maps shard token to its assigned block of rows.
+        self._shard_blocks: dict[int, tuple[int, int]] = {}
+        next_free = self.num_embeddings_conceptual
+        for tok, m in self.shard_tokens.items():
+            self._shard_blocks[tok] = (next_free, m)
+            self.base_map[tok] = next_free
+            self.mask_map[tok] = m - 1
+            next_free += m
+
+        if next_free != self.num_embeddings_internal:
+            raise RuntimeError(f"Internal error in ShardedTokenEmbedding: {next_free=} does not match {self.num_embeddings_internal=}!")
+
+        # Initialize shard blocks by copying the original token row into all shards.
+        self.embedding = nn.Embedding(self.num_embeddings_internal, self.embedding_dim, **kwds)
+        with torch.no_grad():
+            for tok, (b, m) in self._shard_blocks.items():
+                self.embedding.weight[b : b + m].copy_(self.embedding.weight[tok].unsqueeze(0).expand(m, -1))
+
+        # Freeze rows for padding tokens.
+        padding_idx_internal: list[int] = []
+        for tok in self.padding_idx:
+            padding_idx_internal.append(tok)
+            if tok in self._shard_blocks:
+                b, m = self._shard_blocks[tok]
+                padding_idx_internal.extend(list(range(b, b + m)))
+        # Also freeze the rows for the original token IDs that were sharded.
+        for tok in self.shard_tokens.keys():
+            if tok not in self.padding_idx:
+                padding_idx_internal.append(tok)
+        self.register_buffer("padding_idx_internal", torch.tensor(padding_idx_internal, dtype=torch.long), persistent=False)
+        self.register_buffer("padding_idx_conceptual", torch.tensor(self.padding_idx, dtype=torch.long), persistent=False)
+
+        # Frozen-row multiplier mask (1 for trainable rows, 0 for frozen rows).
+        row_mask = torch.ones(self.num_embeddings_internal, 1, dtype=torch.float32)
+        if self.padding_idx_internal.numel() > 0:
+            row_mask[self.padding_idx_internal] = 0.0
+        self.register_buffer("row_mask", row_mask, persistent=False)
+
+        # Cache for positions
+        # self.register_buffer("_pos_cache", torch.empty(0, dtype=torch.int32), persistent=False)
+        self._pos_cache = torch.empty(0, dtype=torch.int32)
+        if self.max_T is not None:
+            self._pos(self.max_T, self.embedding.weight.device)
+
+        # Cache for rows
+        # self.register_buffer("_row_cache", torch.empty(0, dtype=torch.int32), persistent=False)
+        self._row_cache = torch.empty(0, dtype=torch.int32)
+        if self.max_B is not None:
+            self._row(self.max_B, self.embedding.weight.device)
+
+    def _pos(self, T: int, device: torch.device) -> Tensor:
+        """Return/create cache for position indices or raise error if T exceeds max_T (compile-friendly)."""
+        if self.max_T is not None and T > self.max_T:
+            raise ValueError(f"Input sequence length T={T} exceeds max_T={self.max_T} for this ShardedTokenEmbedding instance.")
+        if self._pos_cache.numel() < T or self._pos_cache.device != device:
+            self._pos_cache = torch.arange(T, device=device, dtype=torch.int32)
+        return self._pos_cache[:T]
+
+    def _row(self, B: int, device: torch.device) -> Tensor:
+        """Return/create cache for row indices or raise error if B exceeds max_B (compile-friendly)."""
+        if self.max_B is not None and B > self.max_B:
+            raise ValueError(f"Input batch size B={B} exceeds max_B={self.max_B} for this ShardedTokenEmbedding instance.")
+        if self._row_cache.numel() < B or self._row_cache.device != device:
+            # NOTE: this will overflow but we don't care because we're AND-ing against a power of two mask and the low-bits will be the same.
+            self._row_cache = (torch.arange(B, device=device, dtype=torch.int64) * self.row_hash_stride).to(torch.int32)
+        return self._row_cache[:B]
+
+    def forward(self, input: Tensor) -> Tensor:
+        """
+        Args:
+            input: A tensor of shape (B, T) containing token IDs in the range [0, num_embeddings_conceptual).
+        """
+        self._count_forward += 1
+        # if self._count_forward >= 570:
+        #     print(f"[rank {torch.distributed.get_rank()}] [ShardedTokenEmbedding::forward] [{self._count_forward}] [input] shape={tuple(input.shape)=} dtype={input.dtype} device={input.device} max={input.max()} min={input.min()}")
+
+        check_tensor(input, (None, None), (torch.int64, torch.int32))
+
+        B = input.shape[0]
+        T = input.shape[1]
+        device = input.device
+
+        self.base_map = self.base_map.to(device)
+        self.mask_map = self.mask_map.to(device)
+
+        base = self.base_map[input]
+        mask = self.mask_map[input]
+
+        # if self._count_forward >= 570:
+        #     print(f"[rank {torch.distributed.get_rank()}] [ShardedTokenEmbedding::forward] [{self._count_forward}] [base] shape={tuple(base.shape)=} dtype={base.dtype} device={base.device} max={base.max()} min={base.min()}")
+        #     print(f"[rank {torch.distributed.get_rank()}] [ShardedTokenEmbedding::forward] [{self._count_forward}] [mask] shape={tuple(mask.shape)=} dtype={mask.dtype} device={mask.device} max={mask.max()} min={mask.min()}")
+
+        pos = self._pos(T, device)             # (T,)
+        row = self._row(B, device).view(B, 1)  # (B, 1)
+        shard = pos.view(1, T) + row           # (B, T)
+
+        shard.bitwise_and_(mask)
+
+        base.add_(shard)
+        remapped = base
+
+        # if self._count_forward >= 570:
+        #     print(f"[rank {torch.distributed.get_rank()}] [ShardedTokenEmbedding::forward] [{self._count_forward}] [remapped] shape={tuple(base.shape)=} dtype={base.dtype} device={base.device} max={base.max()} min={base.min()}")
+
+        weight = self.embedding.weight * self.row_mask.to(self.embedding.weight.dtype)
+        return F.embedding(remapped, weight)
+
+    @torch.no_grad()
+    def zero_frozen_rows_(self) -> None:
+        """
+        Zero out the frozen rows corresponding to padding tokens and sharded conceptual tokens.
+        """
+        if self.padding_idx_internal.numel() > 0:
+            self.embedding.weight.index_fill_(0, self.padding_idx_internal, 0)
+
+    @torch.no_grad()
+    def tie_shards_(self) -> None:
+        """
+        Tie sharded tokens together by averaging their embedding weights.
+        """
+        for tok, (b, m) in self._shard_blocks.items():
+            block = self.embedding.weight[b:b+m]
+            mean = block.mean(dim=0, keepdim=True)
+            block.copy_(mean.expand_as(block))
 
 
 class FiLM(nn.Module):
