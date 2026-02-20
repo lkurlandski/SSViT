@@ -171,7 +171,7 @@ class Configuration:
         elif BENCH:
             root = root / "bench"
         else:
-            root /= "01"
+            root /= "03"
 
         parts = [
             f"design--{self.design.value}",
@@ -243,7 +243,7 @@ class Configuration:
                 return 32
 
         if self.arch == Architecture.VIT and self.parch == PatcherArchitecture.DWC:
-            return 8
+            return 64
 
         print(f"WARNING ({str(self)}): per_device_batch_size not found.")
         return 64
@@ -314,7 +314,7 @@ class Configuration:
     def num_workers(self) -> int:
         if DEBUG:
             return 1
-        return 4
+        return 8
 
     @property
     def num_threads_per_worker(self) -> int:
@@ -338,7 +338,7 @@ class Configuration:
 
     @property
     def lr_nclr_ncycles(self) -> int:
-        return 3
+        return 5
 
     @property
     def lr_nclr_max_lr_gamma(self) -> float:
@@ -372,7 +372,7 @@ class Configuration:
 
     @property
     def mp16(self) -> bool:
-        return False
+        return True
 
     @property
     def tf32(self) -> bool:
@@ -418,7 +418,7 @@ class Configuration:
             return 2
         if BENCH:
             return 1
-        return 30
+        return 40
 
     @property
     def eval_epochs(self) -> float:
@@ -450,7 +450,7 @@ class Configuration:
 
     @property
     def enable_compile(self) -> bool:
-        return False
+        return True
 
     @property
     def static_shapes_bin_patcher_seq_lengths(self) -> bool:
@@ -474,7 +474,7 @@ class Configuration:
 
     @property
     def freeze_embedding_epoch(self) -> int:
-        return 1
+        return -1
 
     @property
     def find_unused_parameters(self) -> bool:
