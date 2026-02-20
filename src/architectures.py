@@ -2687,11 +2687,14 @@ class MalConvGCG(MalConvBase):
 # -------------------------------------------------------------------------------- #
 
 
+AnyEmbedding = nn.Embedding | AugmentedEmbedding | ShardedTokenEmbedding
+
+
 def _embed_and_augment_inputs(
     x: Tensor,
     g: Optional[Tensor] = None,
     *,
-    embedding: nn.Embedding | AugmentedEmbedding,
+    embedding: AnyEmbedding,
     filmer: FiLM | FiLMBool | Identity,
 ) -> Tensor:
     if isinstance(filmer, (FiLM, FiLMBool)) and g is None:
@@ -2738,7 +2741,7 @@ class Classifier(nn.Module, ABC):
 
 class MalConvClassifier(Classifier):
 
-    def __init__(self, embedding: nn.Embedding | AugmentedEmbedding, filmer: FiLM | FiLMBool | Identity, backbone: MalConvBase, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: AnyEmbedding, filmer: FiLM | FiLMBool | Identity, backbone: MalConvBase, head: ClassifificationHead) -> None:
         super().__init__()
 
         self.embedding = embedding
@@ -2766,7 +2769,7 @@ class MalConvClassifier(Classifier):
 
 class ViTClassifier(Classifier):
 
-    def __init__(self, embedding: nn.Embedding | AugmentedEmbedding, filmer: FiLM | FiLMBool | Identity, patcher: PatchEncoderBase, norm: Optional[nn.LayerNorm], patchposencoder: PatchPositionalityEncoder | Identity, backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embedding: AnyEmbedding, filmer: FiLM | FiLMBool | Identity, patcher: PatchEncoderBase, norm: Optional[nn.LayerNorm], patchposencoder: PatchPositionalityEncoder | Identity, backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__()
 
         self.embedding = embedding
@@ -2893,7 +2896,7 @@ class HierarchicalMalConvClassifier(HierarchicalClassifier):
         and averages these hidden representations before feeding them to a classification head.
     """
 
-    def __init__(self, embeddings: Sequence[nn.Embedding | AugmentedEmbedding], filmers: Sequence[FiLM | FiLMBool | Identity], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[AnyEmbedding], filmers: Sequence[FiLM | FiLMBool | Identity], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(backbones)):
@@ -2944,7 +2947,7 @@ class HierarchicalViTClassifier(HierarchicalClassifier):
         and feeds the encoded patches to a shared ViT backbone followed by a classification head.
     """
 
-    def __init__(self, embeddings: Sequence[nn.Embedding | AugmentedEmbedding], filmers: Sequence[FiLM | FiLMBool | Identity], patchers: Sequence[PatchEncoderBase], norms: Sequence[Optional[nn.LayerNorm]], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[AnyEmbedding], filmers: Sequence[FiLM | FiLMBool | Identity], patchers: Sequence[PatchEncoderBase], norms: Sequence[Optional[nn.LayerNorm]], patchposencoders: Sequence[PatchPositionalityEncoder | Identity], backbone: ViT, head: ClassifificationHead) -> None:
         super().__init__(len(embeddings))
 
         if not (len(embeddings) == len(filmers) == len(patchers)):
@@ -3279,7 +3282,7 @@ class StructuralClassifier(nn.Module, ABC):
 
 class StructuralMalConvClassifier(StructuralClassifier):
 
-    def __init__(self, embeddings: Sequence[nn.Embedding | AugmentedEmbedding], filmers: Sequence[FiLM | FiLMBool | Identity], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
+    def __init__(self, embeddings: Sequence[AnyEmbedding], filmers: Sequence[FiLM | FiLMBool | Identity], backbones: Sequence[MalConvBase], head: ClassifificationHead) -> None:
         raise NotImplementedError("StructuralMalConvClassifier is not yet implemented.")
 
     def forward(
@@ -3305,7 +3308,7 @@ class StructuralViTClassifier(StructuralClassifier):
 
     def __init__(
         self,
-        embeddings: Sequence[nn.Embedding | AugmentedEmbedding],
+        embeddings: Sequence[AnyEmbedding],
         filmers: Sequence[FiLM | FiLMBool | Identity],
         patchers: Sequence[PatchEncoderBase],
         norms: Sequence[Optional[nn.LayerNorm]],
