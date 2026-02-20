@@ -66,7 +66,9 @@ from src.architectures import Identity
 from src.architectures import ClassifificationHead
 from src.architectures import FiLM
 from src.architectures import FiLMBool
+from src.architectures import AnyEmbedding
 from src.architectures import AugmentedEmbedding
+from src.architectures import ShardedTokenEmbedding
 from src.architectures import MalConvBase
 from src.architectures import MalConv
 from src.architectures import MalConvLowMem
@@ -285,12 +287,17 @@ def get_model(
     )
 
     # (Embedding) Build the embedding
-    def build_embedding() -> Embedding | AugmentedEmbedding:
-        num_embeddings = 384
+    def build_embedding() -> AnyEmbedding:
+        num_embeddings = 256 + 64  # NOTE: we were using 384 before
         padding_idx = 0
         if num_guides > 0 and semantic_context_mode == "aug":
             return AugmentedEmbedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim, guide_dim=num_guides, padding_idx=padding_idx)
-        return Embedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim, padding_idx=padding_idx)
+        return ShardedTokenEmbedding(
+            num_embeddings=num_embeddings,
+            embedding_dim=embedding_dim,
+            padding_idx=padding_idx,
+            shard_tokens={padding_idx: 32, 1: 32},
+        )
 
     # (FiLM | Identity) Build the filmer
     def build_filmer() -> FiLM | FiLMBool | Identity:
