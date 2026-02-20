@@ -498,6 +498,10 @@ class ShardedTokenEmbedding(nn.Module):
         >>> optimizer.step()
         >>> embedding.zero_frozen_rows_()  # NOTE: optional, zero frozen rows if decoupled weight decay in use.
         >>> embedding.tie_shards_()        # NOTE: optional, keep sharded rows aligned.
+
+    Notes:
+        - If max_T or max_B is None, the _pos_cache and _row_cache buffers are dynamic,
+          so DDP's `broadcast_buffers` argument must be set to False.
     """
 
     num_embeddings_conceptual: int  # Number of embeddings this module conceptually represents.
@@ -553,10 +557,12 @@ class ShardedTokenEmbedding(nn.Module):
             raise ValueError(f"shard_tokens contains duplicate keys: {shard_tokens=}")
 
         # Maps conceptual token to base row index.
-        self.base_map = torch.arange(self.num_embeddings_conceptual, dtype=torch.int32)
+        _base_map = torch.arange(self.num_embeddings_conceptual, dtype=torch.int32)
+        self.register_buffer("base_map", _base_map, persistent=False)
 
         # Maps conceptual token to mask for hashing.
-        self.mask_map = torch.zeros(self.num_embeddings_conceptual, dtype=torch.int32)
+        _mask_map = torch.zeros(self.num_embeddings_conceptual, dtype=torch.int32)
+        self.register_buffer("mask_map", _mask_map, persistent=False)
 
         # Maps shard token to its assigned block of rows.
         self._shard_blocks: dict[int, tuple[int, int]] = {}
@@ -597,30 +603,32 @@ class ShardedTokenEmbedding(nn.Module):
         self.register_buffer("row_mask", row_mask, persistent=False)
 
         # Cache for positions
-        self._pos_cache = torch.empty(0, dtype=torch.int32)
+        _pos_cache = torch.empty(0, dtype=torch.int32)
+        self.register_buffer("_pos_cache", _pos_cache, persistent=False)
         if self.max_T is not None:
-            self._pos(self.max_T, self.embedding.weight.device)
+            self._pos(self.max_T)
 
         # Cache for rows
-        self._row_cache = torch.empty(0, dtype=torch.int32)
+        _row_cache = torch.empty(0, dtype=torch.int32)
+        self.register_buffer("_row_cache", _row_cache, persistent=False)
         if self.max_B is not None:
-            self._row(self.max_B, self.embedding.weight.device)
+            self._row(self.max_B)
 
-    def _pos(self, T: int, device: torch.device) -> Tensor:
+    def _pos(self, T: int) -> Tensor:
         """Return/create cache for position indices or raise error if T exceeds max_T (compile-friendly)."""
         if self.max_T is not None and T > self.max_T:
             raise ValueError(f"Input sequence length T={T} exceeds max_T={self.max_T} for this ShardedTokenEmbedding instance.")
-        if self._pos_cache.numel() < T or self._pos_cache.device != device:
-            self._pos_cache = torch.arange(T, device=device, dtype=torch.int32)
+        if self._pos_cache.numel() < T:
+            self._pos_cache = torch.arange(T, device=self.embedding.weight.device, dtype=torch.int32)
         return self._pos_cache[:T]
 
-    def _row(self, B: int, device: torch.device) -> Tensor:
+    def _row(self, B: int) -> Tensor:
         """Return/create cache for row indices or raise error if B exceeds max_B (compile-friendly)."""
         if self.max_B is not None and B > self.max_B:
             raise ValueError(f"Input batch size B={B} exceeds max_B={self.max_B} for this ShardedTokenEmbedding instance.")
-        if self._row_cache.numel() < B or self._row_cache.device != device:
+        if self._row_cache.numel() < B:
             # NOTE: this will overflow but we don't care because we're AND-ing against a power of two mask and the low-bits will be the same.
-            self._row_cache = (torch.arange(B, device=device, dtype=torch.int64) * self.row_hash_stride).to(torch.int32)
+            self._row_cache = (torch.arange(B, device=self.embedding.weight.device, dtype=torch.int64) * self.row_hash_stride).to(torch.int32)
         return self._row_cache[:B]
 
     def forward(self, input: Tensor) -> Tensor:
@@ -634,15 +642,12 @@ class ShardedTokenEmbedding(nn.Module):
         T = input.shape[1]
         device = input.device
 
-        self.base_map = self.base_map.to(device)
-        self.mask_map = self.mask_map.to(device)
-
         base = self.base_map[input]
         mask = self.mask_map[input]
 
-        pos = self._pos(T, device)             # (T,)
-        row = self._row(B, device).view(B, 1)  # (B, 1)
-        shard = pos.view(1, T) + row           # (B, T)
+        pos = self._pos(T)             # (T,)
+        row = self._row(B).view(B, 1)  # (B, 1)
+        shard = pos.view(1, T) + row   # (B, T)
 
         shard.bitwise_and_(mask)
 
