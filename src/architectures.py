@@ -680,6 +680,62 @@ class ShardedTokenEmbedding(nn.Module):
                 m.zero_frozen_rows_()
                 m.tie_shards_()
 
+    @staticmethod
+    def suggest_shard_tokens(distribution: dict[int, int | float], num_embeddings_internal: int) -> tuple[dict[int, int], dict[int, int]]:
+        """
+        Suggest which tokens to shard and how many shards to use based on a distribution over token IDs.
+
+        Args:
+            distribution: mapping from token ID to frequency (or any non-negative value proportional to frequency).
+            num_embeddings_internal: the number of embedding rows that can be instantiated internally.
+
+        Returns:
+            shard_tokens: mapping from token ID to number of shards (power of two) for that token. Only tokens that should be sharded are included.
+            alloc: mapping from token ID to number of embedding rows allocated for that token (including shards). All tokens in the distribution are included.
+        """
+
+        def round_to_power_of_two(x: float) -> int:
+            lo: float = 2 ** math.floor(math.log(x) / math.log(2))
+            hi: float = 2 ** math.ceil(math.log(x) / math.log(2))
+            assert lo.is_integer() and lo <= x, f"{lo} {x} {hi}"
+            assert hi.is_integer() and hi >= x, f"{lo} {x} {hi}"
+            lo = int(lo)
+            hi = int(hi)
+            if x - lo < hi - x:
+                return lo
+            return hi
+
+        # Sharded tokens are allocated contiguously after the conceptual tokens,
+        # so our real budget is less than `num_embeddings_internal`. TODO: this is a bit of a waste...
+        budget = num_embeddings_internal - len(distribution)
+
+        # Normalize the distribution.
+        total = sum(distribution.values())
+        distribution = {int(k): v / total for k, v in distribution.items()}
+
+        # Initially allocate rows proportional to the distribution, rounded to powers of two.
+        alloc = {k: budget * r for k, r in distribution.items()}
+        alloc = {k: round_to_power_of_two(v) for k, v in alloc.items()}
+        alloc = {k: max(1, v) for k, v in alloc.items()}
+
+        # Iteratively halve the allocations until we fit within the internal embedding budget.
+        while True:
+            for k in list(alloc.keys()):
+                if sum(alloc.values()) <= budget:
+                    break
+                if alloc[k] == 1:
+                    continue
+                alloc[k] = alloc[k] // 2
+            else:
+                if all(v == 1 for v in alloc.values()):
+                    raise RuntimeError("Cannot allocate sharded rows.")
+                continue
+            break
+
+        # The initializer expects shard_tokens to only contain the tokens that should actually be sharded.
+        shard_tokens = {k: v for k, v in alloc.items() if v > 1}
+        return shard_tokens, alloc
+
     def print_tied_rows(self) -> None:
         for tok, (lo, nu) in self._shard_blocks.items():
             hi = lo + nu
