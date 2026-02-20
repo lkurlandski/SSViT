@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from copy import deepcopy
 from functools import partial
 from inspect import signature
+import json
 import math
 import os
 from pathlib import Path
@@ -164,6 +165,9 @@ if MAIN_RUN_PROFILE:
     warnings.warn("MAIN_RUN_PROFILE is enabled. Certain command line arguments will be overridden.")
 
 
+BYTE_DISTRIBUTION = json.loads(Path("./cache/byte-distribution.json").read_text())
+
+
 def get_model(
     design: Design,
     arch: Architecture,
@@ -206,6 +210,7 @@ def get_model(
     moe_router_temperature: float = 1.0,
     moe_router_noise_std: float = 0.0,
     moe_router_top_k: int = 1,
+    patcher_seq_lengths: Optional[Sequence[int]] = None,
     patcher_batch_sizes: Optional[Sequence[int]] = None,
     backbone_seq_lengths: Optional[Sequence[int]] = None,
     backbone_batch_sizes: Optional[Sequence[int]] = None,
@@ -292,12 +297,35 @@ def get_model(
         padding_idx = 0
         if num_guides > 0 and semantic_context_mode == "aug":
             return AugmentedEmbedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim, guide_dim=num_guides, padding_idx=padding_idx)
-        return ShardedTokenEmbedding(
+        distribution: dict[int, float] = {int(b, 16) + 1: p for b, p in BYTE_DISTRIBUTION.items()}
+        if padding_idx in distribution:
+            raise RuntimeError(f"{padding_idx=} is non-unique!")
+        distribution[padding_idx] = 0.15   # Assume about 15% of tokens are [PAD]
+        shard_tokens, alloc_tokens = ShardedTokenEmbedding.suggest_shard_tokens(distribution, 1024)
+        max_T = None
+        max_B = None
+        if enable_compile:
+            assert patcher_seq_lengths is not None
+            assert patcher_batch_sizes is not None
+            max_T = max(patcher_seq_lengths)
+            max_B = max(patcher_batch_sizes)
+        embedding = ShardedTokenEmbedding(
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
             padding_idx=padding_idx,
-            shard_tokens={padding_idx: 32, 1: 32},
+            shard_tokens=shard_tokens,
+            max_T=max_T,
+            max_B=max_B,
         )
+        if enable_compile:
+            embedding = torch.compile(  # type: ignore[assignment]
+                embedding,
+                fullgraph=True,
+                dynamic=False,
+                backend="inductor",
+                mode="default",
+            )
+        return embedding
 
     # (FiLM | Identity) Build the filmer
     def build_filmer() -> FiLM | FiLMBool | Identity:
@@ -1113,9 +1141,11 @@ def main() -> None:
         assert patcher_batch_sizes is not None
         assert backbone_seq_lengths is not None
         assert backbone_batch_sizes is not None
+        cache_size_for_embedding = len(patcher_seq_lengths) * len(patcher_batch_sizes)
         cache_size_for_patchers = len(patcher_seq_lengths)  * len(patcher_batch_sizes)
         cache_size_for_backbone = len(backbone_seq_lengths) * len(backbone_batch_sizes)
-        torch._dynamo.config.cache_size_limit = 2 * (cache_size_for_patchers + cache_size_for_backbone)
+        torch._dynamo.config.cache_size_limit = 2 * (cache_size_for_embedding + cache_size_for_patchers + cache_size_for_backbone)
+        print(f"{cache_size_for_embedding=}")
         print(f"{cache_size_for_patchers=}")
         print(f"{cache_size_for_backbone=}")
         print(f"{torch._dynamo.config.cache_size_limit=}")
@@ -1140,6 +1170,7 @@ def main() -> None:
         args.enable_checkpoint,
         args.enable_compile,
         do_ddp_keepalive=False,
+        patcher_seq_lengths=patcher_seq_lengths,
         patcher_batch_sizes=patcher_batch_sizes,
         backbone_seq_lengths=backbone_seq_lengths,
         backbone_batch_sizes=backbone_batch_sizes,
@@ -1157,7 +1188,7 @@ def main() -> None:
     if args.ddp:
         if (args.embedding_freeze or args.update_embedding_steps != 1) and not args.find_unused_parameters:
             warnings.warn("Freezing embedding layers or periodically updating it with DDP probably requires find_unused_parameters=True.")
-        wrap_model = partial(wrap_model_ddp, device=args.device, static_graph=False, find_unused_parameters=args.find_unused_parameters)
+        wrap_model = partial(wrap_model_ddp, device=args.device, static_graph=False, find_unused_parameters=args.find_unused_parameters, broadcast_buffers=False)
     elif args.fsdp:
         wrap_model = partial(wrap_model_fsdp, mpdtype=mpdtype, fsdp_offload=args.fsdp_offload)
     else:
@@ -1238,8 +1269,8 @@ def main() -> None:
     collate_fn = get_collate_fn(args.design, min_lengths, patcher_seq_lengths, structures, args.muddy_padded)
     print(f"{collate_fn=}")
 
-    tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, min(args.num_workers, len(tr_shards)), collate_fn, args.pin_memory, False, args.prefetch_factor)
-    ts_loader = get_loader(ts_dataset, args.ts_batch_size, False, None, None, min(args.num_workers, len(ts_shards)), collate_fn, args.pin_memory, False, args.prefetch_factor)
+    tr_loader = get_loader(tr_dataset, args.tr_batch_size, True,  None, None, min(args.num_workers, len(tr_shards)), collate_fn, args.pin_memory, args.enable_compile, args.prefetch_factor)
+    ts_loader = get_loader(ts_dataset, args.ts_batch_size, False, None, None, min(args.num_workers, len(ts_shards)), collate_fn, args.pin_memory, args.enable_compile, args.prefetch_factor)
     print(f"tr_loader=DataLoader(pin_memory={tr_loader.pin_memory}, num_workers={tr_loader.num_workers}, prefetch_factor={tr_loader.prefetch_factor}, drop_last={tr_loader.drop_last})")
     print(f"ts_loader=DataLoader(pin_memory={ts_loader.pin_memory}, num_workers={ts_loader.num_workers}, prefetch_factor={ts_loader.prefetch_factor}, drop_last={ts_loader.drop_last})")
     print(f"{len(tr_loader)=} {largest_possible_dataloader_length(tr_loader)=}")
