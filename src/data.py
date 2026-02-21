@@ -1830,6 +1830,12 @@ class Preprocessor:
                 {0: HierarchicalStructureNone.ANY},
             )
 
+        assert len(structure.lexicon) == len(self.structures), f"Expected lexicon to contain {len(self.structures)=}. Got {len(structure.lexicon)}."
+        assert len(structure.index) == len(self.structures), f"Expected index to contain {len(self.structures)=}. Got {len(structure.index)}."
+        if self.max_length_per_structure is not None:
+            for i in range(len(structure.index)):
+                assert max((e - s for s, e in structure.index[i]), default=-1) <= self.max_length_per_structure, f"Ranges {structure.index[i]=} exceed {self.max_length_per_structure=}."
+
         return FSample(
             file=file,
             name=name,
@@ -1893,7 +1899,7 @@ class Preprocessor:
                 lexicon[i] = structure
                 index.append([])
                 if structure == self.unkstructure:
-                    index[i].append((0, size))
+                    index[i].append((0, size if self.max_length_per_structure is None else min(size, self.max_length_per_structure)))
             return StructureMap(index, lexicon)
 
         df = meta.filter(
