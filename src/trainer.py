@@ -62,6 +62,9 @@ from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.lr_scheduler import LambdaLR
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.optim.optimizer import ParamsT
+from torch.optim.swa_utils import AveragedModel
+from torch.optim.swa_utils import get_ema_multi_avg_fn
+from torch.optim.swa_utils import update_bn
 from torch.profiler import record_function
 from torch.profiler import profile
 from torch.profiler import ProfilerAction
@@ -319,6 +322,10 @@ class TrainerArgs:
     param_grad_none: str = "error"
     update_embedding_steps: int = 1
     freeze_embedding_epoch: int = -1
+    ema_enable: bool = False
+    ema_decay: float = 0.9995
+    ema_start_step: int = 0
+    ema_start_epoch: int = 0
 
     def __post_init__(self) -> None:
         if (self.max_epochs is not None) and (self.max_steps is not None):
@@ -794,6 +801,22 @@ def control_torch_profiler_for_nsys_profiling_(want_nsys: bool, nsys_on: bool) -
     return nsys_on
 
 
+def model_contains_batch_norm(model: nn.Module) -> bool:
+    modules = (
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+        nn.LazyBatchNorm1d,
+        nn.LazyBatchNorm2d,
+        nn.LazyBatchNorm3d,
+        nn.SyncBatchNorm,
+    )
+    for module in model.modules():
+        if isinstance(module, modules):
+            return True
+    return False
+
+
 class Trainer:
     """
     Trainer class for training models with PyTorch.
@@ -833,6 +856,11 @@ class Trainer:
         self._done: bool = False
         self._vl_dataloader_lengths = self.get_dataloader_lengths(self.vl_loader)
         self._tr_dataloader_lengths = self.get_dataloader_lengths(self.tr_loader)
+        self.ema_model = AveragedModel(
+            unwrapddp(self.model),
+            multi_avg_fn=get_ema_multi_avg_fn(self.args.ema_decay),  # type: ignore[no-untyped-call]
+            use_buffers=model_contains_batch_norm(unwrapddp(self.model)),
+        ) if self.args.ema_enable else None
 
     def __repr__(self) -> str:
         return str(self)
@@ -1140,15 +1168,16 @@ class Trainer:
         timer.stop()
         barrier("Trainer::train:after", self.device)
 
-    def evaluate(self) -> dict[str, float]:
+    def evaluate(self, use_ema: bool = False) -> dict[str, float]:
         """
         Evaluate the model on the validation set.
         """
         barrier("Trainer::evaluate:before", self.device)
         t_0 = time.time()
 
-        was_training = self.model.training
-        self.model.eval()
+        model = self._get_maybe_ema_model(use_ema)
+        was_training = model.training
+        model.eval()
 
         # Get a wrapped dataloader with padding to the longest rank.
         iterable = self.get_iterable(self.vl_loader, self.vl_dataloader_length, "Validating...", leave=False)
@@ -1164,7 +1193,7 @@ class Trainer:
         with torch.no_grad():
             for mini_step, real, batch in iterable:
                 batch = batch.to(self.device, non_blocking=True).finalize(self.mp_dtype, torch.int32, torch.int64)
-                outputs = self.forward(batch)
+                outputs = self.forward(batch, use_ema)
                 loss, losses = self.compute_loss(batch, outputs)
                 if real:
                     totalloss += loss.to(torch.float64) * len(batch)
@@ -1261,11 +1290,14 @@ class Trainer:
             raise RuntimeError("Unreachable.")
 
         if was_training:
-            self.model.train()
+            model.train()
 
         # Save the labels, logits, and names if needed.
         if TRAINER_DONT_SAVE_PREDICTIONS and rank() == 0:
-            output = self.args.outdir / f"predictions-{self.glbl_step}"
+            if use_ema:
+                output = self.args.outdir / f"predictions_ema-{self.glbl_step}"
+            else:
+                output = self.args.outdir / f"predictions-{self.glbl_step}"
             output.mkdir(parents=True, exist_ok=True)
             torch.save(labels, (output / "labels.pt").as_posix())
             torch.save(logits, (output / "logits.pt").as_posix())
@@ -1376,6 +1408,10 @@ class Trainer:
             self.monitor.clear()
             report |= self.evaluate()
             report |= {f"vl_{k}": v for k, v in self.get_monitor_report().items()}
+        if do_eval and self.ema_model is not None:
+            self.monitor.clear()
+            report |= {k.replace("vl_", "ema_"): v for k, v in self.evaluate(use_ema=True).items()}
+            report |= {f"ema_{k}": v for k, v in self.get_monitor_report().items()}
 
         # If scheduled, save a checkpoint.
         if do_chpt:
@@ -1405,12 +1441,13 @@ class Trainer:
             self.print("Early stopping triggered.")
             self._done = True
 
-    def forward(self, batch: Batch) -> Tensor:
+    def forward(self, batch: Batch, use_ema: bool = False) -> Tensor:
         """
         Send a batch of inputs forward through the model.
         """
+        model = self._get_maybe_ema_model(use_ema)
         with torch.autocast(self.device.type, dtype=self.mp_dtype, enabled=self.args.mp16):
-            return self.model(batch.get_inputs(), batch.get_guides(), **batch.get_otherkwds())  # type: ignore[no-any-return]
+            return model(batch.get_inputs(), batch.get_guides(), **batch.get_otherkwds())  # type: ignore[no-any-return]
 
     def compute_loss(self, batch: Batch, outputs: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
         """
@@ -1458,6 +1495,8 @@ class Trainer:
         norm: Tensor = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        if self.ema_model is not None and self.glbl_step >= self.args.ema_start_step and self.epoch_idx >= self.args.ema_start_epoch:
+            self.ema_model.update_parameters(unwrapddp(self.model))
         total_steps = getattr(self.scheduler, "total_steps", None)
         if total_steps is not None and self.glbl_step >= total_steps:
             self.print(
@@ -1524,6 +1563,13 @@ class Trainer:
             "roc": roc,
             "prc": prc,
         }
+
+    def _get_maybe_ema_model(self, use_ema: bool) -> nn.Module:
+        if not use_ema:
+            return self.model
+        if self.ema_model is None:
+            raise RuntimeError("Attempted to perform a forward pass on ema model when self.ema_model is None.")
+        return self.ema_model
 
     def print(self, *args: Any, sep: str = " ", end: str = "\n") -> None:
         if self.args.disable_tqdm:
@@ -1630,35 +1676,35 @@ class Trainer:
 
     @staticmethod
     def round_and_filter_results_dict(results: Mapping[str, int | float]) -> dict[str, int | float]:
+
+        def extract_common(prefix: Literal["tr", "vl", "ema"]) -> dict[str, int | float]:
+            d = {}
+            d[f"{prefix}_loss"] = round(results[f"{prefix}_loss"], 3)
+            if f"{prefix}_aux_loss" in results:
+                d[f"{prefix}_aux_loss"] = round(results[f"{prefix}_aux_loss"], 3)
+                d[f"{prefix}_clf_loss"] = round(results[f"{prefix}_clf_loss"], 3)
+            d[f"{prefix}_gpu_utl"] = round(results[f"{prefix}_gpu_utl"], 2)
+            d[f"{prefix}_gpu_mem"] = round(results[f"{prefix}_gpu_mem"] / (1024 ** 3), 2)
+            d[f"{prefix}_time"] = round(results[f"{prefix}_time"], 0)
+            d[f"{prefix}_samples"] = int(results[f"{prefix}_samples"])
+            d[f"{prefix}_throughput"] = round(results[f"{prefix}_throughput"], 2)
+            return d
+
         d = {}
         d["epoch"] = round(results["epoch"], 2)
         d["glbl_step"] = int(results["glbl_step"])
         d["lr"] = round(results["lr"], 6)
         if any(k.startswith("tr_") for k in results):
+            d |= extract_common("tr")
             d["grad_norm"] = round(results["grad_norm"], 3)
             d["param_norm"] = round(results["param_norm"], 3)
             d["param_delta"] = round(results["param_delta"], 3)
-            d["tr_loss"] = round(results["tr_loss"], 3)
-            if "tr_aux_loss" in results:
-                d["tr_clf_loss"] = round(results["tr_clf_loss"], 3)
-                d["tr_aux_loss"] = round(results["tr_aux_loss"], 3)
-            d["tr_gpu_utl"] = round(results["tr_gpu_utl"], 2)
-            d["tr_gpu_mem"] = round(results["tr_gpu_mem"] / (1024 ** 3), 2)
-            d["tr_time"] = round(results["tr_time"], 0)
-            d["tr_samples"] = int(results["tr_samples"])
-            d["tr_throughput"] = round(results["tr_throughput"], 2)
         if any(k.startswith("vl_") for k in results):
-            d["vl_loss"] = round(results["vl_loss"], 3)
-            if "vl_aux_loss" in results:
-                d["vl_clf_loss"] = round(results["vl_clf_loss"], 3)
-                d["vl_aux_loss"] = round(results["vl_aux_loss"], 3)
+            d |= extract_common("vl")
             d["vl_roc"] = round(results["vl_roc"], 3)
             d["vl_prc"] = round(results["vl_prc"], 3)
-            d["vl_gpu_utl"] = round(results["vl_gpu_utl"], 2)
-            d["vl_gpu_mem"] = round(results["vl_gpu_mem"] / (1024 ** 3), 2)
-            d["vl_time"] = round(results["vl_time"], 0)
-            d["vl_samples"] = int(results["vl_samples"])
-            d["vl_throughput"] = round(results["vl_throughput"], 2)
+        if any(k.startswith("ema") for k in results):
+            d |= extract_common("ema")
         return d
 
     def to_checkpoint(self, path: str | Path) -> None:
@@ -1725,6 +1771,14 @@ class Trainer:
             mstate, ostate = unwrapddp(self.model).state_dict(), self.optimizer.state_dict()
             torch.save(mstate, path / "model.pt")
             torch.save(ostate, path / "optimizer.pt")
+
+        # Same thing for the EMA model (this probably doesn't work for FSDP).
+        if self.ema_model is not None and is_fsdp2(self.ema_model):
+            mstate = get_state_dict(self.ema_model, self.optimizer)[0]
+            dcp.save(mstate, checkpoint_id=path / "model_ema")
+        elif self.ema_model is not None and rank() == 0:
+            mstate = self.ema_model.state_dict()
+            torch.save(mstate, path / "model_ema.pt")
 
         if is_dist():
             dist.barrier(device_ids=[torch.cuda.current_device()])
@@ -1852,6 +1906,15 @@ class Trainer:
         trainer._next_chpt_step = _next_chpt_step
         trainer._next_logg_step = _next_logg_step
         trainer.log = log
+
+        # Getting lazy here with EMA because we aren't really using FSDP anyway.
+        if (path / "model_ema").exists():
+            raise NotImplementedError("Loading FSDP ema model from checkpoint not implemented yet.")
+        if (path / "model_ema.pt").exists():
+            if trainer.ema_model is None:
+                raise RuntimeError("An EMA checkpoint was found but the ema_model is None")
+            mstate = torch.load(path / "model_ema.pt", map_location="cpu")
+            set_model_state_dict(model, mstate)
 
         return trainer
 
