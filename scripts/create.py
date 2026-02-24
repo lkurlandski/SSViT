@@ -172,7 +172,7 @@ class Configuration:
         elif BENCH:
             root = root / "bench"
         else:
-            root /= "03"
+            root /= "04"
 
         parts = [
             f"design--{self.design.value}",
@@ -339,11 +339,19 @@ class Configuration:
 
     @property
     def lr_nclr_ncycles(self) -> int:
-        return 5
+        return 3
 
     @property
     def lr_nclr_max_lr_gamma(self) -> float:
-        return 0.50
+        return 0.25
+
+    @property
+    def ema_enable(self) -> bool:
+       return True
+
+    @property
+    def ema_decay(self) -> bool:
+       return 0.9995
 
     @property
     def auxillary_loss_weight(self) -> float:
@@ -419,7 +427,7 @@ class Configuration:
             return 2
         if BENCH:
             return 1
-        return 40
+        return 30
 
     @property
     def eval_epochs(self) -> float:
@@ -524,7 +532,7 @@ class Requirements:
     @property
     def time(self) -> int:
         """Return the number of seconds required for the job (configure)."""
-        return int(12 * 24 * 3600 / self.world_size)  # FIXME
+        return int(8 * 24 * 3600 / self.world_size)  # FIXME
 
         tr_throughput = self.config.tr_throughput * self.world_size
         vl_throughput = self.config.vl_throughput * self.world_size
@@ -689,6 +697,8 @@ class ScriptBuilder:
             f"--lr_end {self.config.lr_end}",
             f"--lr_nclr_ncycles {self.config.lr_nclr_ncycles}",
             f"--lr_nclr_max_lr_gamma {self.config.lr_nclr_max_lr_gamma}",
+            f"--ema_enable {self.config.ema_enable}",
+            f"--ema_decay {self.config.ema_decay}",
             f"--auxillary_loss_weight {self.config.auxillary_loss_weight}",
             f"--assert_auxillary_loss {self.config.assert_auxillary_loss}",
             f"--weight_decay {self.config.weight_decay}",
