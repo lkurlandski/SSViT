@@ -244,7 +244,7 @@ class Configuration:
                 return 32
 
         if self.arch == Architecture.VIT and self.parch == PatcherArchitecture.DWC:
-            return 64
+            return 128
 
         print(f"WARNING ({str(self)}): per_device_batch_size not found.")
         return 64
