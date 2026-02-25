@@ -1495,8 +1495,6 @@ class Trainer:
         norm: Tensor = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        if self.ema_model is not None and self.glbl_step >= self.args.ema_start_step and self.epoch_idx >= self.args.ema_start_epoch:
-            self.ema_model.update_parameters(unwrapddp(self.model))
         total_steps = getattr(self.scheduler, "total_steps", None)
         if total_steps is not None and self.glbl_step >= total_steps:
             self.print(
@@ -1510,6 +1508,8 @@ class Trainer:
             warnings.resetwarnings()
         self.optimizer.zero_grad()
         ShardedTokenEmbedding.tie_and_freeze_sharded_rows_(self.model)
+        if self.ema_model is not None and self.glbl_step >= self.args.ema_start_step and self.epoch_idx >= self.args.ema_start_epoch:
+            self.ema_model.update_parameters(unwrapddp(self.model))
         self.glbl_step += 1
         return norm
 
