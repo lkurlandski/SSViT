@@ -35,6 +35,15 @@ DISPLAY = (
     'display.width', None,
 )
 
+def round_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for c in list(df.columns):
+        if "gpu_mem" in c or "throughput" in c:
+            df[c] = df[c].astype(int)
+        else:
+            df[c] = df[c].round(4)
+    return df
+
 
 parser = ArgumentParser()
 parser.add_argument("input", type=str, nargs="?", default=None, help="Generic input, i.e., the resfile/logfile/jobid.")
@@ -225,7 +234,7 @@ if args.ddetailed:
             float_print_json(d)
     else:
         with pd.option_context(*DISPLAY):
-            print(df)
+            print(round_df(df))
 
 # Print detailed information, if requested.
 if args.detailed and not args.ddetailed:
@@ -237,7 +246,7 @@ if args.detailed and not args.ddetailed:
                 float_print_json(d)
     else:
         with pd.option_context(*DISPLAY):
-            print(df.dropna())
+            print(round_df(df.dropna()))
 
 # Print summary information, if requested.
 if not args.no_summary:
