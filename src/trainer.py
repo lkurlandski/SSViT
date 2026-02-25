@@ -1705,6 +1705,8 @@ class Trainer:
             d["vl_prc"] = round(results["vl_prc"], 3)
         if any(k.startswith("ema") for k in results):
             d |= extract_common("ema")
+            d["ema_roc"] = round(results["ema_roc"], 3)
+            d["ema_prc"] = round(results["ema_prc"], 3)
         return d
 
     def to_checkpoint(self, path: str | Path) -> None:
