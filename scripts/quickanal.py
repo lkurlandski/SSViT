@@ -39,7 +39,9 @@ def round_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for c in list(df.columns):
         if "gpu_mem" in c or "throughput" in c:
-            df[c] = df[c].astype(int)
+            df[c] = df[c].round(0)
+        elif "lr" in c:
+            df[c] = df[c].round(6)
         else:
             df[c] = df[c].round(4)
     return df
@@ -57,7 +59,7 @@ parser.add_argument("--detailed", action="store_true", help="Print detailed info
 parser.add_argument("--ddetailed", action="store_true", help="Print very detailed information (all entries).")
 parser.add_argument("--include", type=str, nargs="+",
     default=["tr_loss", "vl_loss", "vl_roc", "vl_prc", "tr_gpu_mem", "vl_gpu_mem", "tr_throughput", "vl_throughput", "lr"],
-    choices=["tr_loss", "vl_loss", "aux_loss", "clf_loss", "vl_aux_loss", "vl_clf_loss", "vl_roc", "vl_prc", "tr_gpu_utl", "vl_gpu_utl", "tr_gpu_mem", "vl_gpu_mem", "tr_throughput", "vl_throughput", "lr"],
+    choices=["tr_loss", "vl_loss", "aux_loss", "clf_loss", "vl_aux_loss", "vl_clf_loss", "vl_roc", "vl_prc", "tr_gpu_utl", "vl_gpu_utl", "tr_gpu_mem", "vl_gpu_mem", "tr_throughput", "vl_throughput", "lr", "ema_loss", "ema_prc", "ema_roc"],
     help="Metrics to include in the analysis (aside from 'epoch' and 'glbl_step'). If not provided, all metrics are included.")
 parser.add_argument("--quiet", action="store_true", help="Suppress non-essential output.")
 parser.add_argument("--verbose", action="store_true", help="Print verbose output for debugging.")
@@ -180,12 +182,15 @@ summary: dict[str, Callable[[np.ndarray], float]] = {  # type: ignore[type-arg]
     "lr": np.mean,
     "tr_loss": np.min,
     "vl_loss": np.min,
+    "ema_loss": np.min,
     "aux_loss": np.min,
     "clf_loss": np.min,
     "vl_aux_loss": np.min,
     "vl_clf_loss": np.min,
     "vl_roc": np.max,
     "vl_prc": np.max,
+    "ema_roc": np.max,
+    "ema_prc": np.max,
     "tr_gpu_utl": np.min,
     "vl_gpu_utl": np.min,
     "tr_gpu_mem": np.max,
