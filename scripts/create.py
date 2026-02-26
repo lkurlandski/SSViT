@@ -191,6 +191,7 @@ class Configuration:
             f"lr_nclr_ncycles--{self.lr_nclr_ncycles}",
             f"lr_nclr_max_lr_gamma--{self.lr_nclr_max_lr_gamma}",
             f"weight_decay--{self.weight_decay}",
+            f"weight_decay_transformer--{self.weight_decay_transformer}",
             f"warmup_ratio--{self.warmup_ratio}",
             f"label_smoothing--{self.label_smoothing}",
             f"max_epochs--{self.max_epochs}",
@@ -366,6 +367,10 @@ class Configuration:
     @property
     def weight_decay(self) -> float:
         return 0.001
+
+    @property
+    def weight_decay_transformer(self) -> float:
+        return 0.01
 
     @property
     def warmup_ratio(self) -> float:
@@ -702,6 +707,7 @@ class ScriptBuilder:
             f"--auxillary_loss_weight {self.config.auxillary_loss_weight}",
             f"--assert_auxillary_loss {self.config.assert_auxillary_loss}",
             f"--weight_decay {self.config.weight_decay}",
+            f"--weight_decay_transformer {self.config.weight_decay_transformer}",
             f"--warmup_ratio {self.config.warmup_ratio}",
             f"--label_smoothing {self.config.label_smoothing}",
             f"--stopper_patience {self.config.stopper_patience}",
