@@ -779,13 +779,20 @@ def get_padbatch(design: Design, structures: list[HierarchicalStructure], do_par
     raise NotImplementedError(f"{design}")
 
 
-def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlapping: bool = False, verbose: bool = False) -> list[dict[str, Any]]:
+def decay_aware_param_groups(
+    model: Module,
+    weight_decay: float,
+    weight_decay_transformer: Optional[float] = None,
+    allow_overlapping: bool = False,
+    verbose: bool = False,
+) -> list[dict[str, Any]]:
     """
     Return decay aware parameter groups. Decay will not be applied to biases, normalization, and embeddings.
 
     Args:
         model: The model.
         weight_decay: The weight decay rate.
+        weight_decay_transformer: The weight decay rate for Transformer components.
         allow_overlapping: If overlapping parameters are found between decay
             and non-decay groups, moves them to the non-decay group instead of raising.
         verbose: If True, prints each param's name and whether it will be decayed.
@@ -793,6 +800,7 @@ def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlappi
     Returns:
         A list of parameter groups, each with a `weight_decay` key.
     """
+    weight_decay_transformer = weight_decay if weight_decay_transformer is None else weight_decay_transformer
 
     # Parameters in these modules will be ignored.
     layers = (
@@ -821,9 +829,19 @@ def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlappi
         FiLM,
     )
 
+    # Parameters in these modules and their submodules will be associated with the transformer weight_decay.
+    layerst = (
+        nn.Transformer,
+        nn.TransformerEncoder,
+        nn.TransformerDecoder,
+        nn.TransformerEncoderLayer,
+        nn.TransformerDecoderLayer,
+    )
+
     # Collect the ids of all params into two bins: one for no decay, one for decay.
     no_decay_ids: set[int] = set()
     ys_decay_ids: set[int] = set()
+    tr_decay_ids: set[int] = set()
     for module in model.modules():
         # Don't decay these layers.
         if isinstance(module, layers):
@@ -839,10 +857,29 @@ def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlappi
                 no_decay_ids.add(id(p))
             continue
         # Otherwise, decay them, ignoring bias terms (one-dimensional).
+        if isinstance(module, layerst):
+            for n, p in module.named_parameters(recurse=True):
+                if not p.requires_grad:
+                    continue
+                if id(p) in no_decay_ids:
+                    continue
+                if n == "bias":
+                    no_decay_ids.add(id(p))
+                elif "bias" in n.lower():
+                    warnings.warn(f"Bias-like parameter {n} will be excluded from decay.")
+                    no_decay_ids.add(id(p))
+                elif p.ndim == 1:
+                    warnings.warn(f"Bias-like parameter {n} will not be excluded from decay.")
+                    tr_decay_ids.add(id(p))
+                else:
+                    tr_decay_ids.add(id(p))
+            continue
         for n, p in module.named_parameters(recurse=False):
             if not p.requires_grad:
                 continue
             if id(p) in no_decay_ids:
+                continue
+            if id(p) in tr_decay_ids:
                 continue
             if n == "bias":
                 no_decay_ids.add(id(p))
@@ -865,6 +902,8 @@ def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlappi
                 print(f"  {n} {s} --> no decay")
             elif id(p) in ys_decay_ids:
                 print(f"  {n} {s} --> decay")
+            elif id(p) in tr_decay_ids:
+                print(f"  {n} {s} --> tr decay")
             else:
                 raise RuntimeError("Unreachable.")
 
@@ -872,12 +911,26 @@ def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlappi
     if (intersection := set.intersection(no_decay_ids, ys_decay_ids)):
         if not allow_overlapping:
             raise ValueError(f"Found overlapping param ids: {intersection}.")
+        warnings.warn(f"Found overlapping param ids: {intersection}.")
+        for i in intersection:
+            ys_decay_ids.remove(i)
+    if (intersection := set.intersection(no_decay_ids, tr_decay_ids)):
+        if not allow_overlapping:
+            raise ValueError(f"Found overlapping param ids: {intersection}.")
+        warnings.warn(f"Found overlapping param ids: {intersection}.")
+        for i in intersection:
+            tr_decay_ids.remove(i)
+    if (intersection := set.intersection(ys_decay_ids, tr_decay_ids)):
+        if not allow_overlapping:
+            raise ValueError(f"Found overlapping param ids: {intersection}.")
+        warnings.warn(f"Found overlapping param ids: {intersection}.")
         for i in intersection:
             ys_decay_ids.remove(i)
 
     # Collect the params into two lists: one for no decay, one for decay.
     no_decay_params: list[nn.Parameter] = []
     ys_decay_params: list[nn.Parameter] = []
+    tr_decay_params: list[nn.Parameter] = []
     for p in model.parameters():
         if not p.requires_grad:
             continue
@@ -887,15 +940,19 @@ def decay_aware_param_groups(model: Module, weight_decay: float, allow_overlappi
         if id(p) in ys_decay_ids:
             ys_decay_params.append(p)
             continue
+        if id(p) in tr_decay_ids:
+            tr_decay_params.append(p)
+            continue
         raise ValueError(f"Parameter {id(p)} is not covered by a param group.")
 
     # Ensure every trainable param appears exactly once.
     total = sum(1 for p in model.parameters() if p.requires_grad)
-    if len(no_decay_params) + len(ys_decay_params) != total:
+    if len(no_decay_params) + len(ys_decay_params) + len(tr_decay_params) != total:
         raise ValueError(f"Found {total} trainable parameters, but {len(no_decay_params) + len(ys_decay_params)} are in param groups.")
 
     groups = [
         {"params": ys_decay_params, "weight_decay": weight_decay},
+        {"params": tr_decay_params, "weight_decay": weight_decay_transformer},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
@@ -1381,7 +1438,7 @@ def main() -> None:
             vl_loader=ts_loader,
             loss_fn=loss_fn,
             optimizer_init=optimizer_init,
-            get_param_groups=partial(decay_aware_param_groups, weight_decay=args.weight_decay),
+            get_param_groups=partial(decay_aware_param_groups, weight_decay=args.weight_decay, weight_decay_transformer=args.weight_decay_transformer, allow_overlapping=True),
             scheduler_init=scheduler_init,
             device=args.device,
         )
@@ -1410,7 +1467,7 @@ def main() -> None:
 
     else:
         wmodel = wrap_model(model)
-        params = decay_aware_param_groups(wmodel, args.weight_decay)
+        params = decay_aware_param_groups(wmodel, weight_decay=args.weight_decay, weight_decay_transformer=args.weight_decay_transformer, allow_overlapping=True)
         optimizer = optimizer_init(params)
         scheduler = scheduler_init(optimizer)
         print(f"{scheduler=}")
