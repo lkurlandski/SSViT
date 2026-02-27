@@ -648,6 +648,7 @@ class ScriptBuilder:
 
         environment = "\n".join([
             f"source ./{env}/bin/activate",
+            "spack load gcc/lhqcen5" if SYSTEM == "rc" else "",
         ])
 
         variables = "\n".join([
